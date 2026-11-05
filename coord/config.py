@@ -1552,10 +1552,18 @@ class BoardDoctorConfig:
     finisher leg instead of the #476 gate's silent approve-with-nits.
     `coord.board_doctor_policy._finisher_tier_enabled` reads both this
     field and the per-repo opt-in.
+
+    ``stale_race`` is the fleet-wide switch for #3859's checks-stale-race
+    disposition, mirroring ``investigate``/``finish`` exactly: a repo must
+    still opt in via its own ``repos[].board_doctor.stale_race``
+    (``BoardDoctorRepoConfig.stale_race``, default ``False``).
+    `coord.board_doctor_policy._stale_race_tier_enabled` reads both this
+    field and the per-repo opt-in.
     """
 
     investigate: bool = True
     finish: bool = True
+    stale_race: bool = True
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3540,6 +3548,11 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         if not isinstance(finish, bool):
             raise ConfigError("board_doctor.finish must be a boolean")
         cfg.finish = finish
+    if "stale_race" in raw:
+        stale_race = raw["stale_race"]
+        if not isinstance(stale_race, bool):
+            raise ConfigError("board_doctor.stale_race must be a boolean")
+        cfg.stale_race = stale_race
     return cfg
 
 
@@ -3997,6 +4010,13 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 f"repos[{repo_index}].board_doctor.finish must be a boolean"
             )
         cfg.finish = finish
+    if "stale_race" in raw:
+        stale_race = raw["stale_race"]
+        if not isinstance(stale_race, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.stale_race must be a boolean"
+            )
+        cfg.stale_race = stale_race
     return cfg
 
 

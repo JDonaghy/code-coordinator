@@ -79,10 +79,24 @@ class BoardDoctorRepoConfig:
     function that reads this alongside the fleet-wide kill switch
     (`Config.board_doctor.finish`) and its `COORD_BOARD_DOCTOR_NO_FINISHER`
     env-var override.
+
+    ``stale_race`` is this repo's opt-in to the #3859 checks-stale-race
+    disposition: a drive-queue row that exhausted its merge-attempt budget
+    losing a race against sibling merges (not a real problem with the
+    branch) gets a per-repo merge-gate reservation plus one fresh
+    stale-rebase dispatch instead of escalating straight to a human. `False`
+    (the default) leaves today's behavior unchanged — the row still
+    escalates via `coord.commands.drive_queue._run_auto_revalidate_checks_
+    stale`'s existing `merge_checks_stale_human_required` path.
+    `coord.board_doctor_policy._stale_race_tier_enabled` is the single
+    function that reads this alongside the fleet-wide kill switch
+    (`Config.board_doctor.stale_race`) and its
+    `COORD_BOARD_DOCTOR_NO_STALE_RACE` env-var override.
     """
 
     investigate: bool = False
     finish: bool = False
+    stale_race: bool = False
 
 
 @dataclass

@@ -130,6 +130,18 @@ CAUSE_SMOKE_NO_VERDICT = "smoke-no-verdict"
 #: so a repo with ten blocked PRs produces one alert, not ten.
 CAUSE_BASELINE_RED = "baseline-red"
 
+#: A narrow cause minted by :func:`_reclassify_checks_stale_race`, never by
+#: `queue_diagnose` itself (#3859) — mirrors :data:`CAUSE_CEILING_BLOCKED_
+#: MERGEABLE`'s own "promote only an independently-confirmed subset of
+#: :data:`_LIVE_CLEAR_CAUSES`" shape. A drive-queue row whose live evidence
+#: reads completely clear (review approved, Test passed, PR mergeable) but
+#: whose owning `coord drive` session already gave up because it kept
+#: losing a race against sibling PRs merging into the same repo faster than
+#: its own re-run CI could finish (quadraui#1961) — never a problem with
+#: the branch itself. See `coord.drive_queue.is_checks_stale_race_giveup_
+#: reason` for the exact marker this reclassifier keys on.
+CAUSE_CHECKS_STALE_RACE = "checks-stale-race"
+
 
 def default_tier_of(cause: str) -> str:
     """Default `tier_of`: delegates to the real C2 policy.
@@ -602,6 +614,59 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     return reclassified
 
 
+def _reclassify_checks_stale_race(rows: list[StuckRow]) -> list[StuckRow]:
+    """Relabel checks-stale-race-but-live-clear rows (#3859).
+
+    Runs strictly AFTER :func:`queue_diagnose.diagnose` has already picked a
+    cause from live evidence alone, exactly like :func:`_reclassify_ceiling_
+    blocked` — this never feeds the entry's own stated reason into that
+    classifier (#2235's invariant); it only reads the drive-queue row's
+    OWN stored state/reason afterward, through
+    :func:`coord.drive_queue.checks_stale_race_giveup_for_issue`, to ask
+    whether a row this sweep would otherwise leave at the alert tier (via
+    `CAUSE_GATE_BLOCKED`/`CAUSE_CI_PENDING`, whichever `queue_diagnose`
+    assigned to a row whose live checks are still catching up) actually
+    lost its last life to the quadraui#1961 sibling-merge race rather than
+    a real problem.
+
+    Same freshness/confidence bar as :func:`_reclassify_ceiling_blocked`
+    (:attr:`StuckRow.fresh`, confidence above
+    :data:`coord.queue_diagnose.CONFIDENCE_LOW`) and the same reason: a row
+    :func:`_episode_stuck_row` rebuilt from a stale stored verdict, or a
+    probe `queue_diagnose` itself flagged as incomplete, is not fresh enough
+    evidence to reclassify — the review-approved/Test-passed/mergeable
+    reading this reclassifier promotes on must be confirmed THIS sweep, not
+    inherited from whenever the episode last concluded.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        checks_stale_race_giveup_for_issue,
+        parse_key as _parse_row_key,
+    )
+
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        if (
+            row.queue == "drive-queue"
+            and row.fresh
+            and row.cause in _LIVE_CLEAR_CAUSES
+            and row.confidence != queue_diagnose.CONFIDENCE_LOW
+        ):
+            parsed = _parse_row_key(row.key)
+            if parsed is not None and checks_stale_race_giveup_for_issue(*parsed):
+                row = replace(
+                    row,
+                    cause=CAUSE_CHECKS_STALE_RACE,
+                    evidence=row.evidence
+                    + (
+                        "drive_queue: the owning drive session exhausted its "
+                        "merge-attempt budget losing a race against sibling "
+                        "merges while live reads clear (#3859)",
+                    ),
+                )
+        reclassified.append(row)
+    return reclassified
+
+
 def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRow]:
     """The impure production walk over both queues (#3758).
 
@@ -675,6 +740,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows.extend(refreshed_rows)
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows = _reclassify_ceiling_blocked(rows)
+    rows = _reclassify_checks_stale_race(rows)
     rows.extend(merge_queue_rows(load_merge_queue()))
     rows.extend(smoke_no_verdict_rows(board))
 

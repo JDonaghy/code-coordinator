@@ -2533,6 +2533,164 @@ def record_board_doctor_fixit_rebudget_spent(repo_name: str, issue_number: int) 
     retry_on_locked(_write)
 
 
+# ── #3859: per-repo merge-gate reservation (checks_stale sibling races) ────
+#
+# Persisted in `board_meta`, the same one-JSON-blob-per-key seam
+# `_BOARD_DOCTOR_FIXIT_REBUDGET_META_KEY` uses just above. Maps
+# `repo_name -> {"holder": "repo#issue", "expires_at": epoch_seconds}` — one
+# row reserves the merge gate for the WHOLE repo at a time: once a
+# `checks_stale` sibling-merge race is recognized, the row that just
+# finished a successful stale-rebase gets first claim on the gate until its
+# re-run CI completes and it merges, or the reservation times out, so a
+# sibling PR's CI finishing first can no longer leapfrog it indefinitely.
+_MERGE_RESERVATION_META_KEY = "checks_stale_merge_reservations"
+
+#: Cap on the number of repo-keyed reservations tracked at once — same
+#: "never allowed to grow the `board_meta` row without bound" rationale as
+#: :data:`BOARD_DOCTOR_FIXIT_REBUDGET_LIMIT`. A reservation is one row per
+#: repo, so this is generous headroom, not a tuning knob.
+MERGE_RESERVATION_LIMIT = 500
+
+
+def _load_merge_reservations_raw(conn) -> dict[str, dict]:
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_MERGE_RESERVATION_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def list_merge_reservations() -> dict[str, dict]:
+    """Every currently-live merge-gate reservation, keyed by repo (#3859).
+
+    Same expiry rule as :func:`get_merge_reservation` — an entry whose
+    ``expires_at`` has passed is omitted, not returned stale. Used by
+    cleanup passes that need to release a reservation whose holder stopped
+    being live (merged, or no longer stale) without already knowing which
+    repo to ask about.
+    """
+    _thin_client_local_board_guard("list_merge_reservations")
+    now = time.time()
+    data = _load_merge_reservations_raw(get_connection())
+    return {
+        repo_name: dict(entry)
+        for repo_name, entry in data.items()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("expires_at"), (int, float))
+        and entry["expires_at"] > now
+    }
+
+
+def get_merge_reservation(repo_name: str) -> dict | None:
+    """The live merge-gate reservation for *repo_name*, or ``None`` if there
+    isn't one or it has expired (#3859).
+
+    **Local-DB read only** — same limitation as
+    :func:`board_doctor_fixit_rebudget_spent`: this lives in ``board_meta``
+    on the canonical board, so a thin-client read would otherwise see an
+    empty/stale local copy.
+
+    An expired reservation (``expires_at`` in the past) reads back as
+    ``None`` with no separate cleanup sweep needed — the TTL itself is the
+    one source of truth for "is this still held", never a background job
+    racing the reader.
+    """
+    _thin_client_local_board_guard("get_merge_reservation")
+    data = _load_merge_reservations_raw(get_connection())
+    entry = data.get(repo_name)
+    if not isinstance(entry, dict):
+        return None
+    expires_at = entry.get("expires_at")
+    if not isinstance(expires_at, (int, float)) or expires_at <= time.time():
+        return None
+    return dict(entry)
+
+
+def reserve_merge_slot(repo_name: str, holder_key: str, ttl_seconds: float) -> bool:
+    """Claim the merge-gate reservation for *repo_name* on behalf of
+    *holder_key* (a ``"repo#issue"`` row key), good for *ttl_seconds* (#3859).
+
+    Returns ``True`` when the slot is now held by *holder_key* — either it
+    was free (no reservation, or an expired one), or *holder_key* already
+    held it (renewing the TTL on re-reservation is allowed; it is not a
+    conflict with itself). Returns ``False`` without writing anything when a
+    DIFFERENT holder's reservation is still live — the caller must defer,
+    never overwrite another row's claim.
+    """
+    conn = get_connection()
+    result = {"ok": False}
+
+    def _write() -> None:
+        data = _load_merge_reservations_raw(conn)
+        existing = data.get(repo_name)
+        if (
+            isinstance(existing, dict)
+            and existing.get("holder") != holder_key
+            and isinstance(existing.get("expires_at"), (int, float))
+            and existing["expires_at"] > time.time()
+        ):
+            result["ok"] = False
+            return
+        data[repo_name] = {
+            "holder": holder_key,
+            "expires_at": time.time() + ttl_seconds,
+        }
+        if len(data) > MERGE_RESERVATION_LIMIT:
+            data = dict(list(data.items())[-MERGE_RESERVATION_LIMIT:])
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_MERGE_RESERVATION_META_KEY, json.dumps(data)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+        result["ok"] = True
+
+    retry_on_locked(_write)
+    return result["ok"]
+
+
+def release_merge_reservation(repo_name: str, holder_key: str | None = None) -> bool:
+    """Release *repo_name*'s merge-gate reservation (#3859).
+
+    When *holder_key* is given, only releases a reservation CURRENTLY held
+    by that exact key — a stale caller (e.g. a tick that lost a race to a
+    later reservation on the same repo) cannot release a row it no longer
+    owns. ``None`` releases unconditionally (an operator-level clear).
+    Returns ``True`` only when a reservation was actually removed; ``False``
+    means "nothing to release" — already absent/expired, or held by someone
+    else.
+    """
+    conn = get_connection()
+    result = {"ok": False}
+
+    def _write() -> None:
+        data = _load_merge_reservations_raw(conn)
+        existing = data.get(repo_name)
+        if not isinstance(existing, dict):
+            result["ok"] = False
+            return
+        if holder_key is not None and existing.get("holder") != holder_key:
+            result["ok"] = False
+            return
+        del data[repo_name]
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_MERGE_RESERVATION_META_KEY, json.dumps(data)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+        result["ok"] = True
+
+    retry_on_locked(_write)
+    return result["ok"]
+
+
 def record_board_doctor_decision(entry: dict) -> None:
     """Append one row's sweep outcome to the decision log (#3758, #1478 spirit).
 

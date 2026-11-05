@@ -19,11 +19,13 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_CHECKS_STALE_RACE,
     CAUSE_SMOKE_NO_VERDICT,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
     _reclassify_ceiling_blocked,
+    _reclassify_checks_stale_race,
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
     smoke_no_verdict_rows,
@@ -381,6 +383,107 @@ class TestReclassifyCeilingBlocked:
         row = _row("acme/widgets#-5", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
+
+        assert out == row
+
+
+_STALE_RACE_GIVEUP_REASON = (
+    "merge attempted 3 times without landing.\n"
+    "   Last board state: status='CONFLICT' reason='none'\n"
+    "   Last `coord merge --only` diagnostic:\n"
+    "     CI stale: checks predate the current base — rebase onto main"
+)
+
+
+def _seed_stale_race_blocked_entry(repo: str, issue: int) -> None:
+    """A drive-queue row whose owning drive died burning its whole
+    merge-attempt budget against a `checks_stale`-rooted refusal (#3859,
+    quadraui#1961's shape)."""
+    state.enqueue_drive_queue(repo, issue, after=[])
+    state.update_drive_queue_entry(
+        repo, issue, state="blocked", last_reason=_STALE_RACE_GIVEUP_REASON,
+    )
+
+
+class TestReclassifyChecksStaleRace:
+    """#3859: relabel a checks-stale-race-but-live-clear row."""
+
+    def test_nothing_blocking_row_is_reclassified(self) -> None:
+        _seed_stale_race_blocked_entry("acme/widgets", 201)
+        row = _row("acme/widgets#201", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_checks_stale_race([row])
+
+        assert out.cause == CAUSE_CHECKS_STALE_RACE
+        assert out.evidence[:-1] == row.evidence
+        assert "#3859" in out.evidence[-1]
+
+    def test_stale_row_is_left_alone(self) -> None:
+        _seed_stale_race_blocked_entry("acme/widgets", 202)
+        row = _row("acme/widgets#202", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=False)
+
+        [out] = _reclassify_checks_stale_race([row])
+
+        assert out == row
+
+    def test_low_confidence_row_is_left_alone(self) -> None:
+        _seed_stale_race_blocked_entry("acme/widgets", 203)
+        row = StuckRow(
+            queue="drive-queue", key="acme/widgets#203", state="stuck",
+            cause=queue_diagnose.CAUSE_NOTHING_BLOCKING,
+            confidence=queue_diagnose.CONFIDENCE_LOW,
+            evidence=(f"cause={queue_diagnose.CAUSE_NOTHING_BLOCKING}",),
+            fresh=True,
+        )
+
+        [out] = _reclassify_checks_stale_race([row])
+
+        assert out == row
+
+    def test_a_row_blocked_for_a_different_reason_is_left_alone(self) -> None:
+        # Exhausted merge attempts, but the last diagnostic names a real
+        # conflict, not CI staleness — must not relabel a genuine block.
+        state.enqueue_drive_queue("acme/widgets", 204, after=[])
+        state.update_drive_queue_entry(
+            "acme/widgets", 204, state="blocked",
+            last_reason=(
+                "merge attempted 3 times without landing.\n"
+                "   Last `coord merge --only` diagnostic:\n"
+                "     merge conflict in foo.py"
+            ),
+        )
+        row = _row("acme/widgets#204", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_checks_stale_race([row])
+
+        assert out == row
+
+    def test_ceiling_blocked_row_is_reclassified_as_ceiling_not_stale_race(self) -> None:
+        # The two reclassifiers key on disjoint marker text — a row that IS
+        # #2972-ceiling-blocked (no "checks_stale" marker) must not also
+        # match the stale-race predicate.
+        _seed_ceiling_blocked_entry("acme/widgets", 205)
+        row = _row("acme/widgets#205", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_checks_stale_race([row])
+
+        assert out == row
+
+    def test_merge_queue_rows_are_never_reclassified(self) -> None:
+        _seed_stale_race_blocked_entry("acme/widgets", 206)
+        row = _row(
+            "acme/widgets#206", queue_diagnose.CAUSE_NOTHING_BLOCKING,
+            queue="merge-queue", fresh=True,
+        )
+
+        [out] = _reclassify_checks_stale_race([row])
+
+        assert out == row
+
+    def test_unparseable_key_is_left_alone(self) -> None:
+        row = _row("no-hash-separator", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_checks_stale_race([row])
 
         assert out == row
 

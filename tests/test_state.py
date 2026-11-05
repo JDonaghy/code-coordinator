@@ -6795,3 +6795,105 @@ class TestPrMergeCiRerunBudget:
         assert pr_merge_ci_rerun_already_attempted(
             "acme/api", PR_MERGE_CI_RERUN_LIMIT, f"sha{PR_MERGE_CI_RERUN_LIMIT}"
         )
+
+
+class TestMergeReservation:
+    """#3859: the per-repo merge-gate reservation board-doctor's
+    checks-stale-race disposition uses to order sibling rows instead of
+    letting them leapfrog each other."""
+
+    def test_absent_reservation_reads_as_none(self, coord_db) -> None:
+        from coord.state import get_merge_reservation
+
+        assert get_merge_reservation("acme/api") is None
+
+    def test_reserve_then_read_back(self, coord_db) -> None:
+        from coord.state import get_merge_reservation, reserve_merge_slot
+
+        assert reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60) is True
+
+        reservation = get_merge_reservation("acme/api")
+        assert reservation is not None
+        assert reservation["holder"] == "acme/api#7"
+
+    def test_a_different_holder_is_refused_while_live(self, coord_db) -> None:
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60) is True
+        # A different row cannot steal the reservation while it is live.
+        assert reserve_merge_slot("acme/api", "acme/api#8", ttl_seconds=60) is False
+
+    def test_the_same_holder_may_renew(self, coord_db) -> None:
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60) is True
+        # Renewing its own reservation is not a conflict with itself.
+        assert reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=120) is True
+
+    def test_an_expired_reservation_reads_as_absent_and_may_be_reclaimed(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        import coord.state as state_mod
+        from coord.state import get_merge_reservation, reserve_merge_slot
+
+        now = [1_000_000.0]
+        monkeypatch.setattr(state_mod.time, "time", lambda: now[0])
+
+        assert reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60) is True
+        now[0] += 61  # past the TTL
+
+        assert get_merge_reservation("acme/api") is None
+        # A fresh holder may now claim the slot — the expired one does not
+        # block it.
+        assert reserve_merge_slot("acme/api", "acme/api#8", ttl_seconds=60) is True
+
+    def test_release_only_releases_the_matching_holder(self, coord_db) -> None:
+        from coord.state import (
+            get_merge_reservation,
+            release_merge_reservation,
+            reserve_merge_slot,
+        )
+
+        reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60)
+
+        # A stale caller (lost the race to a later reservation it does not
+        # know about) cannot release a row it no longer owns.
+        assert release_merge_reservation("acme/api", "acme/api#8") is False
+        assert get_merge_reservation("acme/api") is not None
+
+        assert release_merge_reservation("acme/api", "acme/api#7") is True
+        assert get_merge_reservation("acme/api") is None
+
+    def test_release_with_no_holder_is_unconditional(self, coord_db) -> None:
+        from coord.state import (
+            get_merge_reservation,
+            release_merge_reservation,
+            reserve_merge_slot,
+        )
+
+        reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60)
+        assert release_merge_reservation("acme/api") is True
+        assert get_merge_reservation("acme/api") is None
+
+    def test_reservations_are_scoped_per_repo(self, coord_db) -> None:
+        from coord.state import get_merge_reservation, reserve_merge_slot
+
+        reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60)
+        assert get_merge_reservation("acme/web") is None
+
+    def test_list_merge_reservations_omits_expired_entries(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        import coord.state as state_mod
+        from coord.state import list_merge_reservations, reserve_merge_slot
+
+        now = [2_000_000.0]
+        monkeypatch.setattr(state_mod.time, "time", lambda: now[0])
+
+        reserve_merge_slot("acme/api", "acme/api#7", ttl_seconds=60)
+        reserve_merge_slot("acme/web", "acme/web#1", ttl_seconds=600)
+        now[0] += 61
+
+        live = list_merge_reservations()
+        assert "acme/api" not in live
+        assert live["acme/web"]["holder"] == "acme/web#1"
