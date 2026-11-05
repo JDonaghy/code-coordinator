@@ -2264,7 +2264,9 @@ class IssueFacts:
         )
 
 
-def _merge_landed_state(facts: "IssueFacts") -> tuple[str, str]:
+def _merge_landed_state(
+    facts: "IssueFacts", *, confirmed_merged: bool = False
+) -> tuple[str, str]:
     """(state, witness) for a `facts.landed` issue (#3502).
 
     `STATE_DONE`/`"merged"`|`"issue closed"` is the pre-#3502 pair, used for
@@ -2279,12 +2281,43 @@ def _merge_landed_state(facts: "IssueFacts") -> tuple[str, str]:
     drift from each other (#2096: one question, one answer) — three in
     `_reconcile_running`, plus the `_capacity_for` STATE_PARKED/BLOCKED/
     FAILED sweep and `_cordon_reason`, five in total.
+
+    *confirmed_merged* (#3863): set by a caller that already has evidence
+    of the merge itself STRONGER than the cached board — the drive's own
+    live `verify_merged` call behind a confirmed `own_reason`, or
+    `live_prereq_terminal`'s live re-check, both taken THIS tick.
+    `facts.merged_partial` additionally requires `facts.merged`, which is
+    sourced from the SAME cached `/board` snapshot `facts.merge_resolution`
+    is — and that snapshot's `assignments` row can still read `status=
+    'done'` for a while after the merge actually landed: the flip to
+    `'merged'` is a SEPARATE, later write (`coord.reconcile.py`'s own sweep
+    calling `state.mark_assignment_merged`), with no ordering guarantee
+    against the live merge confirmation a caller here already has in hand.
+    Without this, a drive that exits confirming a partial-resolution merge
+    during exactly that lag window reads `facts.merged_partial` as `False`
+    — the cache simply has not caught up — and lands `STATE_DONE` instead
+    of `STATE_MERGED_PARTIAL`. Passing `True` answers the "did it merge"
+    half from the caller's own stronger evidence instead of `facts.merged`;
+    it does NOT also assume "resolved" — `facts.merge_resolution` (and
+    `facts.closed`, a human's own stronger override) still decide partial
+    vs. plain done, because a live merge confirmation says nothing about
+    the worker's/reviewer's `ISSUE_RESOLUTION:` verdict.
     """
-    if facts.merged_partial:
+    merged_partial = (
+        facts.merged_partial
+        if not confirmed_merged
+        else (
+            not facts.closed
+            and facts.merge_resolution != DEFAULT_ISSUE_RESOLUTION
+        )
+    )
+    if merged_partial:
         return (
             STATE_MERGED_PARTIAL,
             f"merged, issue intentionally left open ({facts.merge_resolution})",
         )
+    if confirmed_merged:
+        return STATE_DONE, "merged"
     witness = "merged" if facts.merged else "issue closed"
     return STATE_DONE, witness
 
@@ -2396,6 +2429,30 @@ def build_board_view(
             # `coord assign` and ran the work to completion — see
             # `IssueFacts.work_done`'s docstring.
             entry["work_done"] = True
+            # #3863: the SAME `completion_summary` read as above, but taken
+            # a tick EARLY — while this row still reads `done`, not yet
+            # `merged`. `completion_summary` is captured the moment a work
+            # assignment leaves `running` (`notify.py`'s `_capture_
+            # completion_summary`), which is well before the SEPARATE,
+            # later flip from `done` to `merged` (`coord.reconcile.py`'s own
+            # sweep calling `state.mark_assignment_merged`) — two
+            # independent async writers racing each other, with no ordering
+            # guarantee between them. Gating the read above solely on
+            # `status == "merged"` left a window where a caller with
+            # independent LIVE evidence the merge already landed (the
+            # drive's own `own_reason`, or a live re-check —
+            # `_merge_landed_state`'s `confirmed_merged` override) had
+            # nothing but the DEFAULT "resolved" value to read here, because
+            # THIS row's own snapshot hadn't caught up to `merged` yet.
+            # `if summary:` guards against ever overwriting a real reading
+            # with the default — a `done` row with no `completion_summary`
+            # at all leaves `merge_resolution` exactly as the slot default
+            # left it, never regressing a value the `merged` branch above
+            # already set from an earlier read of this SAME row.
+            if (row.get("type") or "") in CLOSES_ISSUE_TYPES:
+                summary = row.get("completion_summary")
+                if summary:
+                    entry["merge_resolution"] = parse_issue_resolution(summary).value
         if status not in TERMINAL_STATUSES:
             entry["active_work"] = True
         # #2273: high-water mark of `dispatched_at`, regardless of `status` —
@@ -5243,7 +5300,14 @@ def _reconcile_running(
         # the worker/reviewer said the issue itself is resolved, so the
         # cached board's own resolution marker is still the right (and
         # only available) signal for that half of the question.
-        state, _witness = _merge_landed_state(facts)
+        #
+        # #3863: `confirmed_merged=True` — this branch's own live
+        # `verify_merged` evidence IS the "did it merge" answer; it must
+        # not also require `facts.merged` (the cached board's `/board`
+        # snapshot), which a separate, later write can still lag behind
+        # this exact tick. See `_merge_landed_state`'s docstring for the
+        # race this closes.
+        state, _witness = _merge_landed_state(facts, confirmed_merged=True)
         reason = f"{own_reason} — confirmed merged (#2850), not a death"
         return (
             Reconcile(
@@ -5272,7 +5336,12 @@ def _reconcile_running(
         # #3502: same posture as the `own_reason` branch just above — the
         # live probe confirms the MERGE, `facts.merge_resolution` is still
         # what decides `done` vs `merged-partial`.
-        state, _witness = _merge_landed_state(facts)
+        #
+        # #3863: `confirmed_merged=True` — same rationale as the
+        # `own_reason` branch above: this live re-check IS the "did it
+        # land" answer, and must not be gated on `facts.merged` catching up
+        # to it on the SAME tick.
+        state, _witness = _merge_landed_state(facts, confirmed_merged=True)
         reason = (
             "drive finished — a live re-check this tick confirms the issue "
             "is already closed or its PR merged (#2850), independent of "
@@ -8264,6 +8333,42 @@ def plan_tick(
         )
         states[entry.key] = STATE_WAITING
         effective_attempts[entry.key] = 0  # #2273: see #2182 branch above
+
+    # #3863: self-heal a `done` row misclassified before the board caught
+    # up with its merge-time `ISSUE_RESOLUTION:` — going forward,
+    # `_merge_landed_state`'s `confirmed_merged` override above closes the
+    # race that wrote it this way in the first place, but a row ALREADY
+    # written `done` by that race (or by any other cause predating this
+    # fix) gets no further re-check anywhere else in this module: `done`
+    # is terminal, and nothing above touches a row outside {`parked`,
+    # `blocked`, `failed`}. One extra `board.facts()` read per `done` row,
+    # every tick — cheap, and the only path that ever corrects a row
+    # already written wrong.
+    for entry in ordered:
+        if entry.state != STATE_DONE:
+            continue
+        facts = board.facts(entry.key)
+        if not facts.merged_partial:
+            continue
+        reason = (
+            f"{entry.key} corrected from done to merged-partial — the "
+            "board now shows its issue open with a non-resolved "
+            f"`ISSUE_RESOLUTION: {facts.merge_resolution}` marker on the "
+            "merged work (#3863)"
+        )
+        reconciles.append(
+            Reconcile(
+                entry.key,
+                "done",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_MERGED_PARTIAL,
+                    "last_reason": reason,
+                },
+            )
+        )
+        states[entry.key] = STATE_MERGED_PARTIAL
 
     # #1757 step 2: deploy gates.  Resolved from the POST-reconcile states, so
     # a `--hold-after` entry that reconciled to `blocked` cannot also fire a
