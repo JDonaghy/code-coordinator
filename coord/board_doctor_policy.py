@@ -12,8 +12,9 @@ Why the allowlist below is NOT empty
 A cause belongs on the auto-action allowlist only once there is a
 known-safe, reviewed-in-advance fix for it — never as a pre-approved
 guess. #3760 (C3) started this allowlist with two such causes; a third
-(``CAUSE_SMOKE_NO_VERDICT``, #3810) has since joined it the same way, each
-wired below via :func:`_register_auto_action`:
+(``CAUSE_SMOKE_NO_VERDICT``, #3810) and a fourth
+(``queue_diagnose.CAUSE_NEVER_DISPATCHED``, #3874) have since joined it
+the same way, each wired below via :func:`_register_auto_action`:
 
 * ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (minted by
   `coord.board_doctor._reclassify_ceiling_blocked`, never by
@@ -30,6 +31,16 @@ wired below via :func:`_register_auto_action`:
   ``sweep_smoke_requeue`` clears it, bounded by its own
   `coord.smoke.BOARD_DOCTOR_REQUEUE_BUDGET` so a leg that keeps muting
   after each requeue escalates to a human instead of looping forever.
+* ``queue_diagnose.CAUSE_NEVER_DISPATCHED`` — a `blocked`/`parked` row
+  with no branch, no PR and no merge-queue row ever created for it
+  (`coord.drive_queue.is_unreachable_wait_shape`), most often one whose
+  only cause was an `after=` pre-req that has since landed. The SAME
+  ``drive_queue_requeue`` action `CAUSE_CEILING_BLOCKED_MERGEABLE` uses is
+  safe here too, and for the identical reason: nothing was ever
+  dispatched, so taking the row down and putting it straight back as
+  `waiting` re-runs nothing that already ran — it is the mechanical
+  equivalent of the operator `remove` + `add` this shape has otherwise
+  needed every time it has been hit.
 
 Every other mechanical cause stays off this allow-list until it has the
 same kind of reviewed, narrowly-scoped evidence behind it — a wrong
@@ -453,6 +464,50 @@ def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
     return True
 
 
+def _requeue_never_dispatched(row: StuckRow) -> bool:
+    """#3874: reset-to-waiting for a row that was never dispatched at all.
+
+    `queue_diagnose.CAUSE_NEVER_DISPATCHED` already fires straight off
+    `coord.drive_queue.is_unreachable_wait_shape(entry)` — no board-doctor
+    reclassification needed, same as :func:`_clear_merged_row` — so this
+    only has to put the row back. Reuses the SAME ``drive_queue_requeue``
+    primitive :func:`_requeue_ceiling_blocked_mergeable` dispatches (remove
+    then re-add, declaration preserved): safe here for the same reason
+    that action's own docstring gives — a row with nothing dispatched
+    behind it has no Work/Test/Review run to lose by being taken down and
+    put straight back as `waiting`.
+
+    Returns ``True`` only when `sweep_drive_queue_requeue` confirms
+    ``requeued=True``. A row whose #1757 deploy gate is mid-flight
+    (`SweepPermissionError`), or one no longer present/parseable, reports
+    `"auto-dispatch-noop"` instead of a false success — same defensive
+    handling every other dispatch call in this module gets.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, issue_number = parsed
+    import click  # noqa: PLC0415
+
+    try:
+        result = dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
+    except SweepPermissionError as exc:
+        click.echo(
+            f"warning: board-doctor requeue refused for {repo_name}#"
+            f"{issue_number}: {exc}",
+            err=True,
+        )
+        return False
+    if not result.get("requeued"):
+        click.echo(
+            f"warning: board-doctor requeue no-op for {repo_name}#"
+            f"{issue_number}: {result.get('detail')}",
+            err=True,
+        )
+        return False
+    return True
+
+
 _register_auto_action(
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     "drive_queue_requeue",
@@ -467,6 +522,11 @@ _register_auto_action(
     CAUSE_SMOKE_NO_VERDICT,
     "smoke_requeue",
     _requeue_smoke_no_verdict,
+)
+_register_auto_action(
+    queue_diagnose.CAUSE_NEVER_DISPATCHED,
+    "drive_queue_requeue",
+    _requeue_never_dispatched,
 )
 
 

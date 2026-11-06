@@ -5774,6 +5774,64 @@ def test_a_mass_after_prereq_cascade_is_also_staggered():
     assert "#3536" in staggered_reconcile.reason
 
 
+def test_a_staggered_after_prereq_resume_keeps_its_marker_for_the_next_tick():
+    """#3874: the stagger reconcile must not overwrite `last_reason` for a
+    `resumed` outcome that came from `_reconcile_blocked_after`'s own
+    `after=` resume — `updates` must be entirely empty, so the entry keeps
+    the `is_unsatisfiable_prereq_reason` marker that function needs to
+    recognise it again.
+
+    Before this fix, staggering wrote the "resuming on a later tick" text
+    into `last_reason` unconditionally (via `_refresh_only`). That text does
+    not match `is_unsatisfiable_prereq_reason`, so the VERY NEXT tick could
+    never resume #1656 through `_reconcile_blocked_after` again — it fell to
+    `_reconcile_blocked`'s merge-gate probe, which has no branch/PR to read
+    for a never-dispatched entry and reports "could not be read" forever
+    (the quadraui#2035 incident). This pins both halves: the stagger write
+    is a true no-op, and a LATER tick with a free slot resumes for real."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [entry(1650, position=0, state=STATE_DONE)] + [
+        entry(
+            1654 + i,
+            position=1 + i,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        )
+        for i in range(3)
+    ]
+    tick1 = plan_tick(entries, board(merged=(1650,)), capacity=4)
+
+    by_key = {r.key: r for r in tick1.reconciles}
+    staggered_reconcile = by_key[entry_key(REPO, 1656)]
+    assert staggered_reconcile.outcome == "resume_staggered"
+    # The whole point: nothing is written at all, not even `last_reason`.
+    assert staggered_reconcile.updates == {}
+
+    # Tick 2: capacity frees up (the other two rows are no longer `blocked`)
+    # and #1656's `last_reason` is STILL the original marker — untouched by
+    # tick 1 — so `_reconcile_blocked_after` recognises it and resumes it.
+    still_blocked = entry(
+        1656,
+        position=3,
+        after=(dep_key,),
+        state=STATE_BLOCKED,
+        attempts=2,
+        resumes=0,
+        last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+    )
+    tick2 = plan_tick(
+        [entry(1650, position=0, state=STATE_DONE), still_blocked],
+        board(merged=(1650,)),
+        capacity=4,
+    )
+    reconcile = next(r for r in tick2.reconciles if r.key == entry_key(REPO, 1656))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+
+
 # ── #2935: a never-dispatched after=-blocked entry must never reach the ────
 # merge-gate sweep at all
 #

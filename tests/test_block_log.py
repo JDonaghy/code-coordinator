@@ -886,6 +886,66 @@ def test_a_probe_that_raises_becomes_an_abstention_not_an_exception():
     assert "probe raised RuntimeError: boom" in got[0].evidence[-1]
 
 
+# ── #3874: a never-dispatched row's prereq lands, but it has no branch for ──
+# ── any merge-gate/PR probe to ever read ─────────────────────────────────────
+#
+# claude-coordinator#3874 (quadraui#2035): a drive-queue row blocked only on
+# an `after=` pre-req that has since landed, never dispatched at all (no
+# branch, no PR, no merge-queue row), looped forever on "could not be read"
+# once the queue's own #3536 resume stagger overwrote the one marker its
+# `after=`-chain resume needed to recognise it again. `coord drive-queue
+# sweep --dry-run` did not even list the row, because the plain abstention
+# (`CAUSE_UNKNOWN`) this diagnostician produced for it exhausts
+# `MAX_DIAGNOSES_PER_EPISODE` and then drops out of `_episode_stuck_row`
+# entirely. These pin the fix: the diagnostician names the shape instead of
+# abstaining, but ONLY off the structural "no branch exists" signal — never
+# off a probe that merely failed for an unrelated reason.
+
+
+def test_a_never_dispatched_row_is_named_instead_of_abstained():
+    got = qd.diagnose(
+        stalled(
+            11,
+            f"{REPO}#11's merge gate could not be read this tick (no "
+            "merge-queue row for this entry, even after the self-heal "
+            "enqueue attempt) — this is NOT a confirmed-still-shut gate",
+            attempts=0,
+        ),
+        qd.LiveState(probe_errors=(f"gh: no branch known for {REPO}#11",)),
+    )
+    assert got.cause == qd.CAUSE_NEVER_DISPATCHED
+    assert got.confidence == qd.CONFIDENCE_HIGH
+    assert "no branch known" in got.evidence[-1]
+
+
+def test_a_probe_that_merely_fails_is_still_an_abstention_not_never_dispatched():
+    """The same empty `LiveState` shape as the `Exploding`-probe test above,
+    but checked directly against `diagnose`: a generic probe failure must
+    never be promoted to `CAUSE_NEVER_DISPATCHED` just because
+    `attempts == 0` — only the specific "no branch known" signal may."""
+    got = qd.diagnose(
+        stalled(12, "blocked: whatever", attempts=0),
+        qd.LiveState(probe_errors=("gh pr view: RuntimeError: gh: not found",)),
+    )
+    assert got.cause == qd.CAUSE_UNKNOWN
+
+
+def test_a_dispatched_entry_with_no_attempts_is_never_misclassified_never_dispatched():
+    """#2978's lesson, reapplied: `attempts == 0` alone does not mean
+    "never dispatched" — a successful launch never increments it either.
+    `is_unreachable_wait_shape` already excludes the two shapes that are
+    `_reconcile_blocked_after`'s/the permanent-block guard's alone to
+    resolve; this pins that a row outside both of those, but whose probe
+    simply found nothing (e.g. a transient `coord gates` hiccup), still
+    abstains rather than guessing "never dispatched" at a row that may have
+    a real, in-flight branch behind it."""
+    got = qd.diagnose(
+        stalled(13, "blocked: CI red, 2/2 attempts", attempts=0),
+        qd.LiveState(probe_errors=("coord gates: TimeoutError: 30s",)),
+    )
+    assert got.cause == qd.CAUSE_UNKNOWN
+
+
 def test_a_partial_picture_downgrades_a_medium_verdict_but_not_a_high_one():
     partial = {"probe_errors": ("coord gates: TimeoutError: 30s",)}
     medium = qd.diagnose(

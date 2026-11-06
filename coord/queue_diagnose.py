@@ -59,11 +59,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from coord.drive_queue import QueueEntry
+from coord.drive_queue import QueueEntry, is_unreachable_wait_shape
 
 _log = logging.getLogger(__name__)
 
 __all__ = [
+    "CAUSE_NEVER_DISPATCHED",
     "CAUSE_PROSE",
     "CAUSE_UNKNOWN",
     "CONFIDENCE_HIGH",
@@ -104,6 +105,17 @@ CAUSE_GATE_BLOCKED = "gate-blocked"
 CAUSE_NOTHING_BLOCKING = "nothing-blocking"
 CAUSE_CI_GREEN = "ci-green"
 CAUSE_AGENT_UNREACHABLE = "agent-unreachable"
+#: #3874: a `blocked`/`parked` row that has never been dispatched at all —
+#: no branch, no PR, no merge-queue row — and so has structurally nothing
+#: for a live probe to ever read, no matter how many times this diagnoses
+#: it.  See :func:`coord.drive_queue.is_unreachable_wait_shape`, the one
+#: predicate this reuses rather than re-deriving (#2096: one question, one
+#: answer) — the SAME shape `coord.drive_queue._reconcile_blocked_unreachable`
+#: resets to `waiting` from the tick's own reconcile loop, surfaced here so a
+#: row whose tick-side reset is itself bounded (`MAX_BLOCKED_RESUMES`, or an
+#: `after=` resume caught by the #3536 per-tick stagger before this issue's
+#: fix) does not also fall off `coord drive-queue sweep`'s own radar.
+CAUSE_NEVER_DISPATCHED = "never-dispatched"
 CAUSE_UNKNOWN = "unknown"
 
 CAUSE_PROSE: dict[str, str] = {
@@ -118,6 +130,7 @@ CAUSE_PROSE: dict[str, str] = {
     CAUSE_NOTHING_BLOCKING: "no live blocker exists — the gates read clear, checks are green and the PR is mergeable; the queue is stalled on a reading that has since gone stale",
     CAUSE_CI_GREEN: "every check has reported success; the CI-shaped reason no longer describes anything live",
     CAUSE_AGENT_UNREACHABLE: "the machine that owns this entry is not answering /health",
+    CAUSE_NEVER_DISPATCHED: "this row has no branch, no PR and no merge-queue row behind it — it was never dispatched, so no amount of re-probing a merge gate can ever learn anything new; resetting it to waiting re-runs nothing that already ran",
     CAUSE_UNKNOWN: "evidence was too thin to name a cause, and a guess here would poison the corpus Phase 2 is scoped from",
 }
 
@@ -406,6 +419,23 @@ def _rule_conflict(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] |
     return None
 
 
+#: The exact substring `GhLiveProbe._github` appends to `probe_errors` when
+#: `coord gates`'s own board read (`coord.gates.build_gate_report`) found no
+#: branch to look a PR up for — the deterministic "there is no assignment,
+#: and therefore no branch, for this issue at all" signal, never emitted for
+#: an ordinary `gh`/network exception (those get their own, different
+#: `{type(exc).__name__}: {exc}` text). #3874's `diagnose` uses this, not a
+#: bare ``not live.read_anything``, to tell "never dispatched" apart from
+#: "the probe merely failed for an unrelated reason" — see its own call site.
+_NO_BRANCH_PROBE_MARKER = "no branch known for"
+
+
+def _probe_found_no_branch(live: LiveState) -> bool:
+    """Did the probe run and come back having found, structurally, no
+    branch at all for this entry — as opposed to erroring out on one?"""
+    return any(_NO_BRANCH_PROBE_MARKER in err for err in live.probe_errors)
+
+
 def _rule_dead_leg(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
     # Diagnosing this shape is in scope; FIXING it is not (#2276 explicitly
     # leaves the deterministic liveness check to its own issue — mechanism
@@ -565,6 +595,27 @@ def diagnose(
         # Nothing came back at all.  Even a rule that fired on a default would
         # be reading its own assumptions back out; abstain instead.
         cause, confidence = CAUSE_UNKNOWN, CONFIDENCE_NONE
+
+    # #3874: an abstention (`read_anything` false, above) still has one more
+    # chance to be upgraded to a NAMED, high-confidence cause — never
+    # downgraded from one, and never bypassing the abstention check above,
+    # which is why this sits after it rather than as an ordinary `_RULES`
+    # entry.  `_probe_found_no_branch` is the one deterministic signal
+    # `GhLiveProbe._github` emits when `coord gates`' own board read found NO
+    # assignment at all for this issue — categorically different from an
+    # exception, a timeout, or any other reason the picture could be thin,
+    # which is why this never fires for e.g. a probe that merely raised.
+    # Paired with `is_unreachable_wait_shape` (the SAME predicate
+    # `coord.drive_queue._reconcile_blocked_unreachable` already trusts for
+    # "nothing here will ever answer a live probe" — #2096, one question,
+    # one answer) rather than `entry.attempts == 0` alone, because attempts
+    # alone is not sufficient: a successful dispatch never increments it
+    # either, so a row with a real, in-flight branch could misreport.  A row
+    # already excluded there — a permanent block, or `_resolve_prereqs`'s
+    # own unsatisfiable `after=` verdict, which `_reconcile_blocked_after`
+    # alone resolves — is excluded here too.
+    if cause == CAUSE_UNKNOWN and is_unreachable_wait_shape(entry) and _probe_found_no_branch(live):
+        cause, confidence = CAUSE_NEVER_DISPATCHED, CONFIDENCE_HIGH
 
     family = stated_family(entry.last_reason)
     supported = _stated_still_supported(family, live)
