@@ -3286,7 +3286,11 @@ def drive_queue_sweep(
 @click.option(
     "--review-assignment-id",
     default=None,
-    help="bounce: the review assignment id whose request-changes verdict to bounce.",
+    help=(
+        "bounce: the review assignment id whose request-changes verdict to "
+        "bounce. raise_budget: the review assignment id to re-derive "
+        "request-changes-with-findings eligibility from, live."
+    ),
 )
 @click.option(
     "--sibling-repo",
@@ -3311,23 +3315,6 @@ def drive_queue_sweep(
 )
 @click.option("--stage", default=None, help="restage: 'test' or 'review'.")
 @click.option(
-    "--review-verdict",
-    default=None,
-    help="raise_budget: the row's live review verdict (e.g. 'request-changes').",
-)
-@click.option(
-    "--review-has-findings",
-    is_flag=True,
-    default=False,
-    help="raise_budget: the request-changes review carries concrete findings.",
-)
-@click.option(
-    "--ci-red-only",
-    is_flag=True,
-    default=False,
-    help="raise_budget: CI (never the review) is the only red gate.",
-)
-@click.option(
     "--increment",
     type=int,
     default=2,
@@ -3346,14 +3333,11 @@ def drive_queue_doctor_act(
     cause: str,
     evidence: tuple[str, ...],
     stage: str | None,
-    review_verdict: str | None,
-    review_has_findings: bool,
-    ci_red_only: bool,
     increment: int,
     config_path: Path,
 ) -> None:
-    """#3881: the ONE audited, precondition-checked action a daemon-host
-    investigator session may take against a stuck row.
+    """The ONE audited, precondition-checked action a daemon-host
+    investigator session may take against a stuck row (#3881).
 
     *action* is one of ``coord.board_doctor_permissions.INVESTIGATOR_
     ACTIONS`` — ``requeue``, ``raise_budget``, ``bounce``,
@@ -3382,7 +3366,7 @@ def drive_queue_doctor_act(
 
     if is_remote():
         raise click.ClickException(
-            "drive-queue doctor act mutates the daemon host's queues, board "
+            "drive-queue doctor-act mutates the daemon host's queues, board "
             "and merge queue directly — run it there (a board_service-"
             "configured thin client would act on an empty local copy)."
         )
@@ -3400,14 +3384,16 @@ def drive_queue_doctor_act(
     if action == "requeue":
         result = dispatch_investigator_action("requeue", repo, issue, board, reason=reason)
     elif action == "raise_budget":
+        from coord import github_ops as gh_ops  # noqa: PLC0415
+
         result = dispatch_investigator_action(
             "raise_budget",
             repo,
             issue,
+            board,
             config,
-            review_verdict=review_verdict,
-            review_has_findings=review_has_findings,
-            ci_red_only=ci_red_only,
+            gh_ops,
+            review_assignment_id=review_assignment_id,
             reason=reason,
             increment=increment,
         )
