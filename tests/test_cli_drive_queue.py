@@ -5183,6 +5183,51 @@ def test_fetch_live_blocked_gate_suppresses_the_no_row_note_for_a_pre_dispatch_r
     assert unreadable == {}  # suppressed — not "unreadable", not "still shut"
 
 
+def test_fetch_live_blocked_gate_excludes_a_never_dispatched_after_blocked_row(
+    monkeypatch, coord_db,
+):
+    """#3874: an entry whose ONLY cause is `_resolve_prereqs`'s own
+    unsatisfiable `after=` verdict (`is_unsatisfiable_prereq_reason`) must
+    never become a probe target at all — not merely have its "unreadable"
+    note suppressed after the fact the way a pre-dispatch death reason does.
+    `coord.drive_queue._reconcile_blocked_after` is the only thing entitled
+    to resolve this row (from the `after=` graph, on this or a later tick);
+    probing a merge gate for it is a category error for the identical
+    reason a pre-dispatch death reason already gets this treatment — there
+    is no branch, no PR and no merge-queue row to ever read."""
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_blocked_gate
+    from coord.drive_queue import STATE_BLOCKED, QueueEntry, entry_key
+
+    dep_key = entry_key(REPO, 2034)
+    entry = QueueEntry(
+        repo=REPO, issue=2035, position=1, state=STATE_BLOCKED,
+        after=(dep_key,),
+        last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+    )
+
+    load_queue_calls = []
+    monkeypatch.setattr(mq, "load_queue", lambda: load_queue_calls.append(1) or [])
+    monkeypatch.setattr(mq, "enqueue_approved_work", lambda cfg, board: [])
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: object())
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, reasons, unreadable = _fetch_live_blocked_gate([entry], None)
+
+    assert overrides == {}
+    assert reasons == {}
+    assert unreadable == {}
+    # Excluded before the function even tries to build a board/config/queue
+    # for this tick's targets — `load_queue` is never called at all.
+    assert load_queue_calls == []
+
+
 def test_fetch_live_blocked_gate_unreadable_causes_all_log_at_warning(
     monkeypatch, coord_db, caplog,
 ):

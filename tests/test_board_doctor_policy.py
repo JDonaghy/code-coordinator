@@ -35,6 +35,7 @@ from coord.board_doctor_policy import (
     _investigate,
     _register_auto_action,
     _requeue_ceiling_blocked_mergeable,
+    _requeue_never_dispatched,
     dismiss_resolved_escalation,
     escalation_alert_dispatcher,
     make_investigate_capacity_check,
@@ -97,12 +98,15 @@ class TestPolicyTierOf:
         # ceiling-blocked-but-mergeable row gets a fresh fix-round budget,
         # a row whose PR already merged gets cleared, and a row whose smoke
         # leg produced no parseable verdict gets its Test verdict cleared so
-        # it re-dispatches (Action 5, #2244). Every other cause stays
-        # alert-tier.
+        # it re-dispatches (Action 5, #2244). #3874 adds a fourth: a row
+        # that was never dispatched at all gets requeued, the mechanical
+        # equivalent of the operator remove+add that shape otherwise needs.
+        # Every other cause stays alert-tier.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
             queue_diagnose.CAUSE_PR_MERGED: "drive_queue_remove",
             CAUSE_SMOKE_NO_VERDICT: "smoke_requeue",
+            queue_diagnose.CAUSE_NEVER_DISPATCHED: "drive_queue_requeue",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:
@@ -127,6 +131,7 @@ class TestPolicyTierOf:
     def test_registered_3760_causes_are_auto_tier(self) -> None:
         assert policy_tier_of(CAUSE_CEILING_BLOCKED_MERGEABLE) == TIER_AUTO
         assert policy_tier_of(queue_diagnose.CAUSE_PR_MERGED) == TIER_AUTO
+        assert policy_tier_of(queue_diagnose.CAUSE_NEVER_DISPATCHED) == TIER_AUTO
 
     def test_investigate_eligible_causes_are_auto_tier_via_fixit_leg(self) -> None:
         # #3769: a cause with no safe mechanical fix still reaches
@@ -935,6 +940,62 @@ class TestRequeueCeilingBlockedMergeable:
         )
 
         assert _requeue_ceiling_blocked_mergeable(row) is False
+
+
+class TestRequeueNeverDispatched:
+    """#3874: `queue_diagnose.CAUSE_NEVER_DISPATCHED` already fires straight
+    off a live signal — no eligibility gate like #3847's rebudget, so this
+    only exercises the dispatch itself (mirrors #3760 Action 4's
+    `_clear_merged_row` shape, not Action 1's budget-gated one)."""
+
+    def _row(self) -> StuckRow:
+        return _row(
+            "acme/widgets#2035",
+            queue_diagnose.CAUSE_NEVER_DISPATCHED,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            fresh=True,
+        )
+
+    def test_dispatches_the_requeue(self, monkeypatch) -> None:
+        calls: list[tuple] = []
+
+        def fake_dispatch(action, repo_name, issue_number, *args, **kwargs):
+            calls.append((action, repo_name, issue_number))
+            return {"requeued": True, "detail": "requeued"}
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", fake_dispatch
+        )
+
+        assert _requeue_never_dispatched(self._row()) is True
+        assert calls == [("drive_queue_requeue", "acme/widgets", 2035)]
+
+    def test_a_reported_noop_returns_false(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {"requeued": False, "detail": "no longer queued"},
+        )
+
+        assert _requeue_never_dispatched(self._row()) is False
+
+    def test_a_mid_flight_deploy_gate_refusal_returns_false(self, monkeypatch) -> None:
+        def boom(*a, **k):
+            raise SweepPermissionError("acme/widgets#2035's deploy gate is mid-flight")
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", boom)
+
+        assert _requeue_never_dispatched(self._row()) is False
+
+    def test_unparseable_key_does_not_raise(self) -> None:
+        row = _row(
+            "no-hash-separator",
+            queue_diagnose.CAUSE_NEVER_DISPATCHED,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            fresh=True,
+        )
+
+        assert _requeue_never_dispatched(row) is False
 
 
 class TestFixitRebudgetGlobalCap:

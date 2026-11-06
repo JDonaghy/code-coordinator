@@ -5609,6 +5609,19 @@ def _fetch_live_blocked_gate(
         e for e in entries
         if e.state == STATE_BLOCKED
         and not is_permanent_block_reason(getattr(e, "last_reason", "") or "")
+        # #3874: a row whose `last_reason` still names `_resolve_prereqs`'s
+        # own unsatisfiable `after=` verdict
+        # (`coord.drive_queue.is_unsatisfiable_prereq_reason`) is
+        # `coord.drive_queue._reconcile_blocked_after`'s to resolve, from
+        # the `after=` graph, not this probe's: a `waiting` entry that
+        # never reached `running` has no branch, no PR and no merge-queue
+        # row for THIS sweep to have any opinion about, the identical
+        # category error `_reconcile_blocked` itself already refuses to
+        # commit (see its own top-of-function guard). Probing it anyway
+        # only ever comes back "no merge-queue row" below, reported as an
+        # unconfirmed probe failure that implies a retry might help — when
+        # the real answer is "wait for the `after=` graph, not a retry".
+        and not is_unsatisfiable_prereq_reason(getattr(e, "last_reason", "") or "")
     ]
     if not targets:
         return {}, {}, {}

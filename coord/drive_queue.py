@@ -8048,12 +8048,35 @@ def plan_tick(
                         "rate limit fleet-wide (#3536); resuming on a "
                         "later tick"
                     )
+                    # #3874: when the resume this tick staggered came from
+                    # `_reconcile_blocked_after`'s own `after=` resume (the
+                    # ONLY path that can hand back `resumed` while
+                    # `entry.last_reason` still carries
+                    # `_is_unsatisfiable_prereq_reason`'s marker —
+                    # `_reconcile_blocked` refuses to touch a row in that
+                    # shape at all, see its own top-of-function guard),
+                    # writing the stagger note over `last_reason` would
+                    # destroy the ONLY signal a LATER tick's
+                    # `_reconcile_blocked_after` uses to recognise this row
+                    # and try the `after=` resume again. A never-dispatched
+                    # row (no branch, no PR, no merge-queue row — see
+                    # `is_pre_dispatch_block_reason`) has nothing else to
+                    # fall back on once that marker is gone: it drops
+                    # straight into `_reconcile_blocked`'s merge-gate probe,
+                    # which can only ever report "could not be read" for it,
+                    # forever. Leave `last_reason` untouched here so the
+                    # marker survives into the next tick instead.
+                    stagger_updates: dict[str, Any] = (
+                        {}
+                        if _is_unsatisfiable_prereq_reason(entry.last_reason)
+                        else _refresh_only(reason, entry.last_reason)
+                    )
                     blocked_reconcile = Reconcile(
                         entry.key,
                         "resume_staggered",
                         reason,
                         occupies=False,
-                        updates=_refresh_only(reason, entry.last_reason),
+                        updates=stagger_updates,
                     )
                 else:
                     resume_quota_used[entry.repo] = used + 1

@@ -28,6 +28,7 @@ from coord.board_doctor import (
     _reclassify_checks_stale_race,
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
+    drive_queue_rows,
     smoke_no_verdict_rows,
     sweep,
 )
@@ -1019,6 +1020,63 @@ class TestBaselineRedConvergesLikeAnyOtherAlertRow:
         # sweeps see it — a red base has no safe auto-fix.
         assert auto.count == 0
         assert alert.count == 1
+
+
+class TestNeverDispatchedRowReachesTheSweep:
+    """#3874: `coord drive-queue sweep` must list, classify and auto-fix a
+    never-dispatched `blocked` row instead of silently dropping it the
+    moment `queue_diagnose` would otherwise abstain forever.
+
+    End-to-end through the real adapters the CLI's own `collect_rows` uses
+    — `queue_diagnose.run_pass` -> :func:`coord.board_doctor.drive_queue_rows`
+    -> `sweep`, with the real `policy_tier_of` (not a stubbed `_always`), so
+    this is load-bearing evidence the cause is actually wired to the
+    `drive_queue_requeue` auto-action, not a tautology.
+    """
+
+    def test_a_never_dispatched_row_is_classified_and_auto_fixed(self) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+        from coord.drive_queue import STATE_BLOCKED
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2035,
+            state=STATE_BLOCKED,
+            attempts=0,
+            last_reason=(
+                "acme/widgets#2035's merge gate could not be read this tick "
+                "(no merge-queue row for this entry, even after the "
+                "self-heal enqueue attempt)"
+            ),
+        )
+        episode = {
+            "key": entry.key,
+            "state": STATE_BLOCKED,
+            "diagnoses": 0,
+            "diagnosed_cause": "",
+        }
+
+        class _NoBranchProbe:
+            def probe(self, entry_):
+                return LiveState(probe_errors=(f"gh: no branch known for {entry_.key}",))
+
+        diagnoses = queue_diagnose.run_pass([entry], [episode], probe=_NoBranchProbe())
+        rows = drive_queue_rows(diagnoses)
+
+        [row] = rows
+        assert row.key == entry.key
+        assert row.cause == queue_diagnose.CAUSE_NEVER_DISPATCHED
+
+        auto = _Recorder()
+        alert = _Recorder()
+        sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers={queue_diagnose.CAUSE_NEVER_DISPATCHED: auto},
+            alert_dispatcher=alert,
+        )
+        assert auto.count == 1
+        assert alert.count == 0
 
 
 class TestSuppressedRowsStayPresentForClearAbsentRows:
