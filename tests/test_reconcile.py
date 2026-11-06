@@ -1301,7 +1301,21 @@ class TestReconcileConflictFixHeadUnmoved:
     """
 
     @staticmethod
-    def _dispatch_record_with_anchor(head_sha: str) -> Assignment:
+    def _dispatch_record_with_anchor(
+        head_sha: str, *, reason: str = "Merge conflict in foo.py",
+    ) -> Assignment:
+        """Build the dispatched Assignment a real conflict-fix dispatch
+        leaves behind, including the anchor.
+
+        *reason* defaults to the plain conflict text, but callers whose
+        ``QueuedMerge.error`` carries extra wording (as a real entry's does
+        — ``build_conflict_fix_briefing`` embeds ``entry.error`` VERBATIM
+        as this exact ``Reason:`` line) must pass that same text, so the
+        fixture reproduces the real identical-error collision the retry
+        cap's ``done`` + matching-error rule checks for, rather than an
+        unrealistic one where dispatch-time and completion-time text
+        happen to differ.
+        """
         from coord.conflict_fix import DISPATCH_HEAD_SHA_PREFIX
 
         return Assignment(
@@ -1310,7 +1324,7 @@ class TestReconcileConflictFixHeadUnmoved:
             assignment_id="fix-1", status="running",
             type="conflict-fix", review_of_assignment_id="merge-1",
             briefing=(
-                "Reason: Merge conflict in foo.py\n\n"
+                f"Reason: {reason}\n\n"
                 f"{DISPATCH_HEAD_SHA_PREFIX}{head_sha}"
             ),
         )
@@ -1353,7 +1367,15 @@ class TestReconcileConflictFixHeadUnmoved:
             ),
         ])
 
-        fix_assignment = self._dispatch_record_with_anchor("abc123")
+        # The dispatch-time briefing's `Reason:` line must match
+        # `entry.error` EXACTLY — that's what `build_conflict_fix_briefing`
+        # actually writes in production, and it's the fixture choice this
+        # review found missing: production cannot produce the divergence
+        # a mismatched `reason` here would paper over.
+        fix_assignment = self._dispatch_record_with_anchor(
+            "abc123",
+            reason="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+        )
         record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
 
         log = tmp_path / "worker.log"
@@ -1388,6 +1410,7 @@ class TestReconcileConflictFixHeadUnmoved:
         _, payload = mock_post.call_args
         assert payload["json"]["issue_title"].startswith("[conflict-fix]")
 
+    @patch("coord.github_ops.post_issue_comment")
     @patch("coord.github_ops.get_branch_sha")
     @patch("coord.network.fetch_status")
     @patch("coord.reconcile._query_agent")
@@ -1396,6 +1419,7 @@ class TestReconcileConflictFixHeadUnmoved:
         mock_query: MagicMock,
         mock_fetch_status: MagicMock,
         mock_get_branch_sha: MagicMock,
+        mock_post_comment: MagicMock,
         tmp_path: Path,
         coord_db,
     ) -> None:
@@ -1424,7 +1448,13 @@ class TestReconcileConflictFixHeadUnmoved:
             ),
         ])
 
-        fix_assignment = self._dispatch_record_with_anchor("abc123")
+        # Same reasoning as the sibling test above: the dispatch-time
+        # briefing's `Reason:` line must match `entry.error` exactly, like
+        # `build_conflict_fix_briefing` actually produces.
+        fix_assignment = self._dispatch_record_with_anchor(
+            "abc123",
+            reason="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+        )
         record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
 
         log = tmp_path / "worker.log"
@@ -1453,10 +1483,24 @@ class TestReconcileConflictFixHeadUnmoved:
         assert conflict_fix_actually_gave_up(entry.error) is False
         # And must stay re-evaluable — none of the non-mergeability escape
         # phrases (which `reconcile_conflict_entries` would refuse to
-        # re-test) are present.
-        assert "escalation could not be dispatched" not in (entry.error or "")
-        assert "nothing to merge" not in (entry.error or "")
-        assert "not a real conflict" not in (entry.error or "")
+        # re-test) are present. Asserted against the tuple itself, not a
+        # hand-copied subset, so this stays correct as signals are added.
+        from coord.merge_queue import _NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS
+
+        text = (entry.error or "").lower()
+        for signal in _NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS:
+            assert signal not in text
+
+        # The posted GitHub comment — the surface an operator reads first
+        # — must not claim the worker "exited non-zero": it exited ZERO,
+        # it just never pushed. The default headline/body (built for an
+        # actual failed-rebase give-up) would be misleading here.
+        mock_post_comment.assert_called_once()
+        posted_body = mock_post_comment.call_args.args[2]
+        assert "exited non-zero" not in posted_body
+        assert "could not auto-resolve" not in posted_body
+        assert "nothing was pushed" in posted_body
+        assert "exit status 0" in posted_body
 
     @patch("coord.github_ops.get_branch_sha")
     @patch("coord.reconcile._query_agent")

@@ -1376,13 +1376,20 @@ def dispatched_branch_head_sha(briefing: str | None) -> str | None:
     SHA could not be read at dispatch time) — callers must then treat the
     push as unverifiable and fall back to trusting the worker's own exit
     status, exactly like the pre-#3871 behaviour.
+
+    Takes the LAST matching line, not the first: the anchor is always
+    appended as the final line of the stored briefing (see the one write
+    site below), but ``entry.error``/``entry.issue_title`` — both
+    GitHub-sourced, both embedded earlier in the briefing text — are
+    free-form and could themselves start with this exact prefix, which
+    would otherwise shadow the real anchor.
     """
     text = briefing or ""
+    value: str | None = None
     for line in text.splitlines():
         if line.startswith(DISPATCH_HEAD_SHA_PREFIX):
             value = line[len(DISPATCH_HEAD_SHA_PREFIX):].strip()
-            return value if value and value != "unknown" else None
-    return None
+    return value if value and value != "unknown" else None
 
 
 def has_prior_conflict_fix(
@@ -1392,6 +1399,7 @@ def has_prior_conflict_fix(
     current_error: str | None = None,
     ignore_stale_rebase_attempts: bool = False,
     current_base_sha: str | None = None,
+    ignore_assignment_id: str | None = None,
 ) -> bool:
     """True when a second conflict-fix dispatch for *merge_entry_id* is blocked.
 
@@ -1454,6 +1462,20 @@ def has_prior_conflict_fix(
     falls through to the base-SHA-blind rules unchanged. Callers that don't
     pass *current_base_sha* get the pre-#3859 behaviour byte-for-byte.
 
+    *ignore_assignment_id*: skip the ONE row whose own ``assignment_id``
+    matches, regardless of its status. Unlike *ignore_stale_rebase_attempts*
+    (which excludes a whole class of rows by title prefix), this excludes a
+    single, specific attempt — the leg a caller already knows, by other
+    means, did not represent a genuine failure (e.g. a conflict-fix that
+    exited clean but never actually moved the branch: the SAME dispatch-time
+    ``Reason:`` text as *current_error* would otherwise read, via the
+    ``done`` + identical-error rule above, as "the same blocker recurring
+    unchanged" and consume the cap — even though nothing was shown to have
+    actually failed). The one caller doing that
+    (:func:`coord.reconcile._try_ordinary_escalation_after_head_unmoved`)
+    passes the just-completed leg's own ``assignment_id`` so ONLY an
+    earlier, *different* ordinary attempt can still consume the cap.
+
     Thin wrapper around :func:`_classify_prior_conflict_fix`, which makes
     the same decision and additionally says WHY — used where the caller
     needs accurate escalation wording rather than a plain bool.
@@ -1463,6 +1485,7 @@ def has_prior_conflict_fix(
         current_error=current_error,
         ignore_stale_rebase_attempts=ignore_stale_rebase_attempts,
         current_base_sha=current_base_sha,
+        ignore_assignment_id=ignore_assignment_id,
     ) is not None
 
 
@@ -1484,6 +1507,7 @@ def _classify_prior_conflict_fix(
     current_error: str | None = None,
     ignore_stale_rebase_attempts: bool = False,
     current_base_sha: str | None = None,
+    ignore_assignment_id: str | None = None,
 ) -> str | None:
     """The reason :func:`has_prior_conflict_fix` returns ``True``, or ``None``
     when nothing blocks (#3859).
@@ -1512,6 +1536,8 @@ def _classify_prior_conflict_fix(
         if a.type != "conflict-fix":
             continue
         if a.review_of_assignment_id != merge_entry_id:
+            continue
+        if ignore_assignment_id is not None and a.assignment_id == ignore_assignment_id:
             continue
         is_stale_rebase_row = (a.issue_title or "").startswith(
             STALE_REBASE_FIX_TITLE_PREFIX,
@@ -1901,6 +1927,7 @@ def dispatch_conflict_fix(
     stuck_summary: str | None = None,
     stale_rebase: bool = False,
     after_stale_rebase_mismatch: bool = False,
+    after_head_unmoved_fix_assignment_id: str | None = None,
     reword_commit: bool = False,
     status_fetcher: Callable[..., StatusResult] | None = None,
     machine_pick_out: "list[ConflictFixMachinePick] | None" = None,
@@ -2045,6 +2072,19 @@ def dispatch_conflict_fix(
     escalates to a human exactly like a recurring mechanical conflict
     would.
 
+    *after_head_unmoved_fix_assignment_id* dispatches the ORDINARY
+    conflict-fix path (same shape as ``after_stale_rebase_mismatch`` above —
+    a retry-cap carve-out, not a distinct dispatch kind) right after a
+    conflict-fix leg exited clean without ever moving the branch (see
+    ``coord.reconcile._head_unmoved_verdict``). That leg's own dispatch-time
+    briefing embeds the SAME ``entry.error`` as its ``Reason:`` line, so
+    without an exclusion it would trip the ``done`` + identical-error rule
+    in :func:`has_prior_conflict_fix` above and consume the cap even though
+    it never demonstrated a genuine failure — only a missing or rejected
+    push. Passes the just-completed leg's own ``assignment_id`` as
+    ``ignore_assignment_id`` to :func:`has_prior_conflict_fix` so ONLY an
+    earlier, *different* ordinary attempt still counts against the cap.
+
     #3871: every path above stamps the dispatched Assignment's STORED
     ``briefing`` (never the one sent to the worker) with the entry branch's
     pre-dispatch HEAD SHA — see :data:`DISPATCH_HEAD_SHA_PREFIX` and
@@ -2062,6 +2102,7 @@ def dispatch_conflict_fix(
     elif has_prior_conflict_fix(
         board, entry.assignment_id, current_error=entry.error,
         ignore_stale_rebase_attempts=after_stale_rebase_mismatch,
+        ignore_assignment_id=after_head_unmoved_fix_assignment_id,
     ):
         return None
 
