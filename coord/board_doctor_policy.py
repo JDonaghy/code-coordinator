@@ -141,8 +141,11 @@ per-sweep one.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING, Callable
+
+_log = logging.getLogger(__name__)
 
 from coord import queue_diagnose
 from coord.board_doctor import (
@@ -1246,7 +1249,16 @@ def _fixit_leg_in_flight_count(repo_name: str, board: "Board") -> int:
         )
     except Exception:  # noqa: BLE001 — an unreadable audit log fails open
         # ("nothing confirmed in flight") rather than permanently refusing
-        # every future dispatch for this repo.
+        # every future dispatch for this repo. Failing open is the
+        # expensive direction for a budget this tight (default 1), so at
+        # least make it visible rather than silently granting a fresh
+        # dispatch every sweep.
+        _log.warning(
+            "board-doctor: could not read fixit_leg_dispatched audit log for "
+            "%s — fix-it budget check fails open to 0 in-flight",
+            repo_name,
+            exc_info=True,
+        )
         return 0
     dispatched_ids = {e.get("assignment_id") for e in entries if e.get("assignment_id")}
     if not dispatched_ids:
@@ -1367,6 +1379,38 @@ def make_investigate_capacity_check(config: "Config") -> InvestigateCapacityGate
     return InvestigateCapacityGate(config)
 
 
+def _attempted_actions_suffix(queue: str, key: str) -> str:
+    """" — already tried: ..." naming what the doctor tried on *queue*/*key*
+    before this alert, and how it turned out — the one thing #3761's C4
+    reason text could not say until the 90-day outcome-tracked log
+    (`coord.state.board_doctor_decisions`) existed to answer it.
+
+    Reads only the most recent handful of OUTCOME_ACTIONS entries for this
+    exact row — an alert that cannot even read its own history must not
+    block on it, so any read failure here degrades to "" (no suffix),
+    the same fail-open posture as the rest of this module's alert path.
+    """
+    from coord import state  # noqa: PLC0415
+
+    try:
+        entries = state.board_doctor_decisions()
+    except Exception:  # noqa: BLE001 — see docstring
+        return ""
+    attempts = [
+        e for e in entries
+        if e.get("queue") == queue
+        and e.get("key") == key
+        and e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
+    ]
+    if not attempts:
+        return ""
+    recent = attempts[-3:]
+    parts = [
+        f"{e.get('action')} (outcome={e.get('outcome') or 'pending'})" for e in recent
+    ]
+    return " — already tried: " + ", ".join(parts)
+
+
 def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:
     """``(reason_suffix, proposed_command)`` for *row*'s cause (#3761's C4).
 
@@ -1484,11 +1528,12 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
             return ALERT_SKIPPED
 
         resolution_suffix, proposed_command = _alert_resolution(row, repo_name, issue_number)
+        attempted_suffix = _attempted_actions_suffix(row.queue, row.key)
         reason = (
             f"board-doctor: {row.queue} row {row.key} stuck on cause="
             f"{row.cause} (confidence={row.confidence}) — see `coord "
-            "drive-queue sweep --json` for the full decision log"
-            f"{resolution_suffix}"
+            "drive-queue doctor-log` for the full decision log"
+            f"{attempted_suffix}{resolution_suffix}"
         )
         gate_readings = f"queue={row.queue} | cause={row.cause} | evidence={' | '.join(row.evidence)}"
         record_drive_escalation(

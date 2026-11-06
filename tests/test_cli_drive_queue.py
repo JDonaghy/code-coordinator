@@ -8573,6 +8573,108 @@ def test_doctor_log_reads_back_recorded_decisions(cli):
     assert summary["human_interventions_missed"] == 0
 
 
+def test_doctor_log_summary_dedupes_rows_and_catches_a_missed_human_intervention(
+    cli, block_log
+):
+    """`--summary`'s three outcome counters ``== 0`` on an empty log proves
+    nothing — a key-shape mismatch between the decision log and the block
+    log would degrade to the same "0 missed" silently. This drives both
+    sides for real: one row the doctor mixed outcomes on across two sweeps
+    (dedup-by-key, last-outcome-wins), one row a human unstuck that the
+    decision log never mentions (must show up as missed), and one row a
+    human unstuck that the doctor's own `auto-dispatch` already covers
+    (must NOT show up as missed, even though its block-log episode is also
+    `human_acted`)."""
+    from datetime import datetime, timezone
+
+    from coord import block_log as bl
+
+    now = time.time()
+
+    # Row #1: two sweeps, mixed outcomes for the SAME key — must count as
+    # exactly one row, and the LAST (most recent) outcome wins: "unchanged".
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-1",
+            "queue": "drive-queue",
+            "key": f"{REPO}#1",
+            "cause": "ci_red",
+            "tier": "auto",
+            "action": "auto-dispatch",
+            "count": 1,
+            "escalated": False,
+            "confidence": "high",
+            "evidence": [],
+            "recorded_at": datetime.fromtimestamp(now - 7200, tz=timezone.utc).isoformat(),
+            "outcome": "progressed",
+        }
+    )
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-2",
+            "queue": "drive-queue",
+            "key": f"{REPO}#1",
+            "cause": "ci_red",
+            "tier": "auto",
+            "action": "auto-dispatch",
+            "count": 2,
+            "escalated": False,
+            "confidence": "high",
+            "evidence": [],
+            "recorded_at": datetime.fromtimestamp(now - 3600, tz=timezone.utc).isoformat(),
+            "outcome": "unchanged",
+        }
+    )
+    # Row #1 ALSO has a human-acted block-log episode — but the decision
+    # log above already shows an `auto-dispatch` against this exact key,
+    # so it must not be double-counted as a missed intervention.
+    bl.record(
+        [
+            {
+                "event": bl.EVENT_ENTER, "ts": now - 7200, "key": f"{REPO}#1",
+                "state": "blocked", "stated_reason": "ci red", "true_cause": "",
+                "human_acted": None,
+            },
+            {
+                "event": bl.EVENT_RESOLVE, "ts": now - 3600, "key": f"{REPO}#1",
+                "state": "running", "from_state": "blocked",
+                "stated_reason": "ci red", "resolution": "operator",
+                "true_cause": "operator intervened", "human_acted": True,
+                "release_reason": "", "outcome": "resumed",
+            },
+        ],
+        path=block_log,
+    )
+
+    # Row #2: a human-acted episode the decision log never mentions at
+    # all — this is the one that must surface as missed.
+    bl.record(
+        [
+            {
+                "event": bl.EVENT_ENTER, "ts": now - 5000, "key": f"{REPO}#2",
+                "state": "blocked", "stated_reason": "merge conflict",
+                "true_cause": "", "human_acted": None,
+            },
+            {
+                "event": bl.EVENT_RESOLVE, "ts": now - 1000, "key": f"{REPO}#2",
+                "state": "running", "from_state": "blocked",
+                "stated_reason": "merge conflict", "resolution": "operator",
+                "true_cause": "operator intervened", "human_acted": True,
+                "release_reason": "", "outcome": "resumed",
+            },
+        ],
+        path=block_log,
+    )
+
+    result = cli("doctor-log", "--summary", "--json")
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["rows_unstuck"] == 0
+    assert summary["rows_still_stuck"] == 1
+    assert summary["human_interventions_missed"] == 1
+    assert summary["human_interventions_missed_keys"] == [f"{REPO}#2"]
+
+
 def test_doctor_log_on_an_empty_log_says_so_rather_than_printing_nothing(cli):
     result = cli("doctor-log")
     assert result.exit_code == 0, result.output

@@ -1116,14 +1116,15 @@ def sweep(
         # cause/escalation (`current_by_row`) is exactly the "state at the
         # next sweep" that answers whether the action worked.
         for pending in pending_outcomes:
-            if pending.get("sweep_id") == sweep_id:
+            pending_sweep_id = pending.get("sweep_id")
+            if pending_sweep_id is None or pending_sweep_id == sweep_id:
                 continue
             row_key = (pending.get("queue"), pending.get("key"))
             current = current_by_row.get(row_key)
             if current is None:
                 continue
             outcome = state.evaluate_board_doctor_outcome(pending, current)
-            state.record_board_doctor_outcome(pending["sweep_id"], row_key[0], row_key[1], outcome)
+            state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
 
     if not dry_run and clear_absent_rows:
         for queue, key in state.board_doctor_tracked_rows():
@@ -1133,7 +1134,10 @@ def sweep(
                 # which is unambiguous progress for any decision on it
                 # still waiting on a verdict.
                 for pending in pending_outcomes:
-                    if (pending.get("queue"), pending.get("key")) == (queue, key):
+                    if (pending.get("queue"), pending.get("key")) == (
+                        queue,
+                        key,
+                    ) and pending.get("sweep_id") is not None:
                         state.record_board_doctor_outcome(
                             pending["sweep_id"], queue, key, "progressed"
                         )

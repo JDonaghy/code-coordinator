@@ -3151,11 +3151,15 @@ def drive_queue_sweep(
     comments.
 
     A row stuck on the SAME cause for `coord.board_doctor.CONVERGENCE_LIMIT`
-    (default 3) consecutive sweeps stops being re-acted on and escalates to
-    the alert tier exactly once — never a repeat alert for an unresolved
-    cause, never an auto-action looping forever. `--dry-run` classifies and
-    prints but mutates no convergence counter and dispatches nothing — a
-    sweep run right after a dry run sees exactly what the dry run saw.
+    (default 3) consecutive sweeps stops being re-acted on and falls back
+    to the alert tier instead of auto-action looping forever. Escalating
+    never means going silent afterward: a still-unresolved cause keeps
+    getting re-alerted on an exponential backoff
+    (`coord.state.BOARD_DOCTOR_BACKOFF_INITIAL_HOURS` doubling each firing
+    up to `BOARD_DOCTOR_BACKOFF_CAP_HOURS`) rather than alerting once and
+    then being ignored forever. `--dry-run` classifies and prints but
+    mutates no convergence counter and dispatches nothing — a sweep run
+    right after a dry run sees exactly what the dry run saw.
 
     Meant to run on a schedule (`coord/deploy/coord-board-doctor.timer`,
     shipped disabled by default) as well as by hand; same `is_remote()`
@@ -3270,6 +3274,13 @@ def drive_queue_sweep(
 # ── doctor-log ───────────────────────────────────────────────────────────────
 
 
+def _doctor_log_window_label(since_days: float) -> str:
+    """Render ``--since`` for a log line — ``"0"`` means no limit, not a
+    zero-day window, so it gets its own word rather than a misleading
+    ``"0d"``."""
+    return "all time" if since_days <= 0 else f"{since_days:g}d"
+
+
 def _doctor_log_line(entry: Mapping[str, Any]) -> str:
     outcome = entry.get("outcome")
     outcome_suffix = f" outcome={outcome}" if outcome else ""
@@ -3280,11 +3291,24 @@ def _doctor_log_line(entry: Mapping[str, Any]) -> str:
 
 
 def _doctor_log_summary(
-    entries: list[dict], *, since_days: float, repo: str | None
+    entries: list[dict], *, since_days: float, repo: str | None, issue: int | None = None
 ) -> dict[str, Any]:
     """Aggregate a filtered :func:`coord.state.board_doctor_decisions` slice
     against the same window's block-log episodes, so an operator can read
     "what has the doctor fixed" next to "what did a human still have to do."
+
+    ``rows_unstuck``/``rows_still_stuck`` count distinct ROWS (by ``key``),
+    not decision entries: a row stuck for the whole window logs one
+    ``unchanged`` decision per sweep, so counting entries would make
+    ``rows_still_stuck`` grow with the sweep cadence instead of the stuck
+    population. A row can carry mixed outcomes across the window (e.g.
+    `progressed` on one sweep, `unchanged` on a later one) — the LAST
+    outcome recorded for that key wins, since `board_doctor_decisions`
+    returns entries most-recent-last and "still stuck" should answer "is it
+    stuck now," not "was it ever." A key with neither `progressed` nor an
+    `unchanged`/`regressed` outcome in its last entry (e.g. still
+    `outcome: None`, awaiting a later sweep to fill it in) counts toward
+    neither bucket.
     """
     from coord import state  # noqa: PLC0415
     from coord.block_log import episodes, read_events  # noqa: PLC0415
@@ -3292,8 +3316,15 @@ def _doctor_log_summary(
     actions_taken = sum(
         1 for e in entries if e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
     )
-    rows_unstuck = sum(1 for e in entries if e.get("outcome") == "progressed")
-    rows_still_stuck = sum(1 for e in entries if e.get("outcome") in ("unchanged", "regressed"))
+    last_outcome_by_key: dict[Any, str | None] = {}
+    for e in entries:
+        outcome = e.get("outcome")
+        if outcome is not None:
+            last_outcome_by_key[e.get("key")] = outcome
+    rows_unstuck = sum(1 for outcome in last_outcome_by_key.values() if outcome == "progressed")
+    rows_still_stuck = sum(
+        1 for outcome in last_outcome_by_key.values() if outcome in ("unchanged", "regressed")
+    )
     acted_keys = {
         e.get("key") for e in entries if e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
     }
@@ -3304,6 +3335,11 @@ def _doctor_log_summary(
         block_items = [
             item for item in block_items
             if str(item.get("key") or "").rpartition("#")[0] == repo
+        ]
+    if issue is not None:
+        block_items = [
+            item for item in block_items
+            if str(item.get("key") or "").rpartition("#")[2] == str(issue)
         ]
     missed = sorted(
         {
@@ -3370,8 +3406,9 @@ def drive_queue_doctor_log(
     window's log never shows an `auto-dispatch`/`alert` against — staying
     at zero both mean the doctor, not an operator, is doing the unsticking.
 
-    Same `is_remote()` guard as `sweep`/`diagnose`/`block-log` — the
-    decision log and the block log both live on the daemon host.
+    Same `is_remote()` guard as `sweep`/`diagnose` — the decision log
+    lives on the daemon host (unlike `block-log`, which reads a local
+    file and has no such guard).
     """
     from coord import state  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
@@ -3383,18 +3420,21 @@ def drive_queue_doctor_log(
             "client would read an empty local copy)."
         )
 
+    if summary_mode and limit != 200:
+        click.echo("warning: --limit is ignored with --summary", err=True)
+
     since_ts = time.time() - since * 86400.0 if since > 0 else None
     entries = state.board_doctor_decisions(
         since=since_ts, repo=repo, issue=issue, action=action_filter,
     )
 
     if summary_mode:
-        summary = _doctor_log_summary(entries, since_days=since, repo=repo)
+        summary = _doctor_log_summary(entries, since_days=since, repo=repo, issue=issue)
         if output_json:
             click.echo(_json.dumps(summary))
             return
         click.echo(
-            f"{summary['actions_taken']} action(s) taken in {since:g}d — "
+            f"{summary['actions_taken']} action(s) taken in {_doctor_log_window_label(since)} — "
             f"{summary['rows_unstuck']} row(s) unstuck · "
             f"{summary['rows_still_stuck']} still stuck"
         )
@@ -3414,7 +3454,9 @@ def drive_queue_doctor_log(
         click.echo(_json.dumps({"entries": entries}))
         return
     if not entries:
-        click.echo(f"no board-doctor decisions recorded in the last {since:g}d")
+        click.echo(
+            f"no board-doctor decisions recorded in the last {_doctor_log_window_label(since)}"
+        )
         return
     for entry in entries:
         click.echo(_doctor_log_line(entry))
