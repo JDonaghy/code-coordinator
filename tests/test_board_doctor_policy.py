@@ -1301,11 +1301,13 @@ class TestInvestigateCapacityCheck:
         assert actions2["acme/widgets#42"] == "investigate-deferred"
         assert dispatched == ["acme/widgets#40", "acme/widgets#41"]
 
-    def test_an_in_flight_leg_counts_toward_the_cap(self, monkeypatch) -> None:
-        # #C1's in-flight signal: a running work-like assignment for this
-        # repo (from a prior sweep's dispatch, or the drive loop itself)
-        # already occupies the repo's only slot, so capacity_check defers
-        # the row this sweep even though it never reaches a dispatcher.
+    def test_ordinary_work_does_not_count_toward_the_fixit_budget(self, monkeypatch) -> None:
+        # The fix-it-leg budget is now the doctor's OWN, separate from a
+        # repo's `max_parallel` ceiling — an ordinary "work" assignment
+        # busy on the repo's normal queue must not starve the investigate
+        # tier the way sharing `max_parallel` used to.
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         busy_board = Board(
             active=[
                 Assignment(
@@ -1320,6 +1322,67 @@ class TestInvestigateCapacityCheck:
         )
         monkeypatch.setattr(state, "build_board", lambda: busy_board)
 
+        dispatched: list[str] = []
+
+        def fake_dispatch(action, repo_name, issue_number, board, config, **kwargs):
+            dispatched.append(f"{repo_name}#{issue_number}")
+            return {
+                "dispatched": True,
+                "assignment_id": "asn-41",
+                "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        config = self._config(max_parallel=1)
+        capacity_check = make_investigate_capacity_check(config)
+        cause = queue_diagnose.CAUSE_CI_RED
+        rows = [_row("acme/widgets#41", cause)]
+
+        report = sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False,
+            capacity_check=capacity_check,
+        )
+
+        assert report.decisions[0].action == "auto-dispatch"
+        assert dispatched == ["acme/widgets#41"]
+
+    def test_a_dispatched_fixit_leg_counts_toward_its_own_budget(self, monkeypatch) -> None:
+        # Only a leg THIS doctor dispatched — identified by the
+        # `fixit_leg_dispatched` audit event it wrote on its own confirmed
+        # dispatch — occupies the dedicated budget.
+        from coord.audit import record_audit
+
+        record_audit(
+            tier="operational",
+            category="board_doctor",
+            event_type="fixit_leg_dispatched",
+            actor="daemon",
+            summary="board-doctor dispatched a fix-it leg",
+            repo="acme/widgets",
+            issue=40,
+            assignment_id="asn-40",
+            machine="mac1",
+        )
+        busy_board = Board(
+            active=[
+                Assignment(
+                    machine_name="mac1",
+                    repo_name="acme/widgets",
+                    issue_number=40,
+                    issue_title="t",
+                    status="running",
+                    type="work",
+                    assignment_id="asn-40",
+                )
+            ]
+        )
+        monkeypatch.setattr(state, "build_board", lambda: busy_board)
+
         def dispatch_must_not_be_called(*args, **kwargs):
             raise AssertionError("an at-capacity repo must not dispatch")
 
@@ -1327,7 +1390,7 @@ class TestInvestigateCapacityCheck:
             board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
         )
 
-        config = self._config(max_parallel=1)
+        config = self._config(max_parallel=5)
         capacity_check = make_investigate_capacity_check(config)
         cause = queue_diagnose.CAUSE_CI_RED
         rows = [_row("acme/widgets#41", cause)]

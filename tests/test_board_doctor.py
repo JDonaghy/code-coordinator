@@ -869,6 +869,69 @@ class TestConvergence:
         assert row_state["count"] == 1
         assert row_state["escalated"] is False
 
+    def test_escalated_row_realerts_on_exponential_backoff_not_forever_silent(
+        self,
+    ) -> None:
+        """A row that never gets better must not go quiet after its one
+        alert — it keeps getting re-flagged, on a backoff that doubles
+        each time it fires, rather than converging to permanent silence.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#13"
+        cause = "ci_red"
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Sweeps 1-2 dispatch; sweep 3 hits the limit and alerts once.
+        for i in range(3):
+            sweep(
+                [_row(key, cause)],
+                tier_of=_always(TIER_AUTO),
+                auto_dispatchers={cause: dispatch},
+                alert_dispatcher=alert,
+                convergence_limit=3,
+                now=lambda i=i: base + timedelta(minutes=i),
+            )
+        assert alert.count == 1
+
+        # Still inside the 1h initial backoff window: no re-alert yet.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+            now=lambda: base + timedelta(minutes=30),
+        )
+        assert alert.count == 1
+
+        # Past the 1h window (last alert fired at base+2min): re-alerts,
+        # and the wait doubles to 2h.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+            now=lambda: base + timedelta(hours=1, minutes=5),
+        )
+        assert alert.count == 2
+        assert state.board_doctor_row_state("drive-queue", key)["backoff_hours"] == 2.0
+
+        # Inside the NEW 2h window (last alert now at base+1h5min): no
+        # re-alert yet.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+            now=lambda: base + timedelta(hours=2, minutes=35),
+        )
+        assert alert.count == 2
+
     def test_row_absent_from_a_later_sweep_notifies_the_escalation_resolver(
         self,
     ) -> None:
@@ -961,6 +1024,196 @@ class TestConvergence:
             clear_absent_rows=False,
         )
         assert state.board_doctor_row_state("drive-queue", key)["count"] == 1
+
+
+class TestOutcomeTracking:
+    """A logged `auto-dispatch`/`alert` decision gets its own ``outcome``
+    filled in once the row's state at a LATER sweep answers whether it
+    actually worked — never left permanently ``None``.
+    """
+
+    def test_resolved_row_is_recorded_as_progressed(self) -> None:
+        dispatch = _Recorder()
+        key = "repo#20"
+        cause = "ci_red"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-1",
+        )
+
+        # The row resolves — absent from the next sweep's walk entirely.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-2",
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "progressed"
+
+    def test_still_stuck_on_the_same_cause_is_recorded_as_unchanged(self) -> None:
+        dispatch = _Recorder()
+        key = "repo#21"
+        cause = "ci_red"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-1",
+        )
+
+        # Still stuck on the exact same cause next sweep.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-2",
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "unchanged"
+
+    def test_freshly_escalating_after_an_action_is_recorded_as_regressed(self) -> None:
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#22"
+        cause = "ci_red"
+
+        # First sweep: under the convergence limit (2), so it
+        # auto-dispatches rather than alerting.
+        report = sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-1",
+        )
+        assert report.decisions[0].action == "auto-dispatch"
+
+        # Second sweep: still the same cause, now AT the limit, so it
+        # escalates — the auto action from the first sweep did not help.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-2",
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "regressed"
+
+    def test_only_actionable_decisions_ever_get_an_outcome_key(self) -> None:
+        """A `no-dispatcher`/`converged-noop`/deferred row was never
+        actually acted on, so its decision must never claim a pending
+        verdict that will never arrive.
+        """
+        key = "repo#23"
+        cause = "unmapped-cause"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+        )
+
+        logged = [d for d in state.board_doctor_decisions() if d["key"] == key]
+        assert logged[0]["action"] == "no-dispatcher"
+        assert "outcome" not in logged[0]
+
+
+class TestDecisionLogRetentionAndFilters:
+    """A durable, filterable log — trimmed by AGE rather than
+    a fixed entry count, and queryable by the same shape
+    ``coord drive-queue doctor-log`` exposes.
+    """
+
+    def test_entries_older_than_the_retention_window_are_dropped(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=state.BOARD_DOCTOR_LOG_RETENTION_DAYS + 1)
+        recent = now - timedelta(days=1)
+
+        state.record_board_doctor_decision(
+            {
+                "sweep_id": "s-old", "queue": "drive-queue", "key": "acme/x#1",
+                "cause": "ci_red", "tier": "auto", "action": "converged-noop",
+                "count": 1, "escalated": False, "confidence": "high",
+                "evidence": [], "recorded_at": old.isoformat(),
+            }
+        )
+        state.record_board_doctor_decision(
+            {
+                "sweep_id": "s-recent", "queue": "drive-queue", "key": "acme/x#2",
+                "cause": "ci_red", "tier": "auto", "action": "converged-noop",
+                "count": 1, "escalated": False, "confidence": "high",
+                "evidence": [], "recorded_at": recent.isoformat(),
+            }
+        )
+
+        keys = {d["key"] for d in state.board_doctor_decisions()}
+        assert keys == {"acme/x#2"}
+
+    def test_filters_by_repo_issue_and_action_and_since(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        base = datetime.now(timezone.utc) - timedelta(days=1)
+        for i, (key, action) in enumerate(
+            [
+                ("acme/x#1", "auto-dispatch"),
+                ("acme/x#2", "alert"),
+                ("acme/y#1", "auto-dispatch"),
+            ]
+        ):
+            state.record_board_doctor_decision(
+                {
+                    "sweep_id": f"s-{i}", "queue": "drive-queue", "key": key,
+                    "cause": "ci_red", "tier": "auto", "action": action,
+                    "count": 1, "escalated": False, "confidence": "high",
+                    "evidence": [], "recorded_at": (base + timedelta(minutes=i)).isoformat(),
+                }
+            )
+
+        assert {d["key"] for d in state.board_doctor_decisions(repo="acme/x")} == {
+            "acme/x#1", "acme/x#2",
+        }
+        assert {d["key"] for d in state.board_doctor_decisions(repo="acme/x", issue=1)} == {
+            "acme/x#1",
+        }
+        assert {d["key"] for d in state.board_doctor_decisions(action="alert")} == {
+            "acme/x#2",
+        }
+        since_ts = (base + timedelta(minutes=1)).timestamp()
+        assert {d["key"] for d in state.board_doctor_decisions(since=since_ts)} == {
+            "acme/x#2", "acme/y#1",
+        }
 
 
 class TestBaselineRedRows:

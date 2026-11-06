@@ -2097,11 +2097,26 @@ def baseline_red_merge_blocked(repo_name: str | None) -> bool:
 _BOARD_DOCTOR_ROWS_META_KEY = "board_doctor_rows"
 _BOARD_DOCTOR_LOG_META_KEY = "board_doctor_log"
 
-#: Cap on the decision log's length — a ring buffer, not an audit trail
-#: that grows forever. Same rationale as any other bounded `board_meta`
-#: list: unbounded growth here would make every future read of this key
-#: slower for an operator who only ever wants "what happened recently".
-BOARD_DOCTOR_LOG_LIMIT = 500
+#: Cap on the decision log's length — a hard safety ceiling, never the
+#: primary retention mechanism. :func:`record_board_doctor_decision` trims
+#: by AGE first (:data:`BOARD_DOCTOR_LOG_RETENTION_DAYS`); this is only
+#: the backstop against unbounded growth if sweeps ever ran far more often
+#: than once an hour.
+BOARD_DOCTOR_LOG_LIMIT = 50000
+
+#: How long a decision log entry survives before age-based trimming drops
+#: it — the durable, outcome-tracked history an operator can ask "what has
+#: the doctor fixed this week/month?" against, replacing the old fixed
+#: 500-entry ring buffer (which held a few hours of one busy fleet).
+BOARD_DOCTOR_LOG_RETENTION_DAYS = 90
+
+#: The wait before a row stuck on the SAME escalated cause gets re-alerted,
+#: and the cap that wait doubles towards each time it fires again. A row
+#: that stays wrong does not go silent forever after its first alert — it
+#: keeps getting flagged, just less often over time, instead of converging
+#: to permanent silence.
+BOARD_DOCTOR_BACKOFF_INITIAL_HOURS = 1.0
+BOARD_DOCTOR_BACKOFF_CAP_HOURS = 24.0
 
 
 def _board_doctor_row_key(queue: str, key: str) -> str:
@@ -2110,7 +2125,8 @@ def _board_doctor_row_key(queue: str, key: str) -> str:
 
 
 def _load_board_doctor_rows_raw(conn) -> dict[str, dict]:
-    """Best-effort decode of the persisted ``{row_key: {cause,count,escalated}}`` map.
+    """Best-effort decode of the persisted
+    ``{row_key: {cause,count,escalated,last_alert_at,backoff_hours}}`` map.
 
     A missing row, corrupt JSON, or an unexpected shape all read as "no
     sweep history yet" — same fail-open convention as
@@ -2141,6 +2157,8 @@ def _load_board_doctor_rows_raw(conn) -> dict[str, dict]:
                 "cause": value["cause"],
                 "count": value["count"],
                 "escalated": bool(value.get("escalated", False)),
+                "last_alert_at": value.get("last_alert_at"),
+                "backoff_hours": value.get("backoff_hours", BOARD_DOCTOR_BACKOFF_INITIAL_HOURS),
             }
     return out
 
@@ -2157,24 +2175,66 @@ def next_board_doctor_counter(prior: dict | None, cause: str) -> dict:
     """Pure transition: prior convergence counter + this sweep's cause -> next counter.
 
     Same cause as last sweep -> increment ``count`` (the row is STILL
-    stuck on it), carrying forward ``escalated``. A different cause
-    (including a key seen for the first time, i.e. *prior* is ``None``)
-    resets to ``count=1, escalated=False`` — a new cause is a new
+    stuck on it), carrying forward ``escalated``/``last_alert_at``/
+    ``backoff_hours``. A different cause (including a key seen for the
+    first time, i.e. *prior* is ``None``) resets to ``count=1,
+    escalated=False`` with a fresh backoff clock — a new cause is a new
     problem, not a continuation of the old one, so it gets its own chance
-    to auto-act before converging.
+    to auto-act before converging, and its own backoff schedule once it
+    does.
 
     Shared by the real write path (:func:`_record_board_doctor_observation_raw`)
     and :func:`coord.board_doctor.sweep`'s dry-run read path, so the two
-    can never drift apart on what "same cause" vs "new cause" means
-    (#3758).
+    can never drift apart on what "same cause" vs "new cause" means.
     """
     if prior is not None and prior.get("cause") == cause:
         return {
             "cause": cause,
             "count": prior.get("count", 0) + 1,
             "escalated": bool(prior.get("escalated", False)),
+            "last_alert_at": prior.get("last_alert_at"),
+            "backoff_hours": prior.get("backoff_hours", BOARD_DOCTOR_BACKOFF_INITIAL_HOURS),
         }
-    return {"cause": cause, "count": 1, "escalated": False}
+    return {
+        "cause": cause,
+        "count": 1,
+        "escalated": False,
+        "last_alert_at": None,
+        "backoff_hours": BOARD_DOCTOR_BACKOFF_INITIAL_HOURS,
+    }
+
+
+def board_doctor_alert_due(counter: dict, *, now: datetime) -> bool:
+    """Is a row whose persisted *counter* reads ``escalated`` due for
+    another alert right now?
+
+    Pure predicate so :func:`coord.board_doctor.sweep` can call it for
+    both the real write path and its own dry-run read path without either
+    one re-deriving the backoff math. A row never alerted before
+    (``escalated`` false, or no ``last_alert_at`` recorded yet) is always
+    due. Otherwise due once ``now`` is at least ``backoff_hours`` past
+    ``last_alert_at`` — the exponential-backoff re-check that replaces
+    "escalate once and never again": a cause that stays wrong keeps
+    getting flagged, just less often each time, instead of going
+    permanently silent once its first alert fires.
+    """
+    if not counter.get("escalated"):
+        return True
+    last_alert_at = counter.get("last_alert_at")
+    if not last_alert_at:
+        return True
+    try:
+        last = datetime.fromisoformat(str(last_alert_at))
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    backoff_hours = counter.get("backoff_hours")
+    try:
+        backoff_hours = float(backoff_hours) if backoff_hours else BOARD_DOCTOR_BACKOFF_INITIAL_HOURS
+    except (TypeError, ValueError):
+        backoff_hours = BOARD_DOCTOR_BACKOFF_INITIAL_HOURS
+    return (now - last).total_seconds() >= backoff_hours * 3600.0
 
 
 def _record_board_doctor_observation_raw(
@@ -2207,21 +2267,43 @@ def record_board_doctor_observation(queue: str, key: str, cause: str) -> dict:
     return updated
 
 
-def mark_board_doctor_escalated(queue: str, key: str) -> None:
-    """Flag *queue*/*key*'s CURRENT counter as escalated — no-op if absent.
+def mark_board_doctor_escalated(
+    queue: str, key: str, *, now: datetime | None = None
+) -> None:
+    """Flag *queue*/*key*'s CURRENT counter as escalated and record this
+    alert's time — no-op if absent.
 
-    Called once, the sweep a row's `count` first reaches the convergence
-    limit, so the next sweep (and every one after, while the cause stays
-    the same) sees `escalated=True` and stops re-dispatching the alert —
-    the "escalate exactly once" half of #3758's convergence requirement.
+    Called every time an alert for this row's cause actually fires —
+    the first time a row's `count` reaches the convergence limit, and
+    again on every later sweep :func:`board_doctor_alert_due` says is due
+    (exponential backoff, never "escalate once and go silent forever").
+    The first call starts the backoff clock at
+    :data:`BOARD_DOCTOR_BACKOFF_INITIAL_HOURS`; every call AFTER that
+    (i.e. ``escalated`` was already ``True``) doubles it, capped at
+    :data:`BOARD_DOCTOR_BACKOFF_CAP_HOURS` — the row gets flagged less
+    often the longer it stays wrong, but never stops being flagged.
     """
     conn = get_connection()
+    moment = (now or datetime.now(timezone.utc)).isoformat()
 
     def _write() -> None:
         rows = _load_board_doctor_rows_raw(conn)
         row_key = _board_doctor_row_key(queue, key)
         if row_key in rows:
+            already_escalated = bool(rows[row_key].get("escalated"))
             rows[row_key]["escalated"] = True
+            rows[row_key]["last_alert_at"] = moment
+            if already_escalated:
+                prior_backoff = rows[row_key].get("backoff_hours") or BOARD_DOCTOR_BACKOFF_INITIAL_HOURS
+                try:
+                    prior_backoff = float(prior_backoff)
+                except (TypeError, ValueError):
+                    prior_backoff = BOARD_DOCTOR_BACKOFF_INITIAL_HOURS
+                rows[row_key]["backoff_hours"] = min(
+                    BOARD_DOCTOR_BACKOFF_CAP_HOURS, prior_backoff * 2
+                )
+            else:
+                rows[row_key]["backoff_hours"] = BOARD_DOCTOR_BACKOFF_INITIAL_HOURS
             _save_board_doctor_rows_raw(conn, rows)
         conn.commit()
 
@@ -2710,17 +2792,74 @@ def release_merge_reservation(repo_name: str, holder_key: str | None = None) -> 
     return result["ok"]
 
 
+#: Actions a decision log entry needs an eventual outcome for — the
+#: sweep actually DID something to the row, as opposed to merely
+#: observing it (`converged-noop`, `investigate-deferred`,
+#: `suppressed-baseline-red`, `no-dispatcher`) or failing to confirm
+#: anything happened (`auto-dispatch-noop`, `alert-failed`,
+#: `alert-skipped`). Shared by :func:`record_board_doctor_decision` (which
+#: stamps a fresh entry's ``outcome`` as ``None`` only when its action is
+#: in this set — every other action is recorded with ``outcome=None``
+#: that no later sweep will ever try to fill in, so a report never shows
+#: a misleading "still pending" against something the doctor never
+#: actually acted on) and :func:`pending_board_doctor_outcomes`.
+BOARD_DOCTOR_OUTCOME_ACTIONS = frozenset({"auto-dispatch", "alert"})
+
+
+def _board_doctor_log_cutoff(*, now: datetime | None = None) -> str:
+    """ISO timestamp :data:`BOARD_DOCTOR_LOG_RETENTION_DAYS` in the past —
+    entries recorded before this are eligible for trimming."""
+    moment = now or datetime.now(timezone.utc)
+    cutoff = moment.timestamp() - BOARD_DOCTOR_LOG_RETENTION_DAYS * 86400.0
+    return datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+
+
+def _trim_board_doctor_log(log: list, *, now: datetime | None = None) -> list:
+    """Drop entries older than the retention window, then enforce the
+    hard :data:`BOARD_DOCTOR_LOG_LIMIT` backstop.
+
+    Age is read from each entry's own ``recorded_at`` — every caller of
+    :func:`record_board_doctor_decision` sets it. An entry missing or with
+    an unparseable ``recorded_at`` is kept rather than dropped: a decode
+    failure here must fail open (never silently lose provenance), the
+    same convention :func:`_load_board_doctor_rows_raw` documents.
+    """
+    cutoff = _board_doctor_log_cutoff(now=now)
+
+    def _keep(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        recorded_at = item.get("recorded_at")
+        if not isinstance(recorded_at, str):
+            return True
+        return recorded_at >= cutoff
+
+    trimmed = [item for item in log if _keep(item)]
+    if len(trimmed) > BOARD_DOCTOR_LOG_LIMIT:
+        trimmed = trimmed[-BOARD_DOCTOR_LOG_LIMIT:]
+    return trimmed
+
+
 def record_board_doctor_decision(entry: dict) -> None:
-    """Append one row's sweep outcome to the decision log (#3758, #1478 spirit).
+    """Append one row's sweep outcome to the durable decision log.
 
     *entry* is caller-shaped (``coord.board_doctor.sweep`` is the only
-    caller) and stored verbatim as one more JSON object in a ring-buffered
-    list, trimmed to :data:`BOARD_DOCTOR_LOG_LIMIT` entries, oldest first
-    dropped — every decision this harness makes is provenance for an
-    operator asking "why didn't row X get acted on", never silently lost,
-    but also never allowed to grow the `board_meta` row without bound.
+    caller) and stored as one more JSON object in an append-only list,
+    trimmed by AGE (:data:`BOARD_DOCTOR_LOG_RETENTION_DAYS`, default 90)
+    rather than a fixed entry count — every decision this harness makes
+    is provenance for an operator asking "why didn't row X get acted on",
+    kept for the configured window, never silently lost early just
+    because the fleet had a busy day. An ``outcome`` key of ``None`` is
+    added (never overwriting a caller-supplied one) for every entry whose
+    ``action`` is in :data:`BOARD_DOCTOR_OUTCOME_ACTIONS` — the ones
+    :func:`pending_board_doctor_outcomes` will later look for and
+    :func:`record_board_doctor_outcome` will fill in — so the schema is
+    consistent across every entry from the moment it is written.
     """
     conn = get_connection()
+    stamped = dict(entry)
+    if "outcome" not in stamped and entry.get("action") in BOARD_DOCTOR_OUTCOME_ACTIONS:
+        stamped["outcome"] = None
 
     def _write() -> None:
         row = sql.execute(
@@ -2735,9 +2874,8 @@ def record_board_doctor_decision(entry: dict) -> None:
                 decoded = []
             if isinstance(decoded, list):
                 log = decoded
-        log.append(entry)
-        if len(log) > BOARD_DOCTOR_LOG_LIMIT:
-            log = log[-BOARD_DOCTOR_LOG_LIMIT:]
+        log.append(stamped)
+        log = _trim_board_doctor_log(log)
         sql.upsert(
             conn, "board_meta", ["key", "value"],
             (_BOARD_DOCTOR_LOG_META_KEY, json.dumps(log)),
@@ -2748,8 +2886,110 @@ def record_board_doctor_decision(entry: dict) -> None:
     retry_on_locked(_write)
 
 
-def board_doctor_decisions(limit: int | None = None) -> list[dict]:
-    """The persisted decision log, most-recent last (#3758).
+def record_board_doctor_outcome(sweep_id: str, queue: str, key: str, outcome: str) -> None:
+    """Fill in a PREVIOUSLY-recorded decision's ``outcome`` — the one
+    the doctor fired at ``sweep_id`` for ``queue``/``key`` — so the
+    durable log can answer "did this action actually work?" rather than
+    just "what did the doctor try?"
+
+    No-op if no matching entry is found (already trimmed out, or the
+    caller passed a stale identifier) — this never invents a new log
+    entry, only updates one that already exists.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        row = sql.execute(
+            conn, "SELECT value FROM board_meta WHERE key = ?",
+            (_BOARD_DOCTOR_LOG_META_KEY,),
+        ).fetchone()
+        if row is None or not row["value"]:
+            return
+        try:
+            log = json.loads(row["value"])
+        except ValueError:
+            return
+        if not isinstance(log, list):
+            return
+        changed = False
+        for item in log:
+            if (
+                isinstance(item, dict)
+                and item.get("sweep_id") == sweep_id
+                and item.get("queue") == queue
+                and item.get("key") == key
+            ):
+                item["outcome"] = outcome
+                changed = True
+        if not changed:
+            return
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_BOARD_DOCTOR_LOG_META_KEY, json.dumps(log)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
+def pending_board_doctor_outcomes() -> list[dict]:
+    """Every logged decision still waiting on an :func:`record_board_doctor_outcome`
+    call — ``action`` in :data:`BOARD_DOCTOR_OUTCOME_ACTIONS` and
+    ``outcome`` still ``None`` — oldest first, so a caller backfilling
+    outcomes processes the longest-waiting entries first.
+
+    **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
+    """
+    _thin_client_local_board_guard("pending_board_doctor_outcomes")
+    return [
+        item
+        for item in board_doctor_decisions()
+        if item.get("action") in BOARD_DOCTOR_OUTCOME_ACTIONS and item.get("outcome") is None
+    ]
+
+
+def evaluate_board_doctor_outcome(decision: dict, current: dict | None) -> str:
+    """Pure verdict for one PAST decision, given the SAME row's counter
+    state at a later sweep: ``"progressed"``, ``"unchanged"`` or
+    ``"regressed"``.
+
+    *current* is ``None`` when the row no longer appears in the current
+    sweep's stuck set at all — resolved, which is unambiguously progress.
+    A cause change (even to a different still-stuck cause) also reads as
+    progress: the specific problem *decision* acted on stopped recurring.
+    Staying on the exact same cause reads as ``"unchanged"`` by default,
+    or ``"regressed"`` when it has freshly escalated — i.e. the action
+    *decision* took did not keep the row from getting bad enough to need
+    a human.
+    """
+    if current is None:
+        return "progressed"
+    if current.get("cause") != decision.get("cause"):
+        return "progressed"
+    if bool(current.get("escalated")) and not bool(decision.get("escalated")):
+        return "regressed"
+    return "unchanged"
+
+
+def board_doctor_decisions(
+    limit: int | None = None,
+    *,
+    since: float | None = None,
+    repo: str | None = None,
+    issue: int | None = None,
+    action: str | None = None,
+) -> list[dict]:
+    """The persisted decision log, most-recent last.
+
+    All filters are optional and AND together. *since* is a POSIX
+    timestamp — only entries whose ``recorded_at`` is at or after it are
+    kept. *repo*/*issue* match against ``key`` (``"repo#issue"``, the same
+    `coord.drive_queue.entry_key` form every drive-queue row uses); a
+    merge-queue row whose own key does not parse that way never matches
+    either filter rather than raising. *limit* is applied LAST, after
+    every filter, so it means "the most recent N matching entries," not
+    "scan only the most recent N before filtering."
 
     **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
     """
@@ -2766,7 +3006,44 @@ def board_doctor_decisions(limit: int | None = None) -> list[dict]:
         return []
     if not isinstance(log, list):
         return []
-    return log if limit is None else log[-limit:]
+    out = [item for item in log if isinstance(item, dict)]
+    if since is not None:
+        out = [
+            item for item in out
+            if _board_doctor_decision_ts(item) is not None
+            and _board_doctor_decision_ts(item) >= since
+        ]
+    if repo is not None or issue is not None:
+        out = [item for item in out if _board_doctor_key_matches(item, repo, issue)]
+    if action is not None:
+        out = [item for item in out if item.get("action") == action]
+    return out if limit is None else out[-limit:]
+
+
+def _board_doctor_decision_ts(item: dict) -> float | None:
+    recorded_at = item.get("recorded_at")
+    if not isinstance(recorded_at, str):
+        return None
+    try:
+        return datetime.fromisoformat(recorded_at).timestamp()
+    except ValueError:
+        return None
+
+
+def _board_doctor_key_matches(item: dict, repo: str | None, issue: int | None) -> bool:
+    key = str(item.get("key") or "")
+    item_repo, sep, item_issue = key.rpartition("#")
+    if not sep:
+        return False
+    if repo is not None and item_repo != repo:
+        return False
+    if issue is not None:
+        try:
+            if int(item_issue) != int(issue):
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def record_uat_verdict(
