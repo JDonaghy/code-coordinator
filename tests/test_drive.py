@@ -4354,6 +4354,41 @@ def test_human_required_is_matched_case_insensitively(status):
     assert step(approved_work(merge_status=status)).is_exit
 
 
+def test_human_required_message_claims_a_give_up_for_an_ordinary_conflict():
+    """#3871: the generic exit text only claims "an automated conflict-fix
+    already gave up" when `conflict_fix_actually_gave_up` confirms one
+    actually did — an ordinary mechanical give-up message qualifies."""
+    action = step(approved_work(
+        merge_status="HUMAN_REQUIRED",
+        merge_reason=(
+            "Pull request #1 is not mergeable; conflict-fix worker did "
+            "not resolve. Manual rebase required."
+        ),
+    ))
+    assert action.is_exit
+    assert "An automated conflict-fix already gave up." in action.message
+
+
+def test_human_required_message_does_not_claim_a_give_up_when_head_unmoved():
+    """#3871: a "branch head did not move" latch means the leg never
+    actually pushed — no real conflict defeated it, so the exit text must
+    not say one did."""
+    action = step(approved_work(
+        merge_status="HUMAN_REQUIRED",
+        merge_reason=(
+            "Pull request #1 is not mergeable; the conflict-fix worker "
+            "completed but the branch head did not move (still abc123) "
+            "— the push appears to be missing or was rejected, and a "
+            "fresh automated conflict-fix could not be dispatched (no "
+            "capable machine, or one already active) — push the fix by "
+            "hand, or re-run `coord merge` once a machine is free."
+        ),
+    ))
+    assert action.is_exit
+    assert "An automated conflict-fix already gave up." not in action.message
+    assert "No conflict-fix worker was defeated by a real conflict" in action.message
+
+
 def test_a_conflict_runs_coord_merge_rather_than_waiting_forever():
     """#1474: `dispatch_conflict_fix` has exactly two sanctioned callers — an
     actual `coord merge` run, and the semantic-escalation variant reachable

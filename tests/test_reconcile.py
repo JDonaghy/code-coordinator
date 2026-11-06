@@ -1285,6 +1285,239 @@ class TestReconcileConflictFixStaleRebaseMismatchMarker:
         assert entry.error is None
 
 
+# ── #3871: a clean exit that never actually moved the branch must not be ────
+# read as a resolved conflict ────────────────────────────────────────────────
+
+
+class TestReconcileConflictFixHeadUnmoved:
+    """A conflict-fix worker can end its turn clean (``status: done``, no
+    SEMANTIC/already-upstream/stale-rebase/reword marker) without ever
+    having pushed anything — a missing push, or one GitHub rejected. Before
+    this fix `reconcile()`'s "no marker → resolved" fast path trusted that
+    clean exit unconditionally, reset the merge entry to PENDING, and the
+    NEXT merge attempt (which still sees the identical conflict) latched
+    HUMAN_REQUIRED with text that read as if a real conflict had defeated
+    an automated conflict-fix — it hadn't; the leg just never pushed.
+    """
+
+    @staticmethod
+    def _dispatch_record_with_anchor(head_sha: str) -> Assignment:
+        from coord.conflict_fix import DISPATCH_HEAD_SHA_PREFIX
+
+        return Assignment(
+            machine_name="laptop", repo_name="api", issue_number=7,
+            issue_title="[conflict-fix] Do the thing",
+            assignment_id="fix-1", status="running",
+            type="conflict-fix", review_of_assignment_id="merge-1",
+            briefing=(
+                "Reason: Merge conflict in foo.py\n\n"
+                f"{DISPATCH_HEAD_SHA_PREFIX}{head_sha}"
+            ),
+        )
+
+    @patch("coord.github_ops.get_branch_sha")
+    @patch("coord.network.fetch_status")
+    @patch("coord.conflict_fix.httpx.post")
+    @patch("coord.reconcile._query_agent")
+    def test_head_unmoved_redispatches_within_budget_not_human_required(
+        self,
+        mock_query: MagicMock,
+        mock_post: MagicMock,
+        mock_fetch_status: MagicMock,
+        mock_get_branch_sha: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING, QueuedMerge
+        from coord.network import StatusResult
+        from coord.state import record_dispatched_assignment
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=CONFLICT,
+                error="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+            ),
+        ])
+
+        fix_assignment = self._dispatch_record_with_anchor("abc123")
+        record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+
+        board = Board(active=[fix_assignment])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        # The branch never actually moved — GitHub's LIVE head is identical
+        # to the anchor recorded when this leg was dispatched.
+        mock_get_branch_sha.return_value = "abc123"
+        mock_fetch_status.return_value = StatusResult(data={"assignments": []})
+        mock_post.return_value = MagicMock(
+            json=lambda: {"id": "ordinary-fix-2"},
+            raise_for_status=lambda: None,
+        )
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state != HUMAN_REQUIRED
+        assert entry.state == CONFLICT
+        assert "branch head did not move" in (entry.error or "")
+        assert "redispatched an ordinary conflict-fix" in (entry.error or "")
+
+        _, payload = mock_post.call_args
+        assert payload["json"]["issue_title"].startswith("[conflict-fix]")
+
+    @patch("coord.github_ops.get_branch_sha")
+    @patch("coord.network.fetch_status")
+    @patch("coord.reconcile._query_agent")
+    def test_head_unmoved_falls_back_to_human_required_when_redispatch_declines(
+        self,
+        mock_query: MagicMock,
+        mock_fetch_status: MagicMock,
+        mock_get_branch_sha: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.merge_queue import HUMAN_REQUIRED, PENDING, QueuedMerge, conflict_fix_actually_gave_up
+        from coord.network import StatusResult
+        from coord.state import record_dispatched_assignment
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state="conflict",
+                error="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+            ),
+        ])
+
+        fix_assignment = self._dispatch_record_with_anchor("abc123")
+        record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+
+        board = Board(active=[fix_assignment])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        mock_get_branch_sha.return_value = "abc123"
+        # Every candidate machine confirmed unreachable -> redispatch declines.
+        mock_fetch_status.return_value = StatusResult(error="timeout")
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state == HUMAN_REQUIRED
+        assert "branch head did not move" in (entry.error or "")
+        # Must NOT read as a real conflict-fix give-up — see
+        # `coord.merge_queue.conflict_fix_actually_gave_up`, the one
+        # function `coord.drive`'s HUMAN_REQUIRED exit text also keys off.
+        assert conflict_fix_actually_gave_up(entry.error) is False
+        # And must stay re-evaluable — none of the non-mergeability escape
+        # phrases (which `reconcile_conflict_entries` would refuse to
+        # re-test) are present.
+        assert "escalation could not be dispatched" not in (entry.error or "")
+        assert "nothing to merge" not in (entry.error or "")
+        assert "not a real conflict" not in (entry.error or "")
+
+    @patch("coord.github_ops.get_branch_sha")
+    @patch("coord.reconcile._query_agent")
+    def test_head_moved_normally_resets_to_pending(
+        self,
+        mock_query: MagicMock,
+        mock_get_branch_sha: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        """The overwhelming common case — the leg actually pushed — is
+        unaffected: the live head differs from the dispatch anchor, so the
+        entry resets to PENDING exactly like before #3871."""
+        from coord import merge_queue as mq
+        from coord.merge_queue import PENDING, QueuedMerge
+        from coord.state import record_dispatched_assignment
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state="conflict",
+                error="Merge conflict in foo.py",
+            ),
+        ])
+
+        fix_assignment = self._dispatch_record_with_anchor("abc123")
+        record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+
+        board = Board(active=[fix_assignment])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        # The push landed — GitHub's live head has moved past the anchor.
+        mock_get_branch_sha.return_value = "def456"
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state == PENDING
+        assert entry.error is None
+
+
 # ── #3462: an already-upstream verdict must not be read as a genuine ────────
 # content conflict ───────────────────────────────────────────────────────────
 

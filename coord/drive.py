@@ -164,6 +164,7 @@ from coord.worker_events import is_usage_limit_reason
 from coord.merge_queue import (
     STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
     UNKNOWN_BRANCH_HEAD_REASON as _mq_unknown_branch_head_reason,
+    conflict_fix_actually_gave_up,
     is_ci_absent_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
@@ -5137,10 +5138,25 @@ def _decide_merge(
 
     status = state.merge_status
     if status.upper() == "HUMAN_REQUIRED":
+        reason = state.merge_reason or "no reason recorded"
+        # #3871: this latch's cause isn't always a conflict-fix worker
+        # giving up on a real conflict — a usage-limit kill, content
+        # already upstream, a declined escalation, or a worker that exited
+        # clean without ever pushing (`CONFLICT_FIX_HEAD_UNMOVED_SIGNAL`)
+        # all land here too. Only claim the "already gave up" framing when
+        # `conflict_fix_actually_gave_up` confirms one actually did — the
+        # ONE function that answers this, so this exit text and
+        # `reconcile_conflict_entries`'s re-evaluability check can never
+        # disagree about what the latch means (#2096).
+        explanation = (
+            "An automated conflict-fix already gave up."
+            if conflict_fix_actually_gave_up(reason)
+            else "No conflict-fix worker was defeated by a real conflict here "
+            "— see the reason above."
+        )
         return _die(
-            f"merge entry is HUMAN_REQUIRED: {state.merge_reason or 'no reason recorded'}\n"
-            "   An automated conflict-fix already gave up. Resolve by hand, or "
-            "override:\n"
+            f"merge entry is HUMAN_REQUIRED: {reason}\n"
+            f"   {explanation} Resolve by hand, or override:\n"
             f"     coord merge --only {state.merge_aid or state.work_aid} "
             "--override-human-required '<reason>'"
         )

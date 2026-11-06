@@ -1352,6 +1352,39 @@ def _dispatched_base_sha(assignment: Assignment) -> str | None:
     return None
 
 
+# #3871: marker line :func:`dispatch_conflict_fix` appends to a conflict-fix
+# Assignment's own STORED ``briefing`` — never sent to the worker (the
+# worker gets the unmodified briefing text; this is appended only to the
+# copy recorded on the Assignment/dispatched-ledger row) — recording the
+# entry branch's HEAD SHA at the moment this attempt was dispatched. The
+# only durable record of that anchor: ``QueuedMerge.branch_head_sha`` is
+# transient and already holds the CURRENT (post-attempt) value by the time
+# a completion hook asks, not the value it held at dispatch time.
+DISPATCH_HEAD_SHA_PREFIX = "Conflict-fix dispatch anchor — branch HEAD SHA was "
+
+
+def dispatched_branch_head_sha(briefing: str | None) -> str | None:
+    """The entry branch's HEAD SHA recorded when a conflict-fix carrying
+    *briefing* was dispatched (#3871).
+
+    Takes the raw briefing text rather than an ``Assignment`` so any caller
+    holding just that string — e.g. ``coord.notify``'s dispatched-ledger
+    ``record["briefing"]``, which never builds a full ``Assignment`` — can
+    use it without round-tripping through the board. Returns ``None`` when
+    *briefing* carries no such line (predates this feature, a hand-built
+    test briefing, or the literal ``"unknown"`` placeholder written when the
+    SHA could not be read at dispatch time) — callers must then treat the
+    push as unverifiable and fall back to trusting the worker's own exit
+    status, exactly like the pre-#3871 behaviour.
+    """
+    text = briefing or ""
+    for line in text.splitlines():
+        if line.startswith(DISPATCH_HEAD_SHA_PREFIX):
+            value = line[len(DISPATCH_HEAD_SHA_PREFIX):].strip()
+            return value if value and value != "unknown" else None
+    return None
+
+
 def has_prior_conflict_fix(
     board: Board,
     merge_entry_id: str | None,
@@ -2011,6 +2044,15 @@ def dispatch_conflict_fix(
     reword that recurs against the same error after a prior attempt
     escalates to a human exactly like a recurring mechanical conflict
     would.
+
+    #3871: every path above stamps the dispatched Assignment's STORED
+    ``briefing`` (never the one sent to the worker) with the entry branch's
+    pre-dispatch HEAD SHA — see :data:`DISPATCH_HEAD_SHA_PREFIX` and
+    :func:`dispatched_branch_head_sha`. A clean worker exit is not proof the
+    branch actually moved (a missing or rejected push looks identical), so
+    the completion hook (``coord.reconcile.on_conflict_fix_done``) re-reads
+    the branch's LIVE head from GitHub and compares it against this anchor
+    before trusting a reported success.
     """
     if semantic:
         if has_prior_semantic_escalation(board, entry.assignment_id):
@@ -2175,6 +2217,17 @@ def dispatch_conflict_fix(
             machine_pick_out.append(pick)
         return None
 
+    # #3871: record the branch's pre-dispatch HEAD SHA on the STORED copy
+    # of the briefing only — `payload["briefing"]` above (already sent to
+    # the agent) is untouched, so the worker's own instructions never
+    # change. `coord.reconcile.on_conflict_fix_done` reads this back via
+    # `dispatched_branch_head_sha` to confirm a clean worker exit actually
+    # moved the branch, instead of trusting the exit status alone.
+    recorded_briefing = (
+        f"{briefing}\n\n{DISPATCH_HEAD_SHA_PREFIX}"
+        f"{entry.branch_head_sha or 'unknown'}"
+    )
+
     fix_assignment = Assignment(
         machine_name=machine.name,
         repo_name=entry.repo_name,
@@ -2182,7 +2235,7 @@ def dispatch_conflict_fix(
         issue_title=title,
         files_allowed=[],
         files_forbidden=[],
-        briefing=briefing,
+        briefing=recorded_briefing,
         model=model,
         assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
         status="running",

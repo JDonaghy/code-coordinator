@@ -3134,6 +3134,110 @@ def _try_ordinary_escalation_after_stale_mismatch(
         return None
 
 
+def _head_unmoved_verdict(
+    entry: "mq.QueuedMerge", fix_assignment_id: str,
+) -> tuple[bool, str | None]:
+    """(head_unmoved, live_sha) for a conflict-fix that reported no give-up
+    marker (#3871).
+
+    "Unmoved" means the branch's CURRENT HEAD SHA — read fresh from
+    GitHub, never cached — is IDENTICAL to the HEAD SHA it carried at the
+    moment this conflict-fix was dispatched (recorded on the dispatched
+    Assignment's own stored briefing, see
+    :func:`coord.conflict_fix.dispatched_branch_head_sha`): the worker
+    exited clean but never actually pushed anything (a missing push, or
+    one GitHub rejected), so the merge is still blocked on the exact
+    commit it was blocked on before this attempt ran — not because a real
+    conflict defeated the worker.
+
+    Best-effort and fails toward trusting the worker's own exit, exactly
+    like the pre-#3871 behaviour: any failure to find the dispatch record,
+    read its anchor, or reach GitHub for the live SHA returns
+    ``(False, None)`` rather than guessing.
+    """
+    if not entry.repo_github or not entry.branch or not fix_assignment_id:
+        return False, None
+
+    try:
+        from coord.state import load_dispatched  # noqa: PLC0415
+
+        dispatched_record = next(
+            (
+                r for r in load_dispatched()
+                if r.get("assignment_id") == fix_assignment_id
+            ),
+            None,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never block on this
+        dispatched_record = None
+    if dispatched_record is None:
+        return False, None
+
+    from coord.conflict_fix import dispatched_branch_head_sha  # noqa: PLC0415
+
+    dispatched_sha = dispatched_branch_head_sha(
+        dispatched_record.get("briefing"),
+    )
+    if dispatched_sha is None:
+        return False, None
+
+    try:
+        from coord import github_ops  # noqa: PLC0415
+
+        live_sha = github_ops.get_branch_sha(entry.repo_github, entry.branch)
+    except Exception:  # noqa: BLE001
+        live_sha = None
+    if live_sha is None:
+        return False, None
+
+    return (live_sha == dispatched_sha), live_sha
+
+
+def _try_ordinary_escalation_after_head_unmoved(
+    entry: "mq.QueuedMerge",
+    *,
+    board: Board | None,
+    config: Config | None,
+    machine_name: str | None,
+) -> Assignment | None:
+    """Dispatch a fresh ordinary conflict-fix after a prior attempt
+    completed clean without actually moving the branch (#3871).
+
+    Same shape as :func:`_try_ordinary_escalation_after_stale_mismatch` —
+    an ordinary (non-``semantic``, non-``stale_rebase``) dispatch, which
+    goes through the SAME retry-cap check (:func:`coord.conflict_fix.
+    has_prior_conflict_fix`) every other conflict-fix redispatch does, so
+    this redispatches WITHIN the existing per-entry budget rather than
+    granting a fresh one. Returns the dispatched ``Assignment``, or
+    ``None`` when the plumbing isn't available (*board*/*config* weren't
+    supplied — e.g. the lightweight ``coord notify`` call site for the
+    common "no marker" case) or dispatch declined for any of the ordinary
+    reasons (no capable machine, already active, retry cap already
+    consumed) — every ``None`` case falls through to the caller's
+    HUMAN_REQUIRED park.
+    """
+    if board is None or config is None:
+        return None
+
+    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+    from coord.network import fetch_status  # noqa: PLC0415
+
+    try:
+        return dispatch_conflict_fix(
+            entry,
+            board,
+            config,
+            prefer_machine=machine_name or None,
+            status_fetcher=fetch_status,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break reconcile on this
+        import logging  # noqa: PLC0415
+        logging.warning(
+            "head-unmoved → ordinary conflict-fix redispatch failed: %s", exc,
+        )
+        return None
+
+
 def on_conflict_fix_done(
     *,
     parent_assignment_id: str,
@@ -3222,6 +3326,23 @@ def on_conflict_fix_done(
     Called from both ``reconcile()`` (via mark_done/failed) and
     ``coord notify`` (via post_transition) — both paths must trigger this
     so the re-enqueue fires regardless of which polling command runs first.
+
+    #3871: BEFORE any of the marker verdicts above get a say, a *succeeded*
+    completion is independently re-checked against GitHub's LIVE branch
+    head — see :func:`_head_unmoved_verdict`. A clean exit with no marker
+    is not proof the branch moved: a missing push, or one GitHub rejected,
+    looks identical. When the live head is confirmed unchanged from the
+    HEAD this attempt was dispatched against, *succeeded* is treated as
+    ``False`` for a dedicated ``head_unmoved`` branch that tries an
+    ordinary redispatch (:func:`_try_ordinary_escalation_after_head_
+    unmoved`) WITHIN the existing retry cap, falling back to HUMAN_REQUIRED
+    with text that says what actually happened — never the "a real
+    conflict defeated an automated conflict-fix" framing the other
+    branches above use, and never one of
+    :data:`coord.merge_queue._NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS`'s
+    phrases, so the latch stays eligible for
+    :func:`coord.merge_queue.reconcile_conflict_entries`'s live-
+    mergeability re-test instead of parking forever on a stale verdict.
     """
     from coord import merge_queue as mq  # noqa: PLC0415
 
@@ -3234,13 +3355,83 @@ def on_conflict_fix_done(
     for entry in items:
         if entry.assignment_id != parent_assignment_id:
             continue
+        # #3871: a clean worker exit (no STUCK marker — `succeeded` still
+        # True here) is not proof the branch actually moved. Re-read the
+        # branch's LIVE head from GitHub and compare it against the HEAD it
+        # carried when THIS attempt was dispatched — only when both
+        # resolve and match is the push confirmed missing/rejected; any
+        # failure to read either side reads as "moved" (False), preserving
+        # the pre-#3871 behaviour of trusting the worker's own exit.
+        head_unmoved = False
+        head_unmoved_sha: str | None = None
         if succeeded:
+            head_unmoved, head_unmoved_sha = _head_unmoved_verdict(
+                entry, fix_assignment_id,
+            )
+        if succeeded and not head_unmoved:
             entry.state = mq.PENDING
             entry.error = None
             entry.last_attempt = None
         else:
             existing_error = entry.error or "conflict-fix failed"
-            if usage_limit_reason:
+            if head_unmoved:
+                # The leg exited clean and diagnosed nothing (no SEMANTIC/
+                # already-upstream/stale-rebase/reword marker), yet the
+                # branch is still sitting on the exact commit it was on
+                # before this attempt ran — the rebase, if any, was never
+                # pushed, or GitHub rejected the push. This is NOT a real
+                # conflict defeating a conflict-fix worker, so it must not
+                # read like one (see `coord.merge_queue.
+                # conflict_fix_actually_gave_up`, which `coord.drive`'s
+                # HUMAN_REQUIRED exit text keys off of) and it must not
+                # consume the entry's only shot at automated resolution:
+                # redispatch the ordinary mechanical attempt WITHIN the
+                # existing retry cap (a prior `done` status never consumes
+                # it on its own — see `dispatch_conflict_fix`'s retry-cap
+                # docstring) rather than escalating straight to
+                # HUMAN_REQUIRED as if a worker had given up on a genuine
+                # conflict.
+                detail = (
+                    "the conflict-fix worker completed but the branch "
+                    f"head did not move (still {head_unmoved_sha}) — the "
+                    "push appears to be missing or was rejected"
+                )
+                fix = _try_ordinary_escalation_after_head_unmoved(
+                    entry,
+                    board=board,
+                    config=config,
+                    machine_name=machine_name,
+                )
+                if fix is not None:
+                    # Stay in CONFLICT, not HUMAN_REQUIRED — the redispatched
+                    # worker is now in flight.
+                    entry.state = mq.CONFLICT
+                    entry.error = (
+                        f"{existing_error}; {detail}; redispatched an "
+                        f"ordinary conflict-fix (assignment "
+                        f"{fix.assignment_id}) on {fix.machine_name}."
+                    )
+                else:
+                    # No capable machine, already active, or the retry cap
+                    # was already consumed by a genuinely failed prior
+                    # attempt — fall through to HUMAN_REQUIRED, but with
+                    # text that says what actually happened (a missing
+                    # push), not "a conflict-fix worker gave up on a real
+                    # conflict". Deliberately avoids every phrase in
+                    # `_NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS` so
+                    # `reconcile_conflict_entries` keeps re-testing this
+                    # latch against live mergeability instead of treating
+                    # it as permanently non-mergeable.
+                    entry.state = mq.HUMAN_REQUIRED
+                    entry.error = (
+                        f"{existing_error}; {detail}, and a fresh "
+                        "automated conflict-fix could not be dispatched "
+                        "(no capable machine, or one already active) — "
+                        "push the fix by hand, or re-run `coord merge` "
+                        "once a machine is free."
+                    )
+                    failed_entry = entry
+            elif usage_limit_reason:
                 entry.state = mq.HUMAN_REQUIRED
                 entry.error = (
                     f"{existing_error}; conflict-fix worker was killed by "
