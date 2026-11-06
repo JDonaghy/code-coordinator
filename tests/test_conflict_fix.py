@@ -18,7 +18,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -47,11 +47,9 @@ from coord.conflict_fix import (
     build_reword_commit_briefing,
     build_sealed_manifest_conflict_briefing,
     build_stale_rebase_briefing,
-    conflict_fix_session_ended_without_push,
     describe_conflict_fix_decline,
-    detect_premature_end_without_push,
+    detect_premature_wait,
     dispatch_conflict_fix,
-    final_turn_is_sanctioned_giveup,
     looks_like_premature_wait,
     pick_conflict_fix_machine,
     reword_mismatch_verdict_in_text,
@@ -2569,80 +2567,16 @@ class TestSessionEndsOnTurnEndRule:
         assert "before" in lowered
 
 
-# ── #3870: final-message classification ────────────────────────────────────
-
-
-class TestFinalTurnIsSanctionedGiveup:
-    def test_true_for_plain_stuck_line(self) -> None:
-        assert final_turn_is_sanctioned_giveup(
-            "STATUS: tried the rebase\nSTUCK: can't resolve the conflict"
-        ) is True
-
-    def test_true_for_semantic_marker(self) -> None:
-        assert final_turn_is_sanctioned_giveup(
-            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:40-72 — both sides "
-            "rewrote parse_args() differently"
-        ) is True
-
-    def test_true_for_sealed_scope_marker(self) -> None:
-        assert final_turn_is_sanctioned_giveup(
-            f"STUCK: {SEALED_SCOPE_STUCK_MARKER} tests/acceptance/ms-1/x.py"
-        ) is True
-
-    def test_false_for_waiting_announcement(self) -> None:
-        """The exact quadraui#2034 shape: a status line, not a give-up."""
-        assert final_turn_is_sanctioned_giveup("Waiting for the gate.") is False
-
-    def test_false_for_confident_completion_summary(self) -> None:
-        assert final_turn_is_sanctioned_giveup(
-            "### Summary\nRebased and pushed successfully."
-        ) is False
-
-    def test_false_for_none_or_empty(self) -> None:
-        assert final_turn_is_sanctioned_giveup(None) is False
-        assert final_turn_is_sanctioned_giveup("") is False
-
-
-class TestConflictFixSessionEndedWithoutPush:
-    def test_false_when_origin_head_changed_regardless_of_message(self) -> None:
-        """A real push is a fact about origin, not about the worker's own
-        prose (#2096 "unconfirmed success is a defect") — if the head
-        moved, a "Waiting for the gate." final turn doesn't matter."""
-        assert conflict_fix_session_ended_without_push(
-            final_turn_text="Waiting for the gate.",
-            origin_head_changed=True,
-        ) is False
-
-    def test_true_for_waiting_announcement_with_unmoved_head(self) -> None:
-        """The quadraui#2034 case this issue is built from."""
-        assert conflict_fix_session_ended_without_push(
-            final_turn_text="Waiting for the gate.",
-            origin_head_changed=False,
-        ) is True
-
-    def test_true_for_silent_end_with_unmoved_head(self) -> None:
-        assert conflict_fix_session_ended_without_push(
-            final_turn_text=None,
-            origin_head_changed=False,
-        ) is True
-
-    def test_false_for_sanctioned_stuck_giveup_with_unmoved_head(self) -> None:
-        """A worker that correctly refused to guess and said so never
-        pushed, on purpose — that is not the #3870 failure shape."""
-        assert conflict_fix_session_ended_without_push(
-            final_turn_text=f"STUCK: {SEMANTIC_STUCK_MARKER} foo.py:1-9",
-            origin_head_changed=False,
-        ) is False
-
-    def test_false_for_confident_summary_backed_by_a_real_push(self) -> None:
-        assert conflict_fix_session_ended_without_push(
-            final_turn_text="### Summary\nRebased and pushed successfully.",
-            origin_head_changed=True,
-        ) is False
+# ── final-message explanation for a leg that never pushed ──────────────────
 
 
 class TestLooksLikePrematureWait:
-    def test_true_for_the_quadraui_2034_shape(self) -> None:
+    """A conflict-fix leg that provably didn't push gets its parked entry's
+    text sharpened when its own final turn shows WHY: it backgrounded the
+    gate and signed off waiting for it. Never a success/failure verdict of
+    its own — `coord.reconcile._head_unmoved_verdict` owns that."""
+
+    def test_true_for_a_backgrounded_gate_signoff(self) -> None:
         assert looks_like_premature_wait("Waiting for the gate.") is True
 
     def test_true_for_background_monitoring_phrasing(self) -> None:
@@ -2655,30 +2589,30 @@ class TestLooksLikePrematureWait:
             "### Summary\nRebased and pushed to origin/issue-1-fix."
         ) is False
 
+    def test_false_for_a_sanctioned_stuck_giveup(self) -> None:
+        """A worker that refused to guess and said so on a STUCK: line
+        never pushed on purpose — a different shape, even when its wording
+        happens to mention waiting."""
+        assert looks_like_premature_wait(
+            f"STUCK: {SEMANTIC_STUCK_MARKER} foo.py:1-9 — waiting for a "
+            "human to decide which side wins"
+        ) is False
+
     def test_false_for_none_or_empty(self) -> None:
         assert looks_like_premature_wait(None) is False
         assert looks_like_premature_wait("") is False
 
 
-class TestDetectPrematureEndWithoutPush:
-    def test_false_immediately_when_head_changed(self) -> None:
-        """Short-circuits before even looking at the log — a moved head is
-        proof enough, with or without a transcript to read."""
-        assert detect_premature_end_without_push(origin_head_changed=True) is False
-
+class TestDetectPrematureWait:
     def test_reads_local_log_file_plain_text(self, tmp_path) -> None:
         log = tmp_path / "worker.log"
         log.write_text("STATUS: rebasing\nWaiting for the gate.\n")
-        assert detect_premature_end_without_push(
-            origin_head_changed=False, log_path=str(log),
-        ) is True
+        assert detect_premature_wait(log_path=str(log)) is True
 
     def test_local_log_file_with_sanctioned_giveup_is_false(self, tmp_path) -> None:
         log = tmp_path / "worker.log"
         log.write_text(f"STUCK: {SEMANTIC_STUCK_MARKER} foo.py:1-9\n")
-        assert detect_premature_end_without_push(
-            origin_head_changed=False, log_path=str(log),
-        ) is False
+        assert detect_premature_wait(log_path=str(log)) is False
 
     def test_reads_stream_json_log_and_uses_only_the_latest_turn(
         self, tmp_path,
@@ -2702,15 +2636,48 @@ class TestDetectPrematureEndWithoutPush:
         ]
         log = tmp_path / "worker.log"
         log.write_text("\n".join(lines) + "\n")
-        assert detect_premature_end_without_push(
-            origin_head_changed=False, log_path=str(log),
-        ) is True
+        assert detect_premature_wait(log_path=str(log)) is True
+
+    def test_stream_json_log_whose_last_turn_pushed_is_false(
+        self, tmp_path,
+    ) -> None:
+        """The mirror case: an early "waiting for the tests" note followed
+        by a real push must NOT read as a premature wait."""
+        lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Waiting for the tests."},
+                ]},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Pushed with --force-with-lease."},
+                ]},
+            }),
+        ]
+        log = tmp_path / "worker.log"
+        log.write_text("\n".join(lines) + "\n")
+        assert detect_premature_wait(log_path=str(log)) is False
 
     def test_missing_log_and_no_host_is_false(self, tmp_path) -> None:
-        assert detect_premature_end_without_push(
-            origin_head_changed=False,
-            log_path=str(tmp_path / "nope.log"),
-        ) is False
+        assert detect_premature_wait(log_path=str(tmp_path / "nope.log")) is False
 
     def test_no_sources_is_false(self) -> None:
-        assert detect_premature_end_without_push(origin_head_changed=False) is False
+        assert detect_premature_wait() is False
+
+    def test_falls_back_to_the_agent_log_endpoint(self) -> None:
+        resp = MagicMock(text="Waiting for the gate.", raise_for_status=lambda: None)
+        with patch("coord.conflict_fix.httpx.get", return_value=resp) as mock_get:
+            assert detect_premature_wait(host="l", assignment_id="fix-1") is True
+        assert "/logs/fix-1" in mock_get.call_args[0][0]
+
+    def test_unreachable_agent_is_false(self) -> None:
+        import httpx as _httpx
+
+        with patch(
+            "coord.conflict_fix.httpx.get",
+            side_effect=_httpx.ConnectError("down"),
+        ):
+            assert detect_premature_wait(host="l", assignment_id="fix-1") is False

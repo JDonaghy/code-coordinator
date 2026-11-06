@@ -1502,6 +1502,144 @@ class TestReconcileConflictFixHeadUnmoved:
         assert "nothing was pushed" in posted_body
         assert "exit status 0" in posted_body
 
+    def _queue_one_conflict_entry(self) -> None:
+        from coord import merge_queue as mq
+        from coord.merge_queue import QueuedMerge
+
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state="conflict",
+                error="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+            ),
+        ])
+
+    @patch("coord.github_ops.post_issue_comment")
+    @patch("coord.github_ops.get_branch_sha")
+    @patch("coord.network.fetch_status")
+    @patch("coord.reconcile._query_agent")
+    def test_premature_wait_final_turn_is_named_in_the_parked_entry(
+        self,
+        mock_query: MagicMock,
+        mock_fetch_status: MagicMock,
+        mock_get_branch_sha: MagicMock,
+        mock_post_comment: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        """#3870: a leg that backgrounded its gate and signed off with
+        "Waiting for the gate." ended its own `-p` session before pushing.
+        It must be classified as failed (never reset to PENDING as if the
+        conflict were resolved), and the parked entry must SAY that the
+        final message was a wait on a backgrounded step — the generic "the
+        push appears to be missing" text leaves an operator guessing."""
+        from coord import merge_queue as mq
+        from coord.merge_queue import HUMAN_REQUIRED, PENDING
+        from coord.network import StatusResult
+        from coord.state import record_dispatched_assignment
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        self._queue_one_conflict_entry()
+        fix_assignment = self._dispatch_record_with_anchor(
+            "abc123",
+            reason="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+        )
+        record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebased cleanly\n"
+            "STATUS: launched the gate via Monitor\n"
+            "Waiting for the gate.\n"
+        )
+
+        board = Board(active=[fix_assignment])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        mock_get_branch_sha.return_value = "abc123"
+        # Redispatch declines (machine unreachable), so the entry parks and
+        # its text is the surface an operator reads.
+        mock_fetch_status.return_value = StatusResult(error="timeout")
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state == HUMAN_REQUIRED
+        assert "branch head did not move" in (entry.error or "")
+        assert "waiting for a step it had backgrounded" in (entry.error or "")
+
+    @patch("coord.github_ops.post_issue_comment")
+    @patch("coord.github_ops.get_branch_sha")
+    @patch("coord.network.fetch_status")
+    @patch("coord.reconcile._query_agent")
+    def test_head_unmoved_without_a_wait_signoff_keeps_the_generic_text(
+        self,
+        mock_query: MagicMock,
+        mock_fetch_status: MagicMock,
+        mock_get_branch_sha: MagicMock,
+        mock_post_comment: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        """The explanation is additive: a leg whose final turn claims it
+        pushed (but demonstrably didn't) still parks on the head-unmoved
+        verdict, just without the backgrounded-step clause."""
+        from coord import merge_queue as mq
+        from coord.merge_queue import HUMAN_REQUIRED
+        from coord.network import StatusResult
+        from coord.state import record_dispatched_assignment
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        self._queue_one_conflict_entry()
+        fix_assignment = self._dispatch_record_with_anchor(
+            "abc123",
+            reason="Merge conflict in foo.py — GitHub reports it as not mergeable.",
+        )
+        record_dispatched_assignment(assignment=fix_assignment, repo_github="acme/api")
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebased\n### Summary\nRebased and pushed.\n")
+
+        board = Board(active=[fix_assignment])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        mock_get_branch_sha.return_value = "abc123"
+        mock_fetch_status.return_value = StatusResult(error="timeout")
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state == HUMAN_REQUIRED
+        assert "branch head did not move" in (entry.error or "")
+        assert "backgrounded" not in (entry.error or "")
+
     @patch("coord.github_ops.get_branch_sha")
     @patch("coord.reconcile._query_agent")
     def test_head_moved_normally_resets_to_pending(
