@@ -2806,12 +2806,19 @@ def release_merge_reservation(repo_name: str, holder_key: str | None = None) -> 
 BOARD_DOCTOR_OUTCOME_ACTIONS = frozenset({"auto-dispatch", "alert"})
 
 
-def _board_doctor_log_cutoff(*, now: datetime | None = None) -> str:
-    """ISO timestamp :data:`BOARD_DOCTOR_LOG_RETENTION_DAYS` in the past —
-    entries recorded before this are eligible for trimming."""
+def _board_doctor_log_cutoff(*, now: datetime | None = None) -> float:
+    """POSIX timestamp :data:`BOARD_DOCTOR_LOG_RETENTION_DAYS` in the past —
+    entries recorded before this are eligible for trimming.
+
+    POSIX, not an ISO string: "is this entry old enough" has exactly one
+    implementation (:func:`_board_doctor_decision_ts`, which this compares
+    against), not a second lexicographic-string one that happens to agree
+    with it only because every ``recorded_at`` so far has been tz-aware. A
+    naive ``recorded_at`` would be read as UTC by one comparison and as
+    local time by the other if the two ever diverged.
+    """
     moment = now or datetime.now(timezone.utc)
-    cutoff = moment.timestamp() - BOARD_DOCTOR_LOG_RETENTION_DAYS * 86400.0
-    return datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+    return moment.timestamp() - BOARD_DOCTOR_LOG_RETENTION_DAYS * 86400.0
 
 
 def _trim_board_doctor_log(log: list, *, now: datetime | None = None) -> list:
@@ -2829,10 +2836,8 @@ def _trim_board_doctor_log(log: list, *, now: datetime | None = None) -> list:
     def _keep(item: Any) -> bool:
         if not isinstance(item, dict):
             return False
-        recorded_at = item.get("recorded_at")
-        if not isinstance(recorded_at, str):
-            return True
-        return recorded_at >= cutoff
+        ts = _board_doctor_decision_ts(item)
+        return ts is None or ts >= cutoff
 
     trimmed = [item for item in log if _keep(item)]
     if len(trimmed) > BOARD_DOCTOR_LOG_LIMIT:
