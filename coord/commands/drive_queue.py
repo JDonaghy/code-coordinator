@@ -3271,6 +3271,191 @@ def drive_queue_sweep(
         )
 
 
+# ── doctor act (#3881) ────────────────────────────────────────────────────────
+
+
+@drive_queue_group.command("doctor-act")
+@click.argument("action")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--reason",
+    required=True,
+    help="Why this action is being taken now — audited verbatim alongside the action.",
+)
+@click.option(
+    "--review-assignment-id",
+    default=None,
+    help="bounce: the review assignment id whose request-changes verdict to bounce.",
+)
+@click.option(
+    "--sibling-repo",
+    default=None,
+    help="integration_fix: the repo whose own issue is the broken base/integration fix.",
+)
+@click.option(
+    "--sibling-issue",
+    type=int,
+    default=None,
+    help="integration_fix: the sibling issue number to dispatch a fix-it leg against.",
+)
+@click.option(
+    "--cause",
+    default="",
+    help="integration_fix: the diagnosed cause, carried into the dispatched leg's briefing.",
+)
+@click.option(
+    "--evidence",
+    multiple=True,
+    help="integration_fix: one line of supporting evidence (repeatable).",
+)
+@click.option("--stage", default=None, help="restage: 'test' or 'review'.")
+@click.option(
+    "--review-verdict",
+    default=None,
+    help="raise_budget: the row's live review verdict (e.g. 'request-changes').",
+)
+@click.option(
+    "--review-has-findings",
+    is_flag=True,
+    default=False,
+    help="raise_budget: the request-changes review carries concrete findings.",
+)
+@click.option(
+    "--ci-red-only",
+    is_flag=True,
+    default=False,
+    help="raise_budget: CI (never the review) is the only red gate.",
+)
+@click.option(
+    "--increment",
+    type=int,
+    default=2,
+    show_default=True,
+    help="raise_budget: how many fix rounds to add to the current ceiling.",
+)
+@_CONFIG_OPTION
+def drive_queue_doctor_act(
+    action: str,
+    repo: str,
+    issue: int,
+    reason: str,
+    review_assignment_id: str | None,
+    sibling_repo: str | None,
+    sibling_issue: int | None,
+    cause: str,
+    evidence: tuple[str, ...],
+    stage: str | None,
+    review_verdict: str | None,
+    review_has_findings: bool,
+    ci_red_only: bool,
+    increment: int,
+    config_path: Path,
+) -> None:
+    """#3881: the ONE audited, precondition-checked action a daemon-host
+    investigator session may take against a stuck row.
+
+    *action* is one of ``coord.board_doctor_permissions.INVESTIGATOR_
+    ACTIONS`` — ``requeue``, ``raise_budget``, ``bounce``,
+    ``integration_fix``, ``restage``, ``clear_latch``, ``merge``, or
+    ``mark_done``. Every one of them re-reads live board/GitHub/merge-queue
+    state immediately before acting, refuses (prints and exits 0, never an
+    exception) when its own precondition no longer holds, and writes an
+    audit row either way — see `coord.board_doctor_permissions` for each
+    verb's exact precondition. This command is the ONLY way an unattended
+    investigator session reaches any of them: it never runs
+    `--dangerously-skip-permissions`, and the handlers behind it have no
+    code path to `--force-merge`, `--override-human-required`, a sealed
+    suite, an issue close/retitle/rescope, credentials, or
+    `coordinator.yml`.
+
+    Daemon-host only, same as `drive-queue sweep`/`diagnose` — the queues,
+    board and merge queue all live there; a thin client would act on an
+    empty local copy.
+    """
+    from coord.board_doctor_permissions import (  # noqa: PLC0415
+        INVESTIGATOR_ACTIONS,
+        dispatch_investigator_action,
+    )
+    from coord.board_service import is_remote  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+
+    if is_remote():
+        raise click.ClickException(
+            "drive-queue doctor act mutates the daemon host's queues, board "
+            "and merge queue directly — run it there (a board_service-"
+            "configured thin client would act on an empty local copy)."
+        )
+    if action not in INVESTIGATOR_ACTIONS:
+        raise click.ClickException(
+            f"unknown action {action!r} — must be one of "
+            f"{sorted(INVESTIGATOR_ACTIONS)!r}"
+        )
+
+    config = _load_config(config_path)
+    from coord.state import build_board  # noqa: PLC0415
+
+    board = build_board()
+
+    if action == "requeue":
+        result = dispatch_investigator_action("requeue", repo, issue, board, reason=reason)
+    elif action == "raise_budget":
+        result = dispatch_investigator_action(
+            "raise_budget",
+            repo,
+            issue,
+            config,
+            review_verdict=review_verdict,
+            review_has_findings=review_has_findings,
+            ci_red_only=ci_red_only,
+            reason=reason,
+            increment=increment,
+        )
+    elif action == "bounce":
+        if not review_assignment_id:
+            raise click.ClickException("bounce requires --review-assignment-id")
+        result = dispatch_investigator_action(
+            "bounce", repo, issue, review_assignment_id, board, config, reason=reason,
+        )
+    elif action == "integration_fix":
+        if not sibling_repo or sibling_issue is None:
+            raise click.ClickException(
+                "integration_fix requires --sibling-repo and --sibling-issue"
+            )
+        result = dispatch_investigator_action(
+            "integration_fix",
+            repo,
+            issue,
+            board,
+            config,
+            sibling_repo=sibling_repo,
+            sibling_issue=sibling_issue,
+            cause=cause,
+            evidence=tuple(evidence),
+            reason=reason,
+        )
+    elif action == "restage":
+        if stage not in ("test", "review"):
+            raise click.ClickException("restage requires --stage test|review")
+        result = dispatch_investigator_action(
+            "restage", repo, issue, board, config, stage=stage, reason=reason,
+        )
+    elif action in ("clear_latch", "merge"):
+        from coord import github_ops as gh_ops  # noqa: PLC0415
+
+        result = dispatch_investigator_action(
+            action, repo, issue, board, config, gh_ops, reason=reason,
+        )
+    elif action == "mark_done":
+        result = dispatch_investigator_action(
+            "mark_done", repo, issue, board, config, reason=reason,
+        )
+    else:  # pragma: no cover — INVESTIGATOR_ACTIONS checked above
+        raise click.ClickException(f"unhandled action {action!r}")
+
+    click.echo(f"{action} {repo}#{issue}: acted={result['acted']} — {result['detail']}")
+
+
 # ── doctor-log ───────────────────────────────────────────────────────────────
 
 

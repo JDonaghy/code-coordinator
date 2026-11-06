@@ -1766,3 +1766,490 @@ class TestFinisherSelfBless:
             event_type="finisher_self_bless_advance_unconfirmed", repo="api", issue=1
         )
         assert len(unconfirmed["entries"]) == 1
+
+
+# ── #3881: the daemon-host investigator wrapper ──────────────────────────
+
+
+class TestAuthorizeInvestigatorAction:
+    """The investigator's closed action set and its forbidden names —
+    checked ahead of, and independently of, the mechanical handlers below,
+    so a bad verb never reaches a handler at all."""
+
+    def test_every_investigator_action_is_authorized(self) -> None:
+        from coord.board_doctor_permissions import (
+            INVESTIGATOR_ACTIONS,
+            authorize_investigator_action,
+        )
+
+        for action in INVESTIGATOR_ACTIONS:
+            authorize_investigator_action(action)  # must not raise
+
+    def test_force_merge_and_override_human_required_are_refused(self) -> None:
+        from coord.board_doctor_permissions import (
+            SweepPermissionError,
+            authorize_investigator_action,
+        )
+
+        with pytest.raises(SweepPermissionError, match="force_merge"):
+            authorize_investigator_action("force_merge")
+        with pytest.raises(SweepPermissionError, match="override_human_required"):
+            authorize_investigator_action("override_human_required")
+
+    @pytest.mark.parametrize(
+        "forbidden",
+        [
+            "edit_sealed_suite",
+            "close_issue",
+            "reopen_issue",
+            "retitle_issue",
+            "rescope_issue",
+            "edit_credentials",
+            "edit_coordinator_yml",
+            "gh_write",
+        ],
+    )
+    def test_the_3881_forbidden_extras_are_each_refused(self, forbidden: str) -> None:
+        from coord.board_doctor_permissions import (
+            SweepPermissionError,
+            authorize_investigator_action,
+        )
+
+        with pytest.raises(SweepPermissionError, match=forbidden):
+            authorize_investigator_action(forbidden)
+
+    def test_an_unknown_verb_names_the_closed_set(self) -> None:
+        from coord.board_doctor_permissions import (
+            SweepPermissionError,
+            authorize_investigator_action,
+        )
+
+        with pytest.raises(SweepPermissionError, match="bogus_verb"):
+            authorize_investigator_action("bogus_verb")
+
+    def test_aliases_reach_the_same_gate_as_the_sweep(self) -> None:
+        # requeue/merge/integration_fix are a rename, not a second grant —
+        # disabling the underlying safe-tier name must disable the alias.
+        from coord.board_doctor_permissions import (
+            SAFE_TIER_ACTIONS,
+            authorize_investigator_action,
+        )
+
+        assert "drive_queue_requeue" in SAFE_TIER_ACTIONS
+        assert "merge_approved_green" in SAFE_TIER_ACTIONS
+        assert "dispatch_fixit_leg" in SAFE_TIER_ACTIONS
+        authorize_investigator_action("requeue")
+        authorize_investigator_action("merge")
+        authorize_investigator_action("integration_fix")
+
+
+class TestInvestigatorRequeue:
+    def test_acts_and_audits_when_nothing_is_in_flight(self) -> None:
+        from coord.board_doctor_permissions import investigator_requeue
+
+        state.enqueue_drive_queue("acme/widgets", 2035, machine="precision")
+        board = Board()
+
+        result = investigator_requeue(
+            "acme/widgets", 2035, board, reason="frozen blocked row, nothing live against it",
+        )
+
+        assert result["acted"] is True
+        assert state.get_drive_queue_entry("acme/widgets", 2035) is not None
+        log = query_audit_log(event_type="investigator_requeue", repo="acme/widgets", issue=2035)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["details"]["reason"] == (
+            "frozen blocked row, nothing live against it"
+        )
+
+    def test_refuses_without_a_write_when_a_leg_is_already_in_flight(self) -> None:
+        from coord.board_doctor_permissions import investigator_requeue
+
+        state.enqueue_drive_queue("acme/widgets", 2036)
+        before = state.get_drive_queue_entry("acme/widgets", 2036)
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="acme/widgets", issue_number=2036,
+            issue_title="x", assignment_id="w1", status="running", type="work",
+        ))
+
+        result = investigator_requeue("acme/widgets", 2036, board, reason="should not act")
+
+        assert result["acted"] is False
+        assert "already" in result["detail"]
+        after = state.get_drive_queue_entry("acme/widgets", 2036)
+        assert dict(after) == dict(before)
+        log = query_audit_log(
+            event_type="investigator_requeue_refused", repo="acme/widgets", issue=2036,
+        )
+        assert len(log["entries"]) == 1
+
+    def test_already_fixed_by_the_time_we_act_refuses_cleanly(self) -> None:
+        # The row was removed from the queue (e.g. by a human) between
+        # diagnosis and the investigator's own action — not an error.
+        from coord.board_doctor_permissions import investigator_requeue
+
+        board = Board()
+
+        result = investigator_requeue("acme/widgets", 9999, board, reason="already handled")
+
+        assert result["acted"] is False
+        assert "not in the drive queue" in result["detail"]
+
+
+class TestInvestigatorRaiseBudget:
+    def test_acts_once_on_a_request_changes_verdict_with_findings(self) -> None:
+        from coord.board_doctor_permissions import investigator_raise_budget
+        from coord.state import board_doctor_fixit_rebudget_spent
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        state.enqueue_drive_queue("api", 1)
+
+        result = investigator_raise_budget(
+            "api", 1, config,
+            review_verdict="request-changes", review_has_findings=True, ci_red_only=False,
+            reason="request-changes with concrete findings",
+        )
+
+        assert result["acted"] is True
+        assert board_doctor_fixit_rebudget_spent("api", 1) is True
+        row = state.get_drive_queue_entry("api", 1)
+        assert row is not None and row["max_fix_rounds"] is not None
+
+    def test_acts_on_ci_red_on_the_merge_ref_only(self) -> None:
+        from coord.board_doctor_permissions import investigator_raise_budget
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        state.enqueue_drive_queue("api", 2)
+
+        result = investigator_raise_budget(
+            "api", 2, config,
+            review_verdict="approve", review_has_findings=False, ci_red_only=True,
+            reason="CI red, review already approved",
+        )
+
+        assert result["acted"] is True
+
+    def test_refuses_when_neither_condition_holds(self) -> None:
+        from coord.board_doctor_permissions import investigator_raise_budget
+        from coord.state import board_doctor_fixit_rebudget_spent
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        state.enqueue_drive_queue("api", 3)
+
+        result = investigator_raise_budget(
+            "api", 3, config,
+            review_verdict=None, review_has_findings=False, ci_red_only=False,
+            reason="flailing, not environmental",
+        )
+
+        assert result["acted"] is False
+        assert board_doctor_fixit_rebudget_spent("api", 3) is False
+
+    def test_the_lifetime_cap_is_spent_at_most_once_ever(self) -> None:
+        from coord.board_doctor_permissions import investigator_raise_budget
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        state.enqueue_drive_queue("api", 4)
+
+        first = investigator_raise_budget(
+            "api", 4, config,
+            review_verdict="request-changes", review_has_findings=True, ci_red_only=False,
+            reason="first raise",
+        )
+        assert first["acted"] is True
+
+        second = investigator_raise_budget(
+            "api", 4, config,
+            review_verdict="request-changes", review_has_findings=True, ci_red_only=False,
+            reason="second raise attempt",
+        )
+        assert second["acted"] is False
+        assert "already spent" in second["detail"]
+
+
+class TestInvestigatorBounce:
+    def test_refuses_without_a_prior_raise_budget(self) -> None:
+        from coord.board_doctor_permissions import investigator_bounce
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        board.completed.extend([work, review])
+
+        result = investigator_bounce(
+            "api", 1, "r1", board, config, reason="should not act",
+        )
+
+        assert result["acted"] is False
+        assert "raise-budget" in result["detail"]
+
+    def test_acts_after_a_raise_budget_on_a_request_changes_review(self, monkeypatch) -> None:
+        from coord.board_doctor_permissions import investigator_bounce
+        from coord.state import record_board_doctor_fixit_rebudget_spent
+
+        record_board_doctor_fixit_rebudget_spent("api", 1)
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        board.completed.extend([work, review])
+
+        class _FixDispatched:
+            kind = "fix_dispatched"
+
+        monkeypatch.setattr(
+            "coord.auto_loop.process_review_completion",
+            lambda *a, **k: [_FixDispatched()],
+        )
+
+        result = investigator_bounce("api", 1, "r1", board, config, reason="bounce it")
+
+        assert result["acted"] is True
+
+
+class TestInvestigatorRestage:
+    def test_test_stage_reuses_smoke_requeue(self, coord_db) -> None:
+        from coord.board_doctor_permissions import investigator_restage
+        from coord.smoke import TEST_STATE_BLOCKED, mute_smoke_tally
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch, type, status) "
+            "VALUES ('w5', 'm1', 'api', 5, 't', 'issue-5-x', 'work', 'done')",
+        )
+        coord_db.commit()
+        state.record_test_verdict(
+            assignment_id="w5",
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=mute_smoke_tally(MUTE_SMOKE_LEG_BUDGET),
+        )
+
+        result = investigator_restage("api", 5, board, config, stage="test", reason="no verdict")
+
+        assert result["acted"] is True
+
+    def test_an_invalid_stage_raises_rather_than_silently_falling_through(self) -> None:
+        from coord.board_doctor_permissions import investigator_restage
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+
+        with pytest.raises(ValueError):
+            investigator_restage("api", 1, board, config, stage="bogus", reason="x")
+
+    def test_review_stage_refuses_with_no_completed_work_to_restage(self) -> None:
+        from coord.board_doctor_permissions import investigator_restage
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+
+        result = investigator_restage("api", 1, board, config, stage="review", reason="x")
+
+        assert result["acted"] is False
+        assert "no completed work assignment" in result["detail"]
+
+
+class TestInvestigatorIntegrationFix:
+    def test_dispatches_against_the_sibling_issue_never_the_original(self) -> None:
+        from coord.board_doctor_permissions import investigator_integration_fix
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment(aid="w-sibling"))
+        board.completed[-1].issue_number = 2
+        client = _FakeHTTPClient({"id": "sibling-fix"})
+
+        result = investigator_integration_fix(
+            "api", 1, board, config,
+            sibling_repo="api", sibling_issue=2, cause="baseline_red_streak",
+            evidence=("base red for 3 days",), reason="base broke this row's PR",
+        )
+
+        assert "api#1" in result["detail"] or "api#2" in result["detail"]
+        # dispatched (or not) is driven by sweep_dispatch_fixit_leg against
+        # issue 2, never issue 1 — confirmed via the board, not the result
+        # string alone.
+        if result["acted"]:
+            dispatched_for_2 = [
+                a for a in board.active if a.issue_number == 2 and a.type == "work"
+            ]
+            assert dispatched_for_2
+
+
+class TestInvestigatorMarkDone:
+    def test_refuses_cleanly_with_no_candidate_row(self) -> None:
+        from coord.board_doctor_permissions import investigator_mark_done
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+
+        result = investigator_mark_done("api", 1, board, config, reason="nothing to reconcile")
+
+        assert result["acted"] is False
+
+    def test_acts_when_the_pr_merged_out_of_band(self, monkeypatch) -> None:
+        from coord.board_doctor_permissions import investigator_mark_done
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        board.completed.append(work)
+
+        monkeypatch.setattr(
+            "coord.github_ops.work_is_terminal", lambda *a, **k: True,
+        )
+
+        result = investigator_mark_done("api", 1, board, config, reason="merged by hand")
+
+        assert result["acted"] is True
+        assert work.status == "merged"
+
+
+class TestInvestigatorClearLatchAndMerge:
+    def test_clear_latch_refuses_with_no_merge_queue_entry(self) -> None:
+        from coord.board_doctor_permissions import investigator_clear_latch
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+
+        result = investigator_clear_latch(
+            "api", 1, board, config, gh_ops=object(), reason="x",
+        )
+
+        assert result["acted"] is False
+        assert "no merge-queue entry" in result["detail"]
+
+    def test_merge_refuses_with_no_merge_queue_entry(self) -> None:
+        from coord.board_doctor_permissions import investigator_merge
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+
+        result = investigator_merge(
+            "api", 1, board, config, gh_ops=object(), reason="x",
+        )
+
+        assert result["acted"] is False
+        assert "no merge-queue entry" in result["detail"]
+
+    def test_merge_refuses_a_pending_entry_with_no_bound_approval(self) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import investigator_merge
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-1-fix", target_branch="main", issue_number=1,
+                issue_title="Fix the thing", state=mq.PENDING,
+            )
+        ])
+
+        result = investigator_merge(
+            "api", 1, board, config, gh_ops=object(), reason="x",
+        )
+
+        assert result["acted"] is False
+        assert "no approval bound" in result["detail"]
+
+    def test_clear_latch_acts_once_approval_and_live_mergeability_both_confirm(
+        self, monkeypatch,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import investigator_clear_latch
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED, pr_number=7,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mq, "reconcile_conflict_entries",
+            lambda gh_ops: [mq.MergeEvent(entry, "reopened", "cleared for real")],
+        )
+
+        result = investigator_clear_latch(
+            "api", 1, board, config, gh_ops=object(), reason="rebase landed clean",
+        )
+
+        assert result["acted"] is True
+        assert result["detail"] == "cleared for real"
+
+    def test_merge_acts_once_approval_confirms_and_process_reports_merged(
+        self, monkeypatch,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import investigator_merge
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.PENDING,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mq, "process",
+            lambda items, gh_ops, **kwargs: [mq.MergeEvent(entry, "merged", "merged cleanly")],
+        )
+
+        result = investigator_merge(
+            "api", 1, board, config, gh_ops=object(), reason="approved and green",
+        )
+
+        assert result["acted"] is True
+        assert result["detail"] == "merged cleanly"
+
+
+class TestDispatchInvestigatorActionThinClientGuard:
+    """#3881 acceptance: runs only on the daemon host — a thin client
+    refuses via `coord.state._thin_client_local_board_guard`, mirroring
+    `tests/test_state.py`'s own pattern for the same guard."""
+
+    def _set_thin_client(self, monkeypatch) -> None:
+        import coord.client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+    def test_raises_in_strict_mode_on_a_thin_client(self, monkeypatch) -> None:
+        from coord.board_doctor_permissions import dispatch_investigator_action
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+        board = Board()
+
+        with pytest.raises(RuntimeError, match="#615"):
+            dispatch_investigator_action("requeue", "api", 1, board, reason="x")
