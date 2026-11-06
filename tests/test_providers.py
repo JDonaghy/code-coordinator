@@ -2678,6 +2678,13 @@ def _run_real_opencode_work(
             "opencode account credentials are unusable on this machine "
             f"(auth error from the inference endpoint): {auth_error}"
         )
+    unavailable = _provider_unavailable_error(events)
+    if unavailable is not None:
+        pytest.skip(
+            "opencode's model provider refused the run (quota / rate limit / "
+            "overload) — machine account state, not an enforcement or config "
+            f"failure: {unavailable[:300]!r}"
+        )
     return events
 
 
@@ -2698,6 +2705,30 @@ def _opencode_auth_error(events: list[dict]) -> str | None:
         if data.get("statusCode") in (401, 403):
             message = data.get("message") or data.get("responseBody") or ""
             return f"HTTP {data.get('statusCode')}: {str(message)[:200]}"
+    return None
+
+
+# Provider-side refusals that say nothing about coord's argv, agent config or
+# permission rules: the free tier's usage cap ("Free usage limit reached"),
+# rate limiting, and upstream overload. Deliberately narrow — a generic API
+# error (e.g. a 400 caused by a bad provider option) is NOT in here, so a
+# config regression still surfaces as a failure.
+_PROVIDER_UNAVAILABLE_PATTERNS = re.compile(
+    r"usage limit|rate[ _-]?limit|quota|too many requests|overloaded"
+    r"|insufficient (?:credit|balance|funds)|\b429\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_unavailable_error(events: list[dict]) -> str | None:
+    """Return the serialized ``error`` event that reports the model provider
+    as unavailable to this machine's account, or None if there is none."""
+    for event in events:
+        if event.get("type") != "error":
+            continue
+        text = json.dumps(event)
+        if _PROVIDER_UNAVAILABLE_PATTERNS.search(text):
+            return text
     return None
 
 
@@ -3064,6 +3095,45 @@ def test_opencode_routing_pin_inert_without_openrouter_credential_end_to_end(
     error_events = [e for e in events if e.get("type") == "error"]
     assert not error_events, f"routing pin broke a non-OpenRouter run: {error_events}"
     assert any(e.get("type") == "step_finish" for e in events)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "AI_APICallError: Free usage limit reached. Free models work in OpenCode "
+        "(https://opencode.ai); subscribe to OpenCode Go to keep going",
+        "Rate limit exceeded, retry later",
+        "429 Too Many Requests",
+        "Provider is overloaded",
+        "You exceeded your current quota",
+    ],
+)
+def test_opencode_provider_unavailable_error_is_recognised(message: str) -> None:
+    """The real-opencode e2e helper skips, rather than fails, when the free
+    model's provider refuses the run for account reasons — the quota on a
+    shared fleet machine is not something a branch can fix."""
+    events = [
+        {"type": "step_start", "part": {}},
+        {"type": "error", "error": {"name": "APIError", "data": {"message": message}}},
+    ]
+    assert _provider_unavailable_error(events) is not None
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [{"type": "step_finish", "part": {"reason": "stop"}}],
+        # A config/request error is a real regression signal, not an outage.
+        [{"type": "error", "error": {"name": "ConfigInvalidError",
+                                     "data": {"message": "provider.openrouter.options invalid"}}}],
+        [{"type": "error", "error": {"name": "APIError",
+                                     "data": {"message": "400 Bad Request: unknown field"}}}],
+        # Quota wording outside an error event (e.g. model prose) is ignored.
+        [{"type": "text", "part": {"text": "I hit a rate limit once"}}],
+    ],
+)
+def test_opencode_provider_unavailable_error_ignores_other_events(events: list[dict]) -> None:
+    assert _provider_unavailable_error(events) is None
 
 
 def test_opencode_parse_log_records_graphify_query_outcome(tmp_path: Path) -> None:
