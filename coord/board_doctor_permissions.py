@@ -1929,7 +1929,20 @@ def sweep_raise_fixit_budget(
             ),
         )
 
-    entry_id = _enqueue_declared(repo_name, issue_number, declaration)
+    try:
+        entry_id = _enqueue_declared(repo_name, issue_number, declaration)
+    except Exception:
+        log.error(
+            "board-doctor sweep: removed drive-queue row %s#%s to raise its "
+            "fix-round ceiling but could NOT put it back (declaration: %r) "
+            "— the queue is short a row and needs `coord drive-queue add` "
+            "by hand",
+            repo_name,
+            issue_number,
+            declaration,
+        )
+        raise
+
     return RaiseBudget(
         raised=True,
         entry_id=entry_id,
@@ -2146,7 +2159,13 @@ def sweep_mark_done(
     actions = reconcile_board_merges(
         board, config, repo=repo_name, issue=issue_number, dry_run=False,
     )
-    mine = [a for a in actions if f"#{issue_number})" in a or f"#{issue_number}," in a]
+    # `coord.reconcile.reconcile_board_merges`'s action lines consistently
+    # quote their row as ``(<repo_name> #<issue_number>...)`` — matching on
+    # that exact ``"(repo #issue"`` prefix (rather than a bare
+    # ``f"#{issue_number})"``/``f"#{issue_number},"`` substring) means issue
+    # 1 can never match another row's ``#21,``/``#21)`` line.
+    row_marker = f"({repo_name} #{issue_number}"
+    mine = [a for a in actions if row_marker in a]
     marked_line = next((a for a in mine if a.startswith("mark merged")), None)
     if marked_line is not None:
         return MarkDoneResult(marked=True, detail=marked_line)
@@ -2846,14 +2865,23 @@ def dispatch_investigator_action(
 ) -> InvestigatorActionResult:
     """The single entry point `coord drive-queue doctor-act` calls (#3881).
 
-    Daemon-host only: :func:`coord.state._thin_client_local_board_guard`
-    fires first, exactly like every other board-doctor state primitive
-    this module's handlers reach into — an investigator session dispatched
-    against a thin client would otherwise act on an empty/stale local
-    board copy rather than the canonical one. Then authorizes *action*
-    against the closed :data:`INVESTIGATOR_ACTIONS` set (which also covers
-    every permanently-forbidden name) before routing to its handler, so a
-    disallowed verb never reaches this dict lookup at all.
+    Daemon-host only: this function calls
+    :func:`coord.state._thin_client_local_board_guard` first, exactly like
+    every other board-doctor state primitive this module's handlers reach
+    into — an investigator session dispatched against a thin client would
+    otherwise act on an empty/stale local board copy rather than the
+    canonical one. That guard's own enforcement is weaker than "fires
+    first" implies, though: it only raises under
+    ``COORD_STRICT_LOCAL_BOARD=1``; otherwise it emits a ``UserWarning``
+    and lets the call through. The actual hard refusal an operator sees
+    is the `doctor-act` CLI command's own ``is_remote()`` ->
+    ``click.ClickException`` check, ahead of this function — this guard
+    is a second, library-level backstop for a caller that reaches this
+    function directly (bypassing the CLI), not the primary enforcement.
+    Then authorizes *action* against the closed :data:`INVESTIGATOR_
+    ACTIONS` set (which also covers every permanently-forbidden name)
+    before routing to its handler, so a disallowed verb never reaches this
+    dict lookup at all.
     """
     from coord.state import _thin_client_local_board_guard  # noqa: PLC0415
 
