@@ -3209,15 +3209,29 @@ def _try_ordinary_escalation_after_head_unmoved(
     has_prior_conflict_fix`) every other conflict-fix redispatch does, so
     this redispatches WITHIN the existing per-entry budget rather than
     granting a fresh one. Returns the dispatched ``Assignment``, or
-    ``None`` when the plumbing isn't available (*board*/*config* weren't
-    supplied — e.g. the lightweight ``coord notify`` call site for the
-    common "no marker" case) or dispatch declined for any of the ordinary
-    reasons (no capable machine, already active, retry cap already
-    consumed) — every ``None`` case falls through to the caller's
-    HUMAN_REQUIRED park.
+    ``None`` when dispatch declined for any of the ordinary reasons (no
+    capable machine, already active, retry cap already consumed) — every
+    ``None`` case falls through to the caller's HUMAN_REQUIRED park.
+
+    #3871: when *board*/*config* are both ``None`` — ``coord notify``'s
+    "no marker" call site, deliberately left without the eager
+    ``read_board``/config-load every OTHER marker arm there gets, since
+    that case is the overwhelming common one (a real fix, no marker) and
+    the extra cost must not land on it — this loads them itself, lazily,
+    paying that cost only on this rare "head unmoved" path rather than on
+    every ordinary conflict-fix completion. A load failure here still
+    degrades to the pre-#3871 HUMAN_REQUIRED park, same as a genuinely
+    unavailable board/config would.
     """
     if board is None or config is None:
-        return None
+        try:
+            from coord.board_service import read_board  # noqa: PLC0415
+            from coord.config import load as _load_config  # noqa: PLC0415
+
+            board = read_board()
+            config = _load_config()
+        except Exception:  # noqa: BLE001
+            return None
 
     from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
     from coord.network import fetch_status  # noqa: PLC0415

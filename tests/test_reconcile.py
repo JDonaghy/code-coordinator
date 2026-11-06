@@ -1517,6 +1517,63 @@ class TestReconcileConflictFixHeadUnmoved:
         assert entry.state == PENDING
         assert entry.error is None
 
+    @patch("coord.conflict_fix.httpx.post")
+    @patch("coord.network.fetch_status")
+    @patch("coord.config.load")
+    @patch("coord.board_service.read_board")
+    def test_redispatch_lazily_loads_board_and_config_when_caller_passed_none(
+        self,
+        mock_read_board: MagicMock,
+        mock_load_config: MagicMock,
+        mock_fetch_status: MagicMock,
+        mock_post: MagicMock,
+        coord_db,
+    ) -> None:
+        """#3871: `coord notify`'s "no marker" call site deliberately
+        passes `board=None, config=None` to `on_conflict_fix_done` (it
+        skips the eager load every OTHER marker arm there gets, to keep
+        the overwhelming common case cheap). The redispatch helper must
+        still work on that path by loading them itself, lazily, rather
+        than silently giving up and parking on HUMAN_REQUIRED just
+        because the caller didn't hand it a board."""
+        from coord import merge_queue as mq
+        from coord.network import StatusResult
+        from coord.reconcile import _try_ordinary_escalation_after_head_unmoved
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mock_read_board.return_value = Board()
+        mock_load_config.return_value = cfg
+        mock_fetch_status.return_value = StatusResult(data={"assignments": []})
+        mock_post.return_value = MagicMock(
+            json=lambda: {"id": "ordinary-fix-3"},
+            raise_for_status=lambda: None,
+        )
+
+        entry = mq.QueuedMerge(
+            assignment_id="merge-1",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="issue-7-thing",
+            target_branch="main",
+            issue_number=7,
+            issue_title="Do the thing",
+            state=mq.CONFLICT,
+            error="Merge conflict in foo.py",
+        )
+
+        fix = _try_ordinary_escalation_after_head_unmoved(
+            entry, board=None, config=None, machine_name=None,
+        )
+
+        assert fix is not None
+        mock_read_board.assert_called_once()
+        mock_load_config.assert_called_once()
+
 
 # ── #3462: an already-upstream verdict must not be read as a genuine ────────
 # content conflict ───────────────────────────────────────────────────────────
