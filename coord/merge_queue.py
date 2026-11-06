@@ -6026,6 +6026,42 @@ def _is_non_mergeability_human_latch(error: str | None) -> bool:
     return any(sig in text for sig in _NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS)
 
 
+# #3871: the ONE additional phrase (on top of `_NON_MERGEABILITY_HUMAN_
+# REQUIRED_SIGNALS` above) that means a HUMAN_REQUIRED latch was NOT an
+# automated conflict-fix giving up on a real conflict — a worker completed
+# clean but the branch never actually moved (a missing or rejected push).
+# Deliberately kept OUT of `_NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS`
+# itself: unlike every signal in that tuple, THIS one still describes a
+# genuine mergeability question (the branch may become mergeable once the
+# already-made fix is actually pushed, or settles on retry), so
+# `reconcile_conflict_entries` must keep re-testing it against live
+# mergeability rather than treating it as permanently parked.
+CONFLICT_FIX_HEAD_UNMOVED_SIGNAL = "branch head did not move"
+
+
+def conflict_fix_actually_gave_up(error: str | None) -> bool:
+    """True when ``error`` reads as an ACTUAL conflict-fix give-up — a
+    mechanical or semantic worker ran and failed to resolve a real
+    conflict — as opposed to every other cause that can land an entry on
+    HUMAN_REQUIRED (a usage-limit kill, content already upstream, a reword
+    worker's narrow refusal, a declined escalation dispatch, or a worker
+    that exited clean without ever pushing, #3871).
+
+    The ONE function :func:`coord.drive`'s HUMAN_REQUIRED exit text (and
+    any other caller describing the latch to a human) must use, so neither
+    invents its own copy of "was this a real give-up" (#2096) — the
+    coordinator's own exit text previously claimed "an automated
+    conflict-fix already gave up" unconditionally, which was simply false
+    for every one of the non-give-up causes above.
+    """
+    if not error:
+        return False
+    text = error.lower()
+    if CONFLICT_FIX_HEAD_UNMOVED_SIGNAL in text:
+        return False
+    return not _is_non_mergeability_human_latch(error)
+
+
 def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
     """Re-test stale conflict verdicts (``CONFLICT``, and retry-cap-latched
     ``HUMAN_REQUIRED``) against live mergeability and clear them when stale.

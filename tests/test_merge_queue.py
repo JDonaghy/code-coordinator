@@ -7652,6 +7652,79 @@ class TestReconcileHumanRequiredConflictLatch:
         reloaded = load_queue()[0]
         assert reloaded.state == mq.HUMAN_REQUIRED
 
+    def test_unparks_head_unmoved_latch_once_mergeable_again(self, coord_db) -> None:
+        """#3871: unlike the latches above, a "branch head did not move"
+        HUMAN_REQUIRED latch IS a genuine mergeability question — the
+        branch may clear on its own (another push, a settled retry), so
+        this must stay eligible for re-probing rather than parking
+        forever like the non-mergeability causes."""
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = (
+            "Pull request #100 is not mergeable; the conflict-fix worker "
+            "completed but the branch head did not move (still abc123) "
+            "— the push appears to be missing or was rejected, and a "
+            "fresh automated conflict-fix could not be dispatched (no "
+            "capable machine, or one already active) — push the fix by "
+            "hand, or re-run `coord merge` once a machine is free."
+        )
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert len(events) == 1
+        assert events[0].kind == "reopened"
+        reloaded = load_queue()[0]
+        assert reloaded.state == PENDING
+        assert reloaded.error is None
+
+
+class TestConflictFixActuallyGaveUp:
+    """#3871: `coord.drive`'s HUMAN_REQUIRED exit text, and any other
+    caller describing a latch to a human, must use this ONE function to
+    decide whether an automated conflict-fix actually gave up on a real
+    conflict — rather than assuming it always did, which was simply false
+    for every escalation shape below."""
+
+    def test_true_for_an_ordinary_mechanical_give_up(self) -> None:
+        assert mq.conflict_fix_actually_gave_up(
+            "Pull request #100 is not mergeable; conflict-fix worker did "
+            "not resolve. Manual rebase required.",
+        ) is True
+
+    def test_false_for_head_unmoved(self) -> None:
+        assert mq.conflict_fix_actually_gave_up(
+            "Pull request #100 is not mergeable; the conflict-fix worker "
+            "completed but the branch head did not move (still abc123) "
+            "— the push appears to be missing or was rejected, and a "
+            "fresh automated conflict-fix could not be dispatched (no "
+            "capable machine, or one already active) — push the fix by "
+            "hand, or re-run `coord merge` once a machine is free.",
+        ) is False
+
+    def test_false_for_usage_limit_kill(self) -> None:
+        assert mq.conflict_fix_actually_gave_up(
+            "conflict-fix worker was killed by the account's 5-hour "
+            "usage limit — not a real conflict.",
+        ) is False
+
+    def test_false_for_already_upstream(self) -> None:
+        assert mq.conflict_fix_actually_gave_up(
+            "stale-rebase worker found: no unique commits. Branch "
+            "content is already present on main — nothing to merge.",
+        ) is False
+
+    def test_false_for_declined_escalation(self) -> None:
+        assert mq.conflict_fix_actually_gave_up(
+            "the rebase was not content-preserving against the new "
+            "base, and the ordinary conflict-fix escalation could not "
+            "be dispatched either — manual resolution required.",
+        ) is False
+
+    def test_false_for_none_or_empty(self) -> None:
+        assert mq.conflict_fix_actually_gave_up(None) is False
+        assert mq.conflict_fix_actually_gave_up("") is False
+
 
 class TestReconcileConflictEntriesRebaseRefusalGuard:
     """#1467: a `mergeable: MERGEABLE` verdict is not evidence that a
