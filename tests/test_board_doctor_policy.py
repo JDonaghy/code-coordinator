@@ -1183,11 +1183,15 @@ class TestFixitRebudgetGlobalCap:
 
 
 class TestInvestigateCapacityCheck:
-    """#3770: the investigate tier's per-repo cap, read straight from the
-    repo's own `max_parallel` (no second capacity knob), bounds how many
-    fix-it legs one sweep dispatches — the rest defer to the next hourly
-    sweep instead of fanning out unbounded, and a deferred row carries no
-    convergence or escalation side effect of its own.
+    """The investigate tier's own per-repo fix-it-leg budget
+    (`FIXIT_LEG_BUDGET_DEFAULT`, deliberately independent of a repo's
+    `max_parallel` throughput ceiling) bounds how many fix-it legs one
+    sweep dispatches — the rest defer to the next hourly sweep instead of
+    fanning out unbounded, and a deferred row carries no convergence or
+    escalation side effect of its own. Every test here is given a
+    `max_parallel` far above the budget, so a dispatch that got through
+    on ordinary queue capacity rather than the budget would show up as a
+    failure here.
     """
 
     @staticmethod
@@ -1220,7 +1224,7 @@ class TestInvestigateCapacityCheck:
         def alert_must_not_fire(row: StuckRow):
             raise AssertionError("a deferred row must never reach the alert tier")
 
-        config = self._config(max_parallel=1)
+        config = self._config(max_parallel=5)
         capacity_check = make_investigate_capacity_check(config)
         cause = queue_diagnose.CAUSE_CI_RED
         rows = [_row(f"acme/widgets#{n}", cause) for n in (40, 41, 42)]
@@ -1266,7 +1270,7 @@ class TestInvestigateCapacityCheck:
 
         monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
 
-        config = self._config(max_parallel=1)
+        config = self._config(max_parallel=5)
         cause = queue_diagnose.CAUSE_CI_RED
         rows = [_row(f"acme/widgets#{n}", cause) for n in (40, 41, 42)]
 
@@ -1302,10 +1306,10 @@ class TestInvestigateCapacityCheck:
         assert dispatched == ["acme/widgets#40", "acme/widgets#41"]
 
     def test_ordinary_work_does_not_count_toward_the_fixit_budget(self, monkeypatch) -> None:
-        # The fix-it-leg budget is now the doctor's OWN, separate from a
+        # The fix-it-leg budget is the doctor's OWN, separate from a
         # repo's `max_parallel` ceiling — an ordinary "work" assignment
         # busy on the repo's normal queue must not starve the investigate
-        # tier the way sharing `max_parallel` used to.
+        # tier.
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
         monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         busy_board = Board(
@@ -1348,6 +1352,9 @@ class TestInvestigateCapacityCheck:
             capacity_check=capacity_check,
         )
 
+        # `max_parallel=1`, and that single slot already busy with
+        # ordinary work: a gate keyed off the repo's throughput ceiling
+        # would defer this row; the dedicated budget dispatches it.
         assert report.decisions[0].action == "auto-dispatch"
         assert dispatched == ["acme/widgets#41"]
 
@@ -1415,16 +1422,50 @@ class TestInvestigateCapacityCheck:
 
         assert capacity_check(row) is False
 
-    def test_zero_max_parallel_means_unlimited_not_zero_capacity(self) -> None:
-        # `max_parallel=0` means "no per-repo ceiling at all" per
-        # `coord.drive_queue`'s own resolution semantics — never "never
-        # dispatch". A gate that got this backwards would silently stall
-        # every investigate-tier row for any repo with no explicit cap.
+    def test_an_unlimited_repo_still_gets_only_its_fixit_budget(
+        self, monkeypatch
+    ) -> None:
+        # `max_parallel=0` means "no per-repo ceiling at all" for ordinary
+        # drive-queue throughput — it does NOT buy unlimited fix-it legs.
+        # Such a repo still dispatches when its budget is free, and still
+        # defers once a leg this doctor started occupies it.
+        from coord.audit import record_audit
+
         config = self._config(max_parallel=0)
-        capacity_check = make_investigate_capacity_check(config)
         row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
 
-        assert capacity_check(row) is False
+        monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
+        assert make_investigate_capacity_check(config)(row) is False
+
+        record_audit(
+            tier="operational",
+            category="board_doctor",
+            event_type="fixit_leg_dispatched",
+            actor="daemon",
+            summary="board-doctor dispatched a fix-it leg",
+            repo="acme/widgets",
+            issue=41,
+            assignment_id="asn-41",
+            machine="mac1",
+        )
+        monkeypatch.setattr(
+            state,
+            "build_board",
+            lambda: Board(
+                active=[
+                    Assignment(
+                        machine_name="mac1",
+                        repo_name="acme/widgets",
+                        issue_number=41,
+                        issue_title="t",
+                        status="running",
+                        type="work",
+                        assignment_id="asn-41",
+                    )
+                ]
+            ),
+        )
+        assert make_investigate_capacity_check(config)(row) is True
 
 
 class TestInvestigateConvergence:

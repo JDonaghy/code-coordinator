@@ -363,6 +363,8 @@ def test_drive_queue_is_registered_with_every_verb():
         "clear-refusal",
         # #3758: the board-doctor scheduled-sweep harness.
         "sweep",
+        # #3875: the board-doctor decision log read-back verb.
+        "doctor-log",
     }
 
 
