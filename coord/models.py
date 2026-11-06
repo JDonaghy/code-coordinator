@@ -92,11 +92,22 @@ class BoardDoctorRepoConfig:
     function that reads this alongside the fleet-wide kill switch
     (`Config.board_doctor.stale_race`) and its
     `COORD_BOARD_DOCTOR_NO_STALE_RACE` env-var override.
+
+    ``followthrough`` is this repo's opt-in to the merged-partial
+    follow-through disposition (`coord.board_doctor_followthrough`): a
+    read-only plan leg verifies what a ``merged-partial`` issue still lacks,
+    then the sweep files linked follow-up issues and closes the original.
+    `False` (the default) leaves a ``merged-partial`` row untouched.
+    `coord.board_doctor_followthrough.followthrough_enabled` is the single
+    function that reads this alongside the fleet-wide kill switch
+    (`Config.board_doctor.followthrough`) and its
+    `COORD_BOARD_DOCTOR_NO_FOLLOWTHROUGH` env-var override.
     """
 
     investigate: bool = False
     finish: bool = False
     stale_race: bool = False
+    followthrough: bool = False
 
 
 @dataclass
