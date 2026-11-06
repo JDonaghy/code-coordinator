@@ -254,12 +254,16 @@ def _dispatched_issues() -> list[int]:
     return sorted(e["issue"] for e in entries)
 
 
-def test_blocked_rows_in_an_opted_in_repo_each_get_a_fixit_leg(
+def test_a_blocked_row_in_an_opted_in_repo_gets_a_real_fixit_leg(
     config_path, cli, seed, gh_world, block_log, fake_dispatch,
 ):
-    """N blocked, eligible rows -> N real fix-it legs dispatched in one
-    sweep (subject to #3770's capacity cap, hence `max_parallel=2` for
-    N=2 rows here)."""
+    """Two blocked, eligible rows -> one real fix-it leg this sweep and
+    the other row deferred, because the investigate tier spends its own
+    dedicated fix-it-leg budget (`FIXIT_LEG_BUDGET_DEFAULT`), not the
+    repo's `max_parallel` throughput ceiling: `max_parallel=2` here buys
+    two concurrent *work* legs, never two concurrent diagnostic ones.
+    Once the dispatched row leaves the stuck set, the next sweep spends
+    the freed budget on the row it deferred."""
     _write_config(config_path, repo_investigate=True, max_parallel=2)
     seed(issues={101: "open", 102: "open"})
     cli("add", REPO, "101")
@@ -271,10 +275,30 @@ def test_blocked_rows_in_an_opted_in_repo_each_get_a_fixit_leg(
     result = cli("sweep", "--json")
     assert result.exit_code == 0, result.output
     payload = _sweep_json(result.output)
-    assert sorted(d["key"] for d in payload["decisions"]) == [f"{REPO}#101", f"{REPO}#102"]
-    assert [d["action"] for d in payload["decisions"]] == ["auto-dispatch", "auto-dispatch"]
+    actions = {d["key"]: d["action"] for d in payload["decisions"]}
+    assert actions == {
+        f"{REPO}#101": "auto-dispatch",
+        f"{REPO}#102": "investigate-deferred",
+    }
+    assert _dispatched_issues() == [101]
+    assert fake_dispatch == [101]
+
+    # The deferred row carries no side effect of its own — it was not
+    # escalated, so the next sweep still sees an ordinary blocked row.
+    assert state.get_drive_escalation(REPO, 102) is None
+
+    # Next sweep: row 101 has since been taken off the queue (its leg did
+    # its job), so the budget is free again and row 102 gets the leg it
+    # was deferred for — not row 101 a second time.
+    assert cli("remove", REPO, "101").exit_code == 0
+    second = cli("sweep", "--json")
+    assert second.exit_code == 0, second.output
+    second_payload = _sweep_json(second.output)
+    assert {d["key"]: d["action"] for d in second_payload["decisions"]} == {
+        f"{REPO}#102": "auto-dispatch",
+    }
     assert _dispatched_issues() == [101, 102]
-    assert sorted(fake_dispatch) == [101, 102]
+    assert fake_dispatch == [101, 102]
 
 
 def test_no_blocked_rows_dispatches_nothing(config_path, cli):
