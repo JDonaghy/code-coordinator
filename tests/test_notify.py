@@ -5449,6 +5449,37 @@ class TestConflictFixCompletionStaleRebaseMismatch:
         assert kwargs["semantic"] is True
         assert kwargs["stale_rebase_mismatch"] is False
 
+    def test_forwards_the_log_location_for_the_head_unmoved_explanation(
+        self, tmp_path: Path,
+    ) -> None:
+        """#3870: on the no-marker path — the one that reaches the
+        head-unmoved check — `on_conflict_fix_done` needs the finished
+        leg's transcript location to say WHY a leg that never pushed ended
+        anyway. `coord notify` is the routinely-scheduled path, so it must
+        hand both over, not just `reconcile()`."""
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nWaiting for the gate.\n")
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.notify._agent_host", return_value="laptop-host"),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["succeeded"] is True
+        assert kwargs["fix_log_path"] == str(log)
+        assert kwargs["fix_agent_host"] == "laptop-host"
+
 
 # ── #3462: the conflict-fix completion arm must read the already-upstream ───
 # marker BEFORE the stale-rebase-mismatch marker, and must never frame it ────

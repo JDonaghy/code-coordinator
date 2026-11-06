@@ -4658,6 +4658,8 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 board=board,
                 config=config,
                 stuck_summary=stuck_summary,
+                fix_log_path=log_path,
+                fix_agent_host=host,
             )
             if semantic and board is not None:
                 try:

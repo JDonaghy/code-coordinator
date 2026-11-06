@@ -3206,6 +3206,36 @@ def _head_unmoved_verdict(
     return (live_sha == dispatched_sha), live_sha
 
 
+def _ended_waiting_on_a_backgrounded_step(
+    *,
+    log_path: str | None,
+    host: str | None,
+    assignment_id: str | None,
+) -> bool:
+    """True when a finished conflict-fix leg's FINAL turn reads as "I
+    backgrounded the gate and am waiting for it" (#3870).
+
+    Explanatory only, and reached only for a leg :func:`_head_unmoved_
+    verdict` already confirmed did not move the branch: it sharpens the
+    parked entry's text, never the success/failure verdict. Best-effort —
+    an unreadable or unreachable transcript returns ``False``, which just
+    leaves the generic "the push appears to be missing or was rejected"
+    wording in place.
+    """
+    if not log_path and not (host and assignment_id):
+        return False
+    from coord.conflict_fix import detect_premature_wait  # noqa: PLC0415
+
+    try:
+        return detect_premature_wait(
+            log_path=log_path,
+            host=host,
+            assignment_id=assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never break reconcile on a log read
+        return False
+
+
 def _try_ordinary_escalation_after_head_unmoved(
     entry: "mq.QueuedMerge",
     *,
@@ -3302,6 +3332,8 @@ def on_conflict_fix_done(
     config: Config | None = None,
     stuck_summary: str | None = None,
     usage_limit_reason: str | None = None,
+    fix_log_path: str | None = None,
+    fix_agent_host: str | None = None,
 ) -> None:
     """Update the parent merge entry after a conflict-fix worker finishes.
 
@@ -3393,6 +3425,17 @@ def on_conflict_fix_done(
     phrases, so the latch stays eligible for
     :func:`coord.merge_queue.reconcile_conflict_entries`'s live-
     mergeability re-test instead of parking forever on a stale verdict.
+
+    *fix_log_path* / *fix_agent_host* locate the finished leg's transcript
+    (a coordinator-local log file, and the agent that ran it). They are
+    read ONLY on that ``head_unmoved`` branch, to say WHY a leg that
+    provably didn't push ended anyway — a final turn announcing it was
+    waiting on a step it had backgrounded (#3870) names the single-shot-
+    session mistake in the parked entry's text instead of leaving "the push
+    appears to be missing" unexplained. The verdict itself never depends on
+    them: whether the branch moved is answered only by
+    :func:`_head_unmoved_verdict`, and omitting both simply loses the
+    explanation.
     """
     from coord import merge_queue as mq  # noqa: PLC0415
 
@@ -3455,6 +3498,22 @@ def on_conflict_fix_done(
                     f"{head_unmoved_sha}) — the push appears to be missing "
                     "or was rejected"
                 )
+                # Name the single-shot-session mistake when the leg's own
+                # final turn shows it: a `-p` session ends with the turn, so
+                # a worker that backgrounded its gate and signed off with
+                # "Waiting for the gate." never reached its push. Purely
+                # explanatory — the verdict above already stands on the live
+                # branch head.
+                if _ended_waiting_on_a_backgrounded_step(
+                    log_path=fix_log_path,
+                    host=fix_agent_host,
+                    assignment_id=fix_assignment_id,
+                ):
+                    detail += (
+                        "; its final message announced it was waiting for a "
+                        "step it had backgrounded, which a headless session "
+                        "never returns from"
+                    )
                 fix = _try_ordinary_escalation_after_head_unmoved(
                     entry,
                     board=board,
@@ -3799,6 +3858,14 @@ def _on_conflict_fix_done(
         return
 
     usage_limit_reason = (agent_entry or {}).get("usage_limit_reason")
+    log_path = (agent_entry or {}).get("log_path")
+    fix_machine = next(
+        (
+            m for m in (config.machines if config is not None else [])
+            if m.name == fix_assignment.machine_name
+        ),
+        None,
+    )
 
     semantic = False
     already_upstream = False
@@ -3851,6 +3918,8 @@ def _on_conflict_fix_done(
         config=config,
         stuck_summary=stuck_summary,
         usage_limit_reason=usage_limit_reason,
+        fix_log_path=log_path,
+        fix_agent_host=fix_machine.host if fix_machine is not None else None,
     )
 
 
