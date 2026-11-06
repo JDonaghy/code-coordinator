@@ -190,6 +190,20 @@ _ADVISORY_TYPES = ("work",)
 # (the #1534/#2316 truncation incident this constant exists to catch).
 _ZERO_COMMIT_TYPES = ("work", "mock-author", "test-author", "epic-decompose")
 
+# #3869: leg types whose entire job is to rewrite the history already on the
+# branch (a rebase) rather than add commits on top of it. `_setup_worktree`
+# records the SHA origin had for the branch at the START of these legs
+# (`AgentAssignment.history_rewrite_lease_sha`) so `_reap`'s belt-and-
+# suspenders safety-net push can use `--force-with-lease=<branch>:<that
+# SHA>` instead of a plain `git push`, which GitHub always rejects as
+# non-fast-forward once the worker has actually rebased — and a non-fast-
+# forward rejection on the safety-net push for one of these types is
+# promoted to a real FAILED outcome (see `_is_non_fast_forward_push_
+# failure`), not logged and forgotten the way it is for every other type.
+# Only `conflict-fix` today; a future rebase-shaped leg type should be
+# added here.
+_HISTORY_REWRITE_TYPES = ("conflict-fix",)
+
 # #1394: assignment types whose worktree, when left dirty, holds real source
 # the worker meant to ship — so an automatic WIP commit on the assignment
 # branch is strictly better than deleting it.  Everything else is excluded on
@@ -1283,6 +1297,32 @@ def _is_auth_push_failure(message: str) -> bool:
     narrowly rather than firing on any push failure."""
     lowered = message.lower()
     return any(marker in lowered for marker in _AUTH_PUSH_FAILURE_MARKERS)
+
+
+# #3869: substrings git emits when a push is rejected for moving backwards
+# relative to what it expected on the remote — a plain non-fast-forward
+# rejection ("! [rejected] ... (non-fast-forward)") or a `--force-with-
+# lease` rejection where the remote moved out from under the recorded lease
+# SHA ("stale info"). Only checked against the *reap-time* safety-net push
+# for `_HISTORY_REWRITE_TYPES` legs (see `_reap` below) — for every other
+# leg type a rejection here just means "the worker already pushed", which
+# stays non-fatal exactly as before this constant existed.
+_NON_FAST_FORWARD_PUSH_FAILURE_MARKERS = (
+    "non-fast-forward",
+    "stale info",
+    "fetch first",
+)
+
+
+def _is_non_fast_forward_push_failure(message: str) -> bool:
+    """True when *message* (a failed push's error text) looks like the
+    remote rejected it for being behind/diverged from what was expected,
+    rather than e.g. an auth failure or "no remote configured". See
+    `_NON_FAST_FORWARD_PUSH_FAILURE_MARKERS`."""
+    lowered = message.lower()
+    return any(
+        marker in lowered for marker in _NON_FAST_FORWARD_PUSH_FAILURE_MARKERS
+    )
 
 
 def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
@@ -3994,6 +4034,22 @@ class AgentAssignment:
     # instead of leaving it to expand at push time) surfaced only as a line
     # in the worker log that nothing downstream ever read.
     push_failure_reason: str | None = None
+    # #3869: for a `_HISTORY_REWRITE_TYPES` leg (today, only `conflict-fix`),
+    # the SHA `origin/<branch>` resolved to in `_setup_worktree` — i.e. what
+    # the remote looked like BEFORE the worker's rebase. `_reap`'s belt-and-
+    # suspenders safety-net push uses this as the expected value for
+    # `--force-with-lease=<branch>:<sha>` instead of a plain `git push`, so
+    # a rebase the worker forgot to push itself still lands (a plain push
+    # is always rejected non-fast-forward once history has been rewritten)
+    # while a genuinely concurrent push by someone else between setup and
+    # reap is still refused exactly as `--force-with-lease` intends.
+    #
+    # `""` (empty string, not `None`) means the branch did not exist on
+    # origin at setup time — the lease then asserts the remote ref must
+    # still be absent. `None` means this isn't a history-rewrite leg, or
+    # the repo had no `origin` at setup, so `_reap` falls back to the
+    # unconditional plain push every other leg type gets.
+    history_rewrite_lease_sha: str | None = None
     # #2131: set when the reap's watchdog killed this leg because its live
     # spend crossed `spec.cost_ceiling_usd`. Formatted with
     # `coord.spend_ceiling.format_spend_ceiling_reason` (stable "spend
@@ -9837,13 +9893,18 @@ class AgentServer:
         #      deleting any untrusted local leftover with the same name first.
         origin_has_branch = False
         local_has_branch = False
+        # #3869: the SHA `origin/<branch_name>` resolved to, captured here
+        # (before any rebase the worker performs) so a `_HISTORY_REWRITE_
+        # TYPES` leg's `_reap`-time safety-net push can lease against it —
+        # see `AgentAssignment.history_rewrite_lease_sha`.
+        origin_branch_sha: str | None = None
         if not assignment.spec.fresh_branch:
             if has_origin:
                 try:
-                    _git(
+                    origin_branch_sha = _git(
                         repo_path, "rev-parse", "--verify",
                         f"refs/remotes/origin/{branch_name}",
-                    )
+                    ).strip()
                     origin_has_branch = True
                 except _GitError:
                     pass
@@ -9858,6 +9919,7 @@ class AgentServer:
                         )
                         if not remote_heads.strip():
                             origin_has_branch = False
+                            origin_branch_sha = None
                     except _GitError:
                         pass  # network hiccup — trust the (pruned) local ref
             try:
@@ -9868,6 +9930,16 @@ class AgentServer:
                 local_has_branch = True
             except _GitError:
                 pass
+
+        # #3869: record the pre-rebase lease base for history-rewrite legs.
+        # `""` (not `None`) when the branch has no `origin` copy yet — the
+        # lease then asserts the remote ref must still be absent at push
+        # time. Left `None` (the dataclass default) for every other leg
+        # type, and for a history-rewrite leg whose repo has no `origin` at
+        # all (test fixtures / local-only deployments) — `_reap` reads
+        # `None` as "fall back to the plain, unconditional push".
+        if assignment.spec.type in _HISTORY_REWRITE_TYPES and has_origin:
+            assignment.history_rewrite_lease_sha = origin_branch_sha or ""
 
         # `target_branch` means the caller wants THIS branch checked out,
         # not a fresh one derived from the issue title — so when it's set
@@ -11700,10 +11772,30 @@ class AgentServer:
             if assignment.worktree_path:
                 wt_path = Path(assignment.worktree_path)
                 if wt_path.exists() and exit_code == 0:
+                    # #3869: a history-rewrite leg (today, only
+                    # `conflict-fix`) may have rebased the branch — a plain
+                    # `git push` is then always rejected non-fast-forward,
+                    # because the remote still has the PRE-rebase history.
+                    # Lease against the SHA `_setup_worktree` captured from
+                    # `origin/<branch>` BEFORE the leg ran
+                    # (`history_rewrite_lease_sha`) so this push can still
+                    # move the branch, while a genuinely concurrent push by
+                    # someone else since setup is still refused exactly as
+                    # `--force-with-lease` intends.
+                    _lease_sha = assignment.history_rewrite_lease_sha
+                    _use_lease = (
+                        assignment.spec.type in _HISTORY_REWRITE_TYPES
+                        and _lease_sha is not None
+                        and bool(head)
+                        and head != "HEAD"
+                    )
+                    _push_args = ["push", "-u", "origin", "HEAD"]
+                    if _use_lease:
+                        _push_args.append(f"--force-with-lease={head}:{_lease_sha}")
                     try:
                         with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                             reopen.write("\n# reap: push starting\n")
-                        _git(wt_path, "push", "-u", "origin", "HEAD", timeout=60.0)
+                        _git(wt_path, *_push_args, timeout=60.0)
                         try:
                             with open(assignment.log_path, "a", encoding="utf-8") as reopen:
                                 reopen.write("# reap: push completed\n")
@@ -11739,9 +11831,25 @@ class AgentServer:
                         # check itself failing — is promoted, so #1797's
                         # original "nothing ever reached origin" case is
                         # unaffected.
+                        #
+                        # #3869: for a `_HISTORY_REWRITE_TYPES` leg, a
+                        # non-fast-forward/stale-lease rejection is promoted
+                        # the same way an auth-shaped one is — that leg's
+                        # whole job was to move the branch, so a push that
+                        # fails for either reason must not read as success.
+                        # The `_remote_already_has_head` check below still
+                        # applies first: if the worker already pushed its
+                        # own rebase (its own `--force-with-lease`, per its
+                        # briefing), THIS redundant push fails for the exact
+                        # same "stale info" reason — lease sha captured at
+                        # setup no longer matches — and that is correctly a
+                        # non-event, not a failure.
                         _reason = str(e)
                         _suppressed_as_already_pushed = False
-                        if _is_auth_push_failure(_reason):
+                        _promote = _is_auth_push_failure(_reason) or (
+                            _use_lease and _is_non_fast_forward_push_failure(_reason)
+                        )
+                        if _promote:
                             _branch_for_check = (
                                 head if head and head != "HEAD" else None
                             )
