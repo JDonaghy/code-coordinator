@@ -161,6 +161,21 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: :func:`coord.auto_loop.propagate_review_verdict`, the same bookkeeping
 #: hand-off to the ordinary merge queue a human-approved review uses, never
 #: a merge-execution primitive of its own.
+#: #3881 adds five names for the daemon-host investigator wrapper
+#: (:func:`authorize_investigator_action`) — a coordinator-role session
+#: that decides, never a routed worker, acting only through named handlers
+#: here: ``"raise_budget"`` (a row's ONE lifetime fix-round-ceiling bump),
+#: ``"bounce"`` (re-run the auto-loop's review-bounce fix dispatch),
+#: ``"restage"`` (re-dispatch a missing/unreadable Test or Review stage),
+#: ``"clear_latch"`` (re-test a stale CONFLICT/HUMAN_REQUIRED merge-queue
+#: latch against live mergeability), and ``"mark_done"`` (reconcile a row
+#: whose PR merged out-of-band). The investigator's other three verbs
+#: (``"requeue"``, ``"merge"``, ``"integration_fix"``) deliberately reuse
+#: ``"drive_queue_requeue"``, ``"merge_approved_green"`` and
+#: ``"dispatch_fixit_leg"`` above rather than minting new names —
+#: :func:`authorize_investigator_action`'s alias table, not a second grant,
+#: so the sweep and the investigator can never disagree about whether one
+#: of those three is allowed (#2096, one question one answer).
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
         "merge_approved_green",
@@ -171,6 +186,11 @@ SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
         "dispatch_fixit_leg",
         "dispatch_finisher_leg",
         "smoke_requeue",
+        "raise_budget",
+        "bounce",
+        "restage",
+        "clear_latch",
+        "mark_done",
     }
 )
 
@@ -217,6 +237,156 @@ def authorize_sweep_action(action: str) -> None:
             "coord.board_doctor_permissions.SAFE_TIER_ACTIONS, not a "
             "runtime decision."
         )
+
+
+#: #3881: the closed, operator-facing action vocabulary a daemon-host
+#: investigator session — a coordinator-role `claude -p` reading with
+#: `coord gates`/`coord log`/`coord audit`/`drive-queue list`/`block-log`/
+#: `git`/read-only `gh`, never a routed worker — may invoke via the CLI
+#: wrapper (`coord drive-queue doctor act`). Every name here is also
+#: authorized by :func:`authorize_sweep_action` (:func:`authorize_
+#: investigator_action` re-derives the underlying name via
+#: :data:`_INVESTIGATOR_ACTION_ALIAS` and calls it) — the investigator
+#: never gets a permission the periodic sweep itself could not also reach,
+#: it is only ever handed a NARROWER, named subset: :data:`SAFE_TIER_
+#: ACTIONS` also contains ``"drive_queue_add"``/``"dispatch_finisher_leg"``/
+#: ``"smoke_requeue"``/``"ci_rerun"``, none of which have an investigator
+#: verb, because those are reserved for the sweep's own per-cause
+#: dispatchers.
+INVESTIGATOR_ACTIONS: frozenset[str] = frozenset(
+    {
+        "requeue",
+        "raise_budget",
+        "bounce",
+        "integration_fix",
+        "restage",
+        "clear_latch",
+        "merge",
+        "mark_done",
+    }
+)
+
+#: Investigator verbs that are a thin rename of an existing safe-tier name
+#: rather than a new grant — see :data:`SAFE_TIER_ACTIONS`'s own #3881
+#: comment. Looked up by :func:`authorize_investigator_action`; a verb
+#: absent here authorizes under its own, identical name.
+_INVESTIGATOR_ACTION_ALIAS: dict[str, str] = {
+    "requeue": "drive_queue_requeue",
+    "merge": "merge_approved_green",
+    "integration_fix": "dispatch_fixit_leg",
+}
+
+#: #3881 design point 4: permanently forbidden to the investigator, on top
+#: of :data:`PERMANENTLY_FORBIDDEN` (which already covers ``force_merge``/
+#: ``override_human_required``). None of these is a mechanical board
+#: mutation this module could even express a handler for — they are listed
+#: explicitly anyway so a caller that requests one gets a sharp, named
+#: refusal instead of a generic "not on INVESTIGATOR_ACTIONS" one, and so a
+#: future maintainer can never "add a handler" for them by mistake: editing
+#: an issue's scope/title, closing/reopening it, touching credentials or
+#: `coordinator.yml`, and any `gh` write that does not go through this
+#: wrapper are an operator's own informed call, never an unattended
+#: investigator's.
+INVESTIGATOR_FORBIDDEN_EXTRA: frozenset[str] = frozenset(
+    {
+        "edit_sealed_suite",
+        "close_issue",
+        "reopen_issue",
+        "retitle_issue",
+        "rescope_issue",
+        "edit_credentials",
+        "edit_coordinator_yml",
+        "gh_write",
+    }
+)
+
+
+def authorize_investigator_action(action: str) -> None:
+    """The single gate every #3881 investigator action must pass first.
+
+    Raises :class:`SweepPermissionError` for *action* not on
+    :data:`INVESTIGATOR_ACTIONS`, or explicitly on
+    :data:`INVESTIGATOR_FORBIDDEN_EXTRA`/:data:`PERMANENTLY_FORBIDDEN` —
+    the sharper, named refusal in that order. An *action* that passes both
+    checks is then re-authorized under its real :data:`SAFE_TIER_ACTIONS`
+    name via :func:`authorize_sweep_action` (:data:`_INVESTIGATOR_ACTION_
+    ALIAS`), so this function can never grant something that gate alone
+    would refuse — one question, one answer, asked twice under two names
+    for the same underlying mutation only when the alias table says so.
+    """
+    if action in PERMANENTLY_FORBIDDEN or action in INVESTIGATOR_FORBIDDEN_EXTRA:
+        raise SweepPermissionError(
+            f"board-doctor investigator may never perform {action!r} — "
+            "#3881 permanently excludes it from the investigator's closed "
+            "action set: that lever belongs only to a human operator's own "
+            "informed call, never an unattended investigator session."
+        )
+    if action not in INVESTIGATOR_ACTIONS:
+        raise SweepPermissionError(
+            f"board-doctor investigator is not permitted to perform "
+            f"{action!r} — its closed action set is "
+            f"{sorted(INVESTIGATOR_ACTIONS)!r}. Extending it is a "
+            "deliberate edit to coord.board_doctor_permissions."
+            "INVESTIGATOR_ACTIONS, never a runtime decision."
+        )
+    authorize_sweep_action(_INVESTIGATOR_ACTION_ALIAS.get(action, action))
+
+
+class InvestigatorActionResult(TypedDict):
+    """Every #3881 investigator handler's return shape.
+
+    ``acted`` is the one answer to "did this call actually change
+    anything" — set from the underlying primitive's own confirmed result,
+    never from the mere absence of an exception (#2096), so a refused
+    precondition and a confirmed action are never reported through the
+    same truthy value. ``detail`` explains an ``acted=False`` result (a
+    precondition that did not hold, or an underlying primitive's own
+    no-op) so a caller — or #3875's outcome tracking, reading the audit
+    row this always writes — never has to infer why nothing happened.
+    """
+
+    acted: bool
+    action: str
+    repo: str
+    issue: int
+    detail: str
+
+
+def _investigator_result(
+    action: str,
+    repo_name: str,
+    issue_number: int,
+    *,
+    acted: bool,
+    detail: str,
+    reason: str,
+) -> InvestigatorActionResult:
+    """Build an :class:`InvestigatorActionResult` and audit it — every
+    #3881 investigator handler's only way to return, so neither a refusal
+    nor a confirmed action can leave this module without a corresponding
+    audit row (actor, row, action, reason) for #3875's outcome tracking to
+    read. Never raises — audit writes are best-effort
+    (:func:`coord.audit.record_audit`'s own contract).
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="business",
+        category="board_doctor_investigator",
+        event_type=f"investigator_{action}" if acted else f"investigator_{action}_refused",
+        actor="board_doctor_investigator",
+        summary=detail,
+        repo=repo_name,
+        issue=issue_number,
+        details={"reason": reason, "acted": acted},
+    )
+    return InvestigatorActionResult(
+        acted=acted,
+        action=action,
+        repo=repo_name,
+        issue=issue_number,
+        detail=detail,
+    )
 
 
 #: The operator-declared policy columns `coord.state.enqueue_drive_queue`
@@ -736,6 +906,54 @@ class FixitLegDispatch(TypedDict):
     detail: str
 
 
+def _in_flight_work_detail(repo_name: str, issue_number: int, board: "Board") -> str | None:
+    """``None`` when *repo_name*#*issue_number* has no running/pending
+    work-like assignment and no live `coord drive` tmux session; otherwise
+    the human-readable reason it is already in flight.
+
+    The shared "something is already working this row" guard
+    :func:`sweep_dispatch_fixit_leg` (#3768) and the #3881 investigator's
+    :func:`investigator_requeue` both need before taking a row down and
+    putting it back — one question ("is anything live against this row
+    right now"), one answer, so the two callers can never disagree about
+    it. Deliberately narrower than :func:`sweep_dispatch_fixit_leg`'s own
+    "no originating work assignment at all" check just above its call
+    site: a never-dispatched row (no work-like assignment ever created)
+    has nothing live against it either, so it reads as NOT in flight here
+    — exactly the shape :data:`queue_diagnose.CAUSE_NEVER_DISPATCHED`
+    needs :func:`investigator_requeue` to act on.
+    """
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    work_like = [
+        a
+        for a in assignments_for_issue(board, repo_name, issue_number)
+        if a.type in WORK_LIKE_TYPES
+    ]
+    if any(a.status in ("running", "pending") for a in work_like):
+        return (
+            f"{repo_name}#{issue_number} already has a running or "
+            "pending assignment — a leg is already in flight, not acting "
+            "a second time"
+        )
+
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+
+    live_sessions = [
+        s
+        for s in list_drive_sessions()
+        if s.get("repo") == repo_name and s.get("issue") == issue_number
+    ]
+    if live_sessions:
+        return (
+            f"{repo_name}#{issue_number} has a live `coord drive` session "
+            f"({live_sessions[0].get('session_name')}) — a leg is already "
+            "in flight, not acting a second time"
+        )
+    return None
+
+
 def sweep_dispatch_fixit_leg(
     repo_name: str,
     issue_number: int,
@@ -794,35 +1012,16 @@ def sweep_dispatch_fixit_leg(
             ),
         )
 
-    if any(a.status in ("running", "pending") for a in work_like):
+    in_flight = _in_flight_work_detail(repo_name, issue_number, board)
+    if in_flight is not None:
         return FixitLegDispatch(
             dispatched=False,
             assignment_id=None,
             machine=None,
-            detail=(
-                f"{repo_name}#{issue_number} already has a running or "
-                "pending assignment — a fix-it leg is already in flight, "
-                "not dispatching a second one"
-            ),
-        )
-
-    from coord.drive import list_drive_sessions  # noqa: PLC0415
-
-    live_sessions = [
-        s
-        for s in list_drive_sessions()
-        if s.get("repo") == repo_name and s.get("issue") == issue_number
-    ]
-    if live_sessions:
-        return FixitLegDispatch(
-            dispatched=False,
-            assignment_id=None,
-            machine=None,
-            detail=(
-                f"{repo_name}#{issue_number} has a live `coord drive` "
-                f"session ({live_sessions[0].get('session_name')}) — a "
-                "fix-it leg is already in flight, not dispatching a second "
-                "one"
+            detail=in_flight.replace(
+                "a leg is already in flight, not acting a second time",
+                "a fix-it leg is already in flight, not dispatching a "
+                "second one",
             ),
         )
 
@@ -1654,6 +1853,378 @@ def sweep_smoke_requeue(repo_name: str, issue_number: int) -> SmokeRequeue:
     )
 
 
+class RaiseBudget(TypedDict):
+    """:func:`sweep_raise_fixit_budget`'s return shape — same ``detail``
+    contract as :class:`DriveQueueRequeue`."""
+
+    raised: bool
+    entry_id: int | None
+    new_max_fix_rounds: int | None
+    detail: str
+
+
+def sweep_raise_fixit_budget(
+    repo_name: str, issue_number: int, config: "Config", *, increment: int = 2,
+) -> RaiseBudget:
+    """Bump a queued row's ``max_fix_rounds`` ceiling by *increment* (#3881).
+
+    The mechanical half of the investigator's ``raise_budget`` verb —
+    eligibility (the once-ever cap, and the request-changes/CI-red
+    evidence that makes a bump safe) is the caller's job
+    (:func:`investigator_raise_budget`); this function only ever resolves
+    the row's CURRENT effective ceiling (`coord.drive_queue.
+    effective_max_fix_rounds`, which already knows how to fall back from
+    an unset `entry.max_fix_rounds` to the fleet default) and writes back
+    *increment* above it — never a bare, caller-supplied absolute number,
+    so a repeated call without an intervening fix round cannot silently
+    compound past what the caller asked for in isolation.
+
+    Shares :func:`sweep_drive_queue_requeue`'s take-down-and-put-back
+    shape (and its own `_refuse_if_gate_mid_flight`/`_validate_after`
+    guards) because raising the ceiling is, mechanically, the exact same
+    write with one field changed — reusing it rather than inventing a
+    second remove+add keeps the #1757/#3236 declaration-preservation
+    invariants in exactly one place.
+    """
+    authorize_sweep_action("raise_budget")
+
+    entry = _existing_entry(repo_name, issue_number)
+    if entry is None:
+        return RaiseBudget(
+            raised=False,
+            entry_id=None,
+            new_max_fix_rounds=None,
+            detail=(
+                f"{repo_name}#{issue_number} is not in the drive queue — "
+                "nothing to raise"
+            ),
+        )
+
+    _refuse_if_gate_mid_flight(repo_name, issue_number, entry)
+    declaration = _declaration_of(entry)
+    _validate_after(repo_name, issue_number, declaration["after"])
+
+    from coord.drive_queue import effective_max_fix_rounds  # noqa: PLC0415
+
+    config_default = getattr(
+        getattr(config, "pipeline", None), "max_fix_rounds", None
+    )
+    current_ceiling = effective_max_fix_rounds(entry, config_default)
+    new_ceiling = current_ceiling + increment
+    declaration["max_fix_rounds"] = new_ceiling
+
+    authorize_sweep_action("drive_queue_remove")
+    removal = _dequeue_and_log(repo_name, issue_number)
+    if not removal.get("removed"):
+        return RaiseBudget(
+            raised=False,
+            entry_id=None,
+            new_max_fix_rounds=None,
+            detail=(
+                f"{repo_name}#{issue_number} was not removed, so its "
+                "budget was not raised — the queue is unchanged"
+            ),
+        )
+
+    entry_id = _enqueue_declared(repo_name, issue_number, declaration)
+    return RaiseBudget(
+        raised=True,
+        entry_id=entry_id,
+        new_max_fix_rounds=new_ceiling,
+        detail=(
+            f"{repo_name}#{issue_number} max_fix_rounds raised "
+            f"{current_ceiling} -> {new_ceiling}"
+        ),
+    )
+
+
+class RestageResult(TypedDict):
+    """:func:`sweep_restage`'s return shape."""
+
+    restaged: bool
+    detail: str
+
+
+def sweep_restage(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", *, stage: str,
+) -> RestageResult:
+    """Re-dispatch a missing/unreadable Test or Review stage (#3881).
+
+    *stage* is ``"test"`` or ``"review"``; any other value raises
+    ``ValueError`` immediately — a typo here must never silently fall
+    through to one of the two real branches.
+
+    ``"test"`` reuses :func:`sweep_smoke_requeue` verbatim (already the
+    sweep's own "clear a muted smoke leg's verdict fields so it
+    re-dispatches" primitive, #2272/#3810) — restaging a Test stage IS
+    that action under a name an investigator session reads more plainly.
+
+    ``"review"`` finds the row's own most recent completed ``work``
+    assignment and calls :func:`coord.review.dispatch_review` against it
+    directly — the same primitive the auto-loop's own review-dispatch tick
+    calls, never a bespoke HTTP POST. No completed work assignment to
+    restage a review for is reported ``restaged=False``, not an error.
+    """
+    authorize_sweep_action("restage")
+
+    if stage == "test":
+        result = sweep_smoke_requeue(repo_name, issue_number)
+        return RestageResult(restaged=result["requeued"], detail=result["detail"])
+
+    if stage != "review":
+        raise ValueError(f"sweep_restage: stage must be 'test' or 'review', got {stage!r}")
+
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
+
+    work = next(
+        (
+            a
+            for a in reversed(assignments_for_issue(board, repo_name, issue_number))
+            if a.type == "work" and a.status == "done"
+        ),
+        None,
+    )
+    if work is None:
+        return RestageResult(
+            restaged=False,
+            detail=(
+                f"{repo_name}#{issue_number} has no completed work "
+                "assignment to restage a review for"
+            ),
+        )
+
+    from coord.review import dispatch_review  # noqa: PLC0415
+
+    try:
+        dispatched = dispatch_review(work, board, config)
+    except Exception as exc:  # noqa: BLE001 — report, never crash the wrapper
+        return RestageResult(
+            restaged=False,
+            detail=f"{repo_name}#{issue_number} review restage raised: {exc}",
+        )
+    if dispatched is None:
+        return RestageResult(
+            restaged=False,
+            detail=f"{repo_name}#{issue_number} review restage made no dispatch",
+        )
+    return RestageResult(
+        restaged=True,
+        detail=(
+            f"{repo_name}#{issue_number} re-dispatched a review "
+            f"({getattr(dispatched, 'assignment_id', dispatched)!r})"
+        ),
+    )
+
+
+class ClearLatchResult(TypedDict):
+    """:func:`sweep_clear_latch`'s return shape."""
+
+    cleared: bool
+    detail: str
+
+
+def sweep_clear_latch(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", gh_ops: Any,
+) -> ClearLatchResult:
+    """Re-test a stale CONFLICT/HUMAN_REQUIRED merge-queue latch and clear
+    it when it no longer reflects live reality (#3881).
+
+    Two independent, both-required gates before touching anything:
+
+    1. The row must actually BE latched (``CONFLICT`` or
+       ``HUMAN_REQUIRED``) — a row in any other merge-queue state is left
+       untouched and reported ``cleared=False``.
+    2. :func:`coord.merge_queue.has_approved_review` must confirm the
+       current approval is bound to the branch's live content (SHA or,
+       for a content-identical rebase, patch-id) — #3881's "approval
+       bound to the current patch-id" precondition. A latch whose approval
+       is stale is left alone; clearing it would return a row with no
+       valid approval straight to ``PENDING``.
+
+    Only once both hold does this call
+    :func:`coord.merge_queue.reconcile_conflict_entries` — itself a third,
+    independent live-mergeability re-check (GitHub's own
+    ``check_pr_mergeable``, plus the rebase-refusal linearity probe) that
+    this function does not duplicate, and which operates over the WHOLE
+    queue rather than one row; that is intentional and safe (its own
+    docstring: "safe to call unconditionally"), not a scope leak — any
+    OTHER row it also clears was equally stale and would have cleared on
+    the next ordinary `coord merge` tick regardless.
+
+    ``cleared=True`` only when *this* row's key appears in the returned
+    events — a call that unparks a different sibling row but leaves this
+    one latched (gate 3 above still refused it) reports ``cleared=False``.
+    """
+    authorize_sweep_action("clear_latch")
+
+    from coord.merge_queue import (  # noqa: PLC0415
+        CONFLICT,
+        HUMAN_REQUIRED,
+        has_approved_review,
+        load_queue,
+        reconcile_conflict_entries,
+    )
+
+    queue = load_queue()
+    entry = next(
+        (e for e in queue if e.repo_name == repo_name and e.issue_number == issue_number),
+        None,
+    )
+    if entry is None:
+        return ClearLatchResult(
+            cleared=False,
+            detail=f"{repo_name}#{issue_number} has no merge-queue entry",
+        )
+    if entry.state not in (CONFLICT, HUMAN_REQUIRED):
+        return ClearLatchResult(
+            cleared=False,
+            detail=(
+                f"{repo_name}#{issue_number} merge-queue entry is "
+                f"{entry.state!r}, not a latched conflict/human_required row"
+            ),
+        )
+    if not has_approved_review(entry, board, gh_ops, config=config):
+        return ClearLatchResult(
+            cleared=False,
+            detail=(
+                f"{repo_name}#{issue_number} has no approval bound to the "
+                "current branch content — refusing to clear its latch"
+            ),
+        )
+
+    events = reconcile_conflict_entries(gh_ops)
+    mine = [
+        ev
+        for ev in events
+        if ev.entry.repo_name == repo_name and ev.entry.issue_number == issue_number
+    ]
+    if not mine:
+        return ClearLatchResult(
+            cleared=False,
+            detail=(
+                f"{repo_name}#{issue_number} latch did not clear — live "
+                "mergeability still refuses it"
+            ),
+        )
+    return ClearLatchResult(cleared=True, detail=mine[0].message)
+
+
+class MarkDoneResult(TypedDict):
+    """:func:`sweep_mark_done`'s return shape."""
+
+    marked: bool
+    detail: str
+
+
+def sweep_mark_done(
+    repo_name: str, issue_number: int, board: "Board", config: "Config",
+) -> MarkDoneResult:
+    """Reconcile a row whose PR merged (or whose issue closed) out-of-band
+    against GitHub reality (#3881).
+
+    A thin, repo/issue-scoped call into
+    :func:`coord.reconcile.reconcile_board_merges` — the same
+    conservative, confirmed-live-first sweep the daemon tick and ``coord
+    reconcile-merges`` both already run, never a bespoke flip of
+    ``status='merged'`` built here. ``marked=True`` only when that sweep's
+    own action log reports a ``"mark merged"`` line for THIS row — a
+    ``"skip"``/backfill-only/no-op pass reports ``marked=False``, with the
+    sweep's own line as *detail* either way.
+    """
+    authorize_sweep_action("mark_done")
+
+    from coord.reconcile import reconcile_board_merges  # noqa: PLC0415
+
+    actions = reconcile_board_merges(
+        board, config, repo=repo_name, issue=issue_number, dry_run=False,
+    )
+    mine = [a for a in actions if f"#{issue_number})" in a or f"#{issue_number}," in a]
+    marked_line = next((a for a in mine if a.startswith("mark merged")), None)
+    if marked_line is not None:
+        return MarkDoneResult(marked=True, detail=marked_line)
+    detail = (
+        mine[0]
+        if mine
+        else (
+            f"{repo_name}#{issue_number}: reconcile found nothing to mark "
+            "done — no candidate row, or its PR/issue does not read as "
+            "terminal yet"
+        )
+    )
+    return MarkDoneResult(marked=False, detail=detail)
+
+
+class BounceResult(TypedDict):
+    """:func:`sweep_bounce`'s return shape."""
+
+    bounced: bool
+    detail: str
+
+
+def sweep_bounce(
+    repo_name: str,
+    issue_number: int,
+    review_assignment_id: str,
+    board: "Board",
+    config: "Config",
+) -> BounceResult:
+    """Re-run the auto-loop's review-bounce fix dispatch for
+    *review_assignment_id* (#3881).
+
+    The same primitive `coord bounce` (``coord/commands/merge.py``) runs
+    under the hood — :func:`coord.auto_loop.process_review_completion` —
+    called directly rather than through the Click command, which this
+    daemon-internal context never reaches (no TTY, no ``sys.exit``).
+    Refuses (``bounced=False``) rather than dispatching anything when
+    *review_assignment_id* does not resolve to a ``type="review"``
+    assignment on *board*, or when its verdict is not
+    ``"request-changes"`` — the same two checks `coord bounce` itself
+    makes before dispatching.
+    """
+    authorize_sweep_action("bounce")
+
+    review = board.find_by_id(review_assignment_id)
+    if review is None or getattr(review, "type", None) != "review":
+        return BounceResult(
+            bounced=False,
+            detail=f"{review_assignment_id!r} is not a review assignment on the board",
+        )
+    if getattr(review, "review_verdict", None) != "request-changes":
+        return BounceResult(
+            bounced=False,
+            detail=(
+                f"{review_assignment_id} verdict is "
+                f"{review.review_verdict!r}, not 'request-changes' — "
+                "nothing to bounce"
+            ),
+        )
+
+    from coord.auto_loop import process_review_completion  # noqa: PLC0415
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    machine = next(
+        (m for m in config.machines if m.name == review.machine_name), None,
+    )
+    machine_host = machine.host if machine and getattr(machine, "host", None) else None
+    local_log = COORD_DIR / "logs" / f"{review_assignment_id}.log"
+    log_path = str(local_log) if local_log.exists() else None
+
+    actions = process_review_completion(
+        review, board, config, log_path=log_path, machine_host=machine_host,
+    )
+    dispatched = any(getattr(a, "kind", None) == "fix_dispatched" for a in actions)
+    detail = (
+        f"{repo_name}#{issue_number} bounce re-dispatched a fix worker for "
+        f"{review_assignment_id}"
+        if dispatched
+        else (
+            f"{repo_name}#{issue_number} bounce made no fix dispatch for "
+            f"{review_assignment_id}"
+        )
+    )
+    return BounceResult(bounced=dispatched, detail=detail)
+
+
 #: action name -> the daemon-internal handler that actually performs it.
 #: Looked up by :func:`dispatch_sweep_action` only after
 #: :func:`authorize_sweep_action` has already cleared the action — an
@@ -1668,6 +2239,11 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "dispatch_fixit_leg": sweep_dispatch_fixit_leg,
     "dispatch_finisher_leg": sweep_dispatch_finisher_leg,
     "smoke_requeue": sweep_smoke_requeue,
+    "raise_budget": sweep_raise_fixit_budget,
+    "bounce": sweep_bounce,
+    "restage": sweep_restage,
+    "clear_latch": sweep_clear_latch,
+    "mark_done": sweep_mark_done,
 }
 
 
@@ -1692,3 +2268,397 @@ def dispatch_sweep_action(action: str, *args: Any, **kwargs: Any) -> Any:
             "(#3745's C3)."
         )
     return handler(*args, **kwargs)
+
+
+# ── #3881: the investigator's eight closed verbs ─────────────────────────
+#
+# Every function below starts with `authorize_investigator_action`, ends by
+# returning through `_investigator_result` (which audits unconditionally,
+# success or refusal), and never raises for a refused precondition — only
+# for a programmer error (an unknown *stage*) or `authorize_investigator_
+# action` itself. Each re-checks its OWN precondition from live state
+# immediately before calling the underlying `sweep_*` primitive, which in
+# turn re-checks whatever ITS OWN docstring promises (#3881 design point 2:
+# "re-reads live GitHub + board state immediately before acting") — belt
+# and suspenders, not a duplicate question, because the investigator's
+# precondition (e.g. "has this row ever had a raise-budget") and the
+# primitive's (e.g. "is the row still removable") are different questions.
+
+
+def investigator_requeue(
+    repo_name: str, issue_number: int, board: "Board", *, reason: str,
+) -> InvestigatorActionResult:
+    """Take a stuck-but-approved row down and put it back exactly as
+    declared (#3881) — the investigator's ``requeue`` verb.
+
+    Refuses when :func:`_in_flight_work_detail` finds a running/pending
+    assignment or a live `coord drive` session already against this row:
+    a requeue mid-flight would yank the row out from under a leg that is
+    actively using it.
+    """
+    authorize_investigator_action("requeue")
+
+    in_flight = _in_flight_work_detail(repo_name, issue_number, board)
+    if in_flight is not None:
+        return _investigator_result(
+            "requeue", repo_name, issue_number, acted=False, reason=reason, detail=in_flight,
+        )
+
+    result = sweep_drive_queue_requeue(repo_name, issue_number)
+    return _investigator_result(
+        "requeue",
+        repo_name,
+        issue_number,
+        acted=result["requeued"],
+        reason=reason,
+        detail=result["detail"],
+    )
+
+
+def investigator_raise_budget(
+    repo_name: str,
+    issue_number: int,
+    config: "Config",
+    *,
+    review_verdict: str | None,
+    review_has_findings: bool,
+    ci_red_only: bool,
+    reason: str,
+    increment: int = 2,
+) -> InvestigatorActionResult:
+    """Spend this row's ONE lifetime fix-round-ceiling bump (#3881) — the
+    investigator's ``raise_budget`` verb.
+
+    Two independent, both-required gates: the lifetime cap
+    (`coord.state.board_doctor_fixit_rebudget_spent`, keyed by
+    ``(repo_name, issue_number)`` alone so it survives a remove+add
+    cycle), and the evidence that makes a bump safe rather than a blind
+    relaunch — *review_verdict* ``"request-changes"`` with
+    *review_has_findings* True, OR *ci_red_only* True. Both evidence
+    booleans are the CALLER's live read (an investigator session's own
+    `coord gates`/`coord log` probe immediately before calling this), not
+    re-derived here — this function's only job is the mechanical
+    once-ever spend.
+    """
+    authorize_investigator_action("raise_budget")
+
+    from coord.state import (  # noqa: PLC0415
+        board_doctor_fixit_rebudget_spent,
+        record_board_doctor_fixit_rebudget_spent,
+    )
+
+    if board_doctor_fixit_rebudget_spent(repo_name, issue_number):
+        return _investigator_result(
+            "raise_budget",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=(
+                f"{repo_name}#{issue_number} already spent its one "
+                "lifetime raise-budget"
+            ),
+        )
+
+    eligible = (review_verdict == "request-changes" and review_has_findings) or ci_red_only
+    if not eligible:
+        return _investigator_result(
+            "raise_budget",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=(
+                f"{repo_name}#{issue_number} is neither a "
+                "request-changes verdict with concrete findings nor "
+                "CI-red-on-the-merge-ref-only — not eligible for a "
+                "raise-budget"
+            ),
+        )
+
+    result = sweep_raise_fixit_budget(repo_name, issue_number, config, increment=increment)
+    if result["raised"]:
+        record_board_doctor_fixit_rebudget_spent(repo_name, issue_number)
+    return _investigator_result(
+        "raise_budget",
+        repo_name,
+        issue_number,
+        acted=result["raised"],
+        reason=reason,
+        detail=result["detail"],
+    )
+
+
+def investigator_bounce(
+    repo_name: str,
+    issue_number: int,
+    review_assignment_id: str,
+    board: "Board",
+    config: "Config",
+    *,
+    reason: str,
+) -> InvestigatorActionResult:
+    """Re-run the auto-loop's review-bounce fix dispatch (#3881) — the
+    investigator's ``bounce`` verb.
+
+    #3881's design table scopes this to "after a raise-budget": refuses
+    unless this row has already spent its lifetime raise-budget (see
+    :func:`investigator_raise_budget`) — bouncing a row that never needed
+    a fresh ceiling is ordinary auto-loop business, not an investigator
+    action. :func:`sweep_bounce` then makes the same two checks `coord
+    bounce` itself does (a real review assignment, verdict
+    ``"request-changes"``) before dispatching.
+    """
+    authorize_investigator_action("bounce")
+
+    from coord.state import board_doctor_fixit_rebudget_spent  # noqa: PLC0415
+
+    if not board_doctor_fixit_rebudget_spent(repo_name, issue_number):
+        return _investigator_result(
+            "bounce",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=(
+                f"{repo_name}#{issue_number} has not had a raise-budget "
+                "yet — bounce is only for a row already given a fresh "
+                "fix-round ceiling"
+            ),
+        )
+
+    result = sweep_bounce(repo_name, issue_number, review_assignment_id, board, config)
+    return _investigator_result(
+        "bounce",
+        repo_name,
+        issue_number,
+        acted=result["bounced"],
+        reason=reason,
+        detail=result["detail"],
+    )
+
+
+def investigator_integration_fix(
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    sibling_repo: str,
+    sibling_issue: int,
+    cause: str,
+    reason: str,
+    evidence: tuple[str, ...] = (),
+) -> InvestigatorActionResult:
+    """Dispatch the base-merged fix leg against *sibling_repo*#
+    *sibling_issue* — the issue tracking the broken base/integration this
+    row's own PR cannot land against — never against *repo_name*#
+    *issue_number* itself (#3881, the investigator's ``integration_fix``
+    verb).
+
+    A thin re-target of :func:`sweep_dispatch_fixit_leg` — reuses its
+    in-flight guard, its briefing shape and its audit write verbatim
+    (via `authorize_sweep_action("dispatch_fixit_leg")`, reached through
+    :data:`_INVESTIGATOR_ACTION_ALIAS`), so a sibling-issue fix leg reads
+    on the board exactly like any other fix-it leg dispatch.
+    """
+    authorize_investigator_action("integration_fix")
+
+    result = dispatch_sweep_action(
+        "dispatch_fixit_leg",
+        sibling_repo,
+        sibling_issue,
+        board,
+        config,
+        cause=cause,
+        evidence=evidence,
+    )
+    acted = bool(result["dispatched"])
+    detail = (
+        f"{result['detail']} (integration fix for {repo_name}#{issue_number}, "
+        f"via {sibling_repo}#{sibling_issue})"
+    )
+    return _investigator_result(
+        "integration_fix", repo_name, issue_number, acted=acted, reason=reason, detail=detail,
+    )
+
+
+def investigator_restage(
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    stage: str,
+    reason: str,
+) -> InvestigatorActionResult:
+    """Re-dispatch a missing/unreadable Test or Review stage (#3881) —
+    the investigator's ``restage`` verb. *stage* is ``"test"`` or
+    ``"review"``; see :func:`sweep_restage`."""
+    authorize_investigator_action("restage")
+
+    result = sweep_restage(repo_name, issue_number, board, config, stage=stage)
+    return _investigator_result(
+        "restage",
+        repo_name,
+        issue_number,
+        acted=result["restaged"],
+        reason=reason,
+        detail=result["detail"],
+    )
+
+
+def investigator_clear_latch(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", gh_ops: Any, *, reason: str,
+) -> InvestigatorActionResult:
+    """Re-test a stale CONFLICT/HUMAN_REQUIRED merge-queue latch (#3881)
+    — the investigator's ``clear_latch`` verb. See :func:`sweep_clear_latch`
+    for the three gates (latched, approval bound to current content, live
+    mergeability) this requires before clearing anything."""
+    authorize_investigator_action("clear_latch")
+
+    result = sweep_clear_latch(repo_name, issue_number, board, config, gh_ops)
+    return _investigator_result(
+        "clear_latch",
+        repo_name,
+        issue_number,
+        acted=result["cleared"],
+        reason=reason,
+        detail=result["detail"],
+    )
+
+
+def investigator_merge(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", gh_ops: Any, *, reason: str,
+) -> InvestigatorActionResult:
+    """Plain ``coord merge --only`` of an already-approved, CI-green row
+    (#3881) — the investigator's ``merge`` verb, reached through
+    :data:`_INVESTIGATOR_ACTION_ALIAS` as ``"merge_approved_green"``.
+
+    Precondition — approval bound to the current branch content
+    (:func:`coord.merge_queue.has_approved_review`) — is checked here;
+    CI-green and "merge gate reads clear" are re-confirmed, live, by
+    :func:`coord.merge_queue.process` itself the moment it runs (a
+    ``checks_failed``/``checks_pending``/``conflict`` event is exactly
+    "the precondition no longer holds", reported as ``acted=False``,
+    never treated as this call's own failure).
+    """
+    authorize_investigator_action("merge")
+
+    from coord.merge_queue import PENDING, has_approved_review, load_queue, process, save_queue  # noqa: PLC0415
+
+    queue = load_queue()
+    entry = next(
+        (e for e in queue if e.repo_name == repo_name and e.issue_number == issue_number),
+        None,
+    )
+    if entry is None:
+        return _investigator_result(
+            "merge",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=f"{repo_name}#{issue_number} has no merge-queue entry",
+        )
+    if entry.state != PENDING:
+        return _investigator_result(
+            "merge",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=(
+                f"{repo_name}#{issue_number} merge-queue entry is "
+                f"{entry.state!r}, not pending"
+            ),
+        )
+    if not has_approved_review(entry, board, gh_ops, config=config):
+        return _investigator_result(
+            "merge",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=(
+                f"{repo_name}#{issue_number} has no approval bound to the "
+                "current branch content — refusing to merge"
+            ),
+        )
+
+    events = process(
+        [entry], gh_ops, config=config, board=board, skip_review=False, skip_smoke=False, force_merge=False,
+    )
+    # `entry` is the same object `process()` just mutated in place — it is
+    # already one of `queue`'s own items (found by identity-preserving
+    # `next()` above), so persisting the whole list carries that mutation
+    # through for every other entry too, same as `coord merge`'s own
+    # save-after-process step.
+    save_queue(queue)
+    merged_event = next((ev for ev in events if ev.kind in ("merged", "merged_partial")), None)
+    acted = merged_event is not None
+    detail = (
+        merged_event.message
+        if merged_event is not None
+        else (
+            events[0].message
+            if events
+            else f"{repo_name}#{issue_number}: merge attempt produced no event"
+        )
+    )
+    return _investigator_result(
+        "merge", repo_name, issue_number, acted=acted, reason=reason, detail=detail,
+    )
+
+
+def investigator_mark_done(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", *, reason: str,
+) -> InvestigatorActionResult:
+    """Reconcile a row whose PR merged out-of-band and free its slot
+    (#3881) — the investigator's ``mark_done`` verb. See
+    :func:`sweep_mark_done`."""
+    authorize_investigator_action("mark_done")
+
+    result = sweep_mark_done(repo_name, issue_number, board, config)
+    return _investigator_result(
+        "mark_done",
+        repo_name,
+        issue_number,
+        acted=result["marked"],
+        reason=reason,
+        detail=result["detail"],
+    )
+
+
+_INVESTIGATOR_DISPATCH: dict[str, Callable[..., InvestigatorActionResult]] = {
+    "requeue": investigator_requeue,
+    "raise_budget": investigator_raise_budget,
+    "bounce": investigator_bounce,
+    "integration_fix": investigator_integration_fix,
+    "restage": investigator_restage,
+    "clear_latch": investigator_clear_latch,
+    "merge": investigator_merge,
+    "mark_done": investigator_mark_done,
+}
+
+
+def dispatch_investigator_action(
+    action: str, repo_name: str, issue_number: int, *args: Any, **kwargs: Any,
+) -> InvestigatorActionResult:
+    """The single entry point `coord drive-queue doctor act` calls (#3881).
+
+    Daemon-host only: :func:`coord.state._thin_client_local_board_guard`
+    fires first, exactly like every other board-doctor state primitive
+    this module's handlers reach into — an investigator session dispatched
+    against a thin client would otherwise act on an empty/stale local
+    board copy rather than the canonical one. Then authorizes *action*
+    against the closed :data:`INVESTIGATOR_ACTIONS` set (which also covers
+    every permanently-forbidden name) before routing to its handler, so a
+    disallowed verb never reaches this dict lookup at all.
+    """
+    from coord.state import _thin_client_local_board_guard  # noqa: PLC0415
+
+    _thin_client_local_board_guard("board_doctor_investigator_action")
+    authorize_investigator_action(action)
+    handler = _INVESTIGATOR_DISPATCH[action]
+    return handler(repo_name, issue_number, *args, **kwargs)

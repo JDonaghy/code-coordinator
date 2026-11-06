@@ -365,6 +365,8 @@ def test_drive_queue_is_registered_with_every_verb():
         "sweep",
         # #3875: the board-doctor decision log read-back verb.
         "doctor-log",
+        # #3881: the daemon-host investigator's one audited action wrapper.
+        "doctor-act",
     }
 
 
@@ -8571,6 +8573,63 @@ def test_doctor_log_reads_back_recorded_decisions(cli):
     assert summary["rows_unstuck"] == 0
     assert summary["rows_still_stuck"] == 0
     assert summary["human_interventions_missed"] == 0
+
+
+# ── #3881: doctor-act (the investigator's audited action wrapper) ───────────
+
+
+def test_doctor_act_requeues_a_frozen_blocked_row(cli, coord_db):
+    """#3881's quadraui#2035 shape: a row frozen in the drive queue with
+    nothing live against it. `doctor-act requeue` takes it down and puts
+    it back, and the audit log records why."""
+    from coord.audit import query_audit_log
+
+    state.enqueue_drive_queue(REPO, 101, machine="dellserver")
+
+    result = cli(
+        "doctor-act", "requeue", REPO, "101",
+        "--reason", "frozen blocked row, nothing live against it",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "acted=True" in result.output
+    assert state.get_drive_queue_entry(REPO, 101) is not None
+
+    log = query_audit_log(event_type="investigator_requeue", repo=REPO, issue=101)
+    assert len(log["entries"]) == 1
+    assert log["entries"][0]["details"]["reason"] == (
+        "frozen blocked row, nothing live against it"
+    )
+
+
+def test_doctor_act_refuses_an_unknown_action_naming_the_closed_set(cli):
+    result = cli("doctor-act", "bogus-verb", REPO, "1", "--reason", "x")
+
+    assert result.exit_code != 0
+    assert "unknown action" in result.output
+
+
+def test_doctor_act_refuses_a_forbidden_verb(cli):
+    result = cli("doctor-act", "force_merge", REPO, "1", "--reason", "x")
+
+    assert result.exit_code != 0
+    assert "unknown action" in result.output
+
+
+def test_doctor_act_refuses_on_a_thin_client(cli, monkeypatch):
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: True)
+
+    result = cli("doctor-act", "requeue", REPO, "1", "--reason", "x")
+
+    assert result.exit_code != 0
+    assert "run it there" in result.output
+
+
+def test_doctor_act_bounce_requires_the_review_assignment_option(cli):
+    result = cli("doctor-act", "bounce", REPO, "1", "--reason", "x")
+
+    assert result.exit_code != 0
+    assert "--review-assignment-id" in result.output
 
 
 def test_doctor_log_summary_dedupes_rows_and_catches_a_missed_human_intervention(
