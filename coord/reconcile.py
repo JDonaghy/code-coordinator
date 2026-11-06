@@ -2925,6 +2925,8 @@ def _post_human_required_comment_raw(
     *,
     semantic_escalation_note: str | None = None,
     closing_note: str | None = None,
+    headline: str | None = None,
+    exit_description: str | None = None,
 ) -> None:
     """Notify the user on GitHub that a conflict-fix worker gave up.
 
@@ -2940,6 +2942,14 @@ def _post_human_required_comment_raw(
     already-upstream verdict, where there is nothing to rebase or merge.
     Callers whose verdict doesn't call for "manual resolution" in that
     sense pass their own closing sentence instead of the default.
+
+    *headline*/*exit_description*: the defaults below (and their framing —
+    "could not auto-resolve", "exited non-zero") assume the worker actually
+    attempted a rebase and failed at it. That is false for a leg that
+    exited clean but never moved the branch (a missing or rejected push) —
+    callers describing THAT verdict pass both, so the comment an operator
+    reads first says what actually happened instead of asserting a failed
+    rebase attempt that never happened.
     """
     from coord import github_ops  # noqa: PLC0415
 
@@ -2949,12 +2959,15 @@ def _post_human_required_comment_raw(
         "coordinator will not re-dispatch a conflict-fix for this entry "
         "in the current session."
     )
+    default_exit_description = (
+        f"attempted to rebase `{entry.branch}` onto `{entry.target_branch}` "
+        "and exited non-zero"
+    )
     body = (
-        "## Conflict-fix worker could not auto-resolve\n\n"
-        f"Worker `{fix_assignment_id}` on "
-        f"`{machine_name}` attempted to rebase "
-        f"`{entry.branch}` onto `{entry.target_branch}` and exited "
-        "non-zero. The merge queue entry is now `HUMAN_REQUIRED`.\n\n"
+        f"## {headline or 'Conflict-fix worker could not auto-resolve'}\n\n"
+        f"Worker `{fix_assignment_id}` on `{machine_name}` "
+        f"{exit_description or default_exit_description}. The merge queue "
+        "entry is now `HUMAN_REQUIRED`.\n\n"
         f"**Last error:** `{entry.error or 'unknown'}`\n\n"
         + (f"{semantic_escalation_note}\n\n" if semantic_escalation_note else "")
         + (closing_note if closing_note is not None else default_closing_note)
@@ -3199,19 +3212,38 @@ def _try_ordinary_escalation_after_head_unmoved(
     board: Board | None,
     config: Config | None,
     machine_name: str | None,
+    fix_assignment_id: str | None = None,
+    head_unmoved_sha: str | None = None,
 ) -> Assignment | None:
     """Dispatch a fresh ordinary conflict-fix after a prior attempt
     completed clean without actually moving the branch (#3871).
 
     Same shape as :func:`_try_ordinary_escalation_after_stale_mismatch` —
-    an ordinary (non-``semantic``, non-``stale_rebase``) dispatch, which
-    goes through the SAME retry-cap check (:func:`coord.conflict_fix.
-    has_prior_conflict_fix`) every other conflict-fix redispatch does, so
-    this redispatches WITHIN the existing per-entry budget rather than
-    granting a fresh one. Returns the dispatched ``Assignment``, or
-    ``None`` when dispatch declined for any of the ordinary reasons (no
-    capable machine, already active, retry cap already consumed) — every
+    an ordinary (non-``semantic``, non-``stale_rebase``) dispatch — with
+    one difference: that sibling excludes a whole CLASS of prior rows by
+    title prefix (``ignore_stale_rebase_attempts``); this one excludes
+    exactly ONE row, the just-completed leg named by *fix_assignment_id*,
+    via :func:`coord.conflict_fix.dispatch_conflict_fix`'s
+    ``after_head_unmoved_fix_assignment_id``. Without that exclusion, the
+    just-completed leg's own ``done`` status would itself be read as "the
+    same blocker recurring unchanged" by the cap's identical-error rule —
+    its dispatch-time briefing embeds the SAME ``entry.error`` text — even
+    though a clean exit with an unmoved branch never demonstrated a
+    genuine failure, only a missing or rejected push. Every OTHER prior
+    attempt still counts normally, so this redispatches WITHIN the
+    existing per-entry budget rather than granting a fresh one. Returns
+    the dispatched ``Assignment``, or ``None`` when dispatch declined for
+    any of the ordinary reasons (no capable machine, already active, retry
+    cap already consumed by a genuinely different prior failure) — every
     ``None`` case falls through to the caller's HUMAN_REQUIRED park.
+
+    *head_unmoved_sha* (the live SHA the caller already confirmed the
+    branch is still sitting on) is stamped onto ``entry.branch_head_sha``
+    before dispatching, so THIS redispatch gets a real pre-dispatch anchor
+    of its own rather than the ``unknown`` placeholder — a reconcile-
+    dispatched conflict-fix never otherwise has one, since
+    ``entry.branch_head_sha`` is transient and only backfilled inside
+    ``coord.merge_queue.process()``.
 
     #3871: when *board*/*config* are both ``None`` — ``coord notify``'s
     "no marker" call site, deliberately left without the eager
@@ -3236,12 +3268,16 @@ def _try_ordinary_escalation_after_head_unmoved(
     from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
     from coord.network import fetch_status  # noqa: PLC0415
 
+    if head_unmoved_sha is not None:
+        entry.branch_head_sha = head_unmoved_sha
+
     try:
         return dispatch_conflict_fix(
             entry,
             board,
             config,
             prefer_machine=machine_name or None,
+            after_head_unmoved_fix_assignment_id=fix_assignment_id,
             status_fetcher=fetch_status,
         )
     except Exception as exc:  # noqa: BLE001 — never break reconcile on this
@@ -3365,6 +3401,8 @@ def on_conflict_fix_done(
     failed_entry: mq.QueuedMerge | None = None
     failed_entry_note: str | None = None
     failed_entry_closing_note: str | None = None
+    failed_entry_headline: str | None = None
+    failed_entry_exit_description: str | None = None
     escalated: tuple[mq.QueuedMerge, str, str, str] | None = None
     for entry in items:
         if entry.assignment_id != parent_assignment_id:
@@ -3400,21 +3438,30 @@ def on_conflict_fix_done(
                 # HUMAN_REQUIRED exit text keys off of) and it must not
                 # consume the entry's only shot at automated resolution:
                 # redispatch the ordinary mechanical attempt WITHIN the
-                # existing retry cap (a prior `done` status never consumes
-                # it on its own — see `dispatch_conflict_fix`'s retry-cap
-                # docstring) rather than escalating straight to
-                # HUMAN_REQUIRED as if a worker had given up on a genuine
-                # conflict.
+                # existing retry cap. The just-completed leg's own `done`
+                # status WOULD otherwise consume that cap on its own — its
+                # dispatch-time briefing embeds the same `entry.error` text,
+                # so the cap's identical-error rule would read it as a
+                # genuine recurring failure — so this passes the leg's own
+                # `fix_assignment_id` through to `dispatch_conflict_fix`'s
+                # `after_head_unmoved_fix_assignment_id`, which excludes
+                # exactly that one row from the cap walk. Only an earlier,
+                # different, genuinely-failed attempt still escalates
+                # straight to HUMAN_REQUIRED as if a worker had given up on
+                # a genuine conflict.
                 detail = (
-                    "the conflict-fix worker completed but the branch "
-                    f"head did not move (still {head_unmoved_sha}) — the "
-                    "push appears to be missing or was rejected"
+                    "the conflict-fix worker completed but the "
+                    f"{mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} (still "
+                    f"{head_unmoved_sha}) — the push appears to be missing "
+                    "or was rejected"
                 )
                 fix = _try_ordinary_escalation_after_head_unmoved(
                     entry,
                     board=board,
                     config=config,
                     machine_name=machine_name,
+                    fix_assignment_id=fix_assignment_id,
+                    head_unmoved_sha=head_unmoved_sha,
                 )
                 if fix is not None:
                     # Stay in CONFLICT, not HUMAN_REQUIRED — the redispatched
@@ -3427,9 +3474,9 @@ def on_conflict_fix_done(
                     )
                 else:
                     # No capable machine, already active, or the retry cap
-                    # was already consumed by a genuinely failed prior
-                    # attempt — fall through to HUMAN_REQUIRED, but with
-                    # text that says what actually happened (a missing
+                    # was already consumed by a genuinely different failed
+                    # prior attempt — fall through to HUMAN_REQUIRED, but
+                    # with text that says what actually happened (a missing
                     # push), not "a conflict-fix worker gave up on a real
                     # conflict". Deliberately avoids every phrase in
                     # `_NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS` so
@@ -3445,6 +3492,22 @@ def on_conflict_fix_done(
                         "once a machine is free."
                     )
                     failed_entry = entry
+                    # The leg that produced this latch exited ZERO, not
+                    # non-zero — the default comment headline/body
+                    # (`_post_human_required_comment_raw`) claims "attempted
+                    # to rebase ... and exited non-zero", which would be
+                    # false here. Override both with text that matches
+                    # what actually happened.
+                    failed_entry_headline = (
+                        "Conflict-fix worker completed, but nothing was "
+                        "pushed"
+                    )
+                    failed_entry_exit_description = (
+                        f"completed `{entry.branch}` → `{entry.target_branch}` "
+                        "cleanly (exit status 0), but the branch head never "
+                        f"moved (still `{head_unmoved_sha}`) — the push "
+                        "appears to be missing, or GitHub rejected it"
+                    )
             elif usage_limit_reason:
                 entry.state = mq.HUMAN_REQUIRED
                 entry.error = (
@@ -3658,6 +3721,8 @@ def on_conflict_fix_done(
             machine_name=machine_name,
             semantic_escalation_note=failed_entry_note,
             closing_note=failed_entry_closing_note,
+            headline=failed_entry_headline,
+            exit_description=failed_entry_exit_description,
         )
 
 

@@ -1037,6 +1037,59 @@ class TestDispatch:
         assert payload["target_branch"] == "issue-1-fix"
         assert payload["repo_path"] == "/work/api"
 
+    def test_stamps_dispatch_head_sha_anchor_on_stored_assignment_only(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#3871: the dispatched Assignment's STORED briefing must carry
+        the pre-dispatch branch HEAD SHA, round-tripping through
+        `dispatched_branch_head_sha` exactly as the real completion hook
+        (`coord.reconcile.on_conflict_fix_done`) reads it back — and the
+        briefing actually SENT to the worker (`payload["briefing"]`) must
+        stay byte-for-byte unmodified, since the worker is never told
+        about this anchor."""
+        from coord.conflict_fix import dispatched_branch_head_sha
+
+        entry = _entry()
+        entry.branch_head_sha = "abc123"
+        client = _FakeHTTPClient({"id": "fix-id-2"})
+
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+
+        assert result is not None
+        assert dispatched_branch_head_sha(result.briefing) == "abc123"
+
+        _, payload = client.calls[0]
+        assert payload["briefing"] == result.briefing.split(
+            "\n\nConflict-fix dispatch anchor",
+        )[0]
+        assert "Conflict-fix dispatch anchor" not in payload["briefing"]
+
+    def test_dispatch_head_sha_anchor_unknown_when_branch_head_sha_unset(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A dispatch with no live SHA available at dispatch time (the
+        common case for every reconcile-dispatched conflict-fix, since
+        `QueuedMerge.branch_head_sha` is transient and only backfilled in
+        `coord.merge_queue.process()`) stamps the literal `unknown`
+        placeholder, which `dispatched_branch_head_sha` must treat as "no
+        anchor" rather than a real SHA."""
+        from coord.conflict_fix import dispatched_branch_head_sha
+
+        entry = _entry()
+        assert entry.branch_head_sha is None
+
+        result = dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=_FakeHTTPClient({"id": "fix-id-3"}),
+            prefer_machine="laptop",
+        )
+
+        assert result is not None
+        assert dispatched_branch_head_sha(result.briefing) is None
+
     def test_returns_none_if_already_in_flight(
         self, two_machine_config: Config, coord_db,
     ) -> None:

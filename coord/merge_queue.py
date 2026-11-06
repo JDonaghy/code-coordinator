@@ -6038,14 +6038,32 @@ def _is_non_mergeability_human_latch(error: str | None) -> bool:
 # mergeability rather than treating it as permanently parked.
 CONFLICT_FIX_HEAD_UNMOVED_SIGNAL = "branch head did not move"
 
+# The ONLY phrases that mean a mechanical or semantic conflict-fix worker
+# actually ran and failed to resolve a real conflict. `coord.reconcile`
+# writes each of these verbatim into `entry.error` at the one place that
+# applies:
+#   * "conflict-fix worker did not resolve" — the ordinary/semantic
+#     mechanical attempt's own give-up (`on_conflict_fix_done`'s default
+#     HUMAN_REQUIRED arm).
+#   * "no tier-2 attempt made" — the worker judged the conflict SEMANTIC
+#     (a real conflict) but `pipeline.escalate_semantic_conflicts` is off,
+#     so the escalated attempt never ran — still a genuine give-up, just
+#     without a second tier.
+CONFLICT_FIX_GAVE_UP_SIGNALS = (
+    "conflict-fix worker did not resolve",
+    "no tier-2 attempt made",
+)
+
 
 def conflict_fix_actually_gave_up(error: str | None) -> bool:
     """True when ``error`` reads as an ACTUAL conflict-fix give-up — a
     mechanical or semantic worker ran and failed to resolve a real
     conflict — as opposed to every other cause that can land an entry on
     HUMAN_REQUIRED (a usage-limit kill, content already upstream, a reword
-    worker's narrow refusal, a declined escalation dispatch, or a worker
-    that exited clean without ever pushing, #3871).
+    worker's narrow refusal, a declined escalation dispatch, a worker that
+    exited clean without ever pushing (#3871), a permission/branch-
+    protection error surfaced verbatim from GitHub, a ci-fix retry-cap or
+    no-op-streak latch, or simply no reason recorded at all).
 
     The ONE function :func:`coord.drive`'s HUMAN_REQUIRED exit text (and
     any other caller describing the latch to a human) must use, so neither
@@ -6053,13 +6071,20 @@ def conflict_fix_actually_gave_up(error: str | None) -> bool:
     coordinator's own exit text previously claimed "an automated
     conflict-fix already gave up" unconditionally, which was simply false
     for every one of the non-give-up causes above.
+
+    Matches POSITIVELY against :data:`CONFLICT_FIX_GAVE_UP_SIGNALS` rather
+    than matching the absence of known non-give-up phrases: the latter
+    makes "a conflict-fix gave up" the default for ANY unrecognized text —
+    including GitHub's own raw permission/branch-protection error, a
+    ci-fix cap latch, or an empty ``error`` — none of which a conflict-fix
+    worker ever actually produced. Correct by construction instead: this
+    is only ``True`` for the exact wording the one function that writes a
+    genuine give-up (`coord.reconcile.on_conflict_fix_done`) actually uses.
     """
     if not error:
         return False
     text = error.lower()
-    if CONFLICT_FIX_HEAD_UNMOVED_SIGNAL in text:
-        return False
-    return not _is_non_mergeability_human_latch(error)
+    return any(sig in text for sig in CONFLICT_FIX_GAVE_UP_SIGNALS)
 
 
 def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:

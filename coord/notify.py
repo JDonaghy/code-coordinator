@@ -4636,17 +4636,12 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                         stuck_summary = parse_progress(log_path).stuck
                     except Exception:  # noqa: BLE001
                         stuck_summary = None
-            # #3871: the plain "no marker" case (board/config still None
-            # here) is NOT given an eager board/config load — unlike the
-            # three arms above, it's the overwhelming common case (a real
-            # fix, no marker), and this module's own design intentionally
-            # keeps that path free of the extra `read_board`/config-load
-            # cost. `on_conflict_fix_done`'s own head-unmoved check (#3871)
-            # needs no board at all to DETECT a missing/rejected push —
-            # only `_try_ordinary_escalation_after_head_unmoved` needs it,
-            # and only to attempt a redispatch, which it lazily loads
-            # itself (mirroring this exact pattern) in the rare case it's
-            # actually reached. See that function's docstring.
+            # The plain "no marker" case (board/config still None here)
+            # gets no eager load, unlike the three arms above — it's the
+            # overwhelming common case, and a head-unmoved redispatch (the
+            # one thing that would need a board) loads it lazily itself;
+            # see `coord.reconcile._try_ordinary_escalation_after_head_
+            # unmoved`'s docstring.
 
             on_conflict_fix_done(
                 parent_assignment_id=parent_id,
