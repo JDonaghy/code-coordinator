@@ -1829,3 +1829,73 @@ class TestFinisherCapacityCheck:
 
         assert result is True
         assert len(calls) == 1
+
+
+# ── #3881: investigator recommendation replay ────────────────────────────
+
+
+class TestRecommendInvestigatorAction:
+    """Replays the shape of each historical row #3881's own evidence table
+    names, confirming `recommend_investigator_action` names the verb that
+    actually fixed it — and that `coord.board_doctor_permissions`'s
+    wrapper (not this function) is still the one that decides whether
+    acting on that recommendation is safe right now."""
+
+    def test_frozen_blocked_rows_recommend_requeue(self) -> None:
+        # quadraui#2035/#2047/#2045/#2051/#2052/#2058/#2059, coord#3875.
+        row = _row("acme/widgets#2035", queue_diagnose.CAUSE_NEVER_DISPATCHED)
+
+        assert board_doctor_policy.recommend_investigator_action(row) == "requeue"
+
+    def test_ceiling_blocked_mergeable_recommends_requeue(self) -> None:
+        row = _row("acme/widgets#3874b", board_doctor_policy.CAUSE_CEILING_BLOCKED_MERGEABLE)
+
+        assert board_doctor_policy.recommend_investigator_action(row) == "requeue"
+
+    def test_pr_merged_recommends_mark_done(self) -> None:
+        # quadraui#2038: merged by hand, the queue slot still held.
+        row = _row("acme/widgets#2038", queue_diagnose.CAUSE_PR_MERGED)
+
+        assert board_doctor_policy.recommend_investigator_action(row) == "mark_done"
+
+    def test_baseline_red_recommends_integration_fix(self) -> None:
+        # coord#3870: a repo-wide baseline-red streak.
+        row = _row("acme/widgets#0", board_doctor_policy.CAUSE_BASELINE_RED)
+
+        assert board_doctor_policy.recommend_investigator_action(row) == "integration_fix"
+
+    def test_a_cause_with_no_mechanical_recommendation_is_judgment_not_a_guess(self) -> None:
+        # A gate-blocked HUMAN_REQUIRED latch is only sometimes a
+        # clear_latch candidate (conflict-fix-retry-cap + rebaseable) —
+        # this function must not guess that it always is.
+        row = _row("acme/widgets#2034", queue_diagnose.CAUSE_GATE_BLOCKED)
+
+        assert board_doctor_policy.recommend_investigator_action(row) is None
+
+    def test_every_recommended_verb_is_in_the_investigators_closed_set(self) -> None:
+        from coord.board_doctor_permissions import INVESTIGATOR_ACTIONS
+
+        for verb in board_doctor_policy.INVESTIGATOR_RECOMMENDED_ACTION.values():
+            assert verb in INVESTIGATOR_ACTIONS
+
+    def test_recommendation_alone_does_not_bypass_the_wrappers_own_precondition(
+        self,
+    ) -> None:
+        # coord#3875's already-requeued-by-the-time-we-looked shape: the
+        # recommendation still names "requeue", but the row is no longer
+        # queued (a human, or an earlier sweep, already handled it) — the
+        # wrapper must refuse cleanly rather than trust the recommendation.
+        from coord import state
+        from coord.board_doctor_permissions import investigator_requeue
+        from coord.models import Board
+
+        row = _row("acme/widgets#3875", queue_diagnose.CAUSE_NEVER_DISPATCHED)
+        assert board_doctor_policy.recommend_investigator_action(row) == "requeue"
+        assert state.get_drive_queue_entry("acme/widgets", 3875) is None
+
+        result = investigator_requeue(
+            "acme/widgets", 3875, Board(), reason="recommended requeue, already gone",
+        )
+
+        assert result["acted"] is False
+        assert "not in the drive queue" in result["detail"]
