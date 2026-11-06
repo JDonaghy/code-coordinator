@@ -30,11 +30,16 @@ from coord.conflict_fix import (
     ASSIGN_POST_FAILED,
     CONFLICT_FIX_SYSTEM_PROMPT,
     NO_MACHINE_CONFIGURED,
+    REWORD_COMMIT_FIX_SYSTEM_PROMPT,
     REWORD_COMMIT_FIX_TITLE_PREFIX,
     REWORD_MISMATCH_MARKER,
     SEALED_CONFLICT_FIX_TITLE_PREFIX,
     SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT,
     SEALED_SCOPE_STUCK_MARKER,
+    SEMANTIC_CONFLICT_SYSTEM_PROMPT,
+    SEMANTIC_STUCK_MARKER,
+    SESSION_ENDS_ON_TURN_END_RULE,
+    STALE_REBASE_FIX_SYSTEM_PROMPT,
     STALE_REBASE_FIX_TITLE_PREFIX,
     STALE_REBASE_MISMATCH_MARKER,
     already_upstream_verdict_in_text,
@@ -42,8 +47,12 @@ from coord.conflict_fix import (
     build_reword_commit_briefing,
     build_sealed_manifest_conflict_briefing,
     build_stale_rebase_briefing,
+    conflict_fix_session_ended_without_push,
     describe_conflict_fix_decline,
+    detect_premature_end_without_push,
     dispatch_conflict_fix,
+    final_turn_is_sanctioned_giveup,
+    looks_like_premature_wait,
     pick_conflict_fix_machine,
     reword_mismatch_verdict_in_text,
     select_conflict_fix_machine,
@@ -2520,3 +2529,188 @@ class TestDispatchConflictFixCancelsStaleSmokeLegs:
 
         assert result is not None
         assert cancelled == []
+
+
+# ── #3870: session-ends-on-turn-end prompt rule ─────────────────────────────
+
+
+class TestSessionEndsOnTurnEndRule:
+    """The quadraui#2034 leg rebased cleanly, launched the gate in the
+    background, and ended its turn with "Waiting for the gate." — which
+    ended the whole `-p` session before the push happened. Every worker-
+    facing conflict-fix prompt must say explicitly that the session ends on
+    turn end, so a worker doesn't repeat that shape."""
+
+    def test_present_in_ordinary_conflict_fix_prompt(self) -> None:
+        assert SESSION_ENDS_ON_TURN_END_RULE in CONFLICT_FIX_SYSTEM_PROMPT
+
+    def test_present_in_semantic_escalation_prompt(self) -> None:
+        assert SESSION_ENDS_ON_TURN_END_RULE in SEMANTIC_CONFLICT_SYSTEM_PROMPT
+
+    def test_present_in_sealed_manifest_prompt(self) -> None:
+        assert (
+            SESSION_ENDS_ON_TURN_END_RULE in SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+        )
+
+    def test_present_in_stale_rebase_prompt(self) -> None:
+        assert SESSION_ENDS_ON_TURN_END_RULE in STALE_REBASE_FIX_SYSTEM_PROMPT
+
+    def test_present_in_reword_commit_prompt(self) -> None:
+        assert SESSION_ENDS_ON_TURN_END_RULE in REWORD_COMMIT_FIX_SYSTEM_PROMPT
+
+    def test_rule_calls_waiting_for_x_a_failure(self) -> None:
+        lowered = SESSION_ENDS_ON_TURN_END_RULE.lower()
+        assert "waiting for" in lowered
+        assert "failure" in lowered
+
+    def test_rule_tells_worker_to_push_before_final_message(self) -> None:
+        lowered = SESSION_ENDS_ON_TURN_END_RULE.lower()
+        assert "push" in lowered
+        assert "before" in lowered
+
+
+# ── #3870: final-message classification ────────────────────────────────────
+
+
+class TestFinalTurnIsSanctionedGiveup:
+    def test_true_for_plain_stuck_line(self) -> None:
+        assert final_turn_is_sanctioned_giveup(
+            "STATUS: tried the rebase\nSTUCK: can't resolve the conflict"
+        ) is True
+
+    def test_true_for_semantic_marker(self) -> None:
+        assert final_turn_is_sanctioned_giveup(
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:40-72 — both sides "
+            "rewrote parse_args() differently"
+        ) is True
+
+    def test_true_for_sealed_scope_marker(self) -> None:
+        assert final_turn_is_sanctioned_giveup(
+            f"STUCK: {SEALED_SCOPE_STUCK_MARKER} tests/acceptance/ms-1/x.py"
+        ) is True
+
+    def test_false_for_waiting_announcement(self) -> None:
+        """The exact quadraui#2034 shape: a status line, not a give-up."""
+        assert final_turn_is_sanctioned_giveup("Waiting for the gate.") is False
+
+    def test_false_for_confident_completion_summary(self) -> None:
+        assert final_turn_is_sanctioned_giveup(
+            "### Summary\nRebased and pushed successfully."
+        ) is False
+
+    def test_false_for_none_or_empty(self) -> None:
+        assert final_turn_is_sanctioned_giveup(None) is False
+        assert final_turn_is_sanctioned_giveup("") is False
+
+
+class TestConflictFixSessionEndedWithoutPush:
+    def test_false_when_origin_head_changed_regardless_of_message(self) -> None:
+        """A real push is a fact about origin, not about the worker's own
+        prose (#2096 "unconfirmed success is a defect") — if the head
+        moved, a "Waiting for the gate." final turn doesn't matter."""
+        assert conflict_fix_session_ended_without_push(
+            final_turn_text="Waiting for the gate.",
+            origin_head_changed=True,
+        ) is False
+
+    def test_true_for_waiting_announcement_with_unmoved_head(self) -> None:
+        """The quadraui#2034 case this issue is built from."""
+        assert conflict_fix_session_ended_without_push(
+            final_turn_text="Waiting for the gate.",
+            origin_head_changed=False,
+        ) is True
+
+    def test_true_for_silent_end_with_unmoved_head(self) -> None:
+        assert conflict_fix_session_ended_without_push(
+            final_turn_text=None,
+            origin_head_changed=False,
+        ) is True
+
+    def test_false_for_sanctioned_stuck_giveup_with_unmoved_head(self) -> None:
+        """A worker that correctly refused to guess and said so never
+        pushed, on purpose — that is not the #3870 failure shape."""
+        assert conflict_fix_session_ended_without_push(
+            final_turn_text=f"STUCK: {SEMANTIC_STUCK_MARKER} foo.py:1-9",
+            origin_head_changed=False,
+        ) is False
+
+    def test_false_for_confident_summary_backed_by_a_real_push(self) -> None:
+        assert conflict_fix_session_ended_without_push(
+            final_turn_text="### Summary\nRebased and pushed successfully.",
+            origin_head_changed=True,
+        ) is False
+
+
+class TestLooksLikePrematureWait:
+    def test_true_for_the_quadraui_2034_shape(self) -> None:
+        assert looks_like_premature_wait("Waiting for the gate.") is True
+
+    def test_true_for_background_monitoring_phrasing(self) -> None:
+        assert looks_like_premature_wait(
+            "Running in the background, I'll wait for it to finish."
+        ) is True
+
+    def test_false_for_a_push_confirmation(self) -> None:
+        assert looks_like_premature_wait(
+            "### Summary\nRebased and pushed to origin/issue-1-fix."
+        ) is False
+
+    def test_false_for_none_or_empty(self) -> None:
+        assert looks_like_premature_wait(None) is False
+        assert looks_like_premature_wait("") is False
+
+
+class TestDetectPrematureEndWithoutPush:
+    def test_false_immediately_when_head_changed(self) -> None:
+        """Short-circuits before even looking at the log — a moved head is
+        proof enough, with or without a transcript to read."""
+        assert detect_premature_end_without_push(origin_head_changed=True) is False
+
+    def test_reads_local_log_file_plain_text(self, tmp_path) -> None:
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebasing\nWaiting for the gate.\n")
+        assert detect_premature_end_without_push(
+            origin_head_changed=False, log_path=str(log),
+        ) is True
+
+    def test_local_log_file_with_sanctioned_giveup_is_false(self, tmp_path) -> None:
+        log = tmp_path / "worker.log"
+        log.write_text(f"STUCK: {SEMANTIC_STUCK_MARKER} foo.py:1-9\n")
+        assert detect_premature_end_without_push(
+            origin_head_changed=False, log_path=str(log),
+        ) is False
+
+    def test_reads_stream_json_log_and_uses_only_the_latest_turn(
+        self, tmp_path,
+    ) -> None:
+        """An EARLIER turn announcing "pushing now" must not excuse a LATER
+        turn that announces "waiting for the gate" and stops instead — only
+        the latest assistant turn counts."""
+        lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "STATUS: pushing now"},
+                ]},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Waiting for the gate."},
+                ]},
+            }),
+        ]
+        log = tmp_path / "worker.log"
+        log.write_text("\n".join(lines) + "\n")
+        assert detect_premature_end_without_push(
+            origin_head_changed=False, log_path=str(log),
+        ) is True
+
+    def test_missing_log_and_no_host_is_false(self, tmp_path) -> None:
+        assert detect_premature_end_without_push(
+            origin_head_changed=False,
+            log_path=str(tmp_path / "nope.log"),
+        ) is False
+
+    def test_no_sources_is_false(self) -> None:
+        assert detect_premature_end_without_push(origin_head_changed=False) is False

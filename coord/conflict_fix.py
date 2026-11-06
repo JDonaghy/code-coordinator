@@ -92,7 +92,28 @@ from coord.models import (
 from coord.network import StatusResult, probe_reachable
 
 
-CONFLICT_FIX_SYSTEM_PROMPT = """\
+# #3870: a `claude -p` leg's session ends the INSTANT it ends its turn —
+# there is no next turn for a backgrounded step to report back to, and no
+# reaper grace period that counts as "still working". A worker that runs a
+# test suite or a multi-stage gate via a background tool (e.g. `Monitor`)
+# and then ends its turn with a status line like "Waiting for the gate." has
+# just ended its OWN session: the push that line implies is coming never
+# happens, and 30s later the reaper SIGTERMs the still-running process
+# group. Every conflict-fix variant in this module shares this same single-
+# shot-session risk (it is not specific to the ordinary rebase briefing),
+# so this rule is spliced into each one's "Rules" section rather than
+# copied by hand — one string, one place to keep it accurate.
+SESSION_ENDS_ON_TURN_END_RULE = (
+    "- Your session ends the moment you end your turn — there is no next "
+    "turn. Run the test command (and any other check) in the foreground, "
+    "in THIS turn; if something takes a while, wait on it here rather than "
+    "backgrounding it. Push BEFORE your final message, not after. A final "
+    'message like "Waiting for the gate." or "Waiting for tests to '
+    "finish.\" is a failure, not progress — the session is already over "
+    "and nothing you backgrounded gets a chance to finish."
+)
+
+CONFLICT_FIX_SYSTEM_PROMPT = f"""\
 You are a Claude Code conflict-fix worker. The merge of a worker's branch \
 into the project's target branch failed because the branch is out of date \
 or has a conflict. Your job is to rebase the branch and push it back.
@@ -102,6 +123,7 @@ Rules:
 Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
 - Use git push --force-with-lease (NOT --force).
+{SESSION_ENDS_ON_TURN_END_RULE}
 - If conflicts are mechanical (non-overlapping struct fields, list entries, \
 imports, separate functions), resolve them additively — keep both sides.
 - If conflicts are SEMANTIC (same function modified two ways, contradictory \
@@ -155,7 +177,7 @@ SEMANTIC_STUCK_MARKER = "coord:conflict=semantic"
 # `has_prior_semantic_escalation` uses it to enforce exactly-one-retry.
 SEMANTIC_FIX_TITLE_PREFIX = "[semantic-merge]"
 
-SEMANTIC_CONFLICT_SYSTEM_PROMPT = """\
+SEMANTIC_CONFLICT_SYSTEM_PROMPT = f"""\
 You are a Claude Code merge worker. A first worker rebased a branch onto its \
 target branch, hit a conflict it judged SEMANTIC — the two sides changed the \
 same behaviour in incompatible ways — and stopped rather than guess. You are \
@@ -166,6 +188,7 @@ Constraints:
 - The coordinator denies `gh` and `git push --force` for this worker.
 - Stay on the worker's branch — never push to main / develop / the target \
 branch. Push with `git push --force-with-lease`.
+{SESSION_ENDS_ON_TURN_END_RULE}
 - The project's tests must pass before you push. A resolution that compiles \
 but breaks behaviour is worse than no resolution.
 - If you cannot honour both intents with confidence, stop and say so with a \
@@ -299,6 +322,7 @@ Rules:
 Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
 - Use git push --force-with-lease (NOT --force).
+{SESSION_ENDS_ON_TURN_END_RULE}
 - Rebase onto the target branch. If the ONLY conflict is inside a \
 `{SEALED_MANIFEST_FILENAME}` or a `manifest.d/<issue>.(yml|json)` fragment \
 under `tests/acceptance/`, resolve it ADDITIVELY: keep BOTH sides' issue \
@@ -568,7 +592,7 @@ STALE_REBASE_FIX_TITLE_PREFIX = "[stale-rebase-fix]"
 # races" situation either way.
 MAX_STALE_REBASE_RACE_ATTEMPTS = 5
 
-STALE_REBASE_FIX_SYSTEM_PROMPT = """\
+STALE_REBASE_FIX_SYSTEM_PROMPT = f"""\
 You are a Claude Code conflict-fix worker. This branch's CI ran against a \
 base that has since moved (a `checks_stale` merge-gate refusal) — there is \
 no known content conflict, only a stale base. Your job is a PURE rebase: \
@@ -580,10 +604,11 @@ Rules:
 Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
 - Use git push --force-with-lease (NOT --force).
+{SESSION_ENDS_ON_TURN_END_RULE}
 - BEFORE rebasing, check whether this branch's content is already fully \
 present on the target (the same change landed via another issue, maybe \
 with extra tests): compare `git merge-tree --write-tree origin/<target> \
-HEAD` against `git rev-parse origin/<target>^{tree}`. If they match, \
+HEAD` against `git rev-parse origin/<target>^{{tree}}`. If they match, \
 merging this branch would add nothing — there is no conflict AND nothing \
 to rebase. Stop immediately (do not rebase, do not push) and end your turn \
 with a STUCK: line starting with the marker `coord:conflict=already-upstream`.
@@ -803,7 +828,7 @@ REWORD_MISMATCH_MARKER = "coord:conflict=reword-mismatch"
 # narrow, message-only briefing rather than the ordinary conflict-fix one.
 REWORD_COMMIT_FIX_TITLE_PREFIX = "[reword-commit-fix]"
 
-REWORD_COMMIT_FIX_SYSTEM_PROMPT = """\
+REWORD_COMMIT_FIX_SYSTEM_PROMPT = f"""\
 You are a Claude Code conflict-fix worker. This branch's PR is marked \
 `ISSUE_RESOLUTION: partial` or `ISSUE_RESOLUTION: investigation` — it does \
 NOT fully resolve its issue — but one of its own commit messages still \
@@ -817,6 +842,7 @@ Rules:
 - The coordinator denies `gh` and `git push --force` for this worker. \
 Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
+{SESSION_ENDS_ON_TURN_END_RULE}
 - Use git push --force-with-lease (NOT --force).
 - Rewrite ONLY the commit subject/body wording that uses a closing keyword \
 for this entry's own issue number — e.g. `Fix #N: ...` / `Fixes #N ...` / \
@@ -1074,15 +1100,7 @@ def _decode_worker_text(raw: str) -> str:
     reasoning as the equivalent helpers in ``coord.review``/
     ``coord.plan_parser``.
     """
-    stream_json = False
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        stream_json = stripped.startswith("{")
-        break
-
-    if not stream_json:
+    if not _looks_like_stream_json(raw):
         return raw
 
     from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
@@ -1096,6 +1114,24 @@ def _decode_worker_text(raw: str) -> str:
         if text:
             decoded.append(text)
     return "\n".join(decoded)
+
+
+def _looks_like_stream_json(raw: str) -> bool:
+    """True when *raw* is the agent's default stream-json log format (each
+    non-comment, non-blank line a JSON event) rather than a plain-text log.
+
+    Shared sniff used by :func:`_decode_worker_text` (whole-transcript
+    decode, for marker search) and :func:`_latest_turn_text` (last-turn-
+    only decode, for #3870's final-message classification) — the two need
+    the same answer to "is this stream-json", so there is exactly one place
+    that answers it (#2096 "one question, one answer").
+    """
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return stripped.startswith("{")
+    return False
 
 
 def semantic_verdict_in_text(text: str | None) -> bool:
@@ -1237,6 +1273,197 @@ def detect_already_upstream(
             )
             resp.raise_for_status()
             return already_upstream_verdict_in_text(resp.text)
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return False
+
+    return False
+
+
+# ── #3870: premature session end (backgrounded gate, no push) ──────────────
+#
+# Every verdict detector above (`detect_semantic_conflict`,
+# `detect_stale_rebase_mismatch`, `detect_already_upstream`,
+# `detect_reword_mismatch`) recognises a worker that investigated and
+# DELIBERATELY stopped, via a fixed `STUCK:` marker — a sanctioned non-push
+# outcome. The quadraui#2034 leg this issue is built from was none of
+# those: a worker rebased cleanly, launched the test/gate run in the
+# background (the `Monitor` tool), and ended its turn with "Waiting for the
+# gate." — a status line, not a give-up, and not a push. In `-p` mode that
+# ended turn ends the whole session: nothing it backgrounded gets a chance
+# to finish, and the reaper SIGTERMs the still-running process group 30s
+# later with no push ever sent.
+#
+# `conflict_fix_session_ended_without_push` is the one place that answers
+# "did this leg's own final turn account for what actually happened" — it
+# takes the fact a caller must already know from the ONLY authoritative
+# source (whether the branch's head on origin actually moved — #2096
+# "unconfirmed success is a defect": a worker's own prose claiming success
+# is not evidence of it) alongside the worker's final turn text, and
+# resolves to a single True/False verdict. The caller that computes
+# `origin_head_changed` (comparing the branch's pre-dispatch and post-leg
+# SHAs on origin) is a sibling concern — see claude-coordinator#3870's
+# "Overlaps the head-moved check in the sibling issue" note — this module
+# only owns the prompt (above) and this classification.
+
+def final_turn_is_sanctioned_giveup(text: str | None) -> bool:
+    """True when *text* — the worker's OWN final assistant turn, e.g. from
+    :func:`coord.worker_events.latest_assistant_turn_text_from_text` — reads
+    as one of the sanctioned non-push outcomes: a `STUCK:` line.
+
+    Deliberately a single check rather than one branch per marker: every
+    `coord:conflict=...` marker this module defines (semantic, sealed-
+    scope, stale-rebase-mismatch, already-upstream, reword-mismatch) is
+    ALWAYS written on a `STUCK:` line per the system prompts above, so
+    checking for the marker family's own common prefix stays correct as
+    new marker kinds are added, instead of needing a matching new branch
+    here each time (#2096 "one question, one answer"). An empty or missing
+    final turn is NOT a sanctioned give-up — a worker that ended its
+    session without saying anything didn't give up properly either.
+    """
+    if not text:
+        return False
+    return "STUCK:" in text
+
+
+_PREMATURE_WAIT_MARKERS = (
+    "waiting for",
+    "wait for",
+    "will wait for",
+    "i'll wait for",
+    "we'll wait for",
+    "let's wait for",
+    "while the gate",
+    "while it finishes",
+    "while they finish",
+    "once the gate",
+    "running in the background",
+    "monitoring it in the background",
+)
+
+
+def looks_like_premature_wait(text: str | None) -> bool:
+    """Best-effort prose check: does *text* read like the quadraui#2034
+    shape — a worker that backgrounded a long-running step (a test run, a
+    multi-stage gate) and announced, as its OWN final turn, that it would
+    wait for that step to finish?
+
+    NOT authoritative and not used by
+    :func:`conflict_fix_session_ended_without_push` — a legitimate
+    `STUCK:` give-up could happen to use the word "waiting" too (e.g.
+    "waiting on a human call"), and this function has no way to tell that
+    apart from the failure shape. It exists only to produce a clearer
+    human-facing explanation of WHY a leg was classified as a premature
+    end, mirroring the best-effort precedent in
+    :func:`coord.worker_events.looks_like_policy_refusal`/
+    :func:`coord.worker_events.looks_like_premise_refusal`.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PREMATURE_WAIT_MARKERS)
+
+
+def conflict_fix_session_ended_without_push(
+    *, final_turn_text: str | None, origin_head_changed: bool
+) -> bool:
+    """#3870: True when a conflict-fix leg's session looks like it ended
+    before actually finishing its job — a push never happened and the
+    worker never gave up properly either.
+
+    *origin_head_changed* — whether the branch's head on origin differs
+    from before the leg ran — is the authoritative signal and is checked
+    FIRST: a push either happened or it didn't, and that is a fact about
+    origin's own ref, not about what the worker's final message claims
+    (#2096 "unconfirmed success is a defect"). If the head changed, the
+    push happened regardless of what the final turn says, so this returns
+    ``False`` without even looking at *final_turn_text*.
+
+    If the head did NOT change, the only acceptable final turn is a
+    sanctioned give-up (see :func:`final_turn_is_sanctioned_giveup`) — the
+    worker investigated, judged it couldn't safely proceed, and said so on
+    a `STUCK:` line. Anything else — a missing/empty final turn, a
+    confident-sounding summary that was never backed by a real push, or
+    (the quadraui#2034 case this issue is built from) a "Waiting for the
+    gate." status line after backgrounding the test run — means the
+    session ended on its own without either pushing or giving up properly.
+    The caller should treat that as a failure (STUCK-equivalent), never as
+    `done`.
+    """
+    if origin_head_changed:
+        return False
+    return not final_turn_is_sanctioned_giveup(final_turn_text)
+
+
+def _latest_turn_text(raw: str) -> str | None:
+    """Return the worker's most recent assistant turn's text out of *raw*.
+
+    Handles both the agent's default stream-json log format (delegates to
+    :func:`coord.worker_events.latest_assistant_turn_text_from_text`, which
+    knows the real turn boundaries) and a plain-text log (no turn
+    boundaries exist to find, so the whole decoded text stands in for "the
+    final turn" — the same fallback :func:`_decode_worker_text` uses for
+    marker search). Returns ``None`` when no assistant turn is found at
+    all (distinct from an empty string, which means a real turn produced
+    neither text nor a recognised tool call).
+    """
+    if not _looks_like_stream_json(raw):
+        return raw or None
+
+    from coord.worker_events import latest_assistant_turn_text_from_text  # noqa: PLC0415
+
+    return latest_assistant_turn_text_from_text(raw)
+
+
+def detect_premature_end_without_push(
+    *,
+    origin_head_changed: bool,
+    log_path: str | None = None,
+    host: str | None = None,
+    assignment_id: str | None = None,
+    port: int = AGENT_PORT,
+    timeout: float = 15.0,
+) -> bool:
+    """Log-fetching counterpart to
+    :func:`conflict_fix_session_ended_without_push` — tries the local log
+    file first (coordinator-local worker), then falls back to the agent's
+    ``/logs/<id>`` endpoint for remote workers, the same two-step every
+    other detector in this module uses. Best-effort: any read/transport
+    failure that leaves no transcript to examine returns ``False`` — the
+    same "cannot prove a premature end" default every other `detect_*`
+    helper here uses for its own verdict.
+
+    *origin_head_changed* is NOT fetched here — the caller already knows
+    it (or doesn't call this at all) from comparing the branch's SHA on
+    origin before dispatch and after the leg finished; see this section's
+    module comment for why that check lives outside this module.
+    """
+    if origin_head_changed:
+        return False
+
+    if log_path:
+        try:
+            from pathlib import Path  # noqa: PLC0415
+
+            p = Path(log_path)
+            if p.exists():
+                raw = p.read_text(encoding="utf-8", errors="replace")
+                return conflict_fix_session_ended_without_push(
+                    final_turn_text=_latest_turn_text(raw),
+                    origin_head_changed=False,
+                )
+        except OSError:
+            pass
+
+    if host and assignment_id:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{port}/logs/{assignment_id}", timeout=timeout
+            )
+            resp.raise_for_status()
+            return conflict_fix_session_ended_without_push(
+                final_turn_text=_latest_turn_text(resp.text),
+                origin_head_changed=False,
+            )
         except (httpx.HTTPError, httpx.TimeoutException):
             return False
 
