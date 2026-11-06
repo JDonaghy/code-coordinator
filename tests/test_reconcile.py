@@ -1566,13 +1566,34 @@ class TestReconcileConflictFixHeadUnmoved:
             error="Merge conflict in foo.py",
         )
 
-        fix = _try_ordinary_escalation_after_head_unmoved(
-            entry, board=None, config=None, machine_name=None,
-        )
+        # Spy on the dispatch the helper reaches for, delegating to the real
+        # one, so the assertion can be about WHICH board/config it handed
+        # over rather than about how many times the loaders fired. Call
+        # counts are not a usable signal here: `coord.audit` and
+        # `coord.state` each resolve `coord.config.load()` lazily on their
+        # own during a dispatch, so the patched loader legitimately sees
+        # several calls that have nothing to do with this helper.
+        import coord.conflict_fix as cfx
+
+        real_dispatch = cfx.dispatch_conflict_fix
+        handed_over: list[tuple[object, object]] = []
+
+        def _spy(entry_, board_, config_, **kwargs):  # type: ignore[no-untyped-def]
+            handed_over.append((board_, config_))
+            return real_dispatch(entry_, board_, config_, **kwargs)
+
+        with patch.object(cfx, "dispatch_conflict_fix", _spy):
+            fix = _try_ordinary_escalation_after_head_unmoved(
+                entry, board=None, config=None, machine_name=None,
+            )
 
         assert fix is not None
-        mock_read_board.assert_called_once()
-        mock_load_config.assert_called_once()
+        # Exactly one dispatch, and it carried the lazily-loaded board and
+        # config — not `None`, and not some other object the helper
+        # conjured up.
+        assert len(handed_over) == 1
+        assert handed_over[0][0] is mock_read_board.return_value
+        assert handed_over[0][1] is mock_load_config.return_value
 
 
 # ── #3462: an already-upstream verdict must not be read as a genuine ────────
