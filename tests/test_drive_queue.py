@@ -5781,14 +5781,15 @@ def test_a_staggered_after_prereq_resume_keeps_its_marker_for_the_next_tick():
     the `is_unsatisfiable_prereq_reason` marker that function needs to
     recognise it again.
 
-    Before this fix, staggering wrote the "resuming on a later tick" text
-    into `last_reason` unconditionally (via `_refresh_only`). That text does
-    not match `is_unsatisfiable_prereq_reason`, so the VERY NEXT tick could
-    never resume #1656 through `_reconcile_blocked_after` again — it fell to
-    `_reconcile_blocked`'s merge-gate probe, which has no branch/PR to read
-    for a never-dispatched entry and reports "could not be read" forever
-    (the quadraui#2035 incident). This pins both halves: the stagger write
-    is a true no-op, and a LATER tick with a free slot resumes for real."""
+    Writing the "resuming on a later tick" text into `last_reason` here
+    (what `_refresh_only` would do) destroys that marker: the text does not
+    match `is_unsatisfiable_prereq_reason`, so the VERY NEXT tick cannot
+    resume #1656 through `_reconcile_blocked_after` again and the row falls
+    to `_reconcile_blocked`'s merge-gate probe, which has no branch/PR to
+    read for a never-dispatched entry and reports "could not be read"
+    forever (the quadraui#2035 incident). This pins both halves: the
+    stagger write is a true no-op, and a LATER tick with a free slot
+    resumes for real."""
     import dataclasses
 
     dep_key = entry_key(REPO, 1650)

@@ -40,7 +40,11 @@ the same way, each wired below via :func:`_register_auto_action`:
   dispatched, so taking the row down and putting it straight back as
   `waiting` re-runs nothing that already ran — it is the mechanical
   equivalent of the operator `remove` + `add` this shape has otherwise
-  needed every time it has been hit.
+  needed every time it has been hit. Because that safety argument is only
+  as good as the "nothing was dispatched" reading behind it, and a stored
+  diagnosis can be arbitrarily old (`coord.board_doctor.StuckRow.fresh`),
+  :func:`_never_dispatched_still_true` re-confirms it from the board
+  immediately before the requeue fires.
 
 Every other mechanical cause stays off this allow-list until it has the
 same kind of reviewed, narrowly-scoped evidence behind it — a wrong
@@ -464,30 +468,92 @@ def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
     return True
 
 
+def _never_dispatched_still_true(repo_name: str, issue_number: int) -> bool:
+    """Does the board, read right now, still show ZERO assignments for
+    *repo_name*#*issue_number*?
+
+    `queue_diagnose.CAUSE_NEVER_DISPATCHED` is minted from exactly this
+    observation (`coord.queue_diagnose.LiveState.no_assignment_ever`, read
+    off `coord.gates.build_gate_report`'s own `rows`), but a
+    :class:`~coord.board_doctor.StuckRow` reaching an auto action does not
+    have to carry a verdict THIS sweep computed: `coord.board_doctor.
+    _episode_stuck_row` reconstructs a row from an episode's *stored*
+    diagnosis, which can be arbitrarily old (``fresh=False``). Between that
+    diagnosis and this call the row may well have been dispatched for real,
+    and ``drive_queue_requeue`` — a remove plus a re-add — would then orphan
+    a live branch/PR and re-dispatch Work on top of it.
+
+    So this re-asks the one question the action depends on, against the same
+    predicate `coord gates` uses (`coord.gates.assignments_for_issue`, via
+    `coord.state.build_board`) rather than a second scan that could drift
+    (#2096: one question, one answer). It answers only from a board read
+    that SUCCEEDED: a read that raises is reported and treated as "cannot
+    confirm", which refuses the requeue — never as "nothing is there".
+    """
+    import click  # noqa: PLC0415
+
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    try:
+        board = build_board()
+    except Exception as exc:  # noqa: BLE001 — a re-check, never a decision
+        click.echo(
+            f"warning: board-doctor could not read the board to confirm "
+            f"{repo_name}#{issue_number} was never dispatched: "
+            f"{type(exc).__name__}: {exc}",
+            err=True,
+        )
+        return False
+    return not assignments_for_issue(board, repo_name, issue_number)
+
+
 def _requeue_never_dispatched(row: StuckRow) -> bool:
     """#3874: reset-to-waiting for a row that was never dispatched at all.
 
     `queue_diagnose.CAUSE_NEVER_DISPATCHED` already fires straight off
-    `coord.drive_queue.is_unreachable_wait_shape(entry)` — no board-doctor
-    reclassification needed, same as :func:`_clear_merged_row` — so this
-    only has to put the row back. Reuses the SAME ``drive_queue_requeue``
-    primitive :func:`_requeue_ceiling_blocked_mergeable` dispatches (remove
-    then re-add, declaration preserved): safe here for the same reason
-    that action's own docstring gives — a row with nothing dispatched
-    behind it has no Work/Test/Review run to lose by being taken down and
-    put straight back as `waiting`.
+    `coord.drive_queue.is_unreachable_wait_shape(entry)` plus a confirmed
+    `LiveState.no_assignment_ever` — no board-doctor reclassification
+    needed, same as :func:`_clear_merged_row` — so this only has to put the
+    row back. Reuses the SAME ``drive_queue_requeue`` primitive
+    :func:`_requeue_ceiling_blocked_mergeable` dispatches (remove then
+    re-add, declaration preserved): safe here for the same reason that
+    action's own docstring gives — a row with nothing dispatched behind it
+    has no Work/Test/Review run to lose by being taken down and put
+    straight back as `waiting`.
+
+    That safety argument holds only while "nothing was dispatched" is still
+    true, and a stored diagnosis can be arbitrarily old, so
+    :func:`_never_dispatched_still_true` re-reads it from the board
+    immediately before dispatching. A row that now HAS an assignment (or
+    whose board read failed) is left for the alert tier rather than
+    requeued — `sweep_drive_queue_requeue` itself only refuses a mid-flight
+    #1757 deploy gate, not live work, so this is the only check standing
+    between a stale verdict and an orphaned PR.
 
     Returns ``True`` only when `sweep_drive_queue_requeue` confirms
-    ``requeued=True``. A row whose #1757 deploy gate is mid-flight
-    (`SweepPermissionError`), or one no longer present/parseable, reports
-    `"auto-dispatch-noop"` instead of a false success — same defensive
-    handling every other dispatch call in this module gets.
+    ``requeued=True``. A row that no longer reads as never-dispatched, one
+    whose #1757 deploy gate is mid-flight (`SweepPermissionError`), or one
+    no longer present/parseable, reports `"auto-dispatch-noop"` instead of
+    a false success — same defensive handling every other dispatch call in
+    this module gets.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
         return False
     repo_name, issue_number = parsed
     import click  # noqa: PLC0415
+
+    if not _never_dispatched_still_true(repo_name, issue_number):
+        click.echo(
+            f"warning: board-doctor NOT requeuing {repo_name}#{issue_number} "
+            "— the board now shows at least one assignment for it, so it is "
+            "no longer the never-dispatched row this cause was diagnosed "
+            "from; leaving it for the alert tier rather than removing a row "
+            "with live work behind it",
+            err=True,
+        )
+        return False
 
     try:
         result = dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
