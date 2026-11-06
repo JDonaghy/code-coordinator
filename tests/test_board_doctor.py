@@ -1058,7 +1058,10 @@ class TestNeverDispatchedRowReachesTheSweep:
 
         class _NoBranchProbe:
             def probe(self, entry_):
-                return LiveState(probe_errors=(f"gh: no branch known for {entry_.key}",))
+                return LiveState(
+                    probe_errors=(f"gh: no branch known for {entry_.key}",),
+                    no_assignment_ever=True,
+                )
 
         diagnoses = queue_diagnose.run_pass([entry], [episode], probe=_NoBranchProbe())
         rows = drive_queue_rows(diagnoses)

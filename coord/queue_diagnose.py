@@ -105,16 +105,25 @@ CAUSE_GATE_BLOCKED = "gate-blocked"
 CAUSE_NOTHING_BLOCKING = "nothing-blocking"
 CAUSE_CI_GREEN = "ci-green"
 CAUSE_AGENT_UNREACHABLE = "agent-unreachable"
-#: #3874: a `blocked`/`parked` row that has never been dispatched at all —
-#: no branch, no PR, no merge-queue row — and so has structurally nothing
-#: for a live probe to ever read, no matter how many times this diagnoses
-#: it.  See :func:`coord.drive_queue.is_unreachable_wait_shape`, the one
-#: predicate this reuses rather than re-deriving (#2096: one question, one
-#: answer) — the SAME shape `coord.drive_queue._reconcile_blocked_unreachable`
-#: resets to `waiting` from the tick's own reconcile loop, surfaced here so a
-#: row whose tick-side reset is itself bounded (`MAX_BLOCKED_RESUMES`, or an
-#: `after=` resume caught by the #3536 per-tick stagger before this issue's
-#: fix) does not also fall off `coord drive-queue sweep`'s own radar.
+#: A `blocked`/`parked` row that has never been dispatched at all — no
+#: branch, no PR, no merge-queue row — and so has structurally nothing for a
+#: live probe to ever read, no matter how many times this diagnoses it. See
+#: :func:`coord.drive_queue.is_unreachable_wait_shape`, the one predicate
+#: this reuses rather than re-deriving (#2096: one question, one answer) —
+#: the SAME shape `coord.drive_queue._reconcile_blocked_unreachable` resets
+#: to `waiting` from the tick's own reconcile loop, surfaced here so a row
+#: whose tick-side reset is itself bounded (`MAX_BLOCKED_RESUMES`) does not
+#: also fall off `coord drive-queue sweep`'s own radar.
+#:
+#: Two coverage gaps this does NOT close, by design rather than oversight:
+#: `is_unreachable_wait_shape` unconditionally excludes a row whose
+#: `last_reason` still names an unsatisfiable `after=` verdict — that shape
+#: is `_reconcile_blocked_after`'s alone to resolve (#2978), so if that
+#: function ever declines for an unrelated reason (a stale board cache, a
+#: missing `live_prereq_terminal`), the row is blocked with no surface here
+#: either. And an episode that already spent its `MAX_DIAGNOSES_PER_EPISODE`
+#: budget recorded as `unknown` stays `unknown` — `needs_diagnosis` refuses
+#: to re-probe it — so only new or unspent episodes reach this cause.
 CAUSE_NEVER_DISPATCHED = "never-dispatched"
 CAUSE_UNKNOWN = "unknown"
 
@@ -206,6 +215,15 @@ class LiveState:
     #: Probes that raised.  Non-empty means the picture is partial, and every
     #: verdict below high confidence is downgraded accordingly.
     probe_errors: tuple[str, ...] = ()
+    #: ``True`` only when ``coord gates``'s own board read
+    #: (:func:`coord.gates.build_gate_report`) completed WITHOUT raising and
+    #: came back having found zero assignments at all for this issue — a
+    #: positive, board-derived observation, not an absence of one.  ``None``
+    #: means that read did not happen or raised (so this says nothing);
+    #: ``False`` means it ran and found at least one assignment, even if
+    #: that assignment has no branch recorded yet (dispatched, just not
+    #: pushed). Only a confirmed ``True`` may ever upgrade a verdict.
+    no_assignment_ever: bool | None = None
 
     @property
     def read_anything(self) -> bool:
@@ -419,21 +437,21 @@ def _rule_conflict(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] |
     return None
 
 
-#: The exact substring `GhLiveProbe._github` appends to `probe_errors` when
-#: `coord gates`'s own board read (`coord.gates.build_gate_report`) found no
-#: branch to look a PR up for — the deterministic "there is no assignment,
-#: and therefore no branch, for this issue at all" signal, never emitted for
-#: an ordinary `gh`/network exception (those get their own, different
-#: `{type(exc).__name__}: {exc}` text). #3874's `diagnose` uses this, not a
-#: bare ``not live.read_anything``, to tell "never dispatched" apart from
-#: "the probe merely failed for an unrelated reason" — see its own call site.
-_NO_BRANCH_PROBE_MARKER = "no branch known for"
+def _probe_confirms_never_dispatched(live: LiveState) -> bool:
+    """Did the probe positively confirm, via a successful board read, that
+    this issue has no assignment at all — as opposed to a probe that merely
+    failed to find a branch for an unrelated reason (an exception, or an
+    assignment that exists but has no branch recorded yet)?
 
-
-def _probe_found_no_branch(live: LiveState) -> bool:
-    """Did the probe run and come back having found, structurally, no
-    branch at all for this entry — as opposed to erroring out on one?"""
-    return any(_NO_BRANCH_PROBE_MARKER in err for err in live.probe_errors)
+    Reads `live.no_assignment_ever` rather than scanning `probe_errors` for
+    text: `GhLiveProbe._gates` catches EVERY exception `build_gate_report`
+    raises and still appends a distinct `coord gates: ...` error, after
+    which `GhLiveProbe._github` — handed the now-empty branch — appends its
+    own `gh: no branch known for ...` line too. Both strings land in
+    `probe_errors` on a plain timeout/rate-limit, so a string match alone
+    cannot tell that apart from a genuine "never dispatched" reading.
+    """
+    return live.no_assignment_ever is True
 
 
 def _rule_dead_leg(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
@@ -596,15 +614,24 @@ def diagnose(
         # be reading its own assumptions back out; abstain instead.
         cause, confidence = CAUSE_UNKNOWN, CONFIDENCE_NONE
 
-    # #3874: an abstention (`read_anything` false, above) still has one more
-    # chance to be upgraded to a NAMED, high-confidence cause — never
-    # downgraded from one, and never bypassing the abstention check above,
-    # which is why this sits after it rather than as an ordinary `_RULES`
-    # entry.  `_probe_found_no_branch` is the one deterministic signal
-    # `GhLiveProbe._github` emits when `coord gates`' own board read found NO
-    # assignment at all for this issue — categorically different from an
-    # exception, a timeout, or any other reason the picture could be thin,
-    # which is why this never fires for e.g. a probe that merely raised.
+    # A cause still sitting at CAUSE_UNKNOWN here — whether from the
+    # abstention just above, or because no `_RULES` entry matched a readable
+    # picture — gets one more chance to be upgraded to a NAMED,
+    # high-confidence cause, never downgraded from one. Deliberately not
+    # narrowed to the abstention branch alone: "readable, but nothing in
+    # `_RULES` matched" is exactly what a never-dispatched row looks like —
+    # there is no PR state, no mergeable verdict and no checks for any rule
+    # to key off, yet `agent_reachable` can still be read (that probe does
+    # not depend on this issue having a branch at all), which would make
+    # `read_anything` true despite nothing being dispatched.
+    #
+    # `_probe_confirms_never_dispatched` is gated on `live.no_assignment_ever`
+    # — a POSITIVE board-derived observation (coord gates' own read ran
+    # without raising and found zero assignments), never an absence of one.
+    # It cannot fire on a `coord gates` exception, a timeout, or any other
+    # reason the picture could be thin, which is exactly what tells this
+    # apart from a probe that merely failed.
+    #
     # Paired with `is_unreachable_wait_shape` (the SAME predicate
     # `coord.drive_queue._reconcile_blocked_unreachable` already trusts for
     # "nothing here will ever answer a live probe" — #2096, one question,
@@ -614,7 +641,11 @@ def diagnose(
     # already excluded there — a permanent block, or `_resolve_prereqs`'s
     # own unsatisfiable `after=` verdict, which `_reconcile_blocked_after`
     # alone resolves — is excluded here too.
-    if cause == CAUSE_UNKNOWN and is_unreachable_wait_shape(entry) and _probe_found_no_branch(live):
+    if (
+        cause == CAUSE_UNKNOWN
+        and is_unreachable_wait_shape(entry)
+        and _probe_confirms_never_dispatched(live)
+    ):
         cause, confidence = CAUSE_NEVER_DISPATCHED, CONFIDENCE_HIGH
 
     family = stated_family(entry.last_reason)
@@ -713,7 +744,9 @@ class GhLiveProbe:
 
     def probe(self, entry: QueueEntry) -> LiveState:
         errors: list[str] = []
-        branch, gate_ready, gate_blockers = self._gates(entry, errors)
+        branch, gate_ready, gate_blockers, no_assignment_ever = self._gates(
+            entry, errors
+        )
         pr_number, pr_state, mergeable, checks = self._github(entry, branch, errors)
         reachable, has_session, crits = self._health(entry)
         return LiveState(
@@ -727,14 +760,15 @@ class GhLiveProbe:
             agent_has_session=has_session,
             machine_crits=tuple(crits),
             probe_errors=tuple(errors),
+            no_assignment_ever=no_assignment_ever,
         )
 
     # -- `coord gates`, verbatim ------------------------------------------
     def _gates(
         self, entry: QueueEntry, errors: list[str]
-    ) -> tuple[str, bool | None, list[str]]:
+    ) -> tuple[str, bool | None, list[str], bool | None]:
         if self.board is None or self.config is None:
-            return "", None, []
+            return "", None, [], None
         try:
             from coord import github_ops  # noqa: PLC0415
             from coord.gates import build_gate_report  # noqa: PLC0415
@@ -744,14 +778,24 @@ class GhLiveProbe:
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"coord gates: {type(exc).__name__}: {exc}")
-            return "", None, []
+            return "", None, [], None
+        # `build_gate_report` returns early, with `report.rows` empty, ONLY
+        # when `assignments_for_issue` found nothing on the board for this
+        # issue at all (coord/gates.py) — never for an assignment that
+        # exists but merely lacks a branch yet (that leaves `rows`
+        # populated and `report.branch` empty instead). This is why
+        # `no_assignment_ever` is read off `report.rows`, not off
+        # `report.branch` or an error string: it is true only on the one
+        # code path that is a genuine, successful "nothing was ever
+        # dispatched" reading.
+        no_assignment_ever = not report.rows
         decisions = [d for d in report.decisions if getattr(d, "required", False)]
         if not decisions:
-            return str(report.branch or ""), None, []
+            return str(report.branch or ""), None, [], no_assignment_ever
         blockers = [
             f"{d.gate}: {d.reason or 'refused'}" for d in decisions if not d.ok
         ]
-        return str(report.branch or ""), not blockers, blockers
+        return str(report.branch or ""), not blockers, blockers, no_assignment_ever
 
     # -- `gh pr view` / `gh pr checks` ------------------------------------
     def _github(
