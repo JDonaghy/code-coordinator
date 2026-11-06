@@ -282,6 +282,19 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # save_board, wrapped in the same fail-soft `except Exception` that
         # degrades to the pre-#3695 "stay blocked" behaviour.
         ("_fetch_live_test_routing_clear", "load_board"),
+        # #3881-guarded: `drive_queue_doctor_act` is the investigator's single
+        # audited action wrapper, and carries the same guard in the same place
+        # as `drive_queue_diagnose` above — an explicit
+        # `if is_remote(): raise click.ClickException(...)` early-exit sits
+        # ABOVE the `from coord.state import build_board` import, so a
+        # board_service-configured thin client fails loud before the local read
+        # is even imported, let alone called. Everything the handlers mutate
+        # (drive queue, board, merge queue, Phase-0 block log) lives on the
+        # daemon host, so acting anywhere else would act on an empty copy.
+        # Read-only with respect to the board here: build_board only, no
+        # save_board — each handler's own write goes through the routed
+        # board-mutation helpers it already uses.
+        ("drive_queue_doctor_act", "build_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
