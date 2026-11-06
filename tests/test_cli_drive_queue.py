@@ -7993,9 +7993,18 @@ class _Gate:
 
 
 class _GateReport:
-    def __init__(self, branch: str, decisions: list) -> None:
+    """Mirrors the fields of `coord.gates.GateReport` the diagnostician reads.
+
+    `rows` is the per-assignment list: empty ONLY when the board held no
+    assignment at all for the issue, which is the positive "never dispatched"
+    reading `coord.queue_diagnose.LiveState.no_assignment_ever` is derived
+    from. A world with a branch has been dispatched, so it carries a row.
+    """
+
+    def __init__(self, branch: str, decisions: list, rows: list | None = None) -> None:
         self.branch = branch
         self.decisions = decisions
+        self.rows = [] if rows is None else list(rows)
 
 
 @pytest.fixture
@@ -8009,6 +8018,9 @@ def gh_world(monkeypatch):
         "checks": [_Check("test", "success")],
         "gates": [_Gate("merge", True)],
         "branch": "issue-1762",
+        # One dispatched work assignment, matching `branch` above. Set to []
+        # to model an issue the board has never dispatched anything for.
+        "rows": [object()],
         "calls": [],
     }
 
@@ -8035,18 +8047,18 @@ def gh_world(monkeypatch):
         "coord.gates.build_gate_report",
         lambda *a, **k: (
             _record("coord gates"),
-            _GateReport(world["branch"], world["gates"]),
+            _GateReport(world["branch"], world["gates"], world["rows"]),
         )[1],
     )
     return world
 
 
-def _stall(issue: int, reason: str, block_log_path: Path) -> None:
+def _stall(issue: int, reason: str, block_log_path: Path, attempts: int = 2) -> None:
     """Put a real row in `blocked` and open its Phase-0 episode."""
     from coord import block_log as bl
 
     state._update_drive_queue_entry_local(
-        REPO, issue, state="blocked", attempts=2, last_reason=reason
+        REPO, issue, state="blocked", attempts=attempts, last_reason=reason
     )
     bl.record(
         [
@@ -8213,6 +8225,62 @@ def test_diagnose_spends_its_budget_once_and_then_declines(
         r for r in block_log_records(block_log) if r.get("event") == "diagnosis"
     ]
     assert len(diagnoses) == 1
+
+
+_UNREADABLE_GATE_REASON = (
+    f"{REPO}#1762's merge gate could not be read this tick (no merge-queue "
+    "row for this entry, even after the self-heal enqueue attempt) — this is "
+    "NOT a confirmed-still-shut gate"
+)
+
+
+def test_diagnose_names_a_never_dispatched_row_through_the_cli(
+    cli, seed, block_log, gh_world
+):
+    """#3874 end to end: a row that was never dispatched at all — `coord
+    gates`' own board read completes and finds zero assignments, so there is
+    no branch, no PR and no merge-queue row for any probe to ever read — is
+    named rather than abstained on, so `coord drive-queue sweep` can act on
+    it instead of burning the episode's diagnosis budget on `unknown`.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, _UNREADABLE_GATE_REASON, block_log, attempts=0)
+    gh_world["rows"] = []  # the board holds no assignment for this issue
+    gh_world["branch"] = ""
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "cause:  never-dispatched (confidence high)" in result.output
+    assert "1 diagnosed" in result.output
+
+    episode = json.loads(cli("block-log", "--json").output)["episodes"][0]
+    assert episode["diagnosed_cause"] == "never-dispatched"
+
+
+def test_diagnose_will_not_call_a_rate_limited_gate_probe_never_dispatched(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """The failing half of the same gate, which is what makes it a gate: the
+    row's shape is identical to the test above, but `coord gates`' board read
+    raises (the rate-limit/network flake `coord.github_throttle` exists for).
+    The probe then knows nothing about whether anything was dispatched, so the
+    verdict must stay `unknown` — never-dispatched is minted off a positive
+    board reading, not off the absence of one.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, _UNREADABLE_GATE_REASON, block_log, attempts=0)
+
+    def boom(*a, **k):
+        raise TimeoutError("30s")
+
+    monkeypatch.setattr("coord.gates.build_gate_report", boom)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "cause:  unknown (confidence none)" in result.output
+    assert "never-dispatched" not in result.output
 
 
 def test_diagnose_on_a_quiet_queue_says_so_rather_than_printing_nothing(
