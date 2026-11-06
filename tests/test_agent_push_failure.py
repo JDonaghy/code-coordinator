@@ -14,6 +14,14 @@ These tests pin down that a reap-time push failure is its own outcome:
 FAILED, with `push_failure_reason` carrying the raw git error, distinct
 from the unrelated `zero_commit_reason` ADVISORY path (#448) covered by
 test_agent_zero_commit.py.
+
+#3869 extends the same signal to a rebase: a `conflict-fix` leg rewrites
+the branch's history, so the reap-time safety-net push can no longer be a
+plain `git push` (GitHub always rejects that as non-fast-forward once
+history has actually been rewritten). `TestHistoryRewriteLegSafetyNetPush`
+below covers the `--force-with-lease` push this file's `_HISTORY_REWRITE_
+TYPES` leg now uses instead, and the promotion of a non-fast-forward/
+stale-lease rejection to the same FAILED outcome as an auth break.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _is_auth_push_failure,
+    _is_non_fast_forward_push_failure,
     _remote_already_has_head,
 )
 
@@ -134,6 +143,43 @@ class TestIsAuthPushFailure:
     )
     def test_does_not_match_unrelated_push_failures(self, message: str) -> None:
         assert _is_auth_push_failure(message) is False
+
+
+class TestIsNonFastForwardPushFailure:
+    """Direct unit tests for `_is_non_fast_forward_push_failure` (#3869) —
+    mirrors `TestIsAuthPushFailure`'s role for its sibling marker-matcher.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "! [rejected]        HEAD -> feature (non-fast-forward)\n"
+            "error: failed to push some refs to 'origin'",
+            "! [rejected]        HEAD -> feature (stale info)\n"
+            "error: failed to push some refs to 'origin'",
+            "! [rejected]        HEAD -> feature (fetch first)\n"
+            "error: failed to push some refs to 'origin'",
+        ],
+    )
+    def test_matches_known_non_fast_forward_shapes(self, message: str) -> None:
+        assert _is_non_fast_forward_push_failure(message) is True
+
+    def test_matches_case_insensitively(self) -> None:
+        assert _is_non_fast_forward_push_failure(
+            "! [REJECTED] HEAD -> feature (STALE INFO)"
+        ) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "fatal: 'origin' does not appear to be a git repository",
+            "remote: Invalid username or token.",
+            "ssh: connect to host github.com port 22: Connection timed out",
+            "",
+        ],
+    )
+    def test_does_not_match_unrelated_push_failures(self, message: str) -> None:
+        assert _is_non_fast_forward_push_failure(message) is False
 
 
 def _init_repo(d: Path) -> None:
@@ -460,3 +506,192 @@ def test_successful_push_leaves_push_failure_reason_none(
     assert final.status == DONE
     assert final.push_failure_reason is None
     server.shutdown()
+
+
+@pytest.fixture
+def repo_with_existing_branch(tmp_path: Path) -> tuple[Path, Path]:
+    """A clone with `origin` configured and a `feature` branch already
+    pushed there — the shape `conflict-fix` operates on (rebasing an
+    EXISTING PR branch), unlike every fixture above, where the worker
+    branches fresh off `origin/main` inside `_setup_worktree`."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "main")
+
+    clone = tmp_path / "clone"
+    _init_repo(clone)
+    _git(clone, "remote", "add", "origin", str(origin))
+    _commit_file(clone, "README", "init\n", "initial")
+    _git(clone, "push", "-u", "origin", "main")
+
+    _git(clone, "checkout", "-b", "feature")
+    _commit_file(clone, "feature.txt", "feat\n", "feat1")
+    _git(clone, "push", "-u", "origin", "feature")
+    _git(clone, "checkout", "main")
+
+    return clone, origin
+
+
+class TestHistoryRewriteLegSafetyNetPush:
+    """#3869: `conflict-fix` (the one `_HISTORY_REWRITE_TYPES` member
+    today) rewrites the history already on its branch — a plain `git push`
+    is then always rejected non-fast-forward, because origin still has the
+    PRE-rebase history. These pin down that the reap-time safety net
+    leases against the SHA origin had when the leg started instead, and
+    that a genuine conflicting push during the leg is promoted to FAILED
+    rather than silently recorded as success.
+    """
+
+    def test_worker_rewrites_history_without_pushing_safety_net_lands_it(
+        self, tmp_path: Path, repo_with_existing_branch: tuple[Path, Path]
+    ) -> None:
+        """The exact #3869 evidence shape: the worker rebases the branch
+        (here simulated with an amend, which equally invalidates the old
+        SHA) and reports success without pushing itself. The reap-time
+        safety net must still land it on origin — a plain push would be
+        rejected non-fast-forward the instant it tries."""
+        clone, origin = repo_with_existing_branch
+        worker_sh = (
+            "git config user.email w@w.com && "
+            "git config user.name Worker && "
+            "git commit --amend --allow-empty -m 'rebased onto main'"
+        )
+        server = AgentServer(
+            machine_name="t",
+            repos=["api"],
+            repo_paths={"api": str(clone)},
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        )
+        spec = AssignmentSpec(
+            repo_name="api",
+            repo_path=str(clone),
+            issue_number=10,
+            issue_title="conflict fix",
+            briefing="b",
+            branch="main",
+            target_branch="feature",
+            type="conflict-fix",
+        )
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=15)
+
+        assert final.status == DONE, (
+            "expected DONE once the safety-net push lands the rebase, got "
+            f"{final.status!r} ({final.push_failure_reason})"
+        )
+        assert final.push_failure_reason is None
+
+        _git(clone, "fetch", "origin", "feature")
+        subject = _git(clone, "log", "-1", "--format=%s", "FETCH_HEAD")
+        assert subject == "rebased onto main", (
+            "origin/feature must have moved to the worker's rebased commit "
+            "via the reap's own lease-protected push"
+        )
+        server.shutdown()
+
+    def test_concurrent_push_during_leg_is_failed_not_silent_success(
+        self, tmp_path: Path, repo_with_existing_branch: tuple[Path, Path]
+    ) -> None:
+        """A genuinely concurrent push to the same branch between
+        `_setup_worktree` capturing the lease SHA and the reap's own push
+        must still be refused — `--force-with-lease` exists precisely for
+        this — and that refusal must be recorded as FAILED with
+        `push_failure_reason`, never as a silent DONE."""
+        clone, origin = repo_with_existing_branch
+        concurrent_clone = tmp_path / "concurrent"
+        worker_sh = (
+            "git config user.email w@w.com && "
+            "git config user.name Worker && "
+            "git commit --amend --allow-empty -m 'rebased onto main' && "
+            f"git clone --branch feature {origin} {concurrent_clone} && "
+            f"cd {concurrent_clone} && "
+            "git config user.email c@c.com && "
+            "git config user.name Concurrent && "
+            "echo z > conflict.txt && "
+            "git add conflict.txt && "
+            "git commit -m 'concurrent unrelated change' && "
+            "git push origin feature"
+        )
+        server = AgentServer(
+            machine_name="t",
+            repos=["api"],
+            repo_paths={"api": str(clone)},
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        )
+        spec = AssignmentSpec(
+            repo_name="api",
+            repo_path=str(clone),
+            issue_number=11,
+            issue_title="conflict fix racing a concurrent push",
+            briefing="b",
+            branch="main",
+            target_branch="feature",
+            type="conflict-fix",
+        )
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=15)
+
+        assert final.status == FAILED, (
+            "a lease mismatch from a genuinely concurrent push must not be "
+            f"recorded as success, got {final.status!r}"
+        )
+        assert final.push_failure_reason is not None
+        assert _is_non_fast_forward_push_failure(final.push_failure_reason)
+
+        _git(clone, "fetch", "origin", "feature")
+        subject = _git(clone, "log", "-1", "--format=%s", "FETCH_HEAD")
+        assert subject == "concurrent unrelated change", (
+            "the concurrent push must win — the reap's own push must have "
+            "been refused, not silently overwritten it"
+        )
+        server.shutdown()
+
+    def test_non_history_rewrite_leg_keeps_old_non_fatal_behaviour(
+        self, tmp_path: Path, repo_with_existing_branch: tuple[Path, Path]
+    ) -> None:
+        """Regression guard: a leg type NOT in `_HISTORY_REWRITE_TYPES`
+        (the default `type="work"`) must behave exactly as before #3869 —
+        a non-fast-forward rejection on the plain safety-net push stays
+        logged and non-fatal, never promoted to FAILED. Only `conflict-fix`
+        (and any future history-rewrite type) gets the new lease/promotion
+        behaviour."""
+        clone, origin = repo_with_existing_branch
+        worker_sh = (
+            "git config user.email w@w.com && "
+            "git config user.name Worker && "
+            "git commit --amend --allow-empty -m 'amended, never pushed'"
+        )
+        server = AgentServer(
+            machine_name="t",
+            repos=["api"],
+            repo_paths={"api": str(clone)},
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+        )
+        spec = AssignmentSpec(
+            repo_name="api",
+            repo_path=str(clone),
+            issue_number=12,
+            issue_title="ordinary continuation work",
+            briefing="b",
+            branch="main",
+            target_branch="feature",
+        )
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=15)
+
+        assert final.status == DONE, (
+            "a non-history-rewrite leg's plain-push non-fast-forward "
+            f"rejection must stay non-fatal, got {final.status!r}"
+        )
+        assert final.push_failure_reason is None
+
+        _git(clone, "fetch", "origin", "feature")
+        subject = _git(clone, "log", "-1", "--format=%s", "FETCH_HEAD")
+        assert subject == "feat1", (
+            "the plain push must have failed as before — origin/feature "
+            "unchanged"
+        )
+        server.shutdown()
