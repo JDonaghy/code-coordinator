@@ -911,7 +911,10 @@ def test_a_never_dispatched_row_is_named_instead_of_abstained():
             "enqueue attempt) — this is NOT a confirmed-still-shut gate",
             attempts=0,
         ),
-        qd.LiveState(probe_errors=(f"gh: no branch known for {REPO}#11",)),
+        qd.LiveState(
+            probe_errors=(f"gh: no branch known for {REPO}#11",),
+            no_assignment_ever=True,
+        ),
     )
     assert got.cause == qd.CAUSE_NEVER_DISPATCHED
     assert got.confidence == qd.CONFIDENCE_HIGH
@@ -922,7 +925,7 @@ def test_a_probe_that_merely_fails_is_still_an_abstention_not_never_dispatched()
     """The same empty `LiveState` shape as the `Exploding`-probe test above,
     but checked directly against `diagnose`: a generic probe failure must
     never be promoted to `CAUSE_NEVER_DISPATCHED` just because
-    `attempts == 0` — only the specific "no branch known" signal may."""
+    `attempts == 0` — only a confirmed `no_assignment_ever=True` may."""
     got = qd.diagnose(
         stalled(12, "blocked: whatever", attempts=0),
         qd.LiveState(probe_errors=("gh pr view: RuntimeError: gh: not found",)),
@@ -944,6 +947,89 @@ def test_a_dispatched_entry_with_no_attempts_is_never_misclassified_never_dispat
         qd.LiveState(probe_errors=("coord gates: TimeoutError: 30s",)),
     )
     assert got.cause == qd.CAUSE_UNKNOWN
+
+
+def test_a_gh_rate_limit_during_the_gates_probe_never_reads_as_never_dispatched(
+    monkeypatch,
+):
+    """The exact ambiguity the #3874 review caught: `GhLiveProbe._gates`
+    catches EVERY exception `build_gate_report` raises — including an
+    ordinary `gh`/network flake, the failure mode `coord.github_throttle`
+    exists for — appends `coord gates: <Type>: <exc>` to `probe_errors`,
+    and returns an empty branch. `GhLiveProbe._github` then gets handed that
+    empty branch and appends ITS OWN `gh: no branch known for ...` line too.
+
+    Both strings land in `probe_errors` together on a plain timeout, which
+    is why the real "never dispatched" signal is `LiveState.no_assignment_ever`
+    (set only by a `_gates` call that did NOT raise) and never a substring
+    match against `probe_errors` — this drives the actual
+    `GhLiveProbe._gates`/`_github` code, not a hand-built `LiveState`, so a
+    future change that goes back to string-sniffing fails here.
+    """
+
+    def boom(*a, **k):
+        raise TimeoutError("30s")
+
+    monkeypatch.setattr("coord.gates.build_gate_report", boom)
+
+    class _RepoCfg:
+        github = "acme/widgets"
+
+    class _Config:
+        def repo(self, name):
+            return _RepoCfg()
+
+    probe = qd.GhLiveProbe(board=object(), config=_Config())
+    e = stalled(14, "blocked: whatever", attempts=0)
+    errors: list[str] = []
+    branch, gate_ready, blockers, no_assignment_ever = probe._gates(e, errors)  # noqa: SLF001
+    assert branch == ""
+    assert no_assignment_ever is None
+    assert any(err.startswith("coord gates: TimeoutError") for err in errors)
+
+    state = probe.probe(e)
+    assert any("coord gates: TimeoutError" in err for err in state.probe_errors)
+    assert any("no branch known for" in err for err in state.probe_errors)
+    assert state.no_assignment_ever is None
+
+    got = qd.diagnose(e, state)
+    assert got.cause == qd.CAUSE_UNKNOWN
+
+
+def test_a_clean_board_read_with_zero_assignments_sets_no_assignment_ever(
+    monkeypatch,
+):
+    """The other half: `build_gate_report` returning normally (no
+    exception) having found zero assignments for the issue — the ONE real
+    code path `coord.gates.build_gate_report` takes that is a positive
+    "never dispatched" reading — is read straight into
+    `LiveState.no_assignment_ever`, and that alone (paired with
+    `is_unreachable_wait_shape`) is enough for `diagnose` to name
+    `CAUSE_NEVER_DISPATCHED`."""
+    from coord.gates import GateReport
+
+    def no_rows(board, config, repo, issue, *, gh_ops=None):
+        report = GateReport(repo_name=repo, issue_number=issue)
+        report.notes.append(f"no assignments found on the board for {repo}#{issue}")
+        return report
+
+    monkeypatch.setattr("coord.gates.build_gate_report", no_rows)
+
+    probe = qd.GhLiveProbe(board=object(), config=object())
+    e = stalled(
+        15,
+        f"{REPO}#15's merge gate could not be read this tick (no "
+        "merge-queue row for this entry, even after the self-heal "
+        "enqueue attempt)",
+        attempts=0,
+    )
+    state = probe.probe(e)
+    assert state.no_assignment_ever is True
+    assert not any("coord gates:" in err for err in state.probe_errors)
+
+    got = qd.diagnose(e, state)
+    assert got.cause == qd.CAUSE_NEVER_DISPATCHED
+    assert got.confidence == qd.CONFIDENCE_HIGH
 
 
 def test_a_partial_picture_downgrades_a_medium_verdict_but_not_a_high_one():

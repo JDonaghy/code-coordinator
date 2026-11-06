@@ -5789,6 +5789,8 @@ def test_a_staggered_after_prereq_resume_keeps_its_marker_for_the_next_tick():
     for a never-dispatched entry and reports "could not be read" forever
     (the quadraui#2035 incident). This pins both halves: the stagger write
     is a true no-op, and a LATER tick with a free slot resumes for real."""
+    import dataclasses
+
     dep_key = entry_key(REPO, 1650)
     entries = [entry(1650, position=0, state=STATE_DONE)] + [
         entry(
@@ -5811,16 +5813,14 @@ def test_a_staggered_after_prereq_resume_keeps_its_marker_for_the_next_tick():
     assert staggered_reconcile.updates == {}
 
     # Tick 2: capacity frees up (the other two rows are no longer `blocked`)
-    # and #1656's `last_reason` is STILL the original marker — untouched by
-    # tick 1 — so `_reconcile_blocked_after` recognises it and resumes it.
-    still_blocked = entry(
-        1656,
-        position=3,
-        after=(dep_key,),
-        state=STATE_BLOCKED,
-        attempts=2,
-        resumes=0,
-        last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+    # and #1656's `last_reason` is STILL the original marker. Threaded
+    # through `dataclasses.replace` with tick 1's own (empty) `updates`
+    # rather than hand-built fresh — a genuine round trip, so a future
+    # change that goes back to writing the stagger note into `last_reason`
+    # fails here instead of only in the `updates == {}` assertion above.
+    original_1656 = next(e for e in entries if e.issue == 1656)
+    still_blocked = dataclasses.replace(
+        original_1656, position=3, **staggered_reconcile.updates
     )
     tick2 = plan_tick(
         [entry(1650, position=0, state=STATE_DONE), still_blocked],
