@@ -56,9 +56,13 @@ class _Gate:
 
 
 class _GateReport:
-    def __init__(self, branch, decisions):
+    """Mirrors the `coord.gates.GateReport` fields the diagnostician reads;
+    `rows` is empty only for an issue with no assignment on the board at all."""
+
+    def __init__(self, branch, decisions, rows=None):
         self.branch = branch
         self.decisions = decisions
+        self.rows = [] if rows is None else list(rows)
 
 
 def _config_yaml(*, fleet_investigate: bool | None, repo_investigate: bool, max_parallel: int) -> str:
@@ -175,6 +179,7 @@ def gh_world(monkeypatch):
         "checks": [_Check("test", "success")],
         "gates": [_Gate("merge", True)],
         "branch": "issue-branch",
+        "rows": [object()],
     }
     monkeypatch.setattr(
         "coord.github_ops.get_pr_state_for_branch", lambda repo, branch: world["pr_state"],
@@ -190,7 +195,7 @@ def gh_world(monkeypatch):
     )
     monkeypatch.setattr(
         "coord.gates.build_gate_report",
-        lambda *a, **k: _GateReport(world["branch"], world["gates"]),
+        lambda *a, **k: _GateReport(world["branch"], world["gates"], world["rows"]),
     )
     return world
 
