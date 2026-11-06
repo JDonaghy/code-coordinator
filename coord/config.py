@@ -4054,6 +4054,13 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 f"repos[{repo_index}].board_doctor.followthrough must be a boolean"
             )
         cfg.followthrough = followthrough
+    if "followthrough_auto_queue" in raw:
+        auto_queue = raw["followthrough_auto_queue"]
+        if not isinstance(auto_queue, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.followthrough_auto_queue must be a boolean"
+            )
+        cfg.followthrough_auto_queue = auto_queue
     return cfg
 
 

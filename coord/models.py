@@ -102,12 +102,18 @@ class BoardDoctorRepoConfig:
     function that reads this alongside the fleet-wide kill switch
     (`Config.board_doctor.followthrough`) and its
     `COORD_BOARD_DOCTOR_NO_FOLLOWTHROUGH` env-var override.
+
+    ``followthrough_auto_queue`` additionally drive-queues each follow-up the
+    disposition files, pinned to a machine that declares the follow-up's
+    capability. `False` (the default) files follow-ups but never queues
+    them. It has no effect unless ``followthrough`` is also enabled.
     """
 
     investigate: bool = False
     finish: bool = False
     stale_race: bool = False
     followthrough: bool = False
+    followthrough_auto_queue: bool = False
 
 
 @dataclass

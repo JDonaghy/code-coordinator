@@ -154,6 +154,11 @@ class Disposition:
     follow_ups: list[int] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     rendered_plan: str = ""
+    #: Plan key → filed issue number, for every follow-up created so far.
+    follow_up_keys: dict[str, int] = field(default_factory=dict)
+    #: Filed issue number → pinned machine ("" = left to `coord drive`) for
+    #: every follow-up the auto-queue step enqueued.
+    queued: dict[int, str] = field(default_factory=dict)
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -164,6 +169,7 @@ class Disposition:
             "dry_run": self.dry_run,
             "plan_leg_assignment_id": self.plan_leg_assignment_id,
             "follow_ups": list(self.follow_ups),
+            "queued": {str(k): v for k, v in self.queued.items()},
             "reasons": list(self.reasons),
         }
 
@@ -203,6 +209,18 @@ def followthrough_enabled(repo_name: str, config: Any) -> bool:
         return False
     repo = config.repo(repo_name)
     return bool(repo is not None and repo.board_doctor.followthrough)
+
+
+def followthrough_auto_queue_enabled(repo_name: str, config: Any) -> bool:
+    """Whether filed follow-ups for *repo_name* are also drive-queued.
+
+    Requires :func:`followthrough_enabled` plus the per-repo
+    ``repos[].board_doctor.followthrough_auto_queue`` opt-in (default off).
+    """
+    if not followthrough_enabled(repo_name, config):
+        return False
+    repo = config.repo(repo_name)
+    return bool(getattr(repo.board_doctor, "followthrough_auto_queue", False))
 
 
 def is_followthrough_product(body: str | None) -> bool:
@@ -462,6 +480,155 @@ def _close_comment(plan: FollowThroughPlan, successors: Sequence[tuple[int, str]
     return "\n".join(lines)
 
 
+# ── Auto-queue ───────────────────────────────────────────────────────────────
+
+#: Short capability spellings a plan leg may use for the configured names.
+_CAPABILITY_ALIASES = {"win": "windows", "mac": "macos"}
+
+
+def normalize_capability(raw: str) -> str:
+    """``"[win]"`` / ``"Win"`` → ``"windows"``; unknown names pass through."""
+    name = raw.strip().strip("[]").strip().lower()
+    return _CAPABILITY_ALIASES.get(name, name)
+
+
+def capable_machines(
+    capability: str, repo_name: str, machines: Sequence[Any],
+) -> list[str]:
+    """Machines that declare *capability* and have *repo_name* checked out.
+
+    Same candidate filter as :func:`coord.dispatch.route_work_by_capability`
+    (``can_work_on`` plus a configured ``repo_path``), in ``coordinator.yml``
+    declaration order. Pause/quiet-hours state is not consulted: a queue pin
+    outlives a pause, and the tick already waits for a paused pinned machine.
+    """
+    return [
+        m.name for m in machines
+        if capability in m.capabilities
+        and m.can_work_on(repo_name)
+        and m.repo_path(repo_name) is not None
+    ]
+
+
+def _default_enqueue(repo_name: str, issue_number: int, **kwargs: Any) -> Any:
+    from coord.state import enqueue_drive_queue  # noqa: PLC0415
+
+    return enqueue_drive_queue(repo_name, issue_number, **kwargs)
+
+
+@dataclass
+class AutoQueueContext:
+    """What the auto-queue step needs beyond the plan.
+
+    *entries* is the drive queue as it stands (``QueueEntry`` rows);
+    *draining_epic* is the epic whose rows the queue is currently working
+    through, or ``None``. *enqueue* has the signature of
+    :func:`coord.state.enqueue_drive_queue`.
+    """
+
+    machines: Sequence[Any]
+    entries: Sequence[Any] = ()
+    draining_epic: int | None = None
+    enqueue: Callable[..., Any] = _default_enqueue
+
+
+def build_auto_queue_context(
+    repo_name: str,
+    config: Any,
+    *,
+    entries: Sequence[Any] = (),
+    draining_epic: int | None = None,
+    enqueue: Callable[..., Any] = _default_enqueue,
+) -> AutoQueueContext | None:
+    """An :class:`AutoQueueContext`, or ``None`` when *repo_name* has not
+    opted in — ``None`` makes :func:`run_followthrough` file but never queue."""
+    if not followthrough_auto_queue_enabled(repo_name, config):
+        return None
+    return AutoQueueContext(
+        machines=list(config.machines), entries=entries,
+        draining_epic=draining_epic, enqueue=enqueue,
+    )
+
+
+def _queue_position(partial: PartialMerge, ctx: AutoQueueContext) -> int | None:
+    """The original row's slot when its epic is draining, else ``None`` (tail)."""
+    if partial.epic_number is None or partial.epic_number != ctx.draining_epic:
+        return None
+    for entry in ctx.entries:
+        if entry.repo == partial.repo_name and entry.issue == partial.issue_number:
+            return int(entry.position)
+    return None
+
+
+def auto_queue_follow_ups(
+    partial: PartialMerge,
+    plan: FollowThroughPlan,
+    disposition: Disposition,
+    ctx: AutoQueueContext,
+    *,
+    alert: Callable[[str, str], None],
+) -> None:
+    """Drive-queue every filed follow-up in plan order.
+
+    ``after`` edges are the plan's own, resolved to ``repo#N`` keys. A
+    follow-up declaring a capability is pinned to the first capable machine
+    (or its own declared ``machine`` when that one is capable); one whose
+    capability no machine covers is not queued and alerts instead. Without a
+    capability the follow-up's declared ``machine`` is used if configured,
+    else routing is left to ``coord drive``.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        QueueEntry,
+        QueueError,
+        entry_key,
+        validate_enqueue,
+    )
+
+    repo = partial.repo_name
+    known_machines = {m.name for m in ctx.machines}
+    entries: list[Any] = list(ctx.entries)
+    position = _queue_position(partial, ctx)
+    for fu in plan.follow_ups:
+        number = disposition.follow_up_keys.get(fu.key)
+        if number is None:
+            continue
+        key = entry_key(repo, number)
+        machine: str | None
+        if fu.capability:
+            capability = normalize_capability(fu.capability)
+            capable = capable_machines(capability, repo, ctx.machines)
+            if not capable:
+                reason = (
+                    f"#{number} not queued: no machine declares capability "
+                    f"{capability!r} for {repo}"
+                )
+                disposition.reasons.append(reason)
+                alert(f"{key}: follow-up capability unroutable", reason)
+                continue
+            machine = fu.machine if fu.machine in capable else capable[0]
+        else:
+            machine = fu.machine if fu.machine in known_machines else None
+        after = [
+            entry_key(repo, int(t[1:]) if t.startswith("#")
+                      else disposition.follow_up_keys[t])
+            for t in fu.after
+        ]
+        try:
+            validate_enqueue(entries, repo, number, after)
+        except QueueError as exc:
+            reason = f"#{number} not queued: {exc}"
+            disposition.reasons.append(reason)
+            alert(f"{key}: follow-up not queued", reason)
+            continue
+        ctx.enqueue(repo, number, machine=machine, after=after, position=position)
+        entries.append(QueueEntry(
+            repo=repo, issue=number, machine=machine or "", after=tuple(after),
+        ))
+        disposition.queued[number] = machine or ""
+        if position is not None:
+            position += 1
+
+
 # ── Orchestration ────────────────────────────────────────────────────────────
 
 
@@ -484,12 +651,17 @@ def run_followthrough(
     epic_exists: Callable[[int], bool] = lambda _n: True,
     milestone_exists: Callable[[str], bool] = lambda _m: True,
     dry_run: bool = False,
+    auto_queue: AutoQueueContext | None = None,
 ) -> Disposition:
     """Resolve one ``merged-partial`` row end to end.
 
     *alert* and *page* take ``(subject, body)``. With *dry_run* the plan leg
     still runs (it is read-only) and the plan is validated and rendered,
     but nothing is written, alerted, paged or recorded.
+
+    *auto_queue* (see :func:`build_auto_queue_context`) additionally
+    drive-queues each filed follow-up once the original is closed; ``None``
+    files without queueing.
     """
     key = f"{partial.repo_name}#{partial.issue_number}"
     disposition = Disposition(
@@ -558,6 +730,12 @@ def run_followthrough(
             + (", ".join(f"#{n}" for n in disposition.follow_ups) or "none"),
         )
         return _finish(ACTION_WRITE_FAILED)
+    if auto_queue is not None and disposition.follow_ups:
+        try:
+            auto_queue_follow_ups(partial, plan, disposition, auto_queue, alert=alert)
+        except Exception as exc:  # noqa: BLE001 — the follow-ups are filed; alert, don't fail
+            disposition.reasons.append(f"auto-queue failed: {exc}")
+            alert(f"{key}: follow-up auto-queue failed", str(exc))
     return _finish(ACTION_ALL_LANDED if plan.all_landed else ACTION_FILED)
 
 
@@ -580,6 +758,7 @@ def _write_follow_ups(
             milestone=fu.milestone or partial.milestone,
         )
         disposition.follow_ups.append(number)
+        disposition.follow_up_keys[fu.key] = number
         by_key[fu.key] = number
         successors.append((number, fu.title))
         after = tuple(

@@ -9,6 +9,8 @@ import pytest
 
 from coord import board_doctor_followthrough as ft
 from coord.config import ConfigError, _parse_board_doctor, _parse_board_doctor_repo_config
+from coord.drive_queue import QueueEntry
+from coord.models import BoardDoctorRepoConfig, Machine
 from coord.milestone_order import parse_work_order
 
 EPIC_BODY = """Epic body.
@@ -317,3 +319,170 @@ def test_config_parses_followthrough_switches() -> None:
     assert _parse_board_doctor_repo_config({"followthrough": True}, 0).followthrough is True
     with pytest.raises(ConfigError):
         _parse_board_doctor_repo_config({"followthrough": 1}, 0)
+
+
+# ── Auto-queue ───────────────────────────────────────────────────────────────
+
+REPO = "claude-coordinator"
+
+
+def _machine(name: str, caps: list[str], *, repo_path: bool = True) -> Machine:
+    return Machine(
+        name=name, host=name, capabilities=caps, repos=[REPO],
+        repo_paths={REPO: f"/src/{name}"} if repo_path else {},
+    )
+
+
+FLEET = [
+    _machine("linuxbox", ["python", "rust"]),
+    _machine("gtkbox", ["python", "gtk"]),
+    _machine("macmini", ["python", "macos"]),
+    _machine("winbox", ["python", "windows"]),
+    _machine("macnopath", ["macos"], repo_path=False),
+]
+
+
+class Enqueue:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, repo_name, issue_number, **kwargs):
+        self.calls.append(dict(repo=repo_name, issue=issue_number, **kwargs))
+        return len(self.calls)
+
+
+def _cfg(*, auto_queue: bool, followthrough: bool = True):
+    repo = SimpleNamespace(board_doctor=BoardDoctorRepoConfig(
+        followthrough=followthrough, followthrough_auto_queue=auto_queue,
+    ))
+    return SimpleNamespace(
+        board_doctor=SimpleNamespace(followthrough=True),
+        repo=lambda name: repo, machines=FLEET,
+    )
+
+
+def _single_follow_up_plan(capability: str | None, **extra) -> dict:
+    fu = {"key": "a", "title": "Platform piece", "body": "Do it.", "after": ["#100"]}
+    if capability is not None:
+        fu["capability"] = capability
+    fu.update(extra)
+    return {
+        "items": [{"item": "X", "verified_still_missing": True, "evidence": "none"}],
+        "follow_ups": [fu],
+    }
+
+
+@pytest.mark.parametrize("capability, machine", [
+    ("[gtk]", "gtkbox"), ("macos", "macmini"), ("[win]", "winbox"), ("windows", "winbox"),
+])
+def test_platform_follow_up_is_pinned_to_capable_machine(
+    monkeypatch, capability, machine,
+) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    enqueue = Enqueue()
+    ctx = ft.build_auto_queue_context(REPO, _cfg(auto_queue=True), enqueue=enqueue)
+    assert ctx is not None
+    disp, writer, sinks = _run(_partial(), _single_follow_up_plan(capability), auto_queue=ctx)
+    assert disp.action == ft.ACTION_FILED
+    assert enqueue.calls == [dict(
+        repo=REPO, issue=200, machine=machine, after=[f"{REPO}#100"], position=None,
+    )]
+    assert disp.queued == {200: machine}
+    assert sinks.records[-1]["queued"] == {"200": machine}
+    assert not sinks.alerts
+
+
+def test_unroutable_capability_alerts_and_is_not_queued(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    enqueue = Enqueue()
+    ctx = ft.build_auto_queue_context(REPO, _cfg(auto_queue=True), enqueue=enqueue)
+    disp, writer, sinks = _run(_partial(), _single_follow_up_plan("fpga"), auto_queue=ctx)
+    # Still filed and the original still closed — only the queueing is refused.
+    assert [c["number"] for c in writer.created] == [200]
+    assert writer.closed and writer.closed[0][0] == 101
+    assert enqueue.calls == []
+    assert len(sinks.alerts) == 1
+    assert "unroutable" in sinks.alerts[0][0]
+    assert "'fpga'" in sinks.alerts[0][1]
+    assert any("not queued" in r for r in sinks.records[-1]["reasons"])
+
+
+def test_capability_machine_without_repo_checkout_is_not_capable() -> None:
+    assert ft.capable_machines("macos", REPO, FLEET) == ["macmini"]
+    assert ft.capable_machines("macos", "other-repo", FLEET) == []
+
+
+def test_auto_queue_off_files_but_never_queues(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    enqueue = Enqueue()
+    ctx = ft.build_auto_queue_context(REPO, _cfg(auto_queue=False), enqueue=enqueue)
+    assert ctx is None
+    disp, writer, sinks = _run(_partial(), HAPPY_PLAN, auto_queue=ctx)
+    assert [c["number"] for c in writer.created] == [200, 201]
+    assert enqueue.calls == []
+    assert disp.queued == {}
+
+
+def test_auto_queue_requires_followthrough_itself(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    cfg = _cfg(auto_queue=True, followthrough=False)
+    assert ft.build_auto_queue_context(REPO, cfg) is None
+
+
+def test_after_edges_follow_the_plan_and_tail_append(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    enqueue = Enqueue()
+    entries = [QueueEntry(repo=REPO, issue=101, position=3)]
+    # The original's epic (50) is not the one draining → tail.
+    ctx = ft.build_auto_queue_context(
+        REPO, _cfg(auto_queue=True), entries=entries, draining_epic=77, enqueue=enqueue,
+    )
+    _run(_partial(), HAPPY_PLAN, auto_queue=ctx)
+    assert enqueue.calls == [
+        dict(repo=REPO, issue=200, machine="gtkbox", after=[f"{REPO}#100"], position=None),
+        dict(repo=REPO, issue=201, machine=None, after=[f"{REPO}#200"], position=None),
+    ]
+
+
+def test_draining_epic_queues_at_original_position(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    enqueue = Enqueue()
+    entries = [QueueEntry(repo=REPO, issue=101, position=3)]
+    ctx = ft.build_auto_queue_context(
+        REPO, _cfg(auto_queue=True), entries=entries, draining_epic=50, enqueue=enqueue,
+    )
+    _run(_partial(), HAPPY_PLAN, auto_queue=ctx)
+    assert [c["position"] for c in enqueue.calls] == [3, 4]
+
+
+def test_declared_capable_machine_is_preferred(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    fleet = FLEET + [_machine("gtkbox2", ["gtk"])]
+    enqueue = Enqueue()
+    ctx = ft.AutoQueueContext(machines=fleet, enqueue=enqueue)
+    _run(_partial(), _single_follow_up_plan("gtk", machine="gtkbox2"), auto_queue=ctx)
+    assert enqueue.calls[0]["machine"] == "gtkbox2"
+    # A declared machine lacking the capability is overridden.
+    enqueue2 = Enqueue()
+    ctx2 = ft.AutoQueueContext(machines=fleet, enqueue=enqueue2)
+    _run(_partial(), _single_follow_up_plan("gtk", machine="macmini"), auto_queue=ctx2)
+    assert enqueue2.calls[0]["machine"] == "gtkbox"
+
+
+def test_enqueue_failure_alerts_without_failing_disposition(monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise RuntimeError("daemon down")
+
+    ctx = ft.AutoQueueContext(machines=FLEET, enqueue=boom)
+    disp, writer, sinks = _run(_partial(), HAPPY_PLAN, auto_queue=ctx)
+    assert disp.action == ft.ACTION_FILED
+    assert writer.closed
+    assert any("auto-queue failed" in s for s, _ in sinks.alerts)
+
+
+def test_config_parses_followthrough_auto_queue() -> None:
+    assert _parse_board_doctor_repo_config(None, 0).followthrough_auto_queue is False
+    parsed = _parse_board_doctor_repo_config({"followthrough_auto_queue": True}, 0)
+    assert parsed.followthrough_auto_queue is True
+    with pytest.raises(ConfigError):
+        _parse_board_doctor_repo_config({"followthrough_auto_queue": "yes"}, 0)
