@@ -1583,3 +1583,70 @@ def dismiss_resolved_escalation(queue: str, key: str) -> None:
             dismiss_drive_escalation(repo_name, issue_number)
     except Exception as exc:  # noqa: BLE001 — best-effort, never crash the sweep
         click.echo(f"warning: could not dismiss board-doctor escalation: {exc}", err=True)
+
+
+# ── #3881: a starting recommendation for the investigator session ──────────
+#
+# `coord.board_doctor_permissions`'s investigator wrapper enforces every
+# verb's precondition at ACT time regardless of why it was called — this
+# function exists only to save the investigator session a diagnosis step
+# for the causes #3875's audit already showed a mechanical fix for, mapped
+# from the issue's own evidence table. It is advice, never a decision the
+# wrapper trusts blindly: :func:`recommend_investigator_action` returning a
+# verb does not mean that verb's precondition currently holds, and a cause
+# absent from :data:`INVESTIGATOR_RECOMMENDED_ACTION` is not an error —
+# it means "this cause needs the session's own judgment," most often
+# because more than one verb maps to it depending on live evidence this
+# function does not have (e.g. a `gate-blocked` HUMAN_REQUIRED latch is
+# only a `clear_latch` candidate when it is the conflict-fix-retry-cap
+# shape AND the branch is rebaseable — see `coord.merge_queue.
+# reconcile_conflict_entries`'s own docstring for why a permission/
+# protection latch must never be offered that verb).
+#
+# #3874's row (a fix-round-ceiling block with a substantive request-
+# changes verdict) deliberately has NO entry here either: its fix was a
+# two-step sequence (`raise_budget` then `bounce`), which a function
+# returning one verb for one cause cannot express — the investigator
+# calls this again after the first verb lands, same as it re-diagnoses
+# after any other action.
+INVESTIGATOR_RECOMMENDED_ACTION: dict[str, str] = {
+    # quadraui#2035/#2047/#2045/#2051/#2052/#2058/#2059, coord#3875: a row
+    # frozen in the drive queue with nothing live against it — fixed by a
+    # remove+add preserving its declaration.
+    queue_diagnose.CAUSE_NEVER_DISPATCHED: "requeue",
+    CAUSE_CEILING_BLOCKED_MERGEABLE: "requeue",
+    # quadraui#2038: merged by hand, the queue slot still held — fixed by
+    # reconciling the row to done.
+    queue_diagnose.CAUSE_PR_MERGED: "mark_done",
+    # coord#3870: a repo-wide baseline-red streak — fixed by dispatching
+    # the base-repo's own integration fix, then (once it lands) a plain
+    # merge of this row.
+    CAUSE_BASELINE_RED: "integration_fix",
+}
+
+
+def recommend_investigator_action(row: StuckRow) -> str | None:
+    """A starting recommendation for which #3881 investigator verb to try
+    against *row*, derived from :data:`INVESTIGATOR_RECOMMENDED_ACTION`.
+
+    Every name this can return is also in `coord.board_doctor_permissions.
+    INVESTIGATOR_ACTIONS` — asserted once at import time just below, not
+    re-checked per call, since the dict above is a fixed module constant.
+    Returns ``None`` when *row*'s cause has no mechanical recommendation —
+    "use judgment, or escalate," never a guessed verb.
+    """
+    return INVESTIGATOR_RECOMMENDED_ACTION.get(row.cause)
+
+
+def _check_investigator_recommendations_are_in_the_closed_set() -> None:
+    from coord.board_doctor_permissions import INVESTIGATOR_ACTIONS  # noqa: PLC0415
+
+    unknown = set(INVESTIGATOR_RECOMMENDED_ACTION.values()) - INVESTIGATOR_ACTIONS
+    if unknown:
+        raise RuntimeError(
+            f"coord.board_doctor_policy.INVESTIGATOR_RECOMMENDED_ACTION names "
+            f"verb(s) outside INVESTIGATOR_ACTIONS: {sorted(unknown)!r}"
+        )
+
+
+_check_investigator_recommendations_are_in_the_closed_set()
