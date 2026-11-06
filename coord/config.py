@@ -1570,11 +1570,20 @@ class BoardDoctorConfig:
     (``BoardDoctorRepoConfig.stale_race``, default ``False``).
     `coord.board_doctor_policy._stale_race_tier_enabled` reads both this
     field and the per-repo opt-in.
+
+    ``followthrough`` is the fleet-wide switch for the merged-partial
+    follow-through disposition, mirroring ``stale_race`` exactly: a repo
+    must still opt in via ``repos[].board_doctor.followthrough``.
+    ``followthrough_cap`` is the per-issue budget — the most follow-up
+    issues one plan may file; a plan proposing more is rejected and
+    alerted instead of written.
     """
 
     investigate: bool = True
     finish: bool = True
     stale_race: bool = True
+    followthrough: bool = True
+    followthrough_cap: int = 5
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3564,6 +3573,16 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         if not isinstance(stale_race, bool):
             raise ConfigError("board_doctor.stale_race must be a boolean")
         cfg.stale_race = stale_race
+    if "followthrough" in raw:
+        followthrough = raw["followthrough"]
+        if not isinstance(followthrough, bool):
+            raise ConfigError("board_doctor.followthrough must be a boolean")
+        cfg.followthrough = followthrough
+    if "followthrough_cap" in raw:
+        cap = raw["followthrough_cap"]
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ConfigError("board_doctor.followthrough_cap must be a positive integer")
+        cfg.followthrough_cap = cap
     return cfg
 
 
@@ -4028,6 +4047,13 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 f"repos[{repo_index}].board_doctor.stale_race must be a boolean"
             )
         cfg.stale_race = stale_race
+    if "followthrough" in raw:
+        followthrough = raw["followthrough"]
+        if not isinstance(followthrough, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.followthrough must be a boolean"
+            )
+        cfg.followthrough = followthrough
     return cfg
 
 
