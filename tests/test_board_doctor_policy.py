@@ -943,10 +943,12 @@ class TestRequeueCeilingBlockedMergeable:
 
 
 class TestRequeueNeverDispatched:
-    """#3874: `queue_diagnose.CAUSE_NEVER_DISPATCHED` already fires straight
-    off a live signal — no eligibility gate like #3847's rebudget, so this
-    only exercises the dispatch itself (mirrors #3760 Action 4's
-    `_clear_merged_row` shape, not Action 1's budget-gated one)."""
+    """#3874: `queue_diagnose.CAUSE_NEVER_DISPATCHED` fires straight off a
+    live signal — no eligibility gate like #3847's rebudget — but the
+    action still re-confirms "nothing was ever dispatched" against the
+    board before it removes anything, because a `StuckRow` rebuilt from a
+    STORED diagnosis (`coord.board_doctor._episode_stuck_row`, `fresh=
+    False`) can be arbitrarily old."""
 
     def _row(self) -> StuckRow:
         return _row(
@@ -956,6 +958,28 @@ class TestRequeueNeverDispatched:
             fresh=True,
         )
 
+    def _empty_board(self, monkeypatch) -> None:
+        monkeypatch.setattr(state, "build_board", lambda: Board())
+
+    def _board_with_live_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            state,
+            "build_board",
+            lambda: Board(
+                active=[
+                    Assignment(
+                        machine_name="mac1",
+                        repo_name="acme/widgets",
+                        issue_number=2035,
+                        issue_title="t",
+                        status="running",
+                        type="work",
+                        branch="issue-2035-live",
+                    )
+                ]
+            ),
+        )
+
     def test_dispatches_the_requeue(self, monkeypatch) -> None:
         calls: list[tuple] = []
 
@@ -963,6 +987,7 @@ class TestRequeueNeverDispatched:
             calls.append((action, repo_name, issue_number))
             return {"requeued": True, "detail": "requeued"}
 
+        self._empty_board(monkeypatch)
         monkeypatch.setattr(
             board_doctor_policy, "dispatch_sweep_action", fake_dispatch
         )
@@ -971,6 +996,7 @@ class TestRequeueNeverDispatched:
         assert calls == [("drive_queue_requeue", "acme/widgets", 2035)]
 
     def test_a_reported_noop_returns_false(self, monkeypatch) -> None:
+        self._empty_board(monkeypatch)
         monkeypatch.setattr(
             board_doctor_policy,
             "dispatch_sweep_action",
@@ -983,6 +1009,7 @@ class TestRequeueNeverDispatched:
         def boom(*a, **k):
             raise SweepPermissionError("acme/widgets#2035's deploy gate is mid-flight")
 
+        self._empty_board(monkeypatch)
         monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", boom)
 
         assert _requeue_never_dispatched(self._row()) is False
@@ -996,6 +1023,74 @@ class TestRequeueNeverDispatched:
         )
 
         assert _requeue_never_dispatched(row) is False
+
+    def test_a_row_that_now_has_live_work_is_never_requeued(self, monkeypatch) -> None:
+        """The hazard the re-check exists for: a stored `never-dispatched`
+        verdict reaching the sweep after the issue HAS been dispatched.
+        `drive_queue_requeue` is a remove plus a re-add, so firing it here
+        would orphan the live branch and re-dispatch Work on top of it."""
+        calls: list[tuple] = []
+
+        self._board_with_live_work(monkeypatch)
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: calls.append(a) or {"requeued": True},
+        )
+
+        assert _requeue_never_dispatched(self._row()) is False
+        assert calls == []
+
+    def test_an_unreadable_board_refuses_rather_than_assuming_empty(
+        self, monkeypatch
+    ) -> None:
+        """A board read that raises says nothing about whether work exists,
+        so it must fail closed — the same "absence of a reading is not a
+        reading" rule `queue_diagnose` mints the cause under."""
+        calls: list[tuple] = []
+
+        def boom() -> Board:
+            raise TimeoutError("board read timed out")
+
+        monkeypatch.setattr(state, "build_board", boom)
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: calls.append(a) or {"requeued": True},
+        )
+
+        assert _requeue_never_dispatched(self._row()) is False
+        assert calls == []
+
+    def test_the_recheck_matches_a_tracking_issue_assignment(
+        self, monkeypatch
+    ) -> None:
+        """The re-check reuses `coord.gates.assignments_for_issue`, so an
+        assignment booked to a tracking issue but FOR this one (#1553's
+        effective issue) counts as dispatched here too — one question, one
+        answer, rather than a second `issue_number ==` scan."""
+        monkeypatch.setattr(
+            state,
+            "build_board",
+            lambda: Board(
+                completed=[
+                    Assignment(
+                        machine_name="mac1",
+                        repo_name="acme/widgets",
+                        issue_number=9000,
+                        for_issue_number=2035,
+                        issue_title="t",
+                        status="completed",
+                        type="work",
+                    )
+                ]
+            ),
+        )
+
+        assert (
+            board_doctor_policy._never_dispatched_still_true("acme/widgets", 2035)
+            is False
+        )
 
 
 class TestFixitRebudgetGlobalCap:
