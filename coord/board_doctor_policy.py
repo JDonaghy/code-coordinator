@@ -97,23 +97,26 @@ unbounded number of :data:`INVESTIGATE_CAUSES` rows for the same repo
 would otherwise all dispatch in one sweep. :func:`make_investigate_capacity_check`
 builds `coord.board_doctor.sweep`'s optional ``capacity_check`` gate as a
 :class:`InvestigateCapacityGate`: it bounds concurrent investigate-tier
-legs per repo at that repo's existing drive-queue ceiling
-(:func:`_investigate_repo_capacity` — `coordinator.yml`
-`repos[].max_parallel` / `pipeline.max_parallel_per_repo`, never a second
-knob), counting legs already in flight (:func:`_investigate_in_flight_count`
-— the same running/pending work-like assignment plus live `coord drive`
-session signals `sweep_dispatch_fixit_leg`'s own in-flight lock already
-answers) plus whatever the gate has CONFIRMED claimed earlier in the same
-sweep via :meth:`InvestigateCapacityGate.confirm_dispatch`. A row the gate
-defers is not dispatched, not escalated and does not touch the row's
-convergence counter — it is simply deferred to the next sweep, which is
-why `sweep` checks it before, not after, the counter bump. The gate only
-claims a slot once a row's dispatch is confirmed (``action ==
-"auto-dispatch"``), never merely because the row was let through the
-check — so a row that turns out to be a converged-noop, an internal
-alert-tier fallback, or an in-flight no-op never burns a slot, and a
-repo with ``max_parallel=1`` keeps making progress through its rows
-sweep over sweep instead of one never-dispatching row starving the rest.
+legs per repo at a small, FIXED budget of its own
+(:data:`FIXIT_LEG_BUDGET_DEFAULT`) — deliberately not a repo's
+`max_parallel` ceiling, which is ordinary drive-queue throughput, not a
+diagnostic-leg allowance, and sharing it means a repo whose queue is
+already full of real work starves its own doctor at exactly the moment a
+stuck row needs it. The gate counts legs already in flight
+(:func:`_fixit_leg_in_flight_count` — a running/pending assignment whose
+`assignment_id` this doctor itself recorded via the `fixit_leg_dispatched`
+audit event, never ordinary queue work) plus whatever the gate has
+CONFIRMED claimed earlier in the same sweep via
+:meth:`InvestigateCapacityGate.confirm_dispatch`. A row the gate defers is
+not dispatched, not escalated and does not touch the row's convergence
+counter — it is simply deferred to the next sweep, which is why `sweep`
+checks it before, not after, the counter bump. The gate only claims a
+slot once a row's dispatch is confirmed (``action == "auto-dispatch"``),
+never merely because the row was let through the check — so a row that
+turns out to be a converged-noop, an internal alert-tier fallback, or an
+in-flight no-op never burns a slot, and the repo keeps making progress
+through its rows sweep over sweep instead of one never-dispatching row
+starving the rest.
 
 Why the alert path reuses `drive_escalations`
 ------------------------------------------------
@@ -1208,20 +1211,87 @@ def _investigate_in_flight_count(repo_name: str, board: "Board") -> int:
     return len(busy_issues)
 
 
+#: Fix-it worker legs get their own per-repo dispatch budget, independent
+#: of a repo's `max_parallel` ceiling: a fixed small constant rather than
+#: a second `coordinator.yml` knob, since a diagnostic/repair leg is not
+#: ordinary throughput and never needs to scale with a repo's normal
+#: concurrency. :func:`_at_fixit_leg_capacity` is what
+#: :class:`InvestigateCapacityGate` actually compares in-flight occupancy
+#: against — a full repo (every `max_parallel` slot busy with real work)
+#: no longer starves its own investigate tier.
+FIXIT_LEG_BUDGET_DEFAULT = 1
+
+
+def _fixit_leg_in_flight_count(repo_name: str, board: "Board") -> int:
+    """How many fix-it legs this doctor dispatched for *repo_name* are
+    still ``running``/``pending`` — never ordinary drive-queue, review or
+    smoke work, which must not consume this dedicated budget.
+
+    An assignment counts only when both are true: it is `running`/
+    `pending` on *board* right now, AND its `assignment_id` appears in
+    `coord.audit`'s ``fixit_leg_dispatched`` event log — the one event
+    `coord.board_doctor_permissions.sweep_dispatch_fixit_leg` records on
+    every confirmed dispatch, and the only writer of that event type. A
+    leg this doctor never started can therefore never be mistaken for one
+    occupying its own budget, however busy the repo's ordinary queue is.
+    """
+    from coord.audit import query_audit_log  # noqa: PLC0415
+
+    try:
+        entries = (
+            query_audit_log(
+                event_type="fixit_leg_dispatched", repo=repo_name, limit=200,
+            ).get("entries")
+            or []
+        )
+    except Exception:  # noqa: BLE001 — an unreadable audit log fails open
+        # ("nothing confirmed in flight") rather than permanently refusing
+        # every future dispatch for this repo.
+        return 0
+    dispatched_ids = {e.get("assignment_id") for e in entries if e.get("assignment_id")}
+    if not dispatched_ids:
+        return 0
+    return sum(
+        1
+        for assignment in board.active
+        if assignment.repo_name == repo_name
+        and assignment.assignment_id in dispatched_ids
+        and assignment.status in ("running", "pending")
+    )
+
+
+def _at_fixit_leg_capacity(
+    repo_name: str, board: "Board", *, claimed: int = 0
+) -> bool:
+    """Is *repo_name* at or over its OWN fix-it-leg budget?
+
+    Unlike :func:`_at_repo_capacity` (still shared with the finisher tier,
+    keyed off `max_parallel`), this is the investigate tier's dedicated
+    cap — :data:`FIXIT_LEG_BUDGET_DEFAULT`, never a repo's ordinary
+    concurrency ceiling. *claimed* is the caller's own additional
+    in-flight count not yet reflected in *board*, same meaning as
+    :func:`_at_repo_capacity`'s own *claimed* parameter.
+    """
+    in_flight = _fixit_leg_in_flight_count(repo_name, board) + claimed
+    return in_flight >= FIXIT_LEG_BUDGET_DEFAULT
+
+
 class InvestigateCapacityGate:
-    """Per-sweep "is the investigate tier over its per-repo cap" gate for
+    """Per-sweep "is the investigate tier over its OWN budget" gate for
     `coord.board_doctor.sweep`'s ``capacity_check`` parameter.
 
     Built ONCE per sweep (`board = coord.state.build_board()` plus a fresh
     ``claimed`` counter at construction time), then used in two phases:
 
     * ``__call__`` is a pure peek — it answers "would this row's repo be
-      at capacity right now" from the repo's resolved cap, the persisted
-      in-flight signal (:func:`_investigate_in_flight_count`) and whatever
-      has already been CONFIRMED claimed this sweep. It never itself
-      reserves a slot, so calling it twice for the same row (or not
+      at capacity right now" from :data:`FIXIT_LEG_BUDGET_DEFAULT`, the
+      persisted in-flight signal (:func:`_fixit_leg_in_flight_count`) and
+      whatever has already been CONFIRMED claimed this sweep. It never
+      itself reserves a slot, so calling it twice for the same row (or not
       calling :meth:`confirm_dispatch` afterwards) never changes the
-      answer.
+      answer. This budget is independent of *repo_name*'s `max_parallel` —
+      a repo whose ordinary queue is full of real work still has its own
+      small fix-it-leg allowance.
     * :meth:`confirm_dispatch` is the only thing that claims a slot.
       `coord.board_doctor.sweep` calls it only after a row's own
       dispatcher has actually returned a confirmed dispatch (``action ==
@@ -1241,26 +1311,28 @@ class InvestigateCapacityGate:
     def __init__(self, config: "Config") -> None:
         from coord.state import build_board  # noqa: PLC0415
 
+        # *config* is accepted (and `make_investigate_capacity_check` keeps
+        # taking it) so the factory signature stays stable for every
+        # existing call site even though this gate's own budget is now a
+        # fixed constant rather than anything read out of `coordinator.yml`.
         self._config = config
         self._board = build_board()
         self._claimed: dict[str, int] = {}
 
     def __call__(self, row: StuckRow) -> bool:
-        """``True`` means defer: *row*'s repo is at or over its cap.
+        """``True`` means defer: *row*'s repo is at or over its OWN
+        fix-it-leg budget.
 
         * Returns ``False`` (never defer) immediately for any cause outside
-          :data:`INVESTIGATE_CAUSES` — the per-repo cap bounds the
-          investigate tier only; :data:`ALLOWLIST`'s mechanical fixes
-          (#3760) are untouched.
+          :data:`INVESTIGATE_CAUSES` — the budget bounds the investigate
+          tier only; :data:`ALLOWLIST`'s mechanical fixes are untouched.
         * Returns ``False`` if ``row.key`` does not parse — a row this gate
           cannot even attribute to a repo cannot be capacity-checked, so it
           is left to run the normal tier/dispatch path rather than silently
           stuck.
-        * Returns ``False`` (unlimited) if the repo's resolved cap
-          (:func:`_investigate_repo_capacity`) is non-positive.
-        * Otherwise defers to :func:`_at_repo_capacity` (shared with the
-          finisher tier's :func:`dispatch_nit_only_finisher`, #3837) for
-          the actual ``in_flight + claimed`` vs. cap comparison.
+        * Otherwise defers to :func:`_at_fixit_leg_capacity` for the actual
+          ``in_flight + claimed`` vs. :data:`FIXIT_LEG_BUDGET_DEFAULT`
+          comparison.
         """
         if row.cause not in INVESTIGATE_CAUSES:
             return False
@@ -1268,9 +1340,8 @@ class InvestigateCapacityGate:
         if parsed is None:
             return False
         repo_name, _issue_number = parsed
-        return _at_repo_capacity(
+        return _at_fixit_leg_capacity(
             repo_name,
-            self._config,
             self._board,
             claimed=self._claimed.get(repo_name, 0),
         )

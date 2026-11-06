@@ -8531,6 +8531,52 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     assert "action=auto-dispatch-noop" in second.output
 
 
+def test_doctor_log_reads_back_recorded_decisions(cli):
+    """The durable decision log, read through the CLI the same shape
+    `sweep` writes it in — filterable, and summarizable."""
+    from datetime import datetime, timezone
+
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-1",
+            "queue": "drive-queue",
+            "key": f"{REPO}#1",
+            "cause": "ci_red",
+            "tier": "auto",
+            "action": "auto-dispatch",
+            "count": 1,
+            "escalated": False,
+            "confidence": "high",
+            "evidence": [],
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    result = cli("doctor-log")
+    assert result.exit_code == 0, result.output
+    assert f"drive-queue:{REPO}#1" in result.output
+    assert "cause=ci_red action=auto-dispatch" in result.output
+
+    json_result = cli("doctor-log", "--json")
+    assert json_result.exit_code == 0, json_result.output
+    payload = json.loads(json_result.output)
+    assert payload["entries"][0]["key"] == f"{REPO}#1"
+
+    summary_result = cli("doctor-log", "--summary", "--json")
+    assert summary_result.exit_code == 0, summary_result.output
+    summary = json.loads(summary_result.output)
+    assert summary["actions_taken"] == 1
+    assert summary["rows_unstuck"] == 0
+    assert summary["rows_still_stuck"] == 0
+    assert summary["human_interventions_missed"] == 0
+
+
+def test_doctor_log_on_an_empty_log_says_so_rather_than_printing_nothing(cli):
+    result = cli("doctor-log")
+    assert result.exit_code == 0, result.output
+    assert "no board-doctor decisions recorded" in result.output
+
+
 def _sweep_json(output: str) -> dict:
     """The sweep report from `--json` output, ignoring any `warning:` lines.
 

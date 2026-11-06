@@ -26,24 +26,32 @@ since :mod:`coord.queue_diagnose` only understands drive-queue rows).
 :func:`run_sweep` is the production entry point the CLI calls, composing
 the two.
 
-Convergence (#3758, load-bearing)
+Convergence (load-bearing)
 ----------------------------------
 A row stuck on the SAME cause across :data:`CONVERGENCE_LIMIT` (default 3)
-consecutive sweeps stops being re-acted on and escalates to the alert tier
-exactly once — never a second alert for the same still-unresolved cause,
-never an auto-dispatch past the limit. Per-(queue, key) sweep counts persist
-in `board_meta` via :mod:`coord.state`'s ``record_board_doctor_observation``
-/ ``mark_board_doctor_escalated`` — the same one-row-of-truth pattern
-``baseline_red_streaks`` uses for its own streak counter (#2096: one
-question, one answer; convergence is decided by reading that ONE counter,
-never re-derived from the decision log).
+consecutive sweeps stops being re-acted on and falls back to the alert
+tier. Per-(queue, key) sweep counts persist in `board_meta` via
+:mod:`coord.state`'s ``record_board_doctor_observation`` /
+``mark_board_doctor_escalated`` — the same one-row-of-truth pattern
+``baseline_red_streaks`` uses for its own streak counter (one question,
+one answer; convergence is decided by reading that ONE counter, never
+re-derived from the decision log).
+
+Converging never means going silent: a still-unresolved cause keeps
+getting re-alerted on an exponential backoff
+(``coord.state.BOARD_DOCTOR_BACKOFF_INITIAL_HOURS`` doubling each firing
+up to ``BOARD_DOCTOR_BACKOFF_CAP_HOURS``,
+``coord.state.board_doctor_alert_due``) rather than escalating exactly
+once and then being ignored forever — a row that never gets better is
+exactly the one that must not go quiet.
 
 "CONSECUTIVE" is only honest because :func:`sweep` also clears a
 (queue, key)'s counter the moment that row stops appearing in the current
 *rows* — ``coord.state.clear_board_doctor_row``, driven by the
 *clear_absent_rows* parameter (default on). Without it a resolved-then-recurring
 row would resume its stale count instead of starting over, and a row that
-escalated once could never be re-alerted after it later resolves and recurs.
+escalated once could never restart its backoff clock after it later
+resolves and recurs.
 """
 
 from __future__ import annotations
@@ -70,7 +78,7 @@ TIER_ALERT = "alert"
 ALERT_SKIPPED = "skipped"
 
 #: Sweeps a row may stay on the same cause before the harness stops
-#: re-acting on it and escalates once to the alert tier (#3758).
+#: re-acting on it and falls back to the (backoff-gated) alert tier.
 CONVERGENCE_LIMIT = 3
 
 #: Merge-queue states this sweep treats as "stuck". A row merely waiting
@@ -826,28 +834,32 @@ def sweep(
     For each row:
       1. Record this sweep's observation of (queue, key, cause) — same
          cause as last sweep increments the counter; a new/changed cause
-         resets it to 1 and clears any prior escalation.
+         resets it to 1 and clears any prior escalation and backoff
+         clock.
       2. ``tier_of(cause)`` decides auto vs. alert.
-      3. Alert tier: dispatch via *alert_dispatcher* iff not already
-         escalated for this cause, then mark escalated only once that
-         dispatch is CONFIRMED (``alert_dispatcher`` returns truthy) —
-         exactly once per (row, cause), the "escalate exactly once" half
-         of #3758. A dispatcher that raises or returns falsy leaves
-         ``escalated`` False so the next sweep retries, rather than
-         silently treating an unconfirmed write as done; returning
+      3. Alert tier: dispatch via *alert_dispatcher* when either not yet
+         escalated for this cause, OR already escalated but
+         ``state.board_doctor_alert_due`` says the exponential backoff
+         window has elapsed — never forever-silent once the first alert
+         fires. Marks escalated (and bumps the backoff clock) only once
+         the dispatch is CONFIRMED (``alert_dispatcher`` returns truthy).
+         A dispatcher that raises or returns falsy leaves ``escalated``
+         unchanged so the next sweep retries, rather than silently
+         treating an unconfirmed write as done; returning
          :data:`ALERT_SKIPPED` does the same while saying the dispatcher
          chose not to file, not that filing failed.
       4. Auto tier: dispatch via ``auto_dispatchers[cause]`` while under
-         *convergence_limit*; at/past the limit, fall back to the alert
-         path exactly once instead of re-dispatching the same auto action
-         forever — the "stop being re-acted" half of #3758. An
-         ``auto_dispatchers`` callable returns ``True`` only once its action
-         is CONFIRMED to have done something (mirroring *alert_dispatcher*'s
-         own confirmed-truthy contract); a falsy return — the underlying C3
-         handler's primitive reported a no-op (row already gone, nothing to
-         requeue, …) — is recorded as ``action="auto-dispatch-noop"`` rather
-         than ``"auto-dispatch"``, so the decision log never claims an
-         action happened when the queue was, in fact, left untouched.
+         *convergence_limit*; at/past the limit, falls back to the SAME
+         backoff-gated alert path as step 3 instead of re-dispatching the
+         same auto action forever. An ``auto_dispatchers`` callable
+         returns ``True`` only once its action is CONFIRMED to have done
+         something (mirroring *alert_dispatcher*'s own confirmed-truthy
+         contract); a falsy return — the underlying C3 handler's
+         primitive reported a no-op (row already gone, nothing to
+         requeue, …) — is recorded as ``action="auto-dispatch-noop"``
+         rather than ``"auto-dispatch"``, so the decision log never
+         claims an action happened when the queue was, in fact, left
+         untouched.
 
     *dry_run* classifies and logs but dispatches nothing and writes no
     convergence counter — a second sweep immediately after a dry run sees
@@ -903,7 +915,8 @@ def sweep(
     the next row in *rows* — not the same row again next sweep — is the
     one that gets the freed capacity.
     """
-    sweep_id = sweep_id or f"sweep-{(now or _utcnow)().strftime('%Y%m%dT%H%M%SZ')}"
+    moment = (now or _utcnow)()
+    sweep_id = sweep_id or f"sweep-{moment.strftime('%Y%m%dT%H%M%SZ')}"
     auto_dispatchers = auto_dispatchers or {}
     rows = list(rows)
     report = SweepReport(sweep_id=sweep_id, dry_run=dry_run, rows_observed=len(rows))
@@ -911,6 +924,13 @@ def sweep(
     from coord import state  # noqa: PLC0415 — deferred so dry-run callers need no DB.
 
     touched: set[tuple[str, str]] = set()
+    # Outcome backfill: decisions from EARLIER sweeps still
+    # waiting on a verdict, read once up front so this sweep's own
+    # decisions below never get evaluated against themselves. Populated
+    # below as rows are classified (`current_by_row`) and consumed after
+    # the main loop and again inside the `clear_absent_rows` pass.
+    pending_outcomes = state.pending_board_doctor_outcomes() if not dry_run else []
+    current_by_row: dict[tuple[str, str], dict] = {}
 
     def _alert_action(row: StuckRow) -> tuple[bool, str]:
         """Attempt the alert path for *row*; returns (escalated, action).
@@ -933,7 +953,7 @@ def sweep(
             return False, "alert-skipped"
         if not outcome:
             return False, "alert-failed"
-        state.mark_board_doctor_escalated(row.queue, row.key)
+        state.mark_board_doctor_escalated(row.queue, row.key, now=moment)
         return True, "alert"
 
     for row in rows:
@@ -971,7 +991,7 @@ def sweep(
                         "escalated": decision.escalated,
                         "confidence": row.confidence,
                         "evidence": list(row.evidence),
-                        "recorded_at": (now or _utcnow)().isoformat(),
+                        "recorded_at": moment.isoformat(),
                     }
                 )
             continue
@@ -1009,23 +1029,29 @@ def sweep(
                         "escalated": decision.escalated,
                         "confidence": row.confidence,
                         "evidence": list(row.evidence),
-                        "recorded_at": (now or _utcnow)().isoformat(),
+                        "recorded_at": moment.isoformat(),
                     }
                 )
             continue
         if dry_run:
             prior = state.board_doctor_row_state(row.queue, row.key) or None
-            updated = state.next_board_doctor_counter(prior, row.cause)
-            count, escalated = updated["count"], updated["escalated"]
+            counter_state = state.next_board_doctor_counter(prior, row.cause)
         else:
-            counter = state.record_board_doctor_observation(row.queue, row.key, row.cause)
-            count, escalated = counter["count"], counter["escalated"]
+            counter_state = state.record_board_doctor_observation(row.queue, row.key, row.cause)
+        count, escalated = counter_state["count"], counter_state["escalated"]
+        # A row already escalated for this SAME cause is not
+        # re-acted on forever — `board_doctor_alert_due` re-opens the
+        # alert path on an exponential backoff instead, so a still-wrong
+        # row keeps getting flagged (just less often over time) rather
+        # than converging to permanent silence once its first alert
+        # fires.
+        alert_due = not escalated or state.board_doctor_alert_due(counter_state, now=moment)
 
         tier = tier_of(row.cause)
         action = "converged-noop"
 
         if tier == TIER_ALERT:
-            if not escalated:
+            if alert_due:
                 escalated, action = _alert_action(row)
         elif count < convergence_limit:
             dispatcher = auto_dispatchers.get(row.cause)
@@ -1038,8 +1064,10 @@ def sweep(
             else:
                 action = "no-dispatcher"
         else:
-            if not escalated:
+            if alert_due:
                 escalated, action = _alert_action(row)
+
+        current_by_row[(row.queue, row.key)] = {"cause": row.cause, "escalated": escalated}
 
         if action == "auto-dispatch" and capacity_check is not None:
             # #3770: claim this row's capacity slot only now that its
@@ -1078,14 +1106,37 @@ def sweep(
                     "escalated": escalated,
                     "confidence": row.confidence,
                     "evidence": list(row.evidence),
-                    "recorded_at": (now or _utcnow)().isoformat(),
+                    "recorded_at": moment.isoformat(),
                 }
             )
+
+    if not dry_run:
+        # Fill in the verdict for every earlier decision whose
+        # row was classified again THIS sweep — the row's current
+        # cause/escalation (`current_by_row`) is exactly the "state at the
+        # next sweep" that answers whether the action worked.
+        for pending in pending_outcomes:
+            if pending.get("sweep_id") == sweep_id:
+                continue
+            row_key = (pending.get("queue"), pending.get("key"))
+            current = current_by_row.get(row_key)
+            if current is None:
+                continue
+            outcome = state.evaluate_board_doctor_outcome(pending, current)
+            state.record_board_doctor_outcome(pending["sweep_id"], row_key[0], row_key[1], outcome)
 
     if not dry_run and clear_absent_rows:
         for queue, key in state.board_doctor_tracked_rows():
             if (queue, key) not in touched:
                 state.clear_board_doctor_row(queue, key)
+                # The row dropped out of the stuck set entirely — resolved,
+                # which is unambiguous progress for any decision on it
+                # still waiting on a verdict.
+                for pending in pending_outcomes:
+                    if (pending.get("queue"), pending.get("key")) == (queue, key):
+                        state.record_board_doctor_outcome(
+                            pending["sweep_id"], queue, key, "progressed"
+                        )
                 if escalation_resolver is not None:
                     try:
                         escalation_resolver(queue, key)

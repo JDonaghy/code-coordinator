@@ -3263,8 +3263,161 @@ def drive_queue_sweep(
     else:
         click.echo(
             f"{report.rows_observed} row(s) observed and decided — read the log later with "
-            "`coord drive-queue sweep --json`"
+            "`coord drive-queue doctor-log`"
         )
+
+
+# ── doctor-log ───────────────────────────────────────────────────────────────
+
+
+def _doctor_log_line(entry: Mapping[str, Any]) -> str:
+    outcome = entry.get("outcome")
+    outcome_suffix = f" outcome={outcome}" if outcome else ""
+    return (
+        f"{entry.get('recorded_at', '?')}  {entry.get('queue', '?')}:{entry.get('key', '?')} "
+        f"cause={entry.get('cause', '?')} action={entry.get('action', '?')}{outcome_suffix}"
+    )
+
+
+def _doctor_log_summary(
+    entries: list[dict], *, since_days: float, repo: str | None
+) -> dict[str, Any]:
+    """Aggregate a filtered :func:`coord.state.board_doctor_decisions` slice
+    against the same window's block-log episodes, so an operator can read
+    "what has the doctor fixed" next to "what did a human still have to do."
+    """
+    from coord import state  # noqa: PLC0415
+    from coord.block_log import episodes, read_events  # noqa: PLC0415
+
+    actions_taken = sum(
+        1 for e in entries if e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
+    )
+    rows_unstuck = sum(1 for e in entries if e.get("outcome") == "progressed")
+    rows_still_stuck = sum(1 for e in entries if e.get("outcome") in ("unchanged", "regressed"))
+    acted_keys = {
+        e.get("key") for e in entries if e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
+    }
+
+    since = time.time() - since_days * 86400.0 if since_days > 0 else None
+    block_items = episodes(read_events(since=since))
+    if repo is not None:
+        block_items = [
+            item for item in block_items
+            if str(item.get("key") or "").rpartition("#")[0] == repo
+        ]
+    missed = sorted(
+        {
+            str(item.get("key") or "")
+            for item in block_items
+            if item.get("human_acted") and str(item.get("key") or "") not in acted_keys
+        }
+    )
+
+    return {
+        "actions_taken": actions_taken,
+        "rows_unstuck": rows_unstuck,
+        "rows_still_stuck": rows_still_stuck,
+        "human_interventions_missed": len(missed),
+        "human_interventions_missed_keys": missed,
+    }
+
+
+@drive_queue_group.command("doctor-log")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Emit entries (or the summary) as JSON.")
+@click.option(
+    "--since",
+    type=float,
+    default=14.0,
+    show_default=True,
+    help="Only decisions recorded within this many days (0 = no limit).",
+)
+@click.option("--repo", default=None, help="Restrict to one repo.")
+@click.option("--issue", type=int, default=None, help="Restrict to one issue number.")
+@click.option("--action", "action_filter", default=None, help="Restrict to one action name (e.g. auto-dispatch, alert).")
+@click.option("--limit", type=int, default=200, show_default=True, help="Max entries to print (ignored with --summary).")
+@click.option(
+    "--summary",
+    "summary_mode",
+    is_flag=True,
+    default=False,
+    help="Aggregate counts instead of the raw log: actions taken, rows unstuck, rows still "
+    "stuck, and human interventions the doctor missed (cross-referenced from the block log).",
+)
+@_CONFIG_OPTION
+def drive_queue_doctor_log(
+    output_json: bool,
+    since: float,
+    repo: str | None,
+    issue: int | None,
+    action_filter: str | None,
+    limit: int,
+    summary_mode: bool,
+    config_path: Path,
+) -> None:
+    """Read back `coord drive-queue sweep`'s durable decision/action log.
+
+    Replaces the old 500-entry ring buffer with a log kept for
+    `coord.state.BOARD_DOCTOR_LOG_RETENTION_DAYS` (default 90) and
+    outcome-tracked: every `auto-dispatch`/`alert` decision gets an
+    `outcome` ("progressed"/"unchanged"/"regressed") filled in once a
+    later sweep re-observes the same row, so this answers "did it work",
+    not just "what did the doctor try."
+
+    `--summary` is the fleet-health number this was built to drive down
+    `rows_still_stuck` trending to zero and
+    `human_interventions_missed` — a block-log episode a human had to act
+    on (`coord drive-queue block-log`'s own `human_acted`) that this same
+    window's log never shows an `auto-dispatch`/`alert` against — staying
+    at zero both mean the doctor, not an operator, is doing the unsticking.
+
+    Same `is_remote()` guard as `sweep`/`diagnose`/`block-log` — the
+    decision log and the block log both live on the daemon host.
+    """
+    from coord import state  # noqa: PLC0415
+    from coord.board_service import is_remote  # noqa: PLC0415
+
+    if is_remote():
+        raise click.ClickException(
+            "drive-queue doctor-log reads the daemon host's board_meta "
+            "directly — run it there (a board_service-configured thin "
+            "client would read an empty local copy)."
+        )
+
+    since_ts = time.time() - since * 86400.0 if since > 0 else None
+    entries = state.board_doctor_decisions(
+        since=since_ts, repo=repo, issue=issue, action=action_filter,
+    )
+
+    if summary_mode:
+        summary = _doctor_log_summary(entries, since_days=since, repo=repo)
+        if output_json:
+            click.echo(_json.dumps(summary))
+            return
+        click.echo(
+            f"{summary['actions_taken']} action(s) taken in {since:g}d — "
+            f"{summary['rows_unstuck']} row(s) unstuck · "
+            f"{summary['rows_still_stuck']} still stuck"
+        )
+        if summary["human_interventions_missed"]:
+            click.echo(
+                f"{summary['human_interventions_missed']} human intervention(s) the doctor "
+                "missed:"
+            )
+            for key in summary["human_interventions_missed_keys"]:
+                click.echo(f"  {key}")
+        else:
+            click.echo("0 human interventions missed")
+        return
+
+    entries = entries if limit <= 0 else entries[-limit:]
+    if output_json:
+        click.echo(_json.dumps({"entries": entries}))
+        return
+    if not entries:
+        click.echo(f"no board-doctor decisions recorded in the last {since:g}d")
+        return
+    for entry in entries:
+        click.echo(_doctor_log_line(entry))
 
 
 # ── overlap-report (#2247) ───────────────────────────────────────────────────
