@@ -243,7 +243,7 @@ def authorize_sweep_action(action: str) -> None:
 #: investigator session — a coordinator-role `claude -p` reading with
 #: `coord gates`/`coord log`/`coord audit`/`drive-queue list`/`block-log`/
 #: `git`/read-only `gh`, never a routed worker — may invoke via the CLI
-#: wrapper (`coord drive-queue doctor act`). Every name here is also
+#: wrapper (`coord drive-queue doctor-act`). Every name here is also
 #: authorized by :func:`authorize_sweep_action` (:func:`authorize_
 #: investigator_action` re-derives the underlying name via
 #: :data:`_INVESTIGATOR_ACTION_ALIAS` and calls it) — the investigator
@@ -906,7 +906,9 @@ class FixitLegDispatch(TypedDict):
     detail: str
 
 
-def _in_flight_work_detail(repo_name: str, issue_number: int, board: "Board") -> str | None:
+def _in_flight_work_detail(
+    repo_name: str, issue_number: int, board: "Board", *, verb: str = "a leg",
+) -> str | None:
     """``None`` when *repo_name*#*issue_number* has no running/pending
     work-like assignment and no live `coord drive` tmux session; otherwise
     the human-readable reason it is already in flight.
@@ -922,6 +924,12 @@ def _in_flight_work_detail(repo_name: str, issue_number: int, board: "Board") ->
     has nothing live against it either, so it reads as NOT in flight here
     — exactly the shape :data:`queue_diagnose.CAUSE_NEVER_DISPATCHED`
     needs :func:`investigator_requeue` to act on.
+
+    *verb* names what the caller would otherwise dispatch a second of —
+    e.g. ``"a fix-it leg"`` — and is interpolated directly into the
+    returned message, so a caller that wants its own wording never has to
+    `str.replace()` this function's fixed phrasing (a silent no-op the
+    moment either side's wording drifts).
     """
     from coord.gates import assignments_for_issue  # noqa: PLC0415
     from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
@@ -934,8 +942,8 @@ def _in_flight_work_detail(repo_name: str, issue_number: int, board: "Board") ->
     if any(a.status in ("running", "pending") for a in work_like):
         return (
             f"{repo_name}#{issue_number} already has a running or "
-            "pending assignment — a leg is already in flight, not acting "
-            "a second time"
+            f"pending assignment — {verb} is already in flight, not "
+            "acting a second time"
         )
 
     from coord.drive import list_drive_sessions  # noqa: PLC0415
@@ -948,7 +956,7 @@ def _in_flight_work_detail(repo_name: str, issue_number: int, board: "Board") ->
     if live_sessions:
         return (
             f"{repo_name}#{issue_number} has a live `coord drive` session "
-            f"({live_sessions[0].get('session_name')}) — a leg is already "
+            f"({live_sessions[0].get('session_name')}) — {verb} is already "
             "in flight, not acting a second time"
         )
     return None
@@ -1012,17 +1020,15 @@ def sweep_dispatch_fixit_leg(
             ),
         )
 
-    in_flight = _in_flight_work_detail(repo_name, issue_number, board)
+    in_flight = _in_flight_work_detail(
+        repo_name, issue_number, board, verb="a fix-it leg",
+    )
     if in_flight is not None:
         return FixitLegDispatch(
             dispatched=False,
             assignment_id=None,
             machine=None,
-            detail=in_flight.replace(
-                "a leg is already in flight, not acting a second time",
-                "a fix-it leg is already in flight, not dispatching a "
-                "second one",
-            ),
+            detail=in_flight,
         )
 
     work = _select_winning_work_assignment(work_like)
@@ -1906,10 +1912,7 @@ def sweep_raise_fixit_budget(
 
     from coord.drive_queue import effective_max_fix_rounds  # noqa: PLC0415
 
-    config_default = getattr(
-        getattr(config, "pipeline", None), "max_fix_rounds", None
-    )
-    current_ceiling = effective_max_fix_rounds(entry, config_default)
+    current_ceiling = effective_max_fix_rounds(entry, config.pipeline.max_fix_rounds)
     new_ceiling = current_ceiling + increment
     declaration["max_fix_rounds"] = new_ceiling
 
@@ -1993,6 +1996,7 @@ def sweep_restage(
             ),
         )
 
+    from coord.board_service import write_board  # noqa: PLC0415
     from coord.review import dispatch_review  # noqa: PLC0415
 
     try:
@@ -2007,6 +2011,10 @@ def sweep_restage(
             restaged=False,
             detail=f"{repo_name}#{issue_number} review restage made no dispatch",
         )
+    # `dispatch_review`'s own contract (coord/review.py): "the caller is
+    # responsible for persisting the board" — it mutates `work.review_state`
+    # in place but never writes it back itself.
+    write_board(board)
     return RestageResult(
         restaged=True,
         detail=(
@@ -2178,8 +2186,23 @@ def sweep_bounce(
     Refuses (``bounced=False``) rather than dispatching anything when
     *review_assignment_id* does not resolve to a ``type="review"``
     assignment on *board*, or when its verdict is not
-    ``"request-changes"`` — the same two checks `coord bounce` itself
-    makes before dispatching.
+    ``"request-changes"``. Stricter than `coord bounce` on the second
+    check: that command also accepts ``review_verdict is None`` (a review
+    that has not posted a verdict at all), which this sweep-tier
+    primitive deliberately refuses — a daemon-internal action with no
+    human reading its output should not guess at a still-in-flight
+    review's eventual verdict.
+
+    Persists *board* via `coord.board_service.write_board` whenever
+    `process_review_completion` produced an action kind in
+    `coord.auto_loop.PERSIST_ACTION_KINDS` — the same persist obligation
+    `coord bounce` itself discharges with its own narrower
+    ``dispatched or terminal`` check (``coord/commands/merge.py``), and the
+    reason that module-level tuple exists at all rather than living as a
+    local in one caller (#1601/#1624): `process_review_completion` mutates
+    `review.review_verdict` in memory on an approve/approved-with-nits path
+    and `work.review_state` on the #522 terminal path, and either is lost
+    unless the caller writes the board back.
     """
     authorize_sweep_action("bounce")
 
@@ -2199,7 +2222,8 @@ def sweep_bounce(
             ),
         )
 
-    from coord.auto_loop import process_review_completion  # noqa: PLC0415
+    from coord.auto_loop import PERSIST_ACTION_KINDS, process_review_completion  # noqa: PLC0415
+    from coord.board_service import write_board  # noqa: PLC0415
     from coord.state import COORD_DIR  # noqa: PLC0415
 
     machine = next(
@@ -2212,6 +2236,8 @@ def sweep_bounce(
     actions = process_review_completion(
         review, board, config, log_path=log_path, machine_host=machine_host,
     )
+    if any(getattr(a, "kind", None) in PERSIST_ACTION_KINDS for a in actions):
+        write_board(board)
     dispatched = any(getattr(a, "kind", None) == "fix_dispatched" for a in actions)
     detail = (
         f"{repo_name}#{issue_number} bounce re-dispatched a fix worker for "
@@ -2315,14 +2341,101 @@ def investigator_requeue(
     )
 
 
+def _live_review_red_with_findings(
+    review_assignment_id: str | None, board: "Board", config: "Config",
+) -> bool:
+    """True when *review_assignment_id* resolves, live, to a real
+    ``type="review"`` row on *board* with ``review_verdict ==
+    "request-changes"`` AND a body that `coord.review.classify_
+    blocking_evidence` does not confirm as free of blocking findings.
+
+    An observation taken here, from the board and the review's own log —
+    never the caller's say-so — because :func:`investigator_raise_budget`
+    is gated on this being a live re-read (#3881 design point 2), not an
+    assertion by the very agent the gate exists to check.
+
+    Fails closed: no assignment id, an id that does not resolve to a
+    review, a verdict other than ``"request-changes"``, or a body this
+    machine cannot read (`classify_blocking_evidence`'s own `body=""`
+    fail-closed case, same as every other blocking-findings caller in
+    this codebase) all read as "findings not confirmed" in the direction
+    that matters for THIS gate: unreadable means not positively eligible,
+    not positively ineligible.
+    """
+    if not review_assignment_id:
+        return False
+    review = board.find_by_id(review_assignment_id)
+    if review is None or getattr(review, "type", None) != "review":
+        return False
+    if getattr(review, "review_verdict", None) != "request-changes":
+        return False
+
+    from coord.auto_loop import _load_review_findings  # noqa: PLC0415
+    from coord.review import classify_blocking_evidence  # noqa: PLC0415
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    machine = next(
+        (m for m in config.machines if m.name == review.machine_name), None,
+    )
+    machine_host = machine.host if machine and getattr(machine, "host", None) else None
+    local_log = COORD_DIR / "logs" / f"{review_assignment_id}.log"
+    log_path = str(local_log) if local_log.exists() else None
+
+    findings = _load_review_findings(review, log_path, machine_host)
+    if findings is None:
+        return False
+    return not classify_blocking_evidence(
+        findings.body, assignment_id=review_assignment_id,
+    ).confirmed_absent
+
+
+def _live_ci_red_only(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", gh_ops: Any,
+) -> bool:
+    """True when *repo_name*#*issue_number*'s merge-queue entry has an
+    approval bound to its current content (`coord.merge_queue.
+    has_approved_review`) AND a live CI read reports at least one failing
+    check — i.e. CI, never the review, is the reason this row would not
+    merge right now.
+
+    A live observation, not a caller-supplied flag: builds its own
+    `coord.ci_store.CiStore` from *config* (the same `build_ci_store` call
+    every merge call site makes) and asks it directly, rather than trust
+    an ``--ci-red-only`` assertion from the very session being gated.
+    """
+    from coord.ci_store import build_ci_store, failed_checks  # noqa: PLC0415
+    from coord.merge_queue import has_approved_review, load_queue  # noqa: PLC0415
+
+    entry = next(
+        (
+            e
+            for e in load_queue()
+            if e.repo_name == repo_name and e.issue_number == issue_number
+        ),
+        None,
+    )
+    if entry is None or not entry.pr_number:
+        return False
+    if not has_approved_review(entry, board, gh_ops, config=config):
+        return False
+
+    ci_store = build_ci_store(
+        config.ci_store.type, host=config.ci_store.host, token_env=config.ci_store.token_env,
+    )
+    if not ci_store.is_available:
+        return False
+    checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+    return bool(failed_checks(checks))
+
+
 def investigator_raise_budget(
     repo_name: str,
     issue_number: int,
+    board: "Board",
     config: "Config",
+    gh_ops: Any,
     *,
-    review_verdict: str | None,
-    review_has_findings: bool,
-    ci_red_only: bool,
+    review_assignment_id: str | None = None,
     reason: str,
     increment: int = 2,
 ) -> InvestigatorActionResult:
@@ -2333,12 +2446,15 @@ def investigator_raise_budget(
     (`coord.state.board_doctor_fixit_rebudget_spent`, keyed by
     ``(repo_name, issue_number)`` alone so it survives a remove+add
     cycle), and the evidence that makes a bump safe rather than a blind
-    relaunch — *review_verdict* ``"request-changes"`` with
-    *review_has_findings* True, OR *ci_red_only* True. Both evidence
-    booleans are the CALLER's live read (an investigator session's own
-    `coord gates`/`coord log` probe immediately before calling this), not
-    re-derived here — this function's only job is the mechanical
-    once-ever spend.
+    relaunch — a live-read ``request-changes`` review with confirmed
+    findings (:func:`_live_review_red_with_findings`), OR a live-read
+    "CI is the only red gate" (:func:`_live_ci_red_only`). *review_
+    assignment_id* names which review to check; both evidence functions
+    re-derive their own answer from the board/CI backend THIS call reads,
+    never from a boolean the caller merely asserts (#3881 design point 2:
+    "re-reads live GitHub + board state immediately before acting") — the
+    investigator session chooses which review to point at, the wrapper
+    is the one that decides whether it actually qualifies.
     """
     authorize_investigator_action("raise_budget")
 
@@ -2360,7 +2476,9 @@ def investigator_raise_budget(
             ),
         )
 
-    eligible = (review_verdict == "request-changes" and review_has_findings) or ci_red_only
+    eligible = _live_review_red_with_findings(
+        review_assignment_id, board, config,
+    ) or _live_ci_red_only(repo_name, issue_number, board, config, gh_ops)
     if not eligible:
         return _investigator_result(
             "raise_budget",
@@ -2405,9 +2523,10 @@ def investigator_bounce(
     unless this row has already spent its lifetime raise-budget (see
     :func:`investigator_raise_budget`) — bouncing a row that never needed
     a fresh ceiling is ordinary auto-loop business, not an investigator
-    action. :func:`sweep_bounce` then makes the same two checks `coord
-    bounce` itself does (a real review assignment, verdict
-    ``"request-changes"``) before dispatching.
+    action. :func:`sweep_bounce` then makes its own two checks (a real
+    review assignment, verdict ``"request-changes"`` — stricter than
+    `coord bounce` itself, which also accepts an in-flight review with no
+    verdict posted yet) before dispatching.
     """
     authorize_investigator_action("bounce")
 
@@ -2461,8 +2580,34 @@ def investigator_integration_fix(
     (via `authorize_sweep_action("dispatch_fixit_leg")`, reached through
     :data:`_INVESTIGATOR_ACTION_ALIAS`), so a sibling-issue fix leg reads
     on the board exactly like any other fix-it leg dispatch.
+
+    Consults `coord.drive_queue.fix_round_ceiling_blocked_for_issue` for
+    the SIBLING row before dispatching — "#3756: the ONE lookup every
+    dispatcher must use" (vimcode#2018: an independent dispatcher pacing
+    itself off a different counter produced ~14 legs/$31 overnight). A
+    sibling that already gave up on the #2972 fix-round ceiling refuses
+    here with ``acted=False``, the same fallback-to-alert posture
+    `coord.board_doctor_policy._investigate` applies around
+    :func:`sweep_dispatch_fixit_leg` directly.
     """
     authorize_investigator_action("integration_fix")
+
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+    if fix_round_ceiling_blocked_for_issue(sibling_repo, sibling_issue):
+        return _investigator_result(
+            "integration_fix",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=(
+                f"{sibling_repo}#{sibling_issue} already gave up on the "
+                "#2972 fix-round ceiling — refusing to dispatch another "
+                f"fix-it leg against it (integration fix for {repo_name}#"
+                f"{issue_number})"
+            ),
+        )
 
     result = dispatch_sweep_action(
         "dispatch_fixit_leg",
@@ -2541,11 +2686,52 @@ def investigator_merge(
     :func:`coord.merge_queue.process` itself the moment it runs (a
     ``checks_failed``/``checks_pending``/``conflict`` event is exactly
     "the precondition no longer holds", reported as ``acted=False``,
-    never treated as this call's own failure).
+    never treated as this call's own failure) — but only once `process()`
+    is actually handed a real CI backend: a config-built
+    :func:`coord.ci_store.build_ci_store`, the same one every other merge
+    call site (`coord merge`, `coord merge --only`) constructs, never the
+    `NoOpCi` `process()` falls back to when no store is passed, which
+    reports ``is_available=False`` and so never runs the CI gate at all.
+
+    Mirrors the ``--only`` surgical path's post-`process()` bookkeeping,
+    not just its `process()` call: a fresh ``conflict`` or confirmed
+    ``checks_failed`` event here still needs
+    :func:`coord.commands.merge._dispatch_conflict_fixes` /
+    :func:`coord.commands.merge._dispatch_ci_fixes` to escalate or dispatch
+    a bounded fix, and a merge that lands still needs
+    :func:`coord.commands.merge._sweep_sibling_conflicts` to park any sibling
+    PR GitHub just broke — exactly the three steps `--only` runs before its
+    own save (``coord/commands/merge.py``'s ``merge()`` body), omitting none
+    of them the way a hand-rolled re-implementation easily could.
+
+    Persists by re-loading the queue and merging *entry*'s own mutated
+    state back over it (the ``--only`` path's own save shape), never by
+    writing back the whole pre-``process()`` snapshot this call started
+    with — a concurrent writer's row added or changed during the
+    (possibly minutes-long) ``process()`` call is preserved, not reverted.
+
+    ``acted`` is `coord.merge_queue.MERGE_LANDED_KINDS` applied to the
+    events `process()` returned — the one answer `process()` itself gives
+    to "did this land" — never a second, locally-invented tuple of kinds
+    that can drift out of the lockstep `MERGE_LANDED_KINDS` already keeps
+    with `process()`'s own source (#2096).
     """
     authorize_investigator_action("merge")
 
-    from coord.merge_queue import PENDING, has_approved_review, load_queue, process, save_queue  # noqa: PLC0415
+    from coord.ci_store import build_ci_store  # noqa: PLC0415
+    from coord.commands.merge import (  # noqa: PLC0415
+        _dispatch_ci_fixes,
+        _dispatch_conflict_fixes,
+        _sweep_sibling_conflicts,
+    )
+    from coord.merge_queue import (  # noqa: PLC0415
+        MERGE_LANDED_KINDS,
+        PENDING,
+        has_approved_review,
+        load_queue,
+        process,
+        save_queue,
+    )
 
     queue = load_queue()
     entry = next(
@@ -2586,16 +2772,29 @@ def investigator_merge(
             ),
         )
 
-    events = process(
-        [entry], gh_ops, config=config, board=board, skip_review=False, skip_smoke=False, force_merge=False,
+    ci_store = build_ci_store(
+        config.ci_store.type,
+        host=config.ci_store.host,
+        token_env=config.ci_store.token_env,
     )
-    # `entry` is the same object `process()` just mutated in place — it is
-    # already one of `queue`'s own items (found by identity-preserving
-    # `next()` above), so persisting the whole list carries that mutation
-    # through for every other entry too, same as `coord merge`'s own
-    # save-after-process step.
-    save_queue(queue)
-    merged_event = next((ev for ev in events if ev.kind in ("merged", "merged_partial")), None)
+    events = process(
+        [entry], gh_ops, config=config, board=board, ci_store=ci_store,
+        skip_review=False, skip_smoke=False, force_merge=False,
+    )
+    # Same ordering as the `--only` path: classify a fresh conflict/
+    # confirmed-CI-failure event, and sweep any sibling the merge just
+    # broke, BEFORE the save below — each mutates `entry`/its siblings'
+    # `.state` in place, and the save has to pick those mutations up.
+    _dispatch_conflict_fixes(events, config, dry_run=False, gh_ops=gh_ops)
+    _dispatch_ci_fixes(events, config, ci_store, dry_run=False)
+    _sweep_sibling_conflicts(events, [entry], config, gh_ops, dry_run=False)
+    # Persist only `entry` back over the current on-disk queue — never the
+    # whole pre-`process()` snapshot this call started with, which could by
+    # now be stale against a concurrent writer.
+    fresh_queue = load_queue()
+    by_id = {entry.assignment_id: entry}
+    save_queue([by_id.get(x.assignment_id, x) for x in fresh_queue])
+    merged_event = next((ev for ev in events if ev.kind in MERGE_LANDED_KINDS), None)
     acted = merged_event is not None
     detail = (
         merged_event.message
@@ -2645,7 +2844,7 @@ _INVESTIGATOR_DISPATCH: dict[str, Callable[..., InvestigatorActionResult]] = {
 def dispatch_investigator_action(
     action: str, repo_name: str, issue_number: int, *args: Any, **kwargs: Any,
 ) -> InvestigatorActionResult:
-    """The single entry point `coord drive-queue doctor act` calls (#3881).
+    """The single entry point `coord drive-queue doctor-act` calls (#3881).
 
     Daemon-host only: :func:`coord.state._thin_client_local_board_guard`
     fires first, exactly like every other board-doctor state primitive

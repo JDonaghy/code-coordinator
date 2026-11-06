@@ -1898,17 +1898,40 @@ class TestInvestigatorRequeue:
 
 
 class TestInvestigatorRaiseBudget:
-    def test_acts_once_on_a_request_changes_verdict_with_findings(self) -> None:
+    """Eligibility is re-derived live from the board/CI backend THIS call
+    reads (:func:`_live_review_red_with_findings` /
+    :func:`_live_ci_red_only`) — never trusted from a caller-supplied
+    boolean (#3881 review: the precondition must be an observation, not
+    the gated agent's own assertion)."""
+
+    def test_acts_once_on_a_request_changes_verdict_with_findings(
+        self, monkeypatch,
+    ) -> None:
         from coord.board_doctor_permissions import investigator_raise_budget
         from coord.state import board_doctor_fixit_rebudget_spent
 
         repo = _fixit_repo()
         config = _fixit_config(repo)
         state.enqueue_drive_queue("api", 1)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        board.completed.append(
+            _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        )
+        monkeypatch.setattr(
+            "coord.auto_loop._load_review_findings",
+            lambda *a, **k: ReviewFindings(
+                verdict="request-changes",
+                body=(
+                    "<!-- coord:review verdict=request-changes blocking=1 "
+                    "assignment=r1 -->\n## Blocking findings\n- a real bug\n"
+                ),
+            ),
+        )
 
         result = investigator_raise_budget(
-            "api", 1, config,
-            review_verdict="request-changes", review_has_findings=True, ci_red_only=False,
+            "api", 1, board, config, gh_ops=object(),
+            review_assignment_id="r1",
             reason="request-changes with concrete findings",
         )
 
@@ -1917,16 +1940,42 @@ class TestInvestigatorRaiseBudget:
         row = state.get_drive_queue_entry("api", 1)
         assert row is not None and row["max_fix_rounds"] is not None
 
-    def test_acts_on_ci_red_on_the_merge_ref_only(self) -> None:
+    def test_acts_on_ci_red_on_the_merge_ref_only(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+        from coord import ci_store as ci_store_mod
         from coord.board_doctor_permissions import investigator_raise_budget
 
         repo = _fixit_repo()
         config = _fixit_config(repo)
         state.enqueue_drive_queue("api", 2)
+        board = Board()
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w2", repo_name="api", repo_github="acme/api",
+                branch="issue-2-fix", target_branch="main", issue_number=2,
+                issue_title="Fix the thing", state=mq.PENDING, pr_number=9,
+            )
+        ])
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+
+        class _FailingCiStore:
+            is_available = True
+
+            def list_checks_for_pr(self, repo_github, pr_number):
+                return [
+                    ci_store_mod.CheckRun(
+                        name="ci", status="completed", conclusion="failure",
+                        url="", run_id="1", started_at=None, completed_at=None,
+                    )
+                ]
+
+        monkeypatch.setattr(
+            ci_store_mod, "build_ci_store", lambda *a, **k: _FailingCiStore(),
+        )
 
         result = investigator_raise_budget(
-            "api", 2, config,
-            review_verdict="approve", review_has_findings=False, ci_red_only=True,
+            "api", 2, board, config, gh_ops=object(),
+            review_assignment_id=None,
             reason="CI red, review already approved",
         )
 
@@ -1939,33 +1988,85 @@ class TestInvestigatorRaiseBudget:
         repo = _fixit_repo()
         config = _fixit_config(repo)
         state.enqueue_drive_queue("api", 3)
+        board = Board()
 
         result = investigator_raise_budget(
-            "api", 3, config,
-            review_verdict=None, review_has_findings=False, ci_red_only=False,
+            "api", 3, board, config, gh_ops=object(),
+            review_assignment_id=None,
             reason="flailing, not environmental",
         )
 
         assert result["acted"] is False
         assert board_doctor_fixit_rebudget_spent("api", 3) is False
 
-    def test_the_lifetime_cap_is_spent_at_most_once_ever(self) -> None:
+    def test_refuses_a_caller_supplied_claim_unbacked_by_live_state(
+        self, monkeypatch,
+    ) -> None:
+        """A session that merely ASSERTS eligibility — a real review id
+        whose actual body carries no confirmed blocking findings — must
+        not be granted the raise just because it named a plausible-looking
+        review. This is the exact #3881 review finding: the precondition
+        must be observed here, not trusted from the caller."""
+        from coord.board_doctor_permissions import investigator_raise_budget
+        from coord.state import board_doctor_fixit_rebudget_spent
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        state.enqueue_drive_queue("api", 5)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        board.completed.append(
+            _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        )
+        monkeypatch.setattr(
+            "coord.auto_loop._load_review_findings",
+            lambda *a, **k: ReviewFindings(
+                verdict="request-changes",
+                body="<!-- coord:review verdict=request-changes blocking=0 assignment=r1 -->\n",
+            ),
+        )
+
+        result = investigator_raise_budget(
+            "api", 5, board, config, gh_ops=object(),
+            review_assignment_id="r1",
+            reason="claims eligibility",
+        )
+
+        assert result["acted"] is False
+        assert board_doctor_fixit_rebudget_spent("api", 5) is False
+
+    def test_the_lifetime_cap_is_spent_at_most_once_ever(self, monkeypatch) -> None:
         from coord.board_doctor_permissions import investigator_raise_budget
 
         repo = _fixit_repo()
         config = _fixit_config(repo)
         state.enqueue_drive_queue("api", 4)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        board.completed.append(
+            _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        )
+        monkeypatch.setattr(
+            "coord.auto_loop._load_review_findings",
+            lambda *a, **k: ReviewFindings(
+                verdict="request-changes",
+                body=(
+                    "<!-- coord:review verdict=request-changes blocking=1 "
+                    "assignment=r1 -->\n## Blocking findings\n- a real bug\n"
+                ),
+            ),
+        )
 
         first = investigator_raise_budget(
-            "api", 4, config,
-            review_verdict="request-changes", review_has_findings=True, ci_red_only=False,
+            "api", 4, board, config, gh_ops=object(),
+            review_assignment_id="r1",
             reason="first raise",
         )
         assert first["acted"] is True
 
         second = investigator_raise_budget(
-            "api", 4, config,
-            review_verdict="request-changes", review_has_findings=True, ci_red_only=False,
+            "api", 4, board, config, gh_ops=object(),
+            review_assignment_id="r1",
             reason="second raise attempt",
         )
         assert second["acted"] is False
@@ -2013,6 +2114,14 @@ class TestInvestigatorBounce:
         result = investigator_bounce("api", 1, "r1", board, config, reason="bounce it")
 
         assert result["acted"] is True
+        # #3881 review: `process_review_completion`'s own board mutations
+        # (`review_verdict`/`review_state`) are lost unless the caller
+        # persists — confirm `sweep_bounce` actually wrote the board back,
+        # not just mutated the in-memory copy this call happened to hold.
+        from coord.board_service import read_board
+
+        persisted = read_board()
+        assert {a.assignment_id for a in persisted.completed} == {"w1", "r1"}
 
 
 class TestInvestigatorRestage:
@@ -2061,6 +2170,39 @@ class TestInvestigatorRestage:
         assert result["acted"] is False
         assert "no completed work assignment" in result["detail"]
 
+    def test_review_stage_persists_the_board_after_a_successful_dispatch(
+        self, monkeypatch,
+    ) -> None:
+        """`coord.review.dispatch_review`'s own contract: "the caller is
+        responsible for persisting the board" — confirm the restage
+        handler actually discharges it rather than leaving the mutation
+        in-memory only."""
+        from coord.board_doctor_permissions import investigator_restage
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        board.completed.append(work)
+
+        class _Dispatched:
+            assignment_id = "review-fresh"
+
+        def _fake_dispatch_review(w, b, c):
+            w.review_state = "dispatched"
+            return _Dispatched()
+
+        monkeypatch.setattr("coord.review.dispatch_review", _fake_dispatch_review)
+
+        result = investigator_restage("api", 1, board, config, stage="review", reason="x")
+
+        assert result["acted"] is True
+        from coord.board_service import read_board
+
+        persisted = read_board()
+        persisted_work = next(a for a in persisted.completed if a.assignment_id == "w1")
+        assert persisted_work.review_state == "dispatched"
+
 
 class TestInvestigatorIntegrationFix:
     def test_dispatches_against_the_sibling_issue_never_the_original(self) -> None:
@@ -2088,6 +2230,33 @@ class TestInvestigatorIntegrationFix:
                 a for a in board.active if a.issue_number == 2 and a.type == "work"
             ]
             assert dispatched_for_2
+
+    def test_refuses_when_the_sibling_already_gave_up_on_the_fix_round_ceiling(
+        self, monkeypatch,
+    ) -> None:
+        """#3756: the ONE lookup every independent dispatcher must consult
+        before relaunching a fix leg — this verb targets a SIBLING issue,
+        so it must check the sibling's own ceiling, not the original row's."""
+        import coord.drive_queue as dq
+        from coord.board_doctor_permissions import investigator_integration_fix
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        monkeypatch.setattr(
+            dq, "fix_round_ceiling_blocked_for_issue",
+            lambda r, i: r == "api" and i == 2,
+        )
+
+        result = investigator_integration_fix(
+            "api", 1, board, config,
+            sibling_repo="api", sibling_issue=2, cause="baseline_red_streak",
+            evidence=(), reason="base broke this row's PR",
+        )
+
+        assert result["acted"] is False
+        assert "fix-round ceiling" in result["detail"]
+        assert not board.active
 
 
 class TestInvestigatorMarkDone:
@@ -2229,6 +2398,55 @@ class TestInvestigatorClearLatchAndMerge:
 
         assert result["acted"] is True
         assert result["detail"] == "merged cleanly"
+
+    def test_merge_passes_a_real_ci_store_and_preserves_a_concurrent_queue_row(
+        self, monkeypatch,
+    ) -> None:
+        """#3881 review: `process()` must be handed a real
+        `build_ci_store(...)`-constructed backend, never the implicit
+        `NoOpCi` fallback that makes the CI gate unreachable — and the
+        post-`process()` save must merge back over the CURRENT on-disk
+        queue, never clobber a row a concurrent writer added while
+        `process()` was running (minutes-long PR/CI polling)."""
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import investigator_merge
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.PENDING,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+
+        captured: dict = {}
+
+        def _fake_process(items, gh_ops, **kwargs):
+            captured.update(kwargs)
+            # A concurrent writer enqueues a second row while this call is
+            # "running" — must survive the save below.
+            sibling = mq.QueuedMerge(
+                assignment_id="w9", repo_name="api", repo_github="acme/api",
+                branch="issue-9-fix", target_branch="main", issue_number=9,
+                issue_title="other", state=mq.PENDING,
+            )
+            mq.save_queue([entry, sibling])
+            return [mq.MergeEvent(entry, "merged_partial", "merged partially")]
+
+        monkeypatch.setattr(mq, "process", _fake_process)
+
+        result = investigator_merge(
+            "api", 1, board, config, gh_ops=object(), reason="approved and green",
+        )
+
+        assert result["acted"] is True
+        assert captured.get("ci_store") is not None
+        queue_after = mq.load_queue()
+        assert {e.assignment_id for e in queue_after} == {"w1", "w9"}
 
 
 class TestDispatchInvestigatorActionThinClientGuard:
