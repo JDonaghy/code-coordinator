@@ -1321,8 +1321,13 @@ _CREDENTIAL_ERROR_PATTERNS: tuple[str, ...] = (
 #: up near a credential-shaped error — cosmetic only (`EnvDiagnosis.
 #: credential_name` is never required to be non-``None``), so this list may
 #: safely miss a provider without breaking the classification itself.
+#: Every entry is matched as a plain substring of the whole lowercased
+#: output, so each must be long and distinctive enough that it cannot turn
+#: up inside an unrelated English word — a short abbreviation like `gh`
+#: would match "through"/"highlighted" and name the wrong credential, so
+#: the forge is listed only under its full name.
 _KNOWN_CREDENTIAL_NAMES: tuple[str, ...] = (
-    "opencode", "anthropic", "claude", "openai", "github", "gh",
+    "opencode", "anthropic", "claude", "openai", "github",
 )
 
 #: Matches the shell's own "command not found" / "no such file" wording —
