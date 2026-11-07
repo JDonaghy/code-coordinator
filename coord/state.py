@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2846,10 +2846,16 @@ BOARD_DOCTOR_OUTCOME_ACTIONS = frozenset({"auto-dispatch", "alert"})
 
 #: Outcomes :func:`evaluate_board_doctor_outcome` can return. Includes
 #: ``"progressed_by_other"`` (#3889) alongside the original three — a row
-#: that unstuck itself via an operator action (``remove``/``add``, a hand
-#: merge, an override) or the ordinary drive loop, not this doctor's own
-#: confirmed action, so crediting it as plain ``"progressed"`` would let
-#: `coord drive-queue doctor-log --summary` take credit for a human's fix.
+#: that unstuck itself via an operator action (``remove``/``add``), a hand
+#: merge/unrelated branch landing, or the ordinary drive loop, not this
+#: doctor's own confirmed action, so crediting it as plain ``"progressed"``
+#: would let `coord drive-queue doctor-log --summary` take credit for a
+#: human's fix. The evidence for this (:mod:`coord.block_log`'s
+#: ``human_acted``/``resolution`` fields — see
+#: :func:`coord.board_doctor._board_doctor_other_resolutions`) does NOT yet
+#: cover ``coord merge --override-human-required``: that command logs
+#: nothing to the block log, so an override still reads as plain
+#: ``"progressed"`` today.
 BOARD_DOCTOR_OUTCOME_VALUES = frozenset(
     {"progressed", "progressed_by_other", "unchanged", "regressed"}
 )
@@ -2956,12 +2962,7 @@ def record_board_doctor_decision(entry: dict) -> None:
     if "outcome" not in stamped and entry.get("action") in BOARD_DOCTOR_OUTCOME_ACTIONS:
         stamped["outcome"] = None
     recorded_at = stamped.get("recorded_at")
-    recorded_at_ts: float | None = None
-    if isinstance(recorded_at, str) and recorded_at:
-        try:
-            recorded_at_ts = datetime.fromisoformat(recorded_at).timestamp()
-        except ValueError:
-            recorded_at_ts = None
+    recorded_at_ts = board_doctor_decision_ts(stamped) if recorded_at else None
     if recorded_at_ts is None:
         recorded_at_ts = time.time()
         recorded_at = datetime.fromtimestamp(recorded_at_ts, tz=timezone.utc).isoformat()
@@ -3009,7 +3010,17 @@ def record_board_doctor_outcome(sweep_id: str, queue: str, key: str, outcome: st
     No-op if no matching row is found (already pruned, or the caller
     passed a stale identifier) — this never inserts a new log entry, only
     updates one that already exists.
+
+    Raises :class:`ValueError` for an *outcome* outside
+    :data:`BOARD_DOCTOR_OUTCOME_VALUES` (#3889 review) — a declared
+    vocabulary nothing enforced would silently drift the moment a caller
+    typo'd or extended it without updating the frozenset alongside.
     """
+    if outcome not in BOARD_DOCTOR_OUTCOME_VALUES:
+        raise ValueError(
+            f"record_board_doctor_outcome: outcome {outcome!r} not in "
+            f"BOARD_DOCTOR_OUTCOME_VALUES ({sorted(BOARD_DOCTOR_OUTCOME_VALUES)})"
+        )
     conn = get_connection()
 
     def _write() -> None:
@@ -3030,14 +3041,17 @@ def pending_board_doctor_outcomes() -> list[dict]:
     ``outcome`` still ``None`` — oldest first, so a caller backfilling
     outcomes processes the longest-waiting entries first.
 
+    Filters in SQL (#3889 review) rather than pulling every row in the
+    durable log and throwing most of them away in Python — a sweep on a
+    fleet with months of history must not materialise the whole table on
+    every single pass just to find the handful still pending a verdict.
+
     **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
     """
     _thin_client_local_board_guard("pending_board_doctor_outcomes")
-    return [
-        item
-        for item in board_doctor_decisions()
-        if item.get("action") in BOARD_DOCTOR_OUTCOME_ACTIONS and item.get("outcome") is None
-    ]
+    return board_doctor_decisions(
+        actions=sorted(BOARD_DOCTOR_OUTCOME_ACTIONS), outcome_is_null=True,
+    )
 
 
 def evaluate_board_doctor_outcome(
@@ -3088,6 +3102,8 @@ def board_doctor_decisions(
     repo: str | None = None,
     issue: int | None = None,
     action: str | None = None,
+    actions: Sequence[str] | None = None,
+    outcome_is_null: bool = False,
 ) -> list[dict]:
     """The persisted decision log, oldest first.
 
@@ -3099,6 +3115,17 @@ def board_doctor_decisions(
     either filter rather than raising. *limit* is applied LAST, after
     every filter, so it means "the most recent N matching entries," not
     "scan only the most recent N before filtering."
+
+    *action* is a single exact match; *actions* (#3889 review) is its
+    "one of several" counterpart — :func:`pending_board_doctor_outcomes`
+    wants ``action IN (...)``, not a second Python-side filter after
+    pulling every row. Passing both is redundant but not a conflict: both
+    are ANDed in, same as every other filter here.
+
+    *outcome_is_null* (#3889 review) pushes "outcome still pending" into
+    SQL instead of Python — again for :func:`pending_board_doctor_outcomes`,
+    so a sweep with a large durable log never materialises every row just
+    to throw most of them away.
 
     **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
     """
@@ -3112,6 +3139,12 @@ def board_doctor_decisions(
     if action is not None:
         sql_text += " AND action = ?"
         params.append(action)
+    if actions is not None:
+        placeholders = ", ".join("?" for _ in actions)
+        sql_text += f" AND action IN ({placeholders})"
+        params.extend(actions)
+    if outcome_is_null:
+        sql_text += " AND outcome IS NULL"
     sql_text += " ORDER BY id ASC"
     rows = sql.execute(conn, sql_text, tuple(params)).fetchall()
     out = [_board_doctor_log_row_to_dict(row) for row in rows]
@@ -3120,7 +3153,18 @@ def board_doctor_decisions(
     return out if limit is None else out[-limit:]
 
 
-def _board_doctor_decision_ts(item: dict) -> float | None:
+def board_doctor_decision_ts(item: dict) -> float | None:
+    """A decision dict's ``recorded_at`` as a POSIX timestamp, or ``None``
+    if it is missing or unparseable (#3889 review).
+
+    Public because :mod:`coord.board_doctor` and
+    :mod:`coord.board_doctor_policy` are both legitimate consumers — they
+    need the SAME ``recorded_at`` -> timestamp reading
+    :func:`record_board_doctor_decision` and :func:`prune_board_doctor_log`
+    already use internally, not a second guess at it. One question, one
+    answer (#2085): every ``recorded_at`` parse in this module routes
+    through this helper rather than re-deriving it.
+    """
     recorded_at = item.get("recorded_at")
     if not isinstance(recorded_at, str):
         return None

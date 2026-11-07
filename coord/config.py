@@ -3639,21 +3639,37 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         cfg.log_retention_days = log_retention_days
     if "backoff_initial_hours" in raw:
         backoff_initial_hours = raw["backoff_initial_hours"]
-        if isinstance(backoff_initial_hours, bool) or not isinstance(
-            backoff_initial_hours, (int, float)
-        ) or backoff_initial_hours <= 0:
+        if (
+            isinstance(backoff_initial_hours, bool)
+            or not isinstance(backoff_initial_hours, (int, float))
+            or backoff_initial_hours <= 0
+        ):
             raise ConfigError("board_doctor.backoff_initial_hours must be a positive number")
         cfg.backoff_initial_hours = float(backoff_initial_hours)
     if "backoff_cap_hours" in raw:
         backoff_cap_hours = raw["backoff_cap_hours"]
-        if isinstance(backoff_cap_hours, bool) or not isinstance(
-            backoff_cap_hours, (int, float)
-        ) or backoff_cap_hours <= 0:
+        if (
+            isinstance(backoff_cap_hours, bool)
+            or not isinstance(backoff_cap_hours, (int, float))
+            or backoff_cap_hours <= 0
+        ):
             raise ConfigError("board_doctor.backoff_cap_hours must be a positive number")
         cfg.backoff_cap_hours = float(backoff_cap_hours)
     if cfg.backoff_cap_hours < cfg.backoff_initial_hours:
+        # Name which side is the untouched DEFAULT (#3889 review) — a config
+        # that only sets `backoff_initial_hours` above the default cap would
+        # otherwise read as if the cap it never wrote were the typo.
+        cap_note = (
+            "" if "backoff_cap_hours" in raw
+            else f" (board_doctor.backoff_cap_hours was not set — defaults to {cfg.backoff_cap_hours})"
+        )
+        initial_note = (
+            "" if "backoff_initial_hours" in raw
+            else f" (board_doctor.backoff_initial_hours was not set — defaults to {cfg.backoff_initial_hours})"
+        )
         raise ConfigError(
-            "board_doctor.backoff_cap_hours must be >= board_doctor.backoff_initial_hours"
+            "board_doctor.backoff_cap_hours must be >= "
+            f"board_doctor.backoff_initial_hours{cap_note}{initial_note}"
         )
     if "fixit_leg_budget" in raw:
         fixit_leg_budget = raw["fixit_leg_budget"]

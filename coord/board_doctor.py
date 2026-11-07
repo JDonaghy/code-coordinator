@@ -1460,9 +1460,28 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     return rows
 
 
-def _board_doctor_human_resolutions() -> dict[str, list[float]]:
+def _board_doctor_other_resolutions() -> dict[str, list[float]]:
     """``key`` -> every ``resolved_at`` timestamp this host's
-    :mod:`coord.block_log` records with ``human_acted=True`` for it (#3889).
+    :mod:`coord.block_log` records with evidence SOMETHING OTHER THAN this
+    doctor's own confirmed action resolved it (#3889, widened by review).
+
+    Two kinds of evidence qualify, either one on its own:
+
+    * ``human_acted=True`` — an operator ``remove``, an ``add`` that
+      requeued a stalled row (:func:`coord.commands.drive_queue.
+      _record_operator_release_entry`), a logged intervention, or a Gate-A
+      sign-off. All of these run through :mod:`coord.block_log`'s own
+      command surface and are already flagged there.
+    * ``resolution == "landed"`` — :mod:`coord.block_log`'s
+      ``_LANDED_CAUSE``, which its own docstring already distinguishes from
+      ``_AUTO_MERGED_CAUSE``: "the entry sat here and something ELSE
+      finished it while nobody was looking" — a human's hand merge, an
+      unrelated branch landing, or ``coord reconcile-merges`` — as opposed
+      to the queue's OWN tick landing the merge directly. Deliberately
+      excludes ``resolution == "auto_merged"``: that is the queue's own
+      tick completing the merge, which is exactly the shape of "the normal
+      drive loop was carrying the doctor's own dispatched leg to
+      completion" that stays credited to the doctor.
 
     Read ONCE per sweep (:func:`sweep`'s outcome-backfill section), not
     once per pending decision — the block log can hold weeks of episodes
@@ -1489,7 +1508,7 @@ def _board_doctor_human_resolutions() -> dict[str, list[float]]:
         return {}
     out: dict[str, list[float]] = {}
     for item in items:
-        if not item.get("human_acted"):
+        if not item.get("human_acted") and item.get("resolution") != "landed":
             continue
         resolved_at = item.get("resolved_at")
         if resolved_at is None:
@@ -1502,30 +1521,33 @@ def _board_doctor_human_resolutions() -> dict[str, list[float]]:
 
 
 def _board_doctor_attributed_to_other(
-    human_resolutions: Mapping[str, Sequence[float]],
+    other_resolutions: Mapping[str, Sequence[float]],
     key: str,
     since_ts: float | None,
 ) -> bool:
-    """Did a human-attributed :mod:`coord.block_log` resolution for *key*
-    land at/after *since_ts* (#3889)?
+    """Did an "other"-attributed :mod:`coord.block_log` resolution for
+    *key* (see :func:`_board_doctor_other_resolutions`) land at/after
+    *since_ts* (#3889)?
 
     *since_ts* is the PAST decision's own ``recorded_at`` — ``None`` (an
     unparseable timestamp) reads as "no evidence either way" rather than
     matching everything. This answers "did an OPERATOR action resolve the
-    row" (``remove``/``add``, ``log-intervention``, a Gate-A sign-off —
-    anything `human_acted` already recognises); it cannot distinguish that
-    from "the ordinary drive loop resolved it with no operator action", so
-    a row that simply retried its way out on its own, with no logged human
-    action, still reads as the doctor's own `"progressed"` credit — the
-    one case this signal cannot see is exactly the one #3875's wording
-    ("the normal drive loop moved it") also cannot be told apart from "the
-    doctor's own dispatched leg is what the normal drive loop was carrying
-    to completion," so crediting the doctor there is the defensible
-    default rather than a gap.
+    row" (``remove``/``add``, ``log-intervention``, a Gate-A sign-off) OR
+    "did something else land it while nobody was looking" (a hand merge,
+    an unrelated branch, ``coord reconcile-merges``); it cannot distinguish
+    either of those from "the ordinary drive loop resolved it with no
+    operator action and no landed-elsewhere evidence", so a row that
+    simply retried its way out on its own, with no logged human action and
+    no ``landed`` resolution, still reads as the doctor's own
+    `"progressed"` credit — the one case this signal cannot see is exactly
+    the one #3875's wording ("the normal drive loop moved it") also cannot
+    be told apart from "the doctor's own dispatched leg is what the normal
+    drive loop was carrying to completion," so crediting the doctor there
+    is the defensible default rather than a gap.
     """
     if since_ts is None:
         return False
-    return any(ts >= since_ts for ts in human_resolutions.get(key, ()))
+    return any(ts >= since_ts for ts in other_resolutions.get(key, ()))
 
 
 def sweep(
@@ -1677,14 +1699,15 @@ def sweep(
     # below as rows are classified (`current_by_row`) and consumed after
     # the main loop and again inside the `clear_absent_rows` pass.
     pending_outcomes = state.pending_board_doctor_outcomes() if not dry_run else []
-    # #3889: evidence an operator action (or the ordinary drive loop, which
-    # this same `human_acted` signal does NOT distinguish from — see
-    # `_board_doctor_attributed_to_other`'s docstring) moved a row BEFORE
-    # this sweep's own confirmed action could have — read ONCE here rather
-    # than once per pending decision, same rationale as `pending_outcomes`
-    # above. Empty (and never read) when there is nothing pending.
-    human_resolutions = (
-        _board_doctor_human_resolutions() if pending_outcomes else {}
+    # #3889: evidence an operator action, a hand merge/unrelated branch
+    # landing (or the ordinary drive loop, which this signal does NOT
+    # distinguish from — see `_board_doctor_attributed_to_other`'s
+    # docstring) moved a row BEFORE this sweep's own confirmed action could
+    # have — read ONCE here rather than once per pending decision, same
+    # rationale as `pending_outcomes` above. Empty (and never read) when
+    # there is nothing pending.
+    other_resolutions = (
+        _board_doctor_other_resolutions() if pending_outcomes else {}
     )
     current_by_row: dict[tuple[str, str], dict] = {}
 
@@ -1891,7 +1914,7 @@ def sweep(
             if current is None:
                 continue
             attributed_to_other = _board_doctor_attributed_to_other(
-                human_resolutions, row_key[1], state._board_doctor_decision_ts(pending),  # noqa: SLF001
+                other_resolutions, row_key[1], state.board_doctor_decision_ts(pending),
             )
             outcome = state.evaluate_board_doctor_outcome(
                 pending, current, attributed_to_other=attributed_to_other,
@@ -1905,16 +1928,17 @@ def sweep(
                 # The row dropped out of the stuck set entirely — resolved,
                 # which is unambiguous progress for any decision on it
                 # still waiting on a verdict, UNLESS #3889's attribution
-                # evidence says an operator action (or the ordinary drive
-                # loop) got there first.
+                # evidence says an operator action, a hand merge/unrelated
+                # branch landing, or the ordinary drive loop got there
+                # first.
                 for pending in pending_outcomes:
                     if (pending.get("queue"), pending.get("key")) == (
                         queue,
                         key,
                     ) and pending.get("sweep_id") is not None:
                         attributed_to_other = _board_doctor_attributed_to_other(
-                            human_resolutions, key,
-                            state._board_doctor_decision_ts(pending),  # noqa: SLF001
+                            other_resolutions, key,
+                            state.board_doctor_decision_ts(pending),
                         )
                         state.record_board_doctor_outcome(
                             pending["sweep_id"], queue, key,

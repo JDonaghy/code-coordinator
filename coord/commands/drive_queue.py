@@ -608,6 +608,16 @@ def drive_queue_add(
         no_acceptance=no_acceptance,
         plan_destructive=plan_destructive,
     )
+    # #2235 Phase 0 / #3889 review: re-queuing a `blocked`/`parked` row IS
+    # the same operator intervention `remove` already logs — the #2972
+    # "bump --max-fix-rounds and re-add" remedy, and the `remove && add`
+    # requeue both land here. `previous` is the PRE-mutation entry (read
+    # above, before `enqueue_drive_queue` overwrote its row), the same
+    # "read first or the state is gone" posture `remove` takes. Logs
+    # nothing for a fresh insert (`previous is None`) or a routine metadata
+    # edit on a `waiting`/`running` entry — see
+    # `_record_operator_release_entry`'s own guard.
+    _record_operator_release_entry(previous, resolution="operator_requeued")
     # #3395: apply the REVERSED edges rule 2 selected — writing to the
     # INCUMBENT entry's own row, now that this add's row exists to name as
     # its `--after`. Must run after the write above: it names `entry_key
@@ -2136,6 +2146,31 @@ def _record_block_log(events: list[dict[str, Any]]) -> int:
     return block_log.record(events)
 
 
+def _record_operator_release_entry(entry: QueueEntry | None, *, resolution: str) -> None:
+    """Log a stall a HUMAN just cleared, given the PRE-mutation entry.
+
+    Shared tail of :func:`_record_operator_release` (``remove``, which only
+    has a raw row) and ``coord drive-queue add`` (#3889 review — which
+    already has a parsed :class:`~coord.drive_queue.QueueEntry` via
+    ``entries_from_rows(list_drive_queue())``, so converting it to a row and
+    back would be pure overhead). An entry that was not ``blocked``/
+    ``parked`` logs nothing: re-adding a ``waiting``/``running`` entry is a
+    routine metadata edit, and counting it as an intervention would inflate
+    the one number #2235 wants to watch fall.
+    """
+    if entry is None or entry.state not in STALL_STATES:
+        return
+    from coord.block_log import operator_resolution_event  # noqa: PLC0415
+
+    _record_block_log(
+        [
+            operator_resolution_event(
+                entry, resolution=resolution, host=_local_host_id()
+            )
+        ]
+    )
+
+
 def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) -> None:
     """Log a stall a HUMAN just cleared, if the row was actually stalled.
 
@@ -2150,17 +2185,7 @@ def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) 
         entry = entries_from_rows([row])[0]
     except (IndexError, KeyError, TypeError, ValueError):  # pragma: no cover
         return
-    if entry.state not in STALL_STATES:
-        return
-    from coord.block_log import operator_resolution_event  # noqa: PLC0415
-
-    _record_block_log(
-        [
-            operator_resolution_event(
-                entry, resolution=resolution, host=_local_host_id()
-            )
-        ]
-    )
+    _record_operator_release_entry(entry, resolution=resolution)
 
 
 # ── log-intervention (#2540) ─────────────────────────────────────────────────
