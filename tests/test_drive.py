@@ -5424,6 +5424,88 @@ def test_a_confirmed_failure_after_the_recheck_walks_the_bounded_retry_path():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #3886: a sibling entry deferred behind another row's per-repo merge-gate
+# reservation (`coord.merge_queue.is_merge_gate_reserved_reason`) is NOT a
+# CI reason, but is self-refreshing the identical way: nothing about
+# retrying resolves it faster, only the holder merging/leaving the queue or
+# the reservation's own TTL expiring does. Before this, `merge_status`
+# stayed PENDING/READY (a `_RETRYABLE_MERGE_STATUSES` member) while this
+# text sat on `merge_reason`, so a live `coord drive` session walked the
+# GENERIC bounded retry instead — spending `counters.merge_attempts` on
+# every poll and dying at `--max-merge-attempts` (default 3) while the
+# reservation's own TTL (2h) still had most of its life left: a deferral
+# that read, to the operator, as a terminal drive failure.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_merge_gate_reserved_retries_for_real_regardless_of_which_status_the_board_shows(
+    status,
+):
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason="merge gate reserved for api#1 until 2026-01-01T00:00:00+00:00",
+        )
+    )
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert action.serialize_merge is True
+    assert "merge gate reserved for api#1" in action.label
+    assert "not spending an attempt" in action.label
+
+
+def test_merge_gate_reserved_never_spends_a_merge_attempt():
+    """Acceptance (#3886): the exact failure mode this closes — without the
+    attempt-exempt arm, three polls would hit `--max-merge-attempts` and
+    the drive would `_die()` while the reservation still had ~2h left."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason="merge gate reserved for api#1 until 2026-01-01T00:00:00+00:00",
+    )
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == RUN
+        assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+        assert counters.merge_attempts == 0
+
+
+def test_merge_gate_reserved_reason_is_recognised_via_the_shared_predicate():
+    from coord.merge_queue import (
+        MERGE_GATE_RESERVED_PREFIX,
+        is_merge_gate_reserved_reason,
+    )
+
+    assert is_merge_gate_reserved_reason(f"{MERGE_GATE_RESERVED_PREFIX}api#1 until x")
+    assert not is_merge_gate_reserved_reason("checks failed: build (failure)")
+    assert not is_merge_gate_reserved_reason("CI running: build")
+    assert not is_merge_gate_reserved_reason("")
+    assert not is_merge_gate_reserved_reason(None)
+
+
+def test_merge_gate_reserved_reason_wins_over_a_stale_diagnostic_fallback():
+    """#2229's fallback (`_extract_gate_refusal_reason` over a captured
+    diagnostic) must never outrank this live board reason — mirrors the
+    identical contract the four CI-outcome reasons already have in
+    `_effective_merge_gate_reason`."""
+    from coord.drive import _effective_merge_gate_reason
+
+    counters = DriveCounters()
+    counters.last_merge_diagnostic = "  gate review: review required but not approved — will block this merge"
+    s = approved_work(
+        merge_status="READY",
+        merge_reason="merge gate reserved for api#1 until 2026-01-01T00:00:00+00:00",
+    )
+
+    reason, from_diagnostic = _effective_merge_gate_reason(s, counters)
+    assert reason == s.merge_reason
+    assert from_diagnostic is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #3254: the FIFTH CI-outcome case — #1904's `checks_absent`
 # (`is_ci_absent_reason`): this repo declares CI but reported ZERO checks for
 # the PR. Unlike #1891/#1892/#2252/#2347 above, this is NOT self-refreshing —
