@@ -71,9 +71,9 @@ all operate on operator-only parameters that have no parameter here, and
 
 Why `dispatch_sweep_action("merge", ...)` still has no working handler
 -------------------------------------------------------------------------
-:data:`SAFE_TIER_ACTIONS` names `"merge"` (#3902; originally the separately
-spelled `"merge_approved_green"`) because the issue's hard constraints fix
-its shape now, before a real C3 `_HANDLERS` dispatcher for it exists.
+:data:`SAFE_TIER_ACTIONS` names `"merge"` — matching the `"merge"` verb
+`investigator_merge` is authorized under — before a real C3 `_HANDLERS`
+dispatcher for it exists.
 `CAUSE_MERGE_PENDING_STUCK` is in fact already wired to a working merge
 (`coord.board_doctor_policy._merge_pending_stuck_row`), but through the
 #3881 investigator path (`dispatch_investigator_action("merge", ...)` →
@@ -2199,35 +2199,36 @@ def _latest_done_conflict_fix_assignment_id(
 ) -> str | None:
     """The ``type="conflict-fix"`` assignment whose clean-but-unmoved exit
     produced *entry*'s current head-unmoved HUMAN_REQUIRED park, or
-    ``None`` (#3887, precision-fixed by #3902).
+    ``None``.
 
     Primary source: :func:`coord.merge_queue.head_unmoved_fix_assignment_id`
     parsed straight off ``entry.error`` — the EXACT id
     `coord.reconcile.on_conflict_fix_done` recorded there the moment it
-    detected the park (#3902), never re-derived. This is the only source
-    that can never name the wrong row: a periodic sweep that runs after
-    some OTHER conflict-fix attempt for this same entry finished (a manual
-    retry, or an unrelated earlier sweep tick) cannot shift which leg this
-    answers for.
+    detected the park, never re-derived, and always the LATEST marker when
+    the row has parked more than once. This is the only source that can
+    never name the wrong row: a periodic sweep that runs after some OTHER
+    conflict-fix attempt for this same entry finished (a manual retry, or
+    an unrelated earlier sweep tick) cannot shift which leg this answers
+    for.
 
-    Fallback, only when the marker is absent (a latch parked before #3902,
-    predating the recorded marker): the pre-#3902 guess — the most
-    recently FINISHED ``type="conflict-fix"`` assignment linked to this
-    entry (``a.review_of_assignment_id == entry.assignment_id``), picking
-    the one with the latest ``finished_at``. #3902 review: this fallback
-    now also skips stale-rebase-titled rows
-    (:data:`coord.conflict_fix.STALE_REBASE_FIX_TITLE_PREFIX`), the same
-    way :func:`coord.conflict_fix._classify_prior_conflict_fix` does — a
-    stale-rebase attempt never tried the ordinary mechanical resolution
-    this carve-out is about, so it must never be mistaken for the
-    just-completed ordinary leg.
+    Fallback, only when the marker is absent (a latch parked before this
+    marker existed): the most recently FINISHED ``type="conflict-fix"``
+    assignment linked to this entry
+    (``a.review_of_assignment_id == entry.assignment_id``), picking the
+    one with the latest ``finished_at``, and skipping stale-rebase-titled
+    rows (:data:`coord.conflict_fix.STALE_REBASE_FIX_TITLE_PREFIX`) the
+    same way :func:`coord.conflict_fix._classify_prior_conflict_fix` does
+    — a stale-rebase attempt never tried the ordinary mechanical
+    resolution this carve-out is about, so it must never be mistaken for
+    the just-completed ordinary leg.
 
     Either way, the result is passed through to
     :func:`coord.conflict_fix.dispatch_conflict_fix`'s own
     ``after_head_unmoved_fix_assignment_id`` carve-out, which excludes
     exactly this one row from the retry-cap's identical-error walk — the
-    same exclusion #3871's own synchronous completion-time redispatch
-    applies, never a looser one.
+    same exclusion `coord.reconcile._try_ordinary_escalation_after_
+    head_unmoved`'s own synchronous completion-time redispatch applies,
+    never a looser one.
     """
     from coord.conflict_fix import STALE_REBASE_FIX_TITLE_PREFIX  # noqa: PLC0415
     from coord.merge_queue import head_unmoved_fix_assignment_id  # noqa: PLC0415
@@ -2990,17 +2991,16 @@ def investigator_merge(
 ) -> InvestigatorActionResult:
     """Plain ``coord merge --only`` of an already-approved, CI-green row
     (#3881) — the investigator's ``merge`` verb, authorized under the
-    identical ``"merge"`` :data:`SAFE_TIER_ACTIONS` name (#3902; no
-    :data:`_INVESTIGATOR_ACTION_ALIAS` indirection needed since dropping
-    the separately-spelled ``"merge_approved_green"``).
+    identical ``"merge"`` :data:`SAFE_TIER_ACTIONS` name, with no
+    :data:`_INVESTIGATOR_ACTION_ALIAS` indirection needed.
 
-    *allow_fix_dispatch* (#3902) gates the post-``process()`` fan-out below
+    *allow_fix_dispatch* gates the post-``process()`` fan-out below
     (a fresh conflict or CI failure dispatching a conflict-fix/ci-fix
     worker leg, and the sibling-conflict sweep's own leg dispatch) —
-    defaults ``True``, the pre-#3902 behaviour, for the human-attended
-    `coord drive-queue doctor-act` CLI's call site: an operator who invoked
-    this verb directly is accountable for whatever it dispatches, exactly
-    like `coord merge --only` itself. `coord.board_doctor_policy.
+    defaults ``True`` for the human-attended `coord drive-queue doctor-act`
+    CLI's call site: an operator who invoked this verb directly is
+    accountable for whatever it dispatches, exactly like
+    `coord merge --only` itself. `coord.board_doctor_policy.
     _merge_pending_stuck_row` — the UNATTENDED mechanical-tier caller —
     passes ``False``: that cause (:data:`coord.board_doctor_policy.
     CAUSE_MERGE_PENDING_STUCK`) is on the C2 allowlist, never routed
@@ -3027,15 +3027,20 @@ def investigator_merge(
     reports ``is_available=False`` and so never runs the CI gate at all.
 
     Mirrors the ``--only`` surgical path's post-`process()` bookkeeping,
-    not just its `process()` call: a fresh ``conflict`` or confirmed
-    ``checks_failed`` event here still needs
-    :func:`coord.commands.merge._dispatch_conflict_fixes` /
+    not just its `process()` call, WHEN ``allow_fix_dispatch`` is ``True``:
+    a fresh ``conflict`` or confirmed ``checks_failed`` event here still
+    needs :func:`coord.commands.merge._dispatch_conflict_fixes` /
     :func:`coord.commands.merge._dispatch_ci_fixes` to escalate or dispatch
     a bounded fix, and a merge that lands still needs
-    :func:`coord.commands.merge._sweep_sibling_conflicts` to park any sibling
-    PR GitHub just broke — exactly the three steps `--only` runs before its
-    own save (``coord/commands/merge.py``'s ``merge()`` body), omitting none
-    of them the way a hand-rolled re-implementation easily could.
+    :func:`coord.commands.merge._sweep_sibling_conflicts` to park any
+    sibling PR GitHub just broke — the same three steps `--only` runs
+    before its own save (``coord/commands/merge.py``'s ``merge()`` body).
+    With ``allow_fix_dispatch=False`` all three are skipped wholesale,
+    including `_sweep_sibling_conflicts`' own non-dispatch half (parking a
+    broken sibling at ``CONFLICT`` with an error naming the merge that
+    broke it) — a mechanically-merged row's siblings keep reading as
+    whatever they read before this merge until the next ordinary
+    `coord merge` tick, or a later sweep, re-derives their true state.
 
     Persists by re-loading the queue and merging *entry*'s own mutated
     state back over it (the ``--only`` path's own save shape), never by

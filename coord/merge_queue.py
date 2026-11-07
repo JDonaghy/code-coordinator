@@ -6084,17 +6084,22 @@ _HEAD_UNMOVED_FIX_ASSIGNMENT_RE = re.compile(
 def head_unmoved_fix_assignment_id(error: str | None) -> str | None:
     """Parse the #3902 head-unmoved-fix-assignment marker out of *error*.
 
-    ``None`` when absent — a latch parked before this marker existed (and
-    every latch whose shape was never head-unmoved at all) — so a caller
-    reading this always has an honest "not recorded" distinct from a real
-    id, never a fabricated one.
+    ``error`` accumulates a new marker on every head-unmoved park of the
+    same row rather than replacing the previous one, so this takes the
+    LAST match — the one that produced the row's *current* park — not
+    the first. Returns ``None`` when no marker is present at all (a latch
+    parked before this marker existed, or one that was never head-unmoved)
+    and also when the captured id is empty, so a caller reading this
+    always has an honest "not recorded" distinct from a real id, never a
+    fabricated one.
     """
     if not error:
         return None
-    match = _HEAD_UNMOVED_FIX_ASSIGNMENT_RE.search(error)
-    if match is None:
+    matches = _HEAD_UNMOVED_FIX_ASSIGNMENT_RE.findall(error)
+    if not matches:
         return None
-    return match.group(1).rstrip("].;,")
+    assignment_id = matches[-1].rstrip("].;,")
+    return assignment_id or None
 
 
 # The ONLY phrases that mean a mechanical or semantic conflict-fix worker
