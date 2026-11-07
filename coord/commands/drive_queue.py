@@ -2151,6 +2151,7 @@ def _record_operator_release_entry(
     *,
     resolution: str,
     latched_states: frozenset[str] = STALL_STATES,
+    synthesize_enter: bool = False,
 ) -> None:
     """Log a stall a HUMAN just cleared, given the PRE-mutation entry.
 
@@ -2170,18 +2171,50 @@ def _record_operator_release_entry(
     queue's own ``human_required`` — a different vocabulary this function
     has no business hardcoding — so that caller supplies its own
     single-member set instead.
+
+    *synthesize_enter* (#3898): ``remove``/``add`` only ever reach a row
+    that got here via a drive-queue ``blocked``/``parked`` transition, which
+    :func:`coord.block_log.plan_events` (or the launch-failure branch's own
+    :func:`coord.block_log.enter_event`) already opened an episode for — so
+    their ``resolve`` always has a matching ``enter`` to pair with.
+    ``coord merge --override-human-required`` clears the merge queue's OWN
+    ``human_required`` latch, which nothing anywhere ever opens an episode
+    for (no caller in this tree passes ``state="human_required"`` to
+    ``enter_event``, and ``plan_events`` only ever fires on the drive
+    queue's own ``blocked``/``parked`` vocabulary) — so without this, that
+    caller's ``resolve`` would be exactly the orphan :func:`coord.block_log.
+    episodes`'s own docstring says it drops rather than synthesises, and the
+    override would silently vanish from the #2235 corpus instead of
+    downgrading the doctor's verdict. Set ``True`` only by a caller whose
+    latch has no other opener; synthesizing one on TOP of an entry
+    ``remove``/``add`` already have an open episode for would double-count.
     """
     if entry is None or entry.state not in latched_states:
         return
-    from coord.block_log import operator_resolution_event  # noqa: PLC0415
+    from coord.block_log import enter_event, operator_resolution_event  # noqa: PLC0415
 
-    _record_block_log(
-        [
-            operator_resolution_event(
-                entry, resolution=resolution, host=_local_host_id()
+    events: list[dict[str, Any]] = []
+    if synthesize_enter:
+        # Source "operator", not the default "tick": nothing automated
+        # observed this transition, a human action is what both opens and
+        # closes it. Keyed by `entry.key` same as the `resolve` below, so a
+        # drive-queue episode already open for this same key (the row is
+        # ALSO sitting `blocked`/`parked` there) gets closed out as
+        # unresolved rather than silently merged into this one — see
+        # `episodes()`'s own "second enter" handling.
+        events.append(
+            enter_event(
+                entry,
+                state=entry.state,
+                reason=entry.last_reason,
+                host=_local_host_id(),
+                source="operator",
             )
-        ]
+        )
+    events.append(
+        operator_resolution_event(entry, resolution=resolution, host=_local_host_id())
     )
+    _record_block_log(events)
 
 
 def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) -> None:

@@ -16,6 +16,7 @@ from coord import state as state_mod
 from coord.cli import main
 from coord.db import LockContentionExhaustedError
 from tests import backends
+from tests.conftest import block_log_records
 
 
 # #1525: these fixtures never exercise the CI gate (that's covered by
@@ -86,17 +87,14 @@ def block_log(monkeypatch, tmp_path: Path) -> Path:
     Same hazard, same fix as `tests/test_cli_drive_queue.py`'s fixture of
     the same name: `coord.block_log.block_log_path()` resolves under the
     real `~/.coord` unless redirected, and `coord merge
-    --override-human-required` writes there.
+    --override-human-required` writes there. `autouse=True` here is
+    deliberate (and matches that module's own fixture, also autouse): every
+    test in this file invokes `coord merge` at least once, so there is no
+    "only the tests that need it" subset to opt in instead.
     """
     path = tmp_path / "queue-block-log.jsonl"
     monkeypatch.setenv("COORD_BLOCK_LOG", str(path))
     return path
-
-
-def _block_log_records(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 @pytest.fixture
@@ -1168,13 +1166,35 @@ class TestMergeOverrideHumanRequired:
         # `coord.block_log`, the signal `coord.board_doctor.
         # _board_doctor_other_resolutions` reads so a doctor sweep never
         # takes `progressed` credit for a human's override.
-        records = _block_log_records(block_log)
+        records = block_log_records(block_log)
         resolve_records = [r for r in records if r.get("event") == "resolve"]
         assert len(resolve_records) == 1
         assert resolve_records[0]["key"] == "api#1"
         assert resolve_records[0]["resolution"] == "operator_override"
         assert resolve_records[0]["human_acted"] is True
         assert resolve_records[0]["from_state"] == mq.HUMAN_REQUIRED
+
+        # #3898 review: the `resolve` above is only evidence
+        # `_board_doctor_other_resolutions` can actually USE if it also has
+        # a matching `enter` to pair with (`episodes()` drops an orphan
+        # `resolve` rather than synthesising one) — assert the CLI run also
+        # wrote that `enter`, and that `coord.board_doctor` itself, reading
+        # the real log the command just wrote, ends up attributing the key.
+        # A regression that goes back to writing only the `resolve` (the
+        # pre-fix shape) makes THIS assertion fail even though the
+        # `resolve`-only assertions above would still pass.
+        enter_records = [r for r in records if r.get("event") == "enter"]
+        assert len(enter_records) == 1
+        assert enter_records[0]["key"] == "api#1"
+        assert enter_records[0]["state"] == mq.HUMAN_REQUIRED
+
+        from coord.board_doctor import _board_doctor_other_resolutions
+
+        other = _board_doctor_other_resolutions()
+        assert "api#1" in other and other["api#1"], (
+            f"override wrote block-log events but the board doctor still "
+            f"has no attribution evidence for api#1: {other!r}"
+        )
 
     def test_override_rejected_on_non_human_required_entry(
         self, config_file: Path, coord_dir: Path, coord_db,
@@ -1296,7 +1316,7 @@ class TestMergeOverrideHumanRequired:
         # A moot override never ran the actual clear, so it must not
         # write an operator-release block-log event either — the reconcile
         # pass that cleared it is the queue's own tick, not a human.
-        assert _block_log_records(block_log) == []
+        assert block_log_records(block_log) == []
 
     def test_override_dry_run_does_not_persist_or_audit(
         self, config_file: Path, coord_dir: Path, coord_db, block_log: Path,
@@ -1332,7 +1352,7 @@ class TestMergeOverrideHumanRequired:
 
         # The dry-run preview must not write a block-log event
         # either — same "either way" guard as the audit row above.
-        assert _block_log_records(block_log) == []
+        assert block_log_records(block_log) == []
 
 
 class TestMergeAutoEnqueue:

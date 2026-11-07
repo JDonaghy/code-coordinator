@@ -1471,19 +1471,24 @@ class TestSweepAttributesOutcomesHonestly:
         assert logged[0]["outcome"] == "progressed_by_other"
 
     def test_an_override_human_required_before_the_next_sweep_is_progressed_by_other(
-        self,
+        self, monkeypatch,
     ) -> None:
         """`coord merge --override-human-required` releasing a latched
         merge-queue row is the SAME operator intervention `remove`/
-        `add` already log (:func:`coord.commands.drive_queue.
-        _record_operator_release_entry`, which that command reuses with the
-        merge queue's own ``human_required`` in place of the drive queue's
-        ``blocked``/``parked``) — it must downgrade the verdict exactly
-        like those do, not leave the doctor crediting itself for a human's
-        override."""
+        `add` already log, via :func:`coord.commands.drive_queue.
+        _record_operator_release_entry` — it must downgrade the verdict
+        exactly like those do, not leave the doctor crediting itself for a
+        human's override.
+
+        Drives the real helper (``synthesize_enter=True``, the merge
+        queue's own ``human_required`` as the single latched state) rather
+        than hand-writing an ``enter_event`` call directly — no production
+        path ever calls ``enter_event(state="human_required", ...)`` itself,
+        so a hand-written one could assert a log shape the command under
+        test can never actually produce (#3898 review)."""
         from datetime import datetime, timezone
 
-        from coord.block_log import enter_event, operator_resolution_event, record
+        from coord.commands.drive_queue import _record_operator_release_entry
         from coord.drive_queue import QueueEntry as _QE
 
         key = "acme/widgets#306"
@@ -1503,19 +1508,20 @@ class TestSweepAttributesOutcomesHonestly:
         assert dispatch.count == 1
 
         # An operator ran `coord merge --only --override-human-required`
-        # on the latched entry AFTER the decision above was recorded.
+        # on the latched entry AFTER the decision above was recorded — the
+        # synthetic `enter` and the `resolve` land ten seconds apart, both
+        # after `t0`, the same ordering `coord.commands.merge` produces.
         entry = _QE(
             repo="acme/widgets", issue=306, state="human_required",
             last_reason="gh pr merge ... not mergeable",
         )
-        record(
-            [
-                enter_event(entry, state="human_required", reason="not mergeable",
-                             now=t0 - 10.0),
-                operator_resolution_event(
-                    entry, resolution="operator_override", now=t0 + 60.0,
-                ),
-            ]
+        times = iter([t0 + 50.0, t0 + 60.0])
+        monkeypatch.setattr("coord.block_log.time.time", lambda: next(times))
+        _record_operator_release_entry(
+            entry,
+            resolution="operator_override",
+            latched_states=frozenset({"human_required"}),
+            synthesize_enter=True,
         )
 
         sweep(

@@ -49,6 +49,7 @@ from coord.drive_queue import (
 )
 from tests import backends
 from tests.backends import set_board_meta
+from tests.conftest import block_log_records
 
 #: The genuine `coord.state.apply_issue_labels`, captured at import time —
 #: before `_default_pipeline_labels` (autouse) replaces the module attribute
@@ -286,10 +287,8 @@ def block_log(monkeypatch, tmp_path) -> Path:
     return path
 
 
-def block_log_records(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+# #3898 review: `block_log_records` moved to `tests/conftest.py` — this
+# module and `tests/test_cli_merge.py` each carried a byte-identical copy.
 
 
 @pytest.fixture
