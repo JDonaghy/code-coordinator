@@ -1372,6 +1372,13 @@ class TestIntegrationRedClassification:
         )
         diagnosis = queue_diagnose.diagnose(self._entry(), live)
         assert diagnosis.cause == queue_diagnose.CAUSE_CI_RED
+        # The branch Test reading is visible in the record even though it
+        # wasn't decisive — an operator reading a `ci-red` diagnosis can see
+        # why it did NOT come back `integration-red`.
+        assert any(
+            "coord gates (test decision): branch Test verdict reads 'failed'" in line
+            for line in diagnosis.evidence
+        )
 
     def test_ci_red_with_unread_branch_test_stays_plain_ci_red(self) -> None:
         from coord.queue_diagnose import CheckReading
@@ -1379,6 +1386,24 @@ class TestIntegrationRedClassification:
         live = LiveState(
             checks=(CheckReading(name="build", conclusion="failure"),),
             branch_test_state=None,
+        )
+        diagnosis = queue_diagnose.diagnose(self._entry(), live)
+        assert diagnosis.cause == queue_diagnose.CAUSE_CI_RED
+
+    def test_ci_red_with_skipped_branch_test_stays_plain_ci_red(self) -> None:
+        """A `skipped` Test verdict is a structural claim about the SHAPE
+        of the diff ("nothing to smoke-test"), never a claim the code
+        behaved correctly at this SHA — there is no confirmed green half
+        to split the CI failure away from, so this must NOT read as
+        `integration-red`. A `baseline_red`-confirmed skip in particular
+        means the BASE is what's broken; relabeling it `integration-red`
+        would steer it away from `coord.board_doctor.CAUSE_BASELINE_RED`,
+        the cause that actually names that shape."""
+        from coord.queue_diagnose import CheckReading
+
+        live = LiveState(
+            checks=(CheckReading(name="build", conclusion="failure"),),
+            branch_test_state="skipped",
         )
         diagnosis = queue_diagnose.diagnose(self._entry(), live)
         assert diagnosis.cause == queue_diagnose.CAUSE_CI_RED

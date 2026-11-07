@@ -962,6 +962,61 @@ def _fixit_rebudget_eligible(row: StuckRow, repo_name: str, issue_number: int) -
     return _fixit_rebudget_environmental(row)
 
 
+#: Causes whose fix is reproducing a CI-shaped failure — GitHub Actions
+#: builds the PR's merge ref (branch + current base), never the branch in
+#: isolation, so a fix-it leg dispatched for either of these must merge the
+#: base into its worktree before trusting a local `cargo`/`pytest` run.
+#: `CAUSE_CI_RED` covers the generic case; `CAUSE_INTEGRATION_RED` is the
+#: shape where the branch's own Test verdict already read green and only
+#: the combination with the base is red.
+_CI_SHAPED_INVESTIGATE_CAUSES = (
+    queue_diagnose.CAUSE_CI_RED,
+    queue_diagnose.CAUSE_INTEGRATION_RED,
+)
+
+
+def _merge_ref_instruction(
+    repo_name: str, issue_number: int, config: "Config",
+) -> str | None:
+    """The merge-the-base instruction for a CI-shaped fix-it leg, or
+    ``None`` when the base branch can't be resolved (unconfigured repo, a
+    ``gh`` read failure) — best-effort, same posture as every other
+    enrichment in this module: a resolution failure must never block the
+    fix-it dispatch itself, it just leaves the briefing without this one
+    extra line.
+
+    Resolved the same way `coord.gates.build_gate_report` resolves a PR's
+    actual target branch (`coord.branch_model.
+    resolve_base_branch_for_issue_number`) rather than assuming
+    `repo.default_branch`, so a repo on the milestone/`develop_branch`
+    model gets the issue's real base, not a guess.
+    """
+    try:
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None or not getattr(repo_cfg, "github", None):
+            return None
+
+        from coord.branch_model import (  # noqa: PLC0415
+            resolve_base_branch_for_issue_number,
+        )
+
+        target_branch = resolve_base_branch_for_issue_number(
+            repo_cfg, repo_cfg.github, issue_number,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; see docstring
+        return None
+    return (
+        "Reproduce on the MERGED tree, not the branch alone: run `git fetch "
+        f"origin && git rebase origin/{target_branch}` before running the "
+        "test/build command — GitHub Actions CI built this PR's merge ref "
+        f"(this branch plus the current `{target_branch}`), and a local "
+        "run that skips this step can stay green while CI stays red for "
+        "the exact same commit. A REBASE, not a merge, so this branch "
+        "stays free of merge commits and eligible for GitHub's "
+        "rebase-merge."
+    )
+
+
 def _investigate(row: StuckRow) -> bool:
     """#3769's C1 wiring: dispatch a fix-it leg for an alert-eligible
     cause instead of paging a human outright.
@@ -1086,6 +1141,20 @@ def _investigate(row: StuckRow) -> bool:
         _alert_fallback(row)
         return False
 
+    evidence = row.evidence
+    if row.cause in _CI_SHAPED_INVESTIGATE_CAUSES:
+        # The fixit-leg briefing (`_fixit_leg_briefing`) renders *evidence*
+        # verbatim under "Evidence:" — this is the only channel that
+        # reaches the dispatched worker, since that briefing carries no
+        # separate merge-ref/CI-excerpt section the way
+        # `coord.ci_fix.build_ci_fix_briefing` does. Appended, never
+        # prepended, so the diagnosis's own decisive line — which already
+        # names the failing check(s), the closest thing to a CI excerpt
+        # this tier has — stays first.
+        instruction = _merge_ref_instruction(repo_name, issue_number, config)
+        if instruction:
+            evidence = (*evidence, instruction)
+
     board = build_board()
     result = dispatch_sweep_action(
         _INVESTIGATE_ACTION,
@@ -1094,7 +1163,7 @@ def _investigate(row: StuckRow) -> bool:
         board,
         config,
         cause=row.cause,
-        evidence=row.evidence,
+        evidence=evidence,
     )
     if result.get("dispatched"):
         if ceiling_bypassed:
