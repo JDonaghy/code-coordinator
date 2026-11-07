@@ -463,3 +463,40 @@ def test_a_genuine_queue_hold_alert_still_becomes_a_halted_drive(monkeypatch):
     assert out[0].issue == QUEUE_ALERT_ISSUE
     assert "fleet hold" in out[0].reason
     assert out[0].proposed_command == "coord drive-queue resume"
+
+
+def test_a_board_doctor_diagnosis_survives_unabridged_into_a_halted_drive():
+    """#3883: the rich diagnosis `coord.board_doctor_policy.
+    escalation_alert_dispatcher` writes (cause, evidence, attempts,
+    options with commands) must reach the phone alert whole — this proves
+    the one hop `halted_drives` owns (`drive_escalations` row ->
+    `HaltedDrive`) carries it through unabridged, the same real write path
+    `coord drive-queue sweep` uses, not a hand-built fixture that could
+    drift from what that writer actually produces.
+    """
+    from coord import state
+    from coord.board_doctor import CAUSE_CEILING_BLOCKED_MERGEABLE, StuckRow
+    from coord.board_doctor_policy import escalation_alert_dispatcher
+
+    row = StuckRow(
+        queue="drive-queue",
+        key="acme/widgets#77",
+        state="stuck",
+        cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
+        confidence="medium",
+        evidence=("coord gates: every required gate reads clear",),
+        fresh=True,
+    )
+    assert escalation_alert_dispatcher(row) is True
+
+    out = collect.halted_drives(notifier_state=NotifierState(), now=NOW)
+    assert len(out) == 1
+    drive = out[0]
+    assert drive.repo == "acme/widgets"
+    assert drive.issue == 77
+    assert f"cause={CAUSE_CEILING_BLOCKED_MERGEABLE}" in drive.reason
+    assert "options:" in drive.reason
+    assert "[recommended]" in drive.reason
+    assert drive.proposed_command == "coord status"
+
+    state.dismiss_drive_escalation("acme/widgets", 77)

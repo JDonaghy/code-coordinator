@@ -23,6 +23,7 @@ independently-drifting definitions of "night".
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
@@ -33,6 +34,16 @@ from coord.notifier.models import CONDITION_LABELS, Message, NotifyEvent
 #: scrolls off a lock screen is a digest that does not get read; the count
 #: line always reports the true total, so nothing is silently dropped.
 DIGEST_DETAIL_LIMIT = 12
+
+#: #3883: `coord.notifier.predicate._halted_event` appends exactly this
+#: " Fix: <command>" suffix to a drive-halted event's own *body* whenever
+#: `HaltedDrive.proposed_command` is set — a board-doctor escalation's own
+#: recommended next step (`coord.board_doctor_policy.
+#: escalation_alert_dispatcher`). Pulled back out of *body* (the one field
+#: this module already treats as user-facing prose) rather than reached
+#: for out of `NotifyEvent.detail`, which stays "never rendered verbatim"
+#: — see that field's own docstring.
+_FIX_COMMAND_RE = re.compile(r"\bFix: (.+)$")
 
 
 def _as_datetime(now: float | datetime) -> datetime:
@@ -101,6 +112,17 @@ def digest_body(events: Sequence[NotifyEvent]) -> str:
     :func:`coord.notifier.predicate.evaluate` already ordered them) so the
     operator reads "3 halted drives" as a shape rather than as three
     unrelated lines.
+
+    #3883: a board-doctor escalation's recommended next step — the ``Fix:
+    <command>`` tail `coord.notifier.predicate._halted_event` already
+    appends to a drive-halted event's own *body* — is pulled back out and
+    appended to that event's digest line too
+    (:data:`_FIX_COMMAND_RE`), so the overnight digest never sends a bare
+    "drive halted" with the diagnosis held back for the immediate phone
+    alert alone. One line per event is kept: the full evidence/attempts/
+    options breakdown already lives in that alert's body; this is a
+    pointer back to the recommended command, not a second rendering of
+    the whole diagnosis.
     """
     lines: list[str] = []
     shown = list(events[:DIGEST_DETAIL_LIMIT])
@@ -108,7 +130,11 @@ def digest_body(events: Sequence[NotifyEvent]) -> str:
         stamp = _as_datetime(event.created_at).astimezone().strftime("%H:%M")
         label = CONDITION_LABELS.get(event.condition, event.condition)
         where = event.title.split(" — ", 1)[0]
-        lines.append(f"{stamp}  {where}: {label}")
+        line = f"{stamp}  {where}: {label}"
+        match = _FIX_COMMAND_RE.search(event.body or "")
+        if match:
+            line += f" — next: `{match.group(1).strip()}`"
+        lines.append(line)
     hidden = len(events) - len(shown)
     if hidden > 0:
         lines.append(f"… and {hidden} more (coord notifier pending)")

@@ -401,6 +401,179 @@ class TestEscalationAlertDispatcher:
         assert escalation is not None
         assert escalation["proposed_command"] == "coord status"
 
+    def test_the_page_renders_cause_evidence_attempts_and_options_with_commands(
+        self,
+    ) -> None:
+        """#3883 point 1: an escalation must hand the operator the FULL
+        diagnosis — what is stuck, the cause with its evidence, what the
+        doctor already tried and how it ended, and 2-3 concrete options
+        each with an exact command, one marked recommended — rather than
+        the bare `cause=... (escalated)` #3883 was filed to replace.
+        """
+        state.record_board_doctor_decision(
+            {
+                "sweep_id": "s-1", "queue": "drive-queue", "key": "acme/widgets#55",
+                "cause": "gate-blocked", "tier": "alert", "action": "alert",
+                "count": 1, "escalated": True, "confidence": "high",
+                "evidence": [], "recorded_at": "2026-11-01T00:00:00+00:00",
+            }
+        )
+        row = _row(
+            "acme/widgets#55",
+            queue_diagnose.CAUSE_GATE_BLOCKED,
+            evidence=("coord gates: blocked — review not approved",),
+        )
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 55)
+        assert escalation is not None
+        reason = escalation["reason"]
+        # the cause, with its confidence:
+        assert "cause=gate-blocked" in reason
+        assert "confidence=high" in reason
+        # what was already tried, and how it ended:
+        assert "already tried: alert (outcome=" in reason
+        # 2-3 options, each with its own exact command, one recommended:
+        assert "options:" in reason
+        assert "[recommended]" in reason
+        assert "`coord drive-queue diagnose --json`" in reason
+        # the evidence itself lives in gate_readings, read by the same
+        # `coord drive-queue doctor-log` surface:
+        assert "coord gates: blocked — review not approved" in escalation["gate_readings"]
+
+    def test_baseline_red_env_diagnosis_names_a_credential_and_its_host(
+        self, monkeypatch,
+    ) -> None:
+        """#3883 point 2: a fake 401 from a re-run on the repo's own
+        configured host surfaces a "renew credential" option naming that
+        host — the coord#3870 shape (an expired opencode key on
+        dellserver/precision) that used to cost a whole operator session
+        to track down by hand.
+        """
+        import socket
+
+        from coord.config import Config, Machine, Repo, SmokeTestsConfig
+
+        this_host = socket.gethostname()
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[Machine(name="m1", host=this_host, repos=["acme/widgets"])],
+            smoke_tests=SmokeTestsConfig(default_command="pytest -q"),
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "_default_env_probe_runner",
+            lambda host, command: queue_diagnose.EnvProbeResult(
+                exit_code=1,
+                output="requests.exceptions.HTTPError: 401 Unauthorized from opencode",
+            ),
+        )
+        row = _row("acme/widgets#0", CAUSE_BASELINE_RED)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 0)
+        assert escalation is not None
+        reason = escalation["reason"]
+        assert "renew credential" in reason
+        assert this_host in reason
+
+    def test_baseline_red_lost_work_names_a_possibly_lost_branch(
+        self, monkeypatch,
+    ) -> None:
+        """#3883 point 3: a POSSIBLY-LOST branch whose own diff touches a
+        file the re-run just reported failing is named in the page as a
+        likely ready-made fix — the coord#3793 shape.
+        """
+        import socket
+
+        from coord.config import Config, Machine, Repo, SmokeTestsConfig
+        from coord.models import Assignment, Board
+
+        this_host = socket.gethostname()
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[Machine(name="m1", host=this_host, repos=["acme/widgets"])],
+            smoke_tests=SmokeTestsConfig(default_command="pytest -q"),
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "_default_env_probe_runner",
+            lambda host, command: queue_diagnose.EnvProbeResult(
+                exit_code=1,
+                output="FAILED tests/test_widgets.py::test_frobnicate - AssertionError",
+            ),
+        )
+        board = Board(
+            completed=[
+                Assignment(
+                    assignment_id="asn-lost-1",
+                    repo_name="acme/widgets",
+                    machine_name="m1",
+                    issue_number=99,
+                    issue_title="frobnicate",
+                    status="merged",
+                    branch="issue-99-frobnicate-fix",
+                )
+            ]
+        )
+        monkeypatch.setattr(state, "build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.branch_model.resolve_base_branch_for_issue_number",
+            lambda *a, **k: "develop",
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.pr_is_merged", lambda *a, **k: False,
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.branch_commits_ahead", lambda *a, **k: 2,
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda *a, **k: ["tests/test_widgets.py"],
+        )
+        row = _row("acme/widgets#0", CAUSE_BASELINE_RED)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 0)
+        assert escalation is not None
+        assert "issue-99-frobnicate-fix" in escalation["reason"]
+
+    def test_integration_red_confined_to_sealed_paths_pages_a_design_decision(
+        self, monkeypatch,
+    ) -> None:
+        """#3883 point 4: a merged-tree failure whose failing check names
+        are entirely within the repo's own sealed acceptance paths pages
+        "needs a design decision" with the sealed lines, rather than the
+        generic wording every other cause gets — the quadraui#2028 shape.
+        """
+        from coord.config import AcceptanceDriverConfig, Config, Repo
+
+        config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+        config.acceptance.drivers["acme/widgets"] = AcceptanceDriverConfig(kind="cli-pytest")
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+        row = _row(
+            "acme/widgets#61",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            evidence=(
+                "gh pr checks: 2 check(s) — 1 failure "
+                "(tests/acceptance/test_descriptor.py)",
+            ),
+        )
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 61)
+        assert escalation is not None
+        reason = escalation["reason"]
+        assert "needs a design decision" in reason
+        assert "tests/acceptance/test_descriptor.py" in reason
+        assert "redesign" in reason
+
 
 class TestDismissResolvedEscalation:
     def test_dismisses_an_escalation_this_module_filed(self) -> None:
@@ -611,6 +784,43 @@ class TestInvestigate:
         assert _investigate(row) is False
         escalation = state.get_drive_escalation("acme/widgets", 40)
         assert escalation is not None
+
+    def test_never_dispatches_a_fixit_leg_for_a_sealed_confined_integration_red(
+        self, monkeypatch,
+    ) -> None:
+        # #3883 point 4: a merged-tree failure confined to the repo's own
+        # sealed acceptance paths is never fixable by a retry — a fix-it
+        # leg would only re-confirm the `STUCK:` its own ci-fix briefing
+        # (#3882) already refuses to touch, so this must page a design
+        # decision instead of dispatching.
+        from coord.config import AcceptanceDriverConfig, Config, Repo
+
+        config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+        config.acceptance.drivers["acme/widgets"] = AcceptanceDriverConfig(kind="cli-pytest")
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: config)
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "dispatch_sweep_action must not run for a sealed-confined row"
+            )
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+        row = _row(
+            "acme/widgets#61",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            evidence=(
+                "gh pr checks: 1 check(s) — 1 failure "
+                "(tests/acceptance/test_descriptor.py)",
+            ),
+        )
+
+        assert _investigate(row) is False
+        escalation = state.get_drive_escalation("acme/widgets", 61)
+        assert escalation is not None
+        assert "needs a design decision" in escalation["reason"]
 
     def test_falls_back_to_the_alert_tier_when_the_fix_round_ceiling_blocks_it(
         self, monkeypatch

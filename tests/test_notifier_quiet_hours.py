@@ -159,3 +159,29 @@ def test_digest_carries_the_first_available_deep_link():
         event(subject="a2", created_at=at(1, 0), link="http://d:7434/pipeline/coord/9"),
     ]
     assert build_digest(events, now=at(8, 0)).link == "http://d:7434/pipeline/coord/9"
+
+
+def test_digest_names_the_board_doctor_recommended_command():
+    """#3883: the digest must not go silent on a board-doctor escalation's
+    own recommended next step — `coord.notifier.predicate._halted_event`
+    bakes it into the event's body as a trailing ``Fix: <command>``, and
+    the digest line pulls it back out rather than dropping it on the
+    floor the way a bare per-condition label would."""
+    halted = event(
+        subject="drive:acme/widgets#12",
+        condition=CONDITION_DRIVE_HALTED,
+        created_at=at(23, 0),
+        body=(
+            "The drive reached a terminal state and will not tick again. "
+            "board-doctor: drive-queue row acme/widgets#12 stuck since "
+            "2026-11-05T08:00Z on cause=baseline-red. Fix: coord status"
+        ),
+    )
+    body = digest_body([halted])
+    assert "— next: `coord status`" in body
+    assert len(body.splitlines()) == 1
+
+
+def test_digest_line_is_unchanged_when_the_event_has_no_fix_command():
+    plain = event(condition=CONDITION_OVER_BASELINE, created_at=at(23, 0))
+    assert "next:" not in digest_body([plain])
