@@ -145,6 +145,9 @@ class TestPolicyTierOf:
             queue_diagnose.CAUSE_DEAD_LEG,
             queue_diagnose.CAUSE_NO_PR,
             queue_diagnose.CAUSE_CI_RED,
+            # #3882: a `ci-red` row whose own branch Test verdict already
+            # read green — the merged-tree-only failure shape.
+            queue_diagnose.CAUSE_INTEGRATION_RED,
             queue_diagnose.CAUSE_CI_PENDING,
             queue_diagnose.CAUSE_GATE_BLOCKED,
             queue_diagnose.CAUSE_AGENT_UNREACHABLE,

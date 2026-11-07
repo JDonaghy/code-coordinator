@@ -982,7 +982,9 @@ def test_a_gh_rate_limit_during_the_gates_probe_never_reads_as_never_dispatched(
     probe = qd.GhLiveProbe(board=object(), config=_Config())
     e = stalled(14, "blocked: whatever", attempts=0)
     errors: list[str] = []
-    branch, gate_ready, blockers, no_assignment_ever = probe._gates(e, errors)  # noqa: SLF001
+    branch, gate_ready, blockers, no_assignment_ever, _branch_test_state = (
+        probe._gates(e, errors)  # noqa: SLF001
+    )
     assert branch == ""
     assert no_assignment_ever is None
     assert any(err.startswith("coord gates: TimeoutError") for err in errors)

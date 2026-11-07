@@ -64,6 +64,7 @@ from coord.drive_queue import QueueEntry, is_unreachable_wait_shape
 _log = logging.getLogger(__name__)
 
 __all__ = [
+    "CAUSE_INTEGRATION_RED",
     "CAUSE_NEVER_DISPATCHED",
     "CAUSE_PROSE",
     "CAUSE_UNKNOWN",
@@ -100,6 +101,19 @@ CAUSE_MERGE_CONFLICT = "merge-conflict"
 CAUSE_DEAD_LEG = "dead-leg"
 CAUSE_NO_PR = "no-pr"
 CAUSE_CI_RED = "ci-red"
+#: A `ci-red` row whose live checks are failing while the LATEST branch
+#: Test-gate verdict (`coord.gates`'s own "test" decision, keyed off the
+#: SAME assignment row — never re-derived here, #2096) already read
+#: `passed`/`skipped` on this branch alone. CI builds the PR's merge ref
+#: (branch + current base); the Test stage builds the branch. When the two
+#: disagree the failure is a property of the COMBINATION, not of this
+#: branch's own diff — quadraui#2028's shape, where a sibling PR that
+#: landed on the base while #2028 was in flight is what actually broke it,
+#: and three fix legs stayed green on the branch because none of them ever
+#: built the merged tree. Never confused with plain `ci-red`: that cause
+#: covers everything else, including a branch whose own Test verdict is
+#: ALSO red (the regression is real and local, not an integration gap).
+CAUSE_INTEGRATION_RED = "integration-red"
 CAUSE_CI_PENDING = "ci-pending"
 CAUSE_GATE_BLOCKED = "gate-blocked"
 CAUSE_NOTHING_BLOCKING = "nothing-blocking"
@@ -134,6 +148,13 @@ CAUSE_PROSE: dict[str, str] = {
     CAUSE_DEAD_LEG: "the entry names a session the machine that launched it no longer has — the leg is dead, not slow",
     CAUSE_NO_PR: "no PR exists for this entry, so no CI-shaped or merge-shaped reason can be the real blocker",
     CAUSE_CI_RED: "a required check is failing right now",
+    CAUSE_INTEGRATION_RED: (
+        "GitHub Actions CI is failing on the PR's merge ref, but this "
+        "branch's own latest Test-gate verdict read green — the failure "
+        "lives in the combination with the current base, not in this "
+        "branch's own diff; a fix leg must build the merged tree, not "
+        "just the branch, to reproduce it"
+    ),
     CAUSE_CI_PENDING: "checks are still running; nothing has actually failed yet",
     CAUSE_GATE_BLOCKED: "a merge gate is genuinely refusing right now",
     CAUSE_NOTHING_BLOCKING: "no live blocker exists — the gates read clear, checks are green and the PR is mergeable; the queue is stalled on a reading that has since gone stale",
@@ -215,6 +236,16 @@ class LiveState:
     #: Probes that raised.  Non-empty means the picture is partial, and every
     #: verdict below high confidence is downgraded accordingly.
     probe_errors: tuple[str, ...] = ()
+    #: #3882: the LATEST terminal Test-gate verdict for this issue's own
+    #: branch — read off ``coord gates``'s own "test" decision
+    #: (:func:`coord.gates.build_gate_report`), never re-derived from a
+    #: second board read (#2096, one question one answer). ``"passed"`` |
+    #: ``"failed"`` | ``"skipped"`` | ``None``. ``None`` covers every case
+    #: that is NOT a confirmed green/red reading: the read failed, no Test
+    #: gate applies to this issue at all, or no smoke verdict has been
+    #: recorded yet — never collapsed into either verdict, same posture as
+    #: every other optional field on this class.
+    branch_test_state: str | None = None
     #: ``True`` only when ``coord gates``'s own board read
     #: (:func:`coord.gates.build_gate_report`) completed WITHOUT raising and
     #: came back having found zero assignments at all for this issue — a
@@ -471,6 +502,26 @@ def _rule_no_pr(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | No
     return None
 
 
+def _rule_integration_red(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
+    """#3882: a live-failing check whose branch Test verdict is already
+    green is a property of the MERGE, not the branch — see
+    :data:`CAUSE_INTEGRATION_RED`'s docstring. Checked strictly BEFORE
+    :func:`_rule_ci_red` in :data:`_RULES` so the more specific cause wins
+    whenever both would otherwise match; a branch whose own Test verdict
+    also read red falls through to plain ``ci-red`` unchanged.
+    """
+    failing = live.failing_checks()
+    if not failing or live.branch_test_state not in ("passed", "skipped"):
+        return None
+    names = ", ".join(sorted(c.name for c in failing)[:3])
+    return (
+        CAUSE_INTEGRATION_RED,
+        CONFIDENCE_HIGH,
+        f"gh pr checks: failing — {names} — but this branch's own latest "
+        f"Test-gate verdict is {live.branch_test_state!r}",
+    )
+
+
 def _rule_ci_red(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
     failing = live.failing_checks()
     if failing:
@@ -529,6 +580,10 @@ _RULES = (
     _rule_conflict,
     _rule_dead_leg,
     _rule_no_pr,
+    # #3882: integration-red must be tried before the generic ci-red rule
+    # below, or a branch whose own Test verdict is clean would always be
+    # misclassified as a plain (local) regression.
+    _rule_integration_red,
     _rule_ci_red,
     _rule_ci_pending,
     _rule_gate_blocked,
@@ -744,8 +799,8 @@ class GhLiveProbe:
 
     def probe(self, entry: QueueEntry) -> LiveState:
         errors: list[str] = []
-        branch, gate_ready, gate_blockers, no_assignment_ever = self._gates(
-            entry, errors
+        branch, gate_ready, gate_blockers, no_assignment_ever, branch_test_state = (
+            self._gates(entry, errors)
         )
         pr_number, pr_state, mergeable, checks = self._github(entry, branch, errors)
         reachable, has_session, crits = self._health(entry)
@@ -761,14 +816,15 @@ class GhLiveProbe:
             machine_crits=tuple(crits),
             probe_errors=tuple(errors),
             no_assignment_ever=no_assignment_ever,
+            branch_test_state=branch_test_state,
         )
 
     # -- `coord gates`, verbatim ------------------------------------------
     def _gates(
         self, entry: QueueEntry, errors: list[str]
-    ) -> tuple[str, bool | None, list[str], bool | None]:
+    ) -> tuple[str, bool | None, list[str], bool | None, str | None]:
         if self.board is None or self.config is None:
-            return "", None, [], None
+            return "", None, [], None, None
         try:
             from coord import github_ops  # noqa: PLC0415
             from coord.gates import build_gate_report  # noqa: PLC0415
@@ -778,7 +834,7 @@ class GhLiveProbe:
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"coord gates: {type(exc).__name__}: {exc}")
-            return "", None, [], None
+            return "", None, [], None, None
         # `build_gate_report` returns early, with `report.rows` empty, ONLY
         # when `assignments_for_issue` found nothing on the board for this
         # issue at all (coord/gates.py) — never for an assignment that
@@ -789,13 +845,37 @@ class GhLiveProbe:
         # code path that is a genuine, successful "nothing was ever
         # dispatched" reading.
         no_assignment_ever = not report.rows
+        # #3882: the branch's own Test-gate verdict, read off `coord
+        # gates`'s UNFILTERED decisions (not the `required`-only list just
+        # below) — a repo with no Test gate configured at all leaves this
+        # `None` rather than reading as either "passed" or "failed", and
+        # `_rule_integration_red` only ever fires on an explicit
+        # passed/skipped reading, never on the absence of one. Keyed off
+        # `GateDecision.assignment_id` -> the matching `AssignmentGateRow`
+        # (coord/gates.py: `test_decision.assignment_id` is set whenever a
+        # smoke verdict was actually evaluated), never re-derived from a
+        # second board read — one question, one answer (#2096).
+        branch_test_state: str | None = None
+        test_decision = next(
+            (d for d in report.decisions if getattr(d, "gate", None) == "test"), None
+        )
+        if test_decision is not None and test_decision.assignment_id:
+            row = next(
+                (r for r in report.rows if r.assignment_id == test_decision.assignment_id),
+                None,
+            )
+            if row is not None:
+                branch_test_state = row.test_state
         decisions = [d for d in report.decisions if getattr(d, "required", False)]
         if not decisions:
-            return str(report.branch or ""), None, [], no_assignment_ever
+            return str(report.branch or ""), None, [], no_assignment_ever, branch_test_state
         blockers = [
             f"{d.gate}: {d.reason or 'refused'}" for d in decisions if not d.ok
         ]
-        return str(report.branch or ""), not blockers, blockers, no_assignment_ever
+        return (
+            str(report.branch or ""), not blockers, blockers, no_assignment_ever,
+            branch_test_state,
+        )
 
     # -- `gh pr view` / `gh pr checks` ------------------------------------
     def _github(
