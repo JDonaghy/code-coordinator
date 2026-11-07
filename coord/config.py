@@ -1577,6 +1577,14 @@ class BoardDoctorConfig:
     ``followthrough_cap`` is the per-issue budget — the most follow-up
     issues one plan may file; a plan proposing more is rejected and
     alerted instead of written.
+
+    ``no_progress_minutes`` (#3888) is the fleet-wide threshold the sweep
+    uses to decide whether a queue row that is not already in its stuck set
+    (no `block_log` episode, no merge-queue entry) has gone long enough
+    without progress to classify anyway — see
+    :func:`coord.board_doctor.no_progress_rows`. A row inside this window
+    is left alone; one outside it is always classified, down to
+    :data:`coord.queue_diagnose.CAUSE_UNKNOWN` when nothing else fits.
     """
 
     investigate: bool = True
@@ -1584,6 +1592,7 @@ class BoardDoctorConfig:
     stale_race: bool = True
     followthrough: bool = True
     followthrough_cap: int = 5
+    no_progress_minutes: int = 60
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3583,6 +3592,15 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
             raise ConfigError("board_doctor.followthrough_cap must be a positive integer")
         cfg.followthrough_cap = cap
+    if "no_progress_minutes" in raw:
+        no_progress_minutes = raw["no_progress_minutes"]
+        if (
+            isinstance(no_progress_minutes, bool)
+            or not isinstance(no_progress_minutes, int)
+            or no_progress_minutes < 1
+        ):
+            raise ConfigError("board_doctor.no_progress_minutes must be a positive integer")
+        cfg.no_progress_minutes = no_progress_minutes
     return cfg
 
 
