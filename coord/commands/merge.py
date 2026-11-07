@@ -681,6 +681,19 @@ def _dispatch_ci_fixes(events, config, ci_store=None, *, dry_run: bool) -> None:
     is left untouched — no refund, no streak bump, no new dispatch — for
     the next tick to re-check.
 
+    #3900: a no-op leg is ALSO checked (``coord.ci_fix.
+    sealed_stuck_from_last_fix``) for the one shape that must never be
+    refunded/retried — the leg's own transcript carrying a ``coord:
+    sealed=...`` ``STUCK:`` verdict, meaning it correctly declined because
+    the merged-tree failure lives only inside a sealed acceptance-oracle
+    path it isn't authorized to touch (``build_ci_fix_briefing``'s own
+    #3882 guard). That's a terminal classification, not a bounded-retry
+    signal: the entry latches straight to ``HUMAN_REQUIRED`` with a
+    "needs a design decision" reason (also recorded via ``coord.state.
+    record_drive_escalation``, the same escalation surface ``coord.
+    board_doctor_policy``'s PRE-dispatch sealed check already pages
+    through) instead of being refunded into another no-op cycle.
+
     *ci_store* (#3114): the same ``CiStore`` the caller already built to run
     ``mq.process()`` this pass — threaded through so a fresh dispatch can
     fetch the failing job/step/log-excerpt detail via
@@ -714,6 +727,7 @@ def _dispatch_ci_fixes(events, config, ci_store=None, *, dry_run: bool) -> None:
         dispatch_precheck,
         dispatch_was_noop,
         refund_noop_ci_fix,
+        sealed_stuck_from_last_fix,
     )
     from coord.merge_queue import HUMAN_REQUIRED  # noqa: PLC0415
     from coord.state import load_board, save_board  # noqa: PLC0415
@@ -744,6 +758,75 @@ def _dispatch_ci_fixes(events, config, ci_store=None, *, dry_run: bool) -> None:
             )
             continue
         if dispatch_was_noop(entry):
+            # #3900: the SHA comparison behind `dispatch_was_noop` alone
+            # cannot tell "declined because the failure is confined to a
+            # sealed path it isn't authorized to touch" apart from an
+            # ordinary not-attributable-to-this-branch no-op — only the
+            # finished leg's own transcript can. Checked FIRST, before any
+            # refund/streak accounting: a sealed-confined verdict is never
+            # retried (a worker is structurally refused the only edit that
+            # would resolve it, same as #3882's briefing already tells it),
+            # so it must latch for a human instead of spending another
+            # no-op cycle. Mirrors the reason/wording of #3883's own
+            # PRE-dispatch sealed check (`coord.board_doctor_policy.
+            # _sealed_confined_lines`) so the operator sees one shape
+            # either way.
+            sealed_paths = sealed_stuck_from_last_fix(entry, fix_board, config)
+            if sealed_paths is not None:
+                lines_text = ", ".join(sealed_paths) if sealed_paths else (
+                    "the sealed check(s)"
+                )
+                reason = (
+                    "needs a design decision: CI failure confined to "
+                    f"sealed path(s) ({lines_text}) — a ci-fix worker "
+                    "reported this itself and stopped rather than attempt "
+                    "a fix it isn't authorized to make; never fixable by "
+                    "retrying"
+                )
+                entry.state = HUMAN_REQUIRED
+                entry.error = reason
+                dispatched_any = True
+                click.echo(f"  {entry.repo_name} #{entry.issue_number}: {reason}")
+                record_audit(
+                    tier="operational",
+                    category="merge",
+                    event_type="ci_fix_sealed_confined",
+                    actor="daemon",
+                    summary=(
+                        f"ci-fix sealed-confined: {entry.repo_name}#"
+                        f"{entry.issue_number} — {reason}"
+                    ),
+                    repo=entry.repo_name,
+                    issue=entry.issue_number,
+                    assignment_id=entry.assignment_id,
+                    details={
+                        "reason": "ci_fix_sealed_confined",
+                        "sealed_paths": list(sealed_paths),
+                    },
+                )
+                try:
+                    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+                    record_drive_escalation(
+                        entry.repo_name,
+                        entry.issue_number,
+                        stage="ci-fix",
+                        reason=reason,
+                        gate_readings=(
+                            f"checks_failed sealed-confined ({lines_text})"
+                        ),
+                        proposed_command="coord status",
+                        assignment_id=entry.assignment_id,
+                    )
+                except Exception:  # noqa: BLE001 — escalation write is
+                    # best-effort, same posture as every other escalation
+                    # writer in this codebase (see `coord.reconcile`'s own
+                    # `record_drive_escalation` call sites) — a failed
+                    # write must never block the HUMAN_REQUIRED transition
+                    # itself, which is already recorded on the queue entry
+                    # and in the audit log above.
+                    pass
+                continue
             refund_noop_ci_fix(entry)
             dispatched_any = True
             if entry.ci_fix_noop_streak >= MAX_CI_FIX_NOOP_STREAK:
