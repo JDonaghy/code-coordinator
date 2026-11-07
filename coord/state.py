@@ -6270,6 +6270,34 @@ def record_work_review_verdict(assignment_id: str, verdict: str) -> None:
     conn.commit()
 
 
+def repoint_review_of_assignment_id(review_assignment_id: str, new_parent_id: str) -> None:
+    """#3891: re-parent a ``type='review'`` row onto a different work row.
+
+    A SCOPED re-review's ``review_of_assignment_id`` is set, at dispatch
+    time, to the claim key the #3310 chain reuses (an OLDER round on the
+    same branch) rather than the fix round it actually reviewed — see
+    :func:`coord.review.dispatch_scoped_review` and
+    :func:`coord.auto_loop.newest_work_round_on_chain`'s docstrings. Once
+    :func:`coord.auto_loop.propagate_review_verdict` detects that mismatch
+    it calls this to correct the durable row too, not just the in-memory
+    board object — so a later ``read_board()`` (a fresh ``coord drive``
+    poll, ``drive_state.project``'s review match, a daemon restart) sees
+    the same corrected parent the in-memory write already applied.
+
+    Idempotent and narrow: only touches ``type='review'`` rows, and is a
+    no-op when either id is empty.
+    """
+    if not review_assignment_id or not new_parent_id:
+        return
+    conn = get_connection()
+    sql.execute(conn,
+        "UPDATE assignments SET review_of_assignment_id=? "
+        "WHERE assignment_id=? AND type='review'",
+        (new_parent_id, review_assignment_id),
+    )
+    conn.commit()
+
+
 def reset_wedged_test_author_review(assignment_id: str) -> None:
     """#1180: un-wedge a ``test-author``/``mock-author`` row whose
     ``review_state`` was stamped ``'done'`` by a ``work_is_terminal``
