@@ -516,16 +516,25 @@ def enter_event(
 ) -> dict[str, Any]:
     """An ``enter`` record for a stall the TICK PLAN does not describe.
 
-    One caller today: the launch-failure branch of ``coord drive-queue tick``,
-    where the entry is blocked by the ``coord drive --tmux`` subprocess exiting
-    non-zero *after* the plan was applied.  That transition is invisible to
-    :func:`plan_events` — it is not in ``plan.writes()`` and never could be —
-    and it is #2235's own ``stick-demo#1`` row ("dispatch failed"), so leaving
-    it out would omit exactly the category the log was built to count.
+    Two callers today:
+
+    * the launch-failure branch of ``coord drive-queue tick``, where the
+      entry is blocked by the ``coord drive --tmux`` subprocess exiting
+      non-zero *after* the plan was applied. That transition is invisible to
+      :func:`plan_events` — it is not in ``plan.writes()`` and never could
+      be — and it is #2235's own ``stick-demo#1`` row ("dispatch failed"),
+      so leaving it out would omit exactly the category the log was built
+      to count.
+    * ``coord.commands.drive_queue._record_operator_release_entry``
+      (#3898), with ``source="operator"``, synthesizing the opening half of
+      an episode for a merge-queue ``human_required`` latch that nothing
+      else ever opens one for — see that function's ``synthesize_enter``
+      docstring for why its ``resolve`` would otherwise be an orphan
+      :func:`episodes` drops.
 
     *attempts* overrides the snapshot's own count for the same reason the
-    branch itself recomputes it (see the ``base_attempts`` note there): the
-    row's persisted value has already moved on.
+    launch-failure branch itself recomputes it (see the ``base_attempts``
+    note there): the row's persisted value has already moved on.
     """
     record = _enter_record(
         entry.key,

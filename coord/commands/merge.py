@@ -2403,9 +2403,17 @@ def merge(
                     # also writes an operator-release event there — the
                     # same helper `drive-queue remove`/`add` use, with the
                     # merge queue's own `HUMAN_REQUIRED` in place of the
-                    # drive queue's `blocked`/`parked`. The check just
-                    # above already confirmed `only_entry` is actually
-                    # latched, so there is nothing further to guard on here.
+                    # drive queue's `blocked`/`parked`. `latched_states`
+                    # guards `remove`/`add`'s own drive-queue vocabulary and
+                    # performs no filtering here (the check just above
+                    # already confirmed `only_entry.state == HUMAN_REQUIRED`
+                    # before this line is reached) — passed anyway so this
+                    # call site states, rather than assumes, which
+                    # vocabulary it means. `synthesize_enter=True`: nothing
+                    # in this tree ever opens a block-log episode for the
+                    # merge queue's `HUMAN_REQUIRED` latch (see that
+                    # function's own docstring), so without it the `resolve`
+                    # below would be an orphan `episodes()` silently drops.
                     from coord.commands.drive_queue import (  # noqa: PLC0415
                         _record_operator_release_entry,
                     )
@@ -2417,9 +2425,18 @@ def merge(
                             issue=only_entry.issue_number,
                             state=only_entry.state,
                             last_reason=only_entry.error or "",
+                            # #3898 review: `position`/`resumes`/`machine`
+                            # have no merge-queue equivalent — left at the
+                            # stand-in's defaults rather than fabricated.
+                            # `attempts` DOES have one: `ci_fix_dispatches`
+                            # is the count of automated fix attempts spent
+                            # before this entry latched, the same role
+                            # `attempts` plays for a drive-queue row.
+                            attempts=only_entry.ci_fix_dispatches,
                         ),
                         resolution="operator_override",
                         latched_states=frozenset({HUMAN_REQUIRED}),
+                        synthesize_enter=True,
                     )
                     click.echo(
                         "  --override-human-required: cleared HUMAN_REQUIRED on "

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -587,6 +588,19 @@ def _interactive_stdin_is_tty(monkeypatch):
     after this fixture and wins.
     """
     monkeypatch.setattr("coord.commands.dispatch._stdin_is_tty", lambda: True)
+
+
+def block_log_records(path: Path) -> list[dict]:
+    """Parse a #2235 Phase-0 ``COORD_BLOCK_LOG`` JSONL file into records.
+
+    Shared by ``tests/test_cli_drive_queue.py`` and ``tests/test_cli_merge.py``
+    (#3898 review — both had their own byte-identical copy of this). A
+    missing file (no event ever written in this test) reads as ``[]``, not
+    an error.
+    """
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def output_and_stderr(result) -> str:
