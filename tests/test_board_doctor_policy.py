@@ -438,8 +438,9 @@ class TestEscalationAlertDispatcher:
         assert "options:" in reason
         assert "[recommended]" in reason
         assert "`coord drive-queue diagnose --json`" in reason
-        # the evidence itself lives in gate_readings, read by the same
-        # `coord drive-queue doctor-log` surface:
+        # the evidence itself lives in `gate_readings`, the same
+        # `drive_escalations` row `coord drive-queue doctor-log` now also
+        # reads (via its own `reason` field) to surface this diagnosis:
         assert "coord gates: blocked — review not approved" in escalation["gate_readings"]
 
     def test_baseline_red_env_diagnosis_names_a_credential_and_its_host(
@@ -453,7 +454,7 @@ class TestEscalationAlertDispatcher:
         """
         import socket
 
-        from coord.config import Config, Machine, Repo, SmokeTestsConfig
+        from coord.config import Machine, SmokeTestsConfig
 
         this_host = socket.gethostname()
         config = Config(
@@ -465,7 +466,7 @@ class TestEscalationAlertDispatcher:
         monkeypatch.setattr(
             board_doctor_policy,
             "_default_env_probe_runner",
-            lambda host, command: queue_diagnose.EnvProbeResult(
+            lambda host, command, **_kwargs: queue_diagnose.EnvProbeResult(
                 exit_code=1,
                 output="requests.exceptions.HTTPError: 401 Unauthorized from opencode",
             ),
@@ -480,6 +481,44 @@ class TestEscalationAlertDispatcher:
         assert "renew credential" in reason
         assert this_host in reason
 
+    def test_baseline_red_env_probe_never_runs_against_a_non_local_host(
+        self, monkeypatch,
+    ) -> None:
+        """A machine declared for the repo that is NOT the host this
+        process is running on must degrade straight to "can't tell"
+        without ever invoking the probe runner — the fleet has no
+        agent-HTTP exec primitive yet to reach a different host's
+        environment from here, so a fake failing re-run must never be
+        attributed to a host that was never actually probed.
+        """
+        from coord.config import Machine, SmokeTestsConfig
+
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[
+                Machine(name="elsewhere", host="elsewhere.ts.net", repos=["acme/widgets"]),
+            ],
+            smoke_tests=SmokeTestsConfig(default_command="pytest -q"),
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+        def _must_not_run(host, command, **kwargs):
+            raise AssertionError("the probe runner must not run for a non-local host")
+
+        monkeypatch.setattr(
+            board_doctor_policy, "_default_env_probe_runner", _must_not_run,
+        )
+        row = _row("acme/widgets#0", CAUSE_BASELINE_RED)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 0)
+        assert escalation is not None
+        reason = escalation["reason"]
+        assert "renew credential" not in reason
+        assert "install" not in reason
+        assert escalation["proposed_command"] == "coord status"
+
     def test_baseline_red_lost_work_names_a_possibly_lost_branch(
         self, monkeypatch,
     ) -> None:
@@ -489,8 +528,7 @@ class TestEscalationAlertDispatcher:
         """
         import socket
 
-        from coord.config import Config, Machine, Repo, SmokeTestsConfig
-        from coord.models import Assignment, Board
+        from coord.config import Machine, SmokeTestsConfig
 
         this_host = socket.gethostname()
         config = Config(
@@ -502,7 +540,7 @@ class TestEscalationAlertDispatcher:
         monkeypatch.setattr(
             board_doctor_policy,
             "_default_env_probe_runner",
-            lambda host, command: queue_diagnose.EnvProbeResult(
+            lambda host, command, **_kwargs: queue_diagnose.EnvProbeResult(
                 exit_code=1,
                 output="FAILED tests/test_widgets.py::test_frobnicate - AssertionError",
             ),
@@ -526,6 +564,9 @@ class TestEscalationAlertDispatcher:
             lambda *a, **k: "develop",
         )
         monkeypatch.setattr(
+            "coord.github_ops.branch_exists_on_remote", lambda *a, **k: True,
+        )
+        monkeypatch.setattr(
             "coord.github_ops.pr_is_merged", lambda *a, **k: False,
         )
         monkeypatch.setattr(
@@ -535,6 +576,10 @@ class TestEscalationAlertDispatcher:
             "coord.github_ops.get_compare_files",
             lambda *a, **k: ["tests/test_widgets.py"],
         )
+        monkeypatch.setattr(
+            "coord.github_ops.get_repo_file",
+            lambda repo, path, branch: f"content-on-{branch}",
+        )
         row = _row("acme/widgets#0", CAUSE_BASELINE_RED)
 
         assert escalation_alert_dispatcher(row) is True
@@ -543,25 +588,133 @@ class TestEscalationAlertDispatcher:
         assert escalation is not None
         assert "issue-99-frobnicate-fix" in escalation["reason"]
 
+    def test_baseline_red_lost_work_skips_a_branch_already_landed_verbatim(
+        self, monkeypatch,
+    ) -> None:
+        """A branch that is ahead of base but whose changed files are
+        byte-identical to base's own copy already landed via rebase/squash
+        — `coord.reconcile`'s own confirmed-clean rule — and must NOT be
+        named as a likely ready-made fix.
+        """
+        import socket
+
+        from coord.config import Machine, SmokeTestsConfig
+
+        this_host = socket.gethostname()
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[Machine(name="m1", host=this_host, repos=["acme/widgets"])],
+            smoke_tests=SmokeTestsConfig(default_command="pytest -q"),
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "_default_env_probe_runner",
+            lambda host, command, **_kwargs: queue_diagnose.EnvProbeResult(
+                exit_code=1,
+                output="FAILED tests/test_widgets.py::test_frobnicate - AssertionError",
+            ),
+        )
+        board = Board(
+            completed=[
+                Assignment(
+                    assignment_id="asn-lost-2",
+                    repo_name="acme/widgets",
+                    machine_name="m1",
+                    issue_number=100,
+                    issue_title="frobnicate again",
+                    status="merged",
+                    branch="issue-100-frobnicate-fix",
+                )
+            ]
+        )
+        monkeypatch.setattr(state, "build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.branch_model.resolve_base_branch_for_issue_number",
+            lambda *a, **k: "develop",
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.branch_exists_on_remote", lambda *a, **k: True,
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.pr_is_merged", lambda *a, **k: False,
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.branch_commits_ahead", lambda *a, **k: 2,
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda *a, **k: ["tests/test_widgets.py"],
+        )
+        # Byte-identical on both ends — a rebase/squash already landed it.
+        monkeypatch.setattr(
+            "coord.github_ops.get_repo_file", lambda repo, path, branch: "same content",
+        )
+        row = _row("acme/widgets#0", CAUSE_BASELINE_RED)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 0)
+        assert escalation is not None
+        assert "issue-100-frobnicate-fix" not in escalation["reason"]
+
     def test_integration_red_confined_to_sealed_paths_pages_a_design_decision(
         self, monkeypatch,
     ) -> None:
-        """#3883 point 4: a merged-tree failure whose failing check names
-        are entirely within the repo's own sealed acceptance paths pages
+        """A merged-tree failure whose only failing file — read off the
+        failing CI job's own log excerpt, never its check NAME, since a
+        check name never contains a path on this repo's own CI — is
+        entirely within the repo's own sealed acceptance paths pages
         "needs a design decision" with the sealed lines, rather than the
         generic wording every other cause gets — the quadraui#2028 shape.
         """
-        from coord.config import AcceptanceDriverConfig, Config, Repo
+        from coord.ci_store import CIFailureDetail
+        from coord.config import AcceptanceDriverConfig
 
         config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
         config.acceptance.drivers["acme/widgets"] = AcceptanceDriverConfig(kind="cli-pytest")
         monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+        board = Board(
+            active=[
+                Assignment(
+                    assignment_id="asn-61",
+                    repo_name="acme/widgets",
+                    machine_name="m1",
+                    issue_number=61,
+                    issue_title="widget",
+                    status="in_review",
+                    branch="issue-61-widget",
+                )
+            ]
+        )
+        monkeypatch.setattr(state, "build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.github_ops.find_pr_for_branch",
+            lambda repo, branch: {"number": 77},
+        )
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store", lambda *a, **k: object(),
+        )
+        monkeypatch.setattr(
+            "coord.ci_github.build_ci_failure_detail",
+            lambda ci_store, repo, number: CIFailureDetail(
+                check_name="coord acceptance run --all --ci (cli-pytest route, ms-37)",
+                job_name="coord acceptance run --all --ci (cli-pytest route, ms-37)",
+                step_name="pytest",
+                log_excerpt=(
+                    "FAILED tests/acceptance/test_descriptor.py::test_x - "
+                    "AssertionError"
+                ),
+                run_url="https://example.com/run/1",
+            ),
+        )
         row = _row(
             "acme/widgets#61",
             queue_diagnose.CAUSE_INTEGRATION_RED,
             evidence=(
                 "gh pr checks: 2 check(s) — 1 failure "
-                "(tests/acceptance/test_descriptor.py)",
+                "(coord acceptance run --all --ci (cli-pytest route, ms-37))",
             ),
         )
 
@@ -617,6 +770,56 @@ class TestClassifyEnvProbeOutput:
         )
         assert category == queue_diagnose.ENV_DIAGNOSIS_BASE_RED
         assert name is None
+
+    def test_a_bare_line_number_matching_401_or_403_stays_a_red_base(self) -> None:
+        """A pytest traceback's line number (``:403:``) and a pass/fail
+        count (``1401 passed``) must never read as a credential failure —
+        only a status code WITH its HTTP wording should.
+        """
+        category, name = queue_diagnose.classify_env_probe_output(
+            "tests/test_widget.py:403: AssertionError\n1 failed, 1401 passed",
+        )
+        assert category == queue_diagnose.ENV_DIAGNOSIS_BASE_RED
+        assert name is None
+
+
+class TestIsSealedConfinedFailure:
+    """The pure predicate behind the point-4 design-decision page."""
+
+    def test_every_failing_path_under_a_directory_sealed_path_is_confined(self) -> None:
+        assert queue_diagnose.is_sealed_confined_failure(
+            ("tests/acceptance/ms-37/test_descriptor.py",), ("tests/acceptance/",),
+        ) is True
+
+    def test_a_failing_path_outside_every_sealed_path_is_not_confined(self) -> None:
+        assert queue_diagnose.is_sealed_confined_failure(
+            ("coord/board_doctor_policy.py",), ("tests/acceptance/",),
+        ) is False
+
+    def test_a_mix_of_sealed_and_unsealed_paths_is_not_confined(self) -> None:
+        assert queue_diagnose.is_sealed_confined_failure(
+            ("tests/acceptance/test_descriptor.py", "coord/dispatch.py"),
+            ("tests/acceptance/",),
+        ) is False
+
+    def test_a_file_sealed_path_requires_an_exact_or_suffix_match(self) -> None:
+        """An `entrypoint:`-style sealed path with no trailing slash names
+        ONE exact file — a failing path that merely shares a substring with
+        it must not be read as confined (the trailing-slash branch's
+        substring rule is for directories only).
+        """
+        assert queue_diagnose.is_sealed_confined_failure(
+            ("tui/tests/acceptance.rs",), ("tui/tests/acceptance.rs",),
+        ) is True
+        assert queue_diagnose.is_sealed_confined_failure(
+            ("tui/tests/acceptance.rs.bak",), ("tui/tests/acceptance.rs",),
+        ) is False
+
+    def test_no_failing_paths_is_never_confined(self) -> None:
+        assert queue_diagnose.is_sealed_confined_failure((), ("tests/acceptance/",)) is False
+
+    def test_no_sealed_paths_is_never_confined(self) -> None:
+        assert queue_diagnose.is_sealed_confined_failure(("tests/acceptance/test_x.py",), ()) is False
 
 
 class TestDismissResolvedEscalation:
@@ -832,17 +1035,53 @@ class TestInvestigate:
     def test_never_dispatches_a_fixit_leg_for_a_sealed_confined_integration_red(
         self, monkeypatch,
     ) -> None:
-        # #3883 point 4: a merged-tree failure confined to the repo's own
-        # sealed acceptance paths is never fixable by a retry — a fix-it
-        # leg would only re-confirm the `STUCK:` its own ci-fix briefing
-        # (#3882) already refuses to touch, so this must page a design
-        # decision instead of dispatching.
-        from coord.config import AcceptanceDriverConfig, Config, Repo
+        # A merged-tree failure confined to the repo's own sealed
+        # acceptance paths is never fixable by a retry — a fix-it leg
+        # would only re-confirm the `STUCK:` its own ci-fix briefing
+        # already refuses to touch, so this must page a design decision
+        # instead of dispatching.
+        from coord.ci_store import CIFailureDetail
+        from coord.config import AcceptanceDriverConfig
 
         config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
         config.acceptance.drivers["acme/widgets"] = AcceptanceDriverConfig(kind="cli-pytest")
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: config)
         monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+
+        board = Board(
+            active=[
+                Assignment(
+                    assignment_id="asn-61",
+                    repo_name="acme/widgets",
+                    machine_name="m1",
+                    issue_number=61,
+                    issue_title="widget",
+                    status="in_review",
+                    branch="issue-61-widget",
+                )
+            ]
+        )
+        monkeypatch.setattr(state, "build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.github_ops.find_pr_for_branch",
+            lambda repo, branch: {"number": 77},
+        )
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store", lambda *a, **k: object(),
+        )
+        monkeypatch.setattr(
+            "coord.ci_github.build_ci_failure_detail",
+            lambda ci_store, repo, number: CIFailureDetail(
+                check_name="coord acceptance run --all --ci (cli-pytest route, ms-37)",
+                job_name="coord acceptance run --all --ci (cli-pytest route, ms-37)",
+                step_name="pytest",
+                log_excerpt=(
+                    "FAILED tests/acceptance/test_descriptor.py::test_x - "
+                    "AssertionError"
+                ),
+                run_url="https://example.com/run/1",
+            ),
+        )
 
         def dispatch_must_not_be_called(*args, **kwargs):
             raise AssertionError(
@@ -857,7 +1096,7 @@ class TestInvestigate:
             queue_diagnose.CAUSE_INTEGRATION_RED,
             evidence=(
                 "gh pr checks: 1 check(s) — 1 failure "
-                "(tests/acceptance/test_descriptor.py)",
+                "(coord acceptance run --all --ci (cli-pytest route, ms-37))",
             ),
         )
 
@@ -2218,7 +2457,6 @@ class TestRecommendInvestigatorAction:
         # wrapper must refuse cleanly rather than trust the recommendation.
         from coord import state
         from coord.board_doctor_permissions import investigator_requeue
-        from coord.models import Board
 
         row = _row("acme/widgets#3875", queue_diagnose.CAUSE_NEVER_DISPATCHED)
         assert board_doctor_policy.recommend_investigator_action(row) == "requeue"

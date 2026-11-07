@@ -8575,6 +8575,45 @@ def test_doctor_log_reads_back_recorded_decisions(cli):
     assert summary["human_interventions_missed"] == 0
 
 
+def test_doctor_log_surfaces_an_alert_tier_rows_full_diagnosis(cli):
+    """An ``action=alert`` row's plain-text line also carries the live
+    `drive_escalations` diagnosis (cause/evidence/attempts/options) the
+    phone alert and the digest already get — not just the bare
+    ``cause=.../action=alert`` `board_doctor_decisions` columns.
+    """
+    from datetime import datetime, timezone
+
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-1",
+            "queue": "drive-queue",
+            "key": f"{REPO}#2",
+            "cause": "gate-blocked",
+            "tier": "alert",
+            "action": "alert",
+            "count": 1,
+            "escalated": True,
+            "confidence": "high",
+            "evidence": [],
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    state.record_drive_escalation(
+        REPO,
+        2,
+        stage="board-doctor:drive-queue",
+        reason=" — a required gate is blocking merge; full diagnosis here",
+        gate_readings="coord gates: blocked — review not approved",
+        proposed_command="coord drive-queue diagnose --json",
+    )
+
+    result = cli("doctor-log")
+    assert result.exit_code == 0, result.output
+    assert f"drive-queue:{REPO}#2" in result.output
+    assert "cause=gate-blocked action=alert" in result.output
+    assert "full diagnosis here" in result.output
+
+
 # ── #3881: doctor-act (the investigator's audited action wrapper) ───────────
 
 

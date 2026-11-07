@@ -143,7 +143,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 _log = logging.getLogger(__name__)
 
@@ -169,7 +170,7 @@ from coord.queue_diagnose import DiagnosisOption, EnvProbeResult
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
-    from coord.models import Board
+    from coord.models import Board, Machine
 
 #: A fix-it-leg dispatch is already in flight for this row — both
 #: `coord.board_doctor_permissions.sweep_dispatch_fixit_leg` detail strings
@@ -1018,34 +1019,104 @@ def _merge_ref_instruction(
     )
 
 
-#: #3883 point 4: `quadraui#2028`'s shape — an integration-red row whose
-#: live failing checks are ALL confined to the repo's own sealed acceptance
-#: paths. `coord.ci_fix`'s briefing (#3882) already tells a dispatched
-#: fix-it leg to stop with a `STUCK:` line rather than attempt a fix
-#: confined to a sealed path; this is the doctor-side half — recognizing
-#: the same shape BEFORE a leg is even dispatched (from `_investigate`,
-#: never from a leg's own report, which this module has no access to) and
-#: paging "needs a design decision" instead of burning a fix-it leg on
-#: something that briefing already refuses to touch.
+def _issue_branch(board: "Board", repo_name: str, issue_number: int) -> str | None:
+    """The most recent branch an assignment recorded for *repo_name*
+    ``#``*issue_number* — read-only, best-effort: returns ``None`` when no
+    assignment names one, never raises on a board whose
+    ``active``/``completed`` lists are absent or malformed.
+    """
+    candidates = list(getattr(board, "active", None) or ()) + list(
+        getattr(board, "completed", None) or ()
+    )
+    for assignment in candidates:
+        if str(getattr(assignment, "repo_name", "")) != repo_name:
+            continue
+        a_issue = getattr(assignment, "for_issue_number", None) or getattr(
+            assignment, "issue_number", None
+        )
+        try:
+            if a_issue is None or int(a_issue) != issue_number:
+                continue
+        except (TypeError, ValueError):
+            continue
+        branch = str(getattr(assignment, "branch", "") or "")
+        if branch:
+            return branch
+    return None
+
+
+#: `quadraui#2028`'s shape — an integration-red row whose live failing CI
+#: job is confined to the repo's own sealed acceptance paths.
+#: `coord.ci_fix`'s briefing already tells a dispatched fix-it leg to stop
+#: with a `STUCK:` line rather than attempt a fix confined to a sealed
+#: path; this is the doctor-side half — recognizing the same shape BEFORE
+#: a leg is even dispatched (from `_investigate`, never from a leg's own
+#: report, which this module has no access to) and paging "needs a design
+#: decision" instead of burning a fix-it leg on something that briefing
+#: already refuses to touch.
 def _sealed_confined_lines(
-    row: StuckRow, repo_name: str, config: "Config",
+    row: StuckRow, repo_name: str, issue_number: int, config: "Config",
 ) -> tuple[str, ...] | None:
-    """The failing check lines, when *row* is a `CAUSE_INTEGRATION_RED` row
-    whose failure is entirely inside *repo_name*'s sealed acceptance paths —
-    ``None`` otherwise (no sealed driver configured, the cause isn't
-    `integration-red`, or at least one failing check falls outside the
-    sealed tree, which keeps this from misfiring on an ordinary mixed
-    failure that happens to touch a sealed file alongside others).
+    """The failing file path(s), when *row* is a `CAUSE_INTEGRATION_RED`
+    row whose failure is entirely inside *repo_name*'s sealed acceptance
+    paths — ``None`` otherwise (no sealed driver configured, the cause
+    isn't `integration-red`, no PR/log evidence resolvable, or at least
+    one failing path falls outside the sealed tree, which keeps this from
+    misfiring on an ordinary mixed failure that happens to touch a sealed
+    file alongside others).
+
+    The evidence is the failing CI job's own log excerpt
+    (`coord.ci_github.build_ci_failure_detail`), never the check's own
+    NAME: a GitHub Actions check name is an operator-chosen label
+    ("Tests", "coord acceptance run --all --ci (cli-pytest route, ms-37)"
+    per this repo's own `.github/workflows/test.yml`), never the path of
+    whatever file actually failed inside it — matching against the name
+    alone could never fire on this repo's own CI. The log excerpt is read
+    with the SAME `FAILED <path>` pytest short-summary parser
+    (:func:`~coord.queue_diagnose.extract_failing_file_paths`) a
+    baseline-red probe already uses, one parser rather than two
+    independent guesses at "what file failed."
+
+    Best-effort end to end, the same posture as every other enrichment in
+    this module: no branch recorded for the issue, no open PR for that
+    branch, no CI store configured, no completed failing job, or any
+    `gh`/network read failing along the way all degrade to ``None`` —
+    "can't tell", never "confirmed not sealed-confined".
     """
     if row.cause != queue_diagnose.CAUSE_INTEGRATION_RED:
         return None
     sealed_paths = config.acceptance.sealed_paths(repo_name)
     if not sealed_paths:
         return None
-    check_names = queue_diagnose.parse_failing_check_names(row.evidence)
-    if not queue_diagnose.is_sealed_confined_failure(check_names, sealed_paths):
+    try:
+        from coord import github_ops  # noqa: PLC0415
+        from coord.ci_github import build_ci_failure_detail  # noqa: PLC0415
+        from coord.ci_store import build_ci_store  # noqa: PLC0415
+        from coord.state import build_board  # noqa: PLC0415
+
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None or not getattr(repo_cfg, "github", None):
+            return None
+        branch = _issue_branch(build_board(), repo_name, issue_number)
+        if not branch:
+            return None
+        pr = github_ops.find_pr_for_branch(repo_cfg.github, branch)
+        pr_number = pr.get("number") if pr else None
+        if not pr_number:
+            return None
+        ci_cfg = config.ci_store
+        ci_store = build_ci_store(
+            ci_cfg.type or "github", host=ci_cfg.host, token_env=ci_cfg.token_env,
+        )
+        detail = build_ci_failure_detail(ci_store, repo_cfg.github, int(pr_number))
+        if detail is None or not detail.log_excerpt:
+            return None
+        failing_files = queue_diagnose.extract_failing_file_paths(detail.log_excerpt)
+    except Exception:  # noqa: BLE001 — best-effort; see docstring
         return None
-    return check_names
+    if not queue_diagnose.is_sealed_confined_failure(failing_files, sealed_paths):
+        return None
+    return failing_files
 
 
 def _design_decision_options(sealed_lines: tuple[str, ...]) -> tuple[DiagnosisOption, ...]:
@@ -1205,7 +1276,7 @@ def _investigate(row: StuckRow) -> bool:
         _alert_fallback(row)
         return False
 
-    sealed_lines = _sealed_confined_lines(row, repo_name, config)
+    sealed_lines = _sealed_confined_lines(row, repo_name, issue_number, config)
     if sealed_lines is not None:
         click.echo(
             f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
@@ -1601,48 +1672,91 @@ def _stuck_since_text(queue: str, key: str) -> str:
     return f"since {stamp}"
 
 
-def _candidate_hosts_for_repo(repo_name: str, config: "Config") -> tuple[str, ...]:
-    """Every machine's ``host`` declared to carry *repo_name*
-    (``Machine.repos``) — the baseline-red env probe runs against each in
-    turn (#3883 point 2), since coord#3870's own incident spanned TWO hosts
-    (dellserver + precision) with independently expired credentials; a
-    probe confined to a single host would only ever have named half the
-    fix.
+def _candidate_machines_for_repo(repo_name: str, config: "Config") -> tuple["Machine", ...]:
+    """Every machine declared to carry *repo_name* (``Machine.repos``) —
+    the baseline-red env probe runs against each in turn (#3883 point 2),
+    since coord#3870's own incident spanned TWO hosts (dellserver +
+    precision) with independently expired credentials; a probe confined
+    to a single host would only ever have named half the fix.
+
+    Returns the :class:`~coord.models.Machine` objects themselves, not
+    just their ``host`` strings, so a caller can also read
+    ``repo_path(repo_name)`` (where the repo actually lives on that
+    machine) and compare machine identity against
+    :func:`coord.config.resolve_local_machine` — both of which need the
+    whole record, not a bare hostname.
     """
     return tuple(
-        m.host
+        m
         for m in (getattr(config, "machines", None) or ())
         if repo_name in (getattr(m, "repos", None) or ())
     )
 
 
-def _default_env_probe_runner(host: str, command: str) -> EnvProbeResult:
+def _default_env_probe_runner(
+    host: str, command: str, *, cwd: str | None, base_branch: str | None,
+) -> EnvProbeResult:
     """#3883 point 2's production re-run of *command* under THIS process's
-    own environment (PATH, HOME) — real, never simulated, but only when
-    *host* names the machine this process is itself running on.
+    own environment (PATH, HOME) — real, never simulated.
 
-    The fleet has no agent-HTTP exec primitive yet to reach a DIFFERENT
-    host's environment from here (tracked as a gap, not quietly assumed
-    away) — a probe aimed at any other host degrades to an honest
-    :attr:`EnvProbeResult.error` rather than guessing at that host's
-    environment from this one's, which `diagnose_baseline_red_env` then
-    reports as :data:`queue_diagnose.ENV_DIAGNOSIS_INCONCLUSIVE` exactly
-    like any other probe that could not run.
+    *cwd* must be the repo's own checkout on *host*
+    (``Machine.repo_path(repo_name)``) — the same requirement
+    `coord.agent.run_plain_runner_command` already enforces for this exact
+    kind of re-run, since a probe with no `cwd` executes in whatever
+    directory the sweep process happens to be in, never a checkout of the
+    repo being diagnosed. A caller that cannot resolve a configured
+    checkout path passes ``cwd=None``, which this function reports as an
+    :attr:`EnvProbeResult.error` rather than guessing at a directory —
+    `diagnose_baseline_red_env` then reports it as
+    :data:`queue_diagnose.ENV_DIAGNOSIS_INCONCLUSIVE` exactly like any
+    other probe that could not run.
+
+    *base_branch*, when given, is checked out (fetch + hard reset to
+    ``origin/<base_branch>``) in *cwd* before *command* runs — "re-run the
+    failing tests on the base" (#3883 point 2) means the base branch's own
+    tree, not whatever the checkout happened to have sitting in it. A
+    checkout failure is reported as an error rather than falling through
+    to running *command* against an unknown tree.
+
+    Whether *host* is reachable from this process at all (same host, vs.
+    the fleet's missing agent-HTTP exec primitive for a different one) is
+    the CALLER's decision (:func:`coord.config.resolve_local_machine` —
+    #2085's single answer to "is this host me") — this function trusts
+    that it was only invoked for a host *cwd* actually resolves locally.
     """
-    import socket  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
 
-    this_host = socket.gethostname()
-    if host != this_host and host.split(".")[0] != this_host.split(".")[0]:
+    if cwd is None:
         return EnvProbeResult(
-            error=(
-                f"no remote-exec primitive to reach {host} from {this_host} "
-                "yet (#3883)"
-            ),
+            error=f"no configured checkout for this repo on {host} (#3883)",
         )
+    if base_branch:
+        for prep in (
+            ["git", "fetch", "origin", base_branch],
+            ["git", "checkout", base_branch],
+            ["git", "reset", "--hard", f"origin/{base_branch}"],
+        ):
+            try:
+                prep_result = subprocess.run(  # noqa: S603, S607 — fixed argv, operator-configured cwd
+                    prep, cwd=cwd, capture_output=True, text=True, timeout=120,
+                )
+            except Exception as exc:  # noqa: BLE001 — a probe failing is not a verdict
+                return EnvProbeResult(
+                    error=(
+                        f"could not check out {base_branch} in {cwd}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            if prep_result.returncode != 0:
+                return EnvProbeResult(
+                    error=(
+                        f"could not check out {base_branch} in {cwd}: "
+                        f"{(prep_result.stderr or prep_result.stdout).strip()}"
+                    ),
+                )
     try:
         completed = subprocess.run(  # noqa: S602 — operator-configured test command
-            command, shell=True, capture_output=True, text=True, timeout=600,
+            command, shell=True, capture_output=True, text=True, timeout=600, cwd=cwd,
         )
     except Exception as exc:  # noqa: BLE001 — a probe failing is not a verdict
         return EnvProbeResult(error=f"{type(exc).__name__}: {exc}")
@@ -1661,13 +1775,25 @@ def _baseline_red_env_and_lost_work_options(
     Re-runs the repo's own Test-stage command (`coord.smoke.
     resolve_smoke_command` — the SAME resolution `coord drive-queue
     sweep`'s own Test-stage dispatch uses, never a second guess at what
-    "the failing tests" means) on every machine :func:`_candidate_hosts_
-    for_repo` names, classifies each re-run
+    "the failing tests" means) on every machine :func:`_candidate_
+    machines_for_repo` names, classifies each re-run
     (`queue_diagnose.diagnose_baseline_red_env`), and — only for a host
     that genuinely reproduced a red base rather than a credential/missing-
     tool error — cross-checks the files that re-run named against the
     board's own :class:`~coord.queue_diagnose.LostWorkCandidate` branches
     (:func:`_lost_work_candidates`) for a likely ready-made fix.
+
+    Which machine is reachable from this process at all is answered once,
+    by `coord.config.resolve_local_machine` (#2085's single "is this host
+    me" answer) — a machine that isn't the local one degrades straight to
+    :data:`queue_diagnose.ENV_DIAGNOSIS_INCONCLUSIVE` without ever calling
+    the probe runner, the fleet having no agent-HTTP exec primitive yet to
+    reach a different host's environment from here. The probe itself runs
+    in that machine's own configured checkout (``Machine.repo_path``) on
+    the repo's base branch (`coord.branch_model.resolve_base_branch` with
+    no milestone — this cause is about the repo's base, not one issue), so
+    the re-run is of the actual tree the issue asks about, never whatever
+    directory the sweep process happens to be in.
 
     Returns ``()`` whenever nothing came of any of this (no acceptance
     driver/test command configured, no machine declares the repo, every
@@ -1675,6 +1801,8 @@ def _baseline_red_env_and_lost_work_options(
     generic ``coord status`` wording exactly as before #3883, never
     invent a finding out of an inconclusive probe.
     """
+    from coord.branch_model import resolve_base_branch  # noqa: PLC0415
+    from coord.config import resolve_local_machine  # noqa: PLC0415
     from coord.smoke import resolve_smoke_command  # noqa: PLC0415
 
     repo_cfg = config.repo(repo_name)
@@ -1684,19 +1812,34 @@ def _baseline_red_env_and_lost_work_options(
     command = resolve_smoke_command(repo_cfg, smoke_cfg).command if smoke_cfg else None
     if not command:
         return ()
-    hosts = _candidate_hosts_for_repo(repo_name, config)
-    if not hosts:
+    machines = _candidate_machines_for_repo(repo_name, config)
+    if not machines:
         return ()
+    base_branch = resolve_base_branch(repo_cfg, None)
+    local_machine = resolve_local_machine(config)
 
     credential_hosts: list[str] = []
     credential_name: str | None = None
     tool_hosts: list[str] = []
     tool_name: str | None = None
     failing_files: tuple[str, ...] = ()
-    for host in hosts:
-        diagnosis = queue_diagnose.diagnose_baseline_red_env(
-            repo_name, command, host=host, run=_default_env_probe_runner,
-        )
+    for machine in machines:
+        host = machine.host
+        if local_machine is None or local_machine.name != machine.name:
+            diagnosis = queue_diagnose.EnvDiagnosis(
+                queue_diagnose.ENV_DIAGNOSIS_INCONCLUSIVE,
+                f"no remote-exec primitive to reach {host} from this "
+                "process yet (#3883)",
+                host,
+            )
+        else:
+            cwd = machine.repo_path(repo_name)
+            diagnosis = queue_diagnose.diagnose_baseline_red_env(
+                repo_name, command, host=host,
+                run=lambda h, c, _cwd=cwd, _base=base_branch: (
+                    _default_env_probe_runner(h, c, cwd=_cwd, base_branch=_base)
+                ),
+            )
         if diagnosis.category == queue_diagnose.ENV_DIAGNOSIS_CREDENTIAL:
             credential_hosts.append(host)
             credential_name = credential_name or diagnosis.credential_name
@@ -1751,17 +1894,36 @@ def _baseline_red_env_and_lost_work_options(
     return tuple(options)
 
 
+#: Bounds how many of a candidate branch's changed files this function
+#: diffs against the base before giving up on confirming "actually
+#: differs" — mirrors `coord.reconcile`'s own `_FALSE_MERGE_AUDIT_MAX_FILES`
+#: (per-candidate file cap), kept as a separate constant rather than an
+#: import so this module never depends on reconcile's private name.
+_LOST_WORK_AUDIT_MAX_FILES = 20
+
+#: Bounds how many distinct branches one pass of this cross-check probes
+#: — a per-PASS cap on candidates, not the per-candidate file cap above.
+_LOST_WORK_AUDIT_MAX_BRANCHES = 20
+
+
 def _lost_work_candidates(
     repo_name: str, config: "Config", failing_files: Sequence[str],
 ) -> list[queue_diagnose.LostWorkCandidate]:
     """#3883 point 3: which of the board's merged-status rows for
-    *repo_name* touched any of *failing_files* — a best-effort,
-    bounded scan, never a re-derivation of `coord.reconcile`'s own
-    false-merge AUDIT (that still owns actually confirming a row is lost
-    and clearing the ones that are not, #2096). This only answers a
-    narrower question: "could one of these already be the fix a baseline-
-    red streak is waiting on" — read-only, and every failure fails open to
-    "no candidate found" rather than raising into the escalation path.
+    *repo_name* touched any of *failing_files* — a best-effort, bounded
+    scan that reuses `coord.reconcile`'s own false-merge AUDIT chain (the
+    SAME ``branch_exists_on_remote`` -> ``pr_is_merged`` ->
+    ``branch_commits_ahead`` -> ``get_compare_files`` -> per-file
+    ``get_repo_file`` content-diff steps, #2096: one question, one
+    answer) so a branch whose content already landed via squash/rebase —
+    gone from the remote, or ahead-but-verbatim-on-base — is ruled OUT
+    here exactly as it would be by `coord.reconcile`'s own audit, rather
+    than named on the page as a likely fix reconcile would have confirmed
+    clean. This still never REPLACES that audit (which alone owns
+    clearing a row), only answers a narrower question: "could one of
+    these already be the fix a baseline-red streak is waiting on" — and
+    every failure fails open to "no candidate found" rather than raising
+    into the escalation path.
     """
     import click  # noqa: PLC0415
 
@@ -1796,10 +1958,15 @@ def _lost_work_candidates(
         branch = str(getattr(assignment, "branch", "") or "")
         if not branch or branch in seen_branches:
             continue
+        if len(seen_branches) >= _LOST_WORK_AUDIT_MAX_BRANCHES:
+            break  # bounded scan — caps branches probed in this one pass
         seen_branches.add(branch)
-        if len(seen_branches) > 20:
-            break  # bounded scan — mirrors reconcile's own per-pass cap
         try:
+            if not github_ops.branch_exists_on_remote(repo_cfg.github, branch):
+                # Gone from the remote — presumed genuinely merged and
+                # cleaned up (reconcile's own confirmed-clean rule), never
+                # a lost-work candidate.
+                continue
             issue_number = int(getattr(assignment, "for_issue_number", None)
                                 or getattr(assignment, "issue_number", 0) or 0)
             base_branch = resolve_base_branch_for_issue_number(
@@ -1812,6 +1979,25 @@ def _lost_work_candidates(
                 continue
             changed = github_ops.get_compare_files(repo_cfg.github, base_branch, branch)
             if not changed:
+                continue
+            content_differs = False
+            for _path in changed[:_LOST_WORK_AUDIT_MAX_FILES]:
+                try:
+                    branch_content = github_ops.get_repo_file(repo_cfg.github, _path, branch)
+                except RuntimeError:
+                    continue  # file gone from the branch tip too — no signal
+                try:
+                    base_content = github_ops.get_repo_file(
+                        repo_cfg.github, _path, base_branch,
+                    )
+                except RuntimeError:
+                    base_content = None  # never landed on base at all
+                if branch_content != base_content:
+                    content_differs = True
+                    break
+            if not content_differs:
+                # Verbatim on base already — rebase/squash, not lost
+                # (reconcile's own confirmed-clean rule).
                 continue
         except Exception as exc:  # noqa: BLE001 — one bad row must not sink the scan
             click.echo(
@@ -2026,7 +2212,8 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
             return ALERT_SKIPPED
 
         sealed_lines = (
-            _sealed_confined_lines(row, repo_name, config) if config is not None else None
+            _sealed_confined_lines(row, repo_name, issue_number, config)
+            if config is not None else None
         )
         if sealed_lines is not None:
             lines_text = ", ".join(sealed_lines) if sealed_lines else "the sealed check(s)"
