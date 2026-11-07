@@ -1478,6 +1478,97 @@ class TestResetWedgedTestAuthorReview:
         reset_wedged_test_author_review("")  # must not raise
 
 
+class TestRepointReviewOfAssignmentId:
+    """#3891: re-parents a ``type='review'`` row's ``review_of_assignment_id``
+    onto a different work round — used by
+    ``coord.auto_loop.propagate_review_verdict`` when a SCOPED re-review's
+    recorded parent is a superseded round rather than the one it actually
+    reviewed."""
+
+    def _insert_review(self, *, assignment_id: str, review_of: str) -> None:
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        assignment = Assignment(
+            machine_name="laptop",
+            repo_name="myrepo",
+            issue_number=1,
+            issue_title="[review] t",
+            assignment_id=assignment_id,
+            status="done",
+            branch="issue-1-fix",
+            type="review",
+            review_of_assignment_id=review_of,
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/myrepo")
+
+    def test_repoints_a_review_row(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import repoint_review_of_assignment_id
+
+        self._insert_review(assignment_id="r-1", review_of="w-1")
+        repoint_review_of_assignment_id("r-1", "fix-1")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_of_assignment_id FROM assignments WHERE assignment_id=?",
+            ("r-1",),
+        ).fetchone()
+        assert row[0] == "fix-1"
+
+    def test_ignores_non_review_type(self, coord_db) -> None:
+        """Only ``type='review'`` rows may be re-parented — a work row's own
+        ``review_of_assignment_id`` (which fix rounds use to point BACK at
+        the work they fix) is a different field semantically and must never
+        be touched by this helper."""
+        from coord.db import get_connection
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment, repoint_review_of_assignment_id
+
+        assignment = Assignment(
+            machine_name="laptop",
+            repo_name="myrepo",
+            issue_number=1,
+            issue_title="[fix-1] t",
+            assignment_id="fix-1",
+            status="done",
+            branch="issue-1-fix",
+            type="work",
+            review_of_assignment_id="w-1",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/myrepo")
+        repoint_review_of_assignment_id("fix-1", "something-else")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_of_assignment_id FROM assignments WHERE assignment_id=?",
+            ("fix-1",),
+        ).fetchone()
+        assert row[0] == "w-1"
+
+    def test_noop_on_missing_row(self, coord_db) -> None:
+        from coord.state import repoint_review_of_assignment_id
+
+        repoint_review_of_assignment_id("no-such-id", "fix-1")  # must not raise
+
+    def test_noop_on_empty_ids(self, coord_db) -> None:
+        from coord.state import repoint_review_of_assignment_id
+
+        self._insert_review(assignment_id="r-2", review_of="w-1")
+        repoint_review_of_assignment_id("", "fix-1")
+        repoint_review_of_assignment_id("r-2", "")
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_of_assignment_id FROM assignments WHERE assignment_id=?",
+            ("r-2",),
+        ).fetchone()
+        assert row[0] == "w-1"
+
+
 class TestRecordDispatchedBranch:
     """#706: _record_dispatched_local must persist the branch column so
     completed work rows are never branch=NULL in the TUI."""

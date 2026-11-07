@@ -2230,6 +2230,100 @@ class TestFullCycle:
         assert fix1_final is not None
         assert fix1_final.review_state == "done"
 
+    def test_scoped_rereview_linked_to_stale_round_re_parents_onto_newest(
+        self, config: Config, tmp_path, coord_db,
+    ) -> None:
+        """#3891: a SCOPED re-review's ``review_of_assignment_id`` can stay
+        anchored to an OLDER, superseded round on the same chain (the
+        ``maybe_scoped_review_for_completed_fix``/``dispatch_scoped_review``
+        claim-key shape) rather than the fix round it actually reviewed.
+
+        work A → request-changes → fix round B → re-review completes, but
+        is recorded with ``review_of_assignment_id=A`` (the stale anchor) —
+        the approval must still land on B: B gets ``review_state="done"``,
+        ``review_verdict="approve"``, and the review itself is re-parented
+        onto B (in memory AND durably) so every later reader keyed on
+        ``review_of_assignment_id`` (not just this one call) agrees.
+        """
+        from coord.state import load_board, save_board
+
+        work = _work_assignment(assignment_id="w-1", review_iteration=0)
+        board = Board(completed=[work])
+        save_board(board)
+
+        review_log = tmp_path / "review1.log"
+        review_log.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "Missing input validation on the endpoint.\n"
+            "END_REVIEW\n"
+        )
+        review1 = _review_assignment(assignment_id="r-1", review_of="w-1")
+        review1.status = "done"
+        board2 = load_board()
+        assert board2 is not None
+        board2.completed.append(review1)
+        save_board(board2)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-1"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            process_review_completion(
+                review1, board2, config,
+                log_path=str(review_log),
+                http_client=mock_http,
+            )
+        save_board(board2)
+
+        board3 = load_board()
+        assert board3 is not None
+        fix1_on_board = board3.find_by_id("fix-1")
+        assert fix1_on_board is not None
+        fix1_on_board.status = "done"
+        board3.completed.append(
+            board3.active.pop(board3.active.index(fix1_on_board))
+        )
+
+        # #3891: the scoped re-review is dispatched with the STALE anchor
+        # ("w-1", the original round) as its review_of_assignment_id —
+        # exactly the shape `dispatch_scoped_review` produces today — not
+        # "fix-1", the round it actually reviewed.
+        review2_log = tmp_path / "review2.log"
+        review2_log.write_text(
+            "REVIEW_VERDICT: approve\n"
+            "REVIEW_BODY:\n"
+            "Validation added. Tests pass. LGTM.\n"
+            "END_REVIEW\n"
+        )
+        review2 = _review_assignment(assignment_id="r-2", review_of="w-1")
+        review2.status = "done"
+        board3.completed.append(review2)
+        save_board(board3)
+
+        actions2 = process_review_completion(
+            review2, board3, config,
+            log_path=str(review2_log),
+        )
+
+        assert actions2[0].kind == "approved"
+        fix1_final = board3.find_by_id("fix-1")
+        assert fix1_final is not None
+        assert fix1_final.review_state == "done"
+        assert fix1_final.review_verdict == "approve"
+        # The original round must NOT have silently absorbed the approval.
+        w1_final = board3.find_by_id("w-1")
+        assert w1_final is not None
+        assert w1_final.review_verdict != "approve"
+        # The review itself is re-parented, in memory...
+        assert review2.review_of_assignment_id == "fix-1"
+        # ...and durably, so a fresh read agrees too.
+        board4 = load_board()
+        assert board4 is not None
+        review2_reloaded = board4.find_by_id("r-2")
+        assert review2_reloaded is not None
+        assert review2_reloaded.review_of_assignment_id == "fix-1"
+
     def test_max_iterations_stops_at_configured_limit(
         self, config: Config, tmp_path
     ) -> None:
