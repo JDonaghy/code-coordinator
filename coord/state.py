@@ -6271,13 +6271,13 @@ def record_work_review_verdict(assignment_id: str, verdict: str) -> None:
 
 
 def repoint_review_of_assignment_id(review_assignment_id: str, new_parent_id: str) -> None:
-    """#3891: re-parent a ``type='review'`` row onto a different work row.
+    """Re-parent a ``type='review'`` row onto a different work row.
 
     A SCOPED re-review's ``review_of_assignment_id`` is set, at dispatch
     time, to the claim key the #3310 chain reuses (an OLDER round on the
-    same branch) rather than the fix round it actually reviewed — see
+    same issue) rather than the fix round it actually reviewed — see
     :func:`coord.review.dispatch_scoped_review` and
-    :func:`coord.auto_loop.newest_work_round_on_chain`'s docstrings. Once
+    :func:`coord.review.newest_done_work_leg`'s docstrings. Once
     :func:`coord.auto_loop.propagate_review_verdict` detects that mismatch
     it calls this to correct the durable row too, not just the in-memory
     board object — so a later ``read_board()`` (a fresh ``coord drive``
@@ -6286,6 +6286,15 @@ def repoint_review_of_assignment_id(review_assignment_id: str, new_parent_id: st
 
     Idempotent and narrow: only touches ``type='review'`` rows, and is a
     no-op when either id is empty.
+
+    **Ordering matters to the caller.**
+    :func:`release_review_claim_if_row_is_review` releases the #3310
+    review-dispatch claim by reading ``review_of_assignment_id`` straight
+    back off this same row — so every current caller of this function runs
+    it only AFTER that release has already happened (both go through the
+    review's own terminal-status write first). Call this before that
+    release ever runs and the claim leaks permanently on the OLD anchor —
+    the coord-tui#49 "lost the atomic dispatch-claim race" wedge.
     """
     if not review_assignment_id or not new_parent_id:
         return
