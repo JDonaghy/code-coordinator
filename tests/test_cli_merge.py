@@ -79,6 +79,26 @@ def develop_branch_config_file(tmp_path: Path) -> Path:
     return p
 
 
+@pytest.fixture(autouse=True)
+def block_log(monkeypatch, tmp_path: Path) -> Path:
+    """Give every test its own #2235 Phase-0 stall log.
+
+    Same hazard, same fix as `tests/test_cli_drive_queue.py`'s fixture of
+    the same name: `coord.block_log.block_log_path()` resolves under the
+    real `~/.coord` unless redirected, and `coord merge
+    --override-human-required` writes there.
+    """
+    path = tmp_path / "queue-block-log.jsonl"
+    monkeypatch.setenv("COORD_BLOCK_LOG", str(path))
+    return path
+
+
+def _block_log_records(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
 @pytest.fixture
 def coord_dir(tmp_path: Path, coord_db):
     """Provide an isolated in-memory DB and return a temp dir for logs."""
@@ -1103,7 +1123,7 @@ class TestMergeOverrideHumanRequired:
     wasn't run"."""
 
     def test_override_clears_flag_and_merges_in_same_run(
-        self, config_file: Path, coord_dir: Path, coord_db, monkeypatch,
+        self, config_file: Path, coord_dir: Path, coord_db, monkeypatch, block_log: Path,
     ) -> None:
         """A HUMAN_REQUIRED entry is cleared to PENDING and merged in the
         same invocation, and an audited business-tier row is written."""
@@ -1143,6 +1163,18 @@ class TestMergeOverrideHumanRequired:
         assert rows[0]["actor"] == "user"
         assert rows[0]["assignment_id"] == "h1"
         assert "verified clean rebase" in rows[0]["summary"]
+
+        # The override is also an operator-release event in
+        # `coord.block_log`, the signal `coord.board_doctor.
+        # _board_doctor_other_resolutions` reads so a doctor sweep never
+        # takes `progressed` credit for a human's override.
+        records = _block_log_records(block_log)
+        resolve_records = [r for r in records if r.get("event") == "resolve"]
+        assert len(resolve_records) == 1
+        assert resolve_records[0]["key"] == "api#1"
+        assert resolve_records[0]["resolution"] == "operator_override"
+        assert resolve_records[0]["human_acted"] is True
+        assert resolve_records[0]["from_state"] == mq.HUMAN_REQUIRED
 
     def test_override_rejected_on_non_human_required_entry(
         self, config_file: Path, coord_dir: Path, coord_db,
@@ -1219,7 +1251,7 @@ class TestMergeOverrideHumanRequired:
         assert rows == []
 
     def test_override_moot_when_reconcile_already_cleared_entry(
-        self, config_file: Path, coord_dir: Path, coord_db,
+        self, config_file: Path, coord_dir: Path, coord_db, block_log: Path,
     ) -> None:
         """`--only`'s own stale-conflict reconcile pass (#1477) runs before
         this validation and can itself unpark a HUMAN_REQUIRED retry-cap
@@ -1261,8 +1293,13 @@ class TestMergeOverrideHumanRequired:
         ).fetchall()
         assert rows == []
 
+        # A moot override never ran the actual clear, so it must not
+        # write an operator-release block-log event either — the reconcile
+        # pass that cleared it is the queue's own tick, not a human.
+        assert _block_log_records(block_log) == []
+
     def test_override_dry_run_does_not_persist_or_audit(
-        self, config_file: Path, coord_dir: Path, coord_db,
+        self, config_file: Path, coord_dir: Path, coord_db, block_log: Path,
     ) -> None:
         """--dry-run previews the clear (mirroring the review/smoke gate
         dry-run convention) but writes neither the state change nor the
@@ -1292,6 +1329,10 @@ class TestMergeOverrideHumanRequired:
             "SELECT * FROM audit_log WHERE event_type='human_required_override'"
         ).fetchall()
         assert rows == []
+
+        # The dry-run preview must not write a block-log event
+        # either — same "either way" guard as the audit row above.
+        assert _block_log_records(block_log) == []
 
 
 class TestMergeAutoEnqueue:

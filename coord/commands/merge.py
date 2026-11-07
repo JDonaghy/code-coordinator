@@ -2397,6 +2397,30 @@ def merge(
                         assignment_id=only_entry.assignment_id,
                         details={"reason": override_human_required},
                     )
+                    # `record_audit` above is the permanent business-tier
+                    # trail; `coord.board_doctor._board_doctor_other_
+                    # resolutions` instead reads `coord.block_log`, so this
+                    # also writes an operator-release event there — the
+                    # same helper `drive-queue remove`/`add` use, with the
+                    # merge queue's own `HUMAN_REQUIRED` in place of the
+                    # drive queue's `blocked`/`parked`. The check just
+                    # above already confirmed `only_entry` is actually
+                    # latched, so there is nothing further to guard on here.
+                    from coord.commands.drive_queue import (  # noqa: PLC0415
+                        _record_operator_release_entry,
+                    )
+                    from coord.drive_queue import QueueEntry as _DriveQueueEntry  # noqa: PLC0415
+
+                    _record_operator_release_entry(
+                        _DriveQueueEntry(
+                            repo=only_entry.repo_name,
+                            issue=only_entry.issue_number,
+                            state=only_entry.state,
+                            last_reason=only_entry.error or "",
+                        ),
+                        resolution="operator_override",
+                        latched_states=frozenset({HUMAN_REQUIRED}),
+                    )
                     click.echo(
                         "  --override-human-required: cleared HUMAN_REQUIRED on "
                         f"{only_assignment!r} — {override_human_required!r} — "

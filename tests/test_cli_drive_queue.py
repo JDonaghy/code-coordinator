@@ -969,6 +969,44 @@ def test_add_accepts_a_requeue_over_a_blocked_entry_with_a_green_pr_missing_gate
     assert queued(1753) is not None
 
 
+def test_add_over_a_blocked_entry_writes_an_operator_requeued_block_log_event(
+    cli, seed, monkeypatch, block_log
+):
+    """The attribution tests in `tests/test_board_doctor.py` build the
+    block-log events directly and bypass the command entirely — this
+    drives the actual `coord drive-queue add` invocation through the
+    Click runner and confirms IT is what writes the `operator_requeued`
+    event, not just that `operator_resolution_event` works when called by
+    hand."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={1753: "open"})
+    cli("add", REPO, "1753")
+    state._update_drive_queue_entry_local(REPO, 1753, state=STATE_BLOCKED)
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=4242,
+            branch="issue-1753-some-fix",
+            url="https://github.com/example/claude-coordinator/pull/4242",
+            all_green=True,
+            missing_gates=("review", "test"),
+        ),
+    )
+
+    result = cli("add", REPO, "1753", "--max-fix-rounds", "3")
+    assert result.exit_code == 0, result.output
+
+    records = block_log_records(block_log)
+    resolve_records = [r for r in records if r.get("event") == "resolve"]
+    assert len(resolve_records) == 1
+    assert resolve_records[0]["key"] == f"{REPO}#1753"
+    assert resolve_records[0]["resolution"] == "operator_requeued"
+    assert resolve_records[0]["human_acted"] is True
+    assert resolve_records[0]["from_state"] == STATE_BLOCKED
+
+
 def test_add_resume_note_names_a_single_missing_gate_in_the_singular(
     cli, seed, monkeypatch
 ):
