@@ -50,11 +50,14 @@ way, each wired below via :func:`_register_auto_action`:
   :func:`_never_dispatched_still_true` re-confirms it from the board
   immediately before the requeue fires.
 * ``CAUSE_LATCH_STALE_MERGEABLE`` (minted by `coord.board_doctor.
-  _reclassify_stale_latch`, #3887) — a `CONFLICT`/`HUMAN_REQUIRED`
-  merge-queue latch whose approval is already confirmed bound to the
-  current branch content (quadraui#2034). ``clear_latch`` (#3881's
-  wrapper) re-tests live mergeability before clearing anything; a latch
-  that still refuses is a confirmed no-op, not a false success.
+  _reclassify_stale_latch`, #3887) — a `HUMAN_REQUIRED` merge-queue latch
+  whose approval is already confirmed bound to the current branch content
+  (quadraui#2034). Never promoted from `CAUSE_MERGE_CONFLICT`: that cause
+  is GitHub's own live `mergeable is False` reading, and approval alone
+  cannot override live conflict evidence — a genuine conflict keeps that
+  cause name and its own #3769 investigate-lane remediation. ``clear_latch``
+  (#3881's wrapper) re-tests live mergeability before clearing anything; a
+  latch that still refuses is a confirmed no-op, not a false success.
 * ``CAUSE_MERGE_PENDING_STUCK`` (`coord.board_doctor.merge_queue_rows`) —
   a `PENDING` merge-queue entry that has sat past
   `coord.board_doctor.MERGE_PENDING_STALE_AFTER_SECONDS` since its last
@@ -415,11 +418,11 @@ def _resolve_board_and_config_for_mechanical_action(
     harness never threads a board/config through to an auto-dispatcher,
     only a bare :class:`~coord.board_doctor.StuckRow`).
 
-    Returns ``None`` (after printing a warning) on a config load failure —
-    never raises — so a caller treats that exactly like any other
-    "precondition did not hold" no-op: the row stays for a later sweep
-    (or, past the convergence limit, the alert tier) rather than this
-    taking the whole sweep down.
+    Returns ``None`` (after printing a warning) on a config load OR board
+    read failure — never raises — so a caller treats that exactly like any
+    other "precondition did not hold" no-op: the row stays for a later
+    sweep (or, past the convergence limit, the alert tier) rather than
+    this taking the whole sweep down.
     """
     import click  # noqa: PLC0415
 
@@ -435,15 +438,80 @@ def _resolve_board_and_config_for_mechanical_action(
             err=True,
         )
         return None
-    return build_board(), config
+    try:
+        board = build_board()
+    except Exception as exc:  # noqa: BLE001 — a board-read failure is the
+        # identical "can't act" case as a config-load failure above, and
+        # must reach the same no-op return rather than propagate into the
+        # unshielded dispatcher call site above (#3887).
+        click.echo(
+            f"warning: board-doctor could not read the board to {action} "
+            f"{repo_name}#{issue_number}: {type(exc).__name__}: {exc}",
+            err=True,
+        )
+        return None
+    return board, config
 
 
 #: #3887's own attribution for every `reason=` this module passes to
 #: :func:`coord.board_doctor_permissions.dispatch_investigator_action` —
-#: named once so the five mechanical dispatchers below never drift on the
+#: named once so the four mechanical dispatchers below never drift on the
 #: wording, and so `coord audit`/`coord log` readers see one consistent
 #: phrase for "the deterministic sweep decided this, not a human session".
 _SWEEP_REASON = "board-doctor sweep: unambiguous queue-repair precondition held (#3887)"
+
+
+def _warn_noop(action: str, repo_name: str, issue_number: int, detail: str) -> bool:
+    """Warn-then-``False`` for a mechanical dispatcher's confirmed no-op.
+
+    One shared copy of the shape each #3887 dispatcher below otherwise
+    repeated with its own local ``import click`` + f-string — a confirmed
+    no-op (the precondition no longer holds by the time this call
+    actually ran) is never a false success.
+    """
+    import click  # noqa: PLC0415
+
+    click.echo(
+        f"warning: board-doctor {action} no-op for {repo_name}#{issue_number}: {detail}",
+        err=True,
+    )
+    return False
+
+
+def _run_mechanical_action(action: str, row: StuckRow, body: Callable[[], bool]) -> bool:
+    """Run one #3887 mechanical dispatcher's *body*, never letting an
+    uncaught exception escape to `coord.board_doctor.sweep`'s bare
+    ``performed = dispatcher(row)`` call site (#3887, reintroducing
+    #3805's whole-sweep abort otherwise).
+
+    Every primitive the four dispatchers below reach —
+    `coord.merge_queue.process` (via `investigator_merge`),
+    `coord.merge_queue.reconcile_conflict_entries` (via
+    `investigator_clear_latch`/`sweep_clear_latch`),
+    `coord.reconcile.reconcile_board_merges` (via `investigator_mark_done`),
+    `coord.conflict_fix.dispatch_conflict_fix` (via
+    `sweep_redispatch_head_unmoved_conflict_fix`), and the strict-mode
+    ``RuntimeError`` `coord.state._thin_client_local_board_guard` raises —
+    is live-GitHub/network-bound, not local-DB-only, and `sweep` has no
+    shield of its own at this call site: an uncaught exception here would
+    abort the WHOLE sweep, leaving every row ordered after this one
+    unclassified and `clear_absent_rows` never run. Reports the exception
+    and returns ``False`` instead, the same "confirmed no-op, not a false
+    success" posture :func:`_warn_noop` gives an ordinary refusal — the row
+    simply stays for a later sweep (or, past the convergence limit, the
+    alert tier).
+    """
+    import click  # noqa: PLC0415
+
+    try:
+        return body()
+    except Exception as exc:  # noqa: BLE001 — see docstring: must never abort the sweep
+        click.echo(
+            f"warning: board-doctor {action} raised for {row.key}: "
+            f"{type(exc).__name__}: {exc}",
+            err=True,
+        )
+        return False
 
 
 def _reconcile_merged_row(row: StuckRow) -> bool:
@@ -462,43 +530,41 @@ def _reconcile_merged_row(row: StuckRow) -> bool:
     bare removal would.
 
     Returns ``True`` only when the wrapper confirms ``acted=True``. An
-    unparseable key, a config load failure, or the wrapper's own refusal
-    (no candidate row, or its PR/issue does not read as terminal yet) all
-    report ``False`` so :func:`coord.board_doctor.sweep` records
-    ``"auto-dispatch-noop"`` rather than a false success.
+    unparseable key, a config/board load failure, or the wrapper's own
+    refusal (no candidate row, or its PR/issue does not read as terminal
+    yet) all report ``False`` so :func:`coord.board_doctor.sweep` records
+    ``"auto-dispatch-noop"`` rather than a false success. Any OTHER
+    exception — `reconcile_board_merges` is live-GitHub/network-bound — is
+    caught by :func:`_run_mechanical_action` rather than aborting the sweep.
     """
-    parsed = _parse_row_key(row.key)
-    if parsed is None:
-        return False
-    repo_name, issue_number = parsed
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
 
-    resolved = _resolve_board_and_config_for_mechanical_action(
-        repo_name, issue_number, action="mark_done",
-    )
-    if resolved is None:
-        return False
-    board, config = resolved
-
-    result = dispatch_investigator_action(
-        "mark_done", repo_name, issue_number, board, config,
-        reason=_SWEEP_REASON, actor="sweep",
-    )
-    if not result["acted"]:
-        import click  # noqa: PLC0415
-
-        click.echo(
-            f"warning: board-doctor mark_done no-op for {repo_name}#"
-            f"{issue_number}: {result['detail']}",
-            err=True,
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="mark_done",
         )
-        return False
-    return True
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        result = dispatch_investigator_action(
+            "mark_done", repo_name, issue_number, board, config,
+            reason=_SWEEP_REASON, actor="sweep",
+        )
+        if not result["acted"]:
+            return _warn_noop("mark_done", repo_name, issue_number, result["detail"])
+        return True
+
+    return _run_mechanical_action("mark_done", row, _body)
 
 
 def _clear_stale_latch(row: StuckRow) -> bool:
-    """#3887 case 2: clear a stale `CONFLICT`/`HUMAN_REQUIRED` merge-queue
-    latch whose approval is already confirmed bound to the current branch
-    content (quadraui#2034).
+    """#3887 case 2: clear a stale `HUMAN_REQUIRED` merge-queue latch whose
+    approval is already confirmed bound to the current branch content
+    (quadraui#2034).
 
     :data:`CAUSE_LATCH_STALE_MERGEABLE` is only minted by
     :func:`coord.board_doctor._reclassify_stale_latch` once that
@@ -511,36 +577,34 @@ def _clear_stale_latch(row: StuckRow) -> bool:
 
     Returns ``True`` only when the wrapper confirms ``acted=True`` — a
     latch that does not actually clear (live mergeability still refuses
-    it) is a confirmed no-op, not a success.
+    it) is a confirmed no-op, not a success. Any OTHER exception —
+    `reconcile_conflict_entries` is live-GitHub/network-bound — is caught
+    by :func:`_run_mechanical_action` rather than aborting the sweep.
     """
-    parsed = _parse_row_key(row.key)
-    if parsed is None:
-        return False
-    repo_name, issue_number = parsed
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
 
-    resolved = _resolve_board_and_config_for_mechanical_action(
-        repo_name, issue_number, action="clear_latch",
-    )
-    if resolved is None:
-        return False
-    board, config = resolved
-
-    from coord import github_ops as gh_ops  # noqa: PLC0415
-
-    result = dispatch_investigator_action(
-        "clear_latch", repo_name, issue_number, board, config, gh_ops,
-        reason=_SWEEP_REASON, actor="sweep",
-    )
-    if not result["acted"]:
-        import click  # noqa: PLC0415
-
-        click.echo(
-            f"warning: board-doctor clear_latch no-op for {repo_name}#"
-            f"{issue_number}: {result['detail']}",
-            err=True,
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="clear_latch",
         )
-        return False
-    return True
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        from coord import github_ops as gh_ops  # noqa: PLC0415
+
+        result = dispatch_investigator_action(
+            "clear_latch", repo_name, issue_number, board, config, gh_ops,
+            reason=_SWEEP_REASON, actor="sweep",
+        )
+        if not result["acted"]:
+            return _warn_noop("clear_latch", repo_name, issue_number, result["detail"])
+        return True
+
+    return _run_mechanical_action("clear_latch", row, _body)
 
 
 def _merge_pending_stuck_row(row: StuckRow) -> bool:
@@ -558,36 +622,34 @@ def _merge_pending_stuck_row(row: StuckRow) -> bool:
     green, approval still bound to current content, mergeable) is
     re-confirmed by `coord.merge_queue.process()` itself the moment it
     runs; a fresh conflict or CI failure there is reported ``acted=False``,
-    never treated as this call's own failure.
+    never treated as this call's own failure. Any OTHER exception —
+    `process()` is live-GitHub/network-bound — is caught by
+    :func:`_run_mechanical_action` rather than aborting the sweep.
     """
-    parsed = _parse_row_key(row.key)
-    if parsed is None:
-        return False
-    repo_name, issue_number = parsed
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
 
-    resolved = _resolve_board_and_config_for_mechanical_action(
-        repo_name, issue_number, action="merge",
-    )
-    if resolved is None:
-        return False
-    board, config = resolved
-
-    from coord import github_ops as gh_ops  # noqa: PLC0415
-
-    result = dispatch_investigator_action(
-        "merge", repo_name, issue_number, board, config, gh_ops,
-        reason=_SWEEP_REASON, actor="sweep",
-    )
-    if not result["acted"]:
-        import click  # noqa: PLC0415
-
-        click.echo(
-            f"warning: board-doctor merge no-op for {repo_name}#"
-            f"{issue_number}: {result['detail']}",
-            err=True,
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="merge",
         )
-        return False
-    return True
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        from coord import github_ops as gh_ops  # noqa: PLC0415
+
+        result = dispatch_investigator_action(
+            "merge", repo_name, issue_number, board, config, gh_ops,
+            reason=_SWEEP_REASON, actor="sweep",
+        )
+        if not result["acted"]:
+            return _warn_noop("merge", repo_name, issue_number, result["detail"])
+        return True
+
+    return _run_mechanical_action("merge", row, _body)
 
 
 def _redispatch_head_unmoved_conflict_fix(row: StuckRow) -> bool:
@@ -608,33 +670,34 @@ def _redispatch_head_unmoved_conflict_fix(row: StuckRow) -> bool:
     — "no capable machine right now" (the same reason #3871's own
     synchronous attempt may have declined) is a confirmed no-op, so the
     row stays eligible for another attempt next sweep, still within the
-    SAME retry cap #3871 already enforces.
+    SAME retry cap #3871 already enforces. Any OTHER exception —
+    `coord.conflict_fix.dispatch_conflict_fix` is live-GitHub/network-bound
+    — is caught by :func:`_run_mechanical_action` rather than aborting the
+    sweep.
     """
-    parsed = _parse_row_key(row.key)
-    if parsed is None:
-        return False
-    repo_name, issue_number = parsed
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
 
-    resolved = _resolve_board_and_config_for_mechanical_action(
-        repo_name, issue_number, action="conflict_fix_redispatch",
-    )
-    if resolved is None:
-        return False
-    board, config = resolved
-
-    result = dispatch_sweep_action(
-        "conflict_fix_redispatch", repo_name, issue_number, board, config,
-    )
-    if not result["redispatched"]:
-        import click  # noqa: PLC0415
-
-        click.echo(
-            f"warning: board-doctor conflict-fix redispatch no-op for "
-            f"{repo_name}#{issue_number}: {result['detail']}",
-            err=True,
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="conflict_fix_redispatch",
         )
-        return False
-    return True
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        result = dispatch_sweep_action(
+            "conflict_fix_redispatch", repo_name, issue_number, board, config,
+        )
+        if not result["redispatched"]:
+            return _warn_noop(
+                "conflict_fix_redispatch", repo_name, issue_number, result["detail"],
+            )
+        return True
+
+    return _run_mechanical_action("conflict_fix_redispatch", row, _body)
 
 
 def _requeue_smoke_no_verdict(row: StuckRow) -> bool:

@@ -27,6 +27,7 @@ from coord.board_doctor import (
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
+    _confirm_merge_pending_stuck,
     _reclassify_stale_latch,
     merge_queue_rows,
     sweep,
@@ -2569,6 +2570,87 @@ class TestMergeQueueRowHeadUnmovedAndStalePendingClassification:
         assert rows == []
 
 
+class TestConfirmMergePendingStuck:
+    """#3887 review: `merge_queue_rows`'s ``last_attempt``-staleness read is
+    only a cheap candidate filter — it fires on two healthy shapes
+    (CI re-running after a conflict-fix rebase; a row deferred behind
+    another entry's #3886 per-repo merge-gate reservation) that are not
+    actually stuck. `_confirm_merge_pending_stuck` re-confirms live via
+    `coord.merge_queue.entry_gate_status` before the cause survives."""
+
+    @staticmethod
+    def _entry(**overrides):
+        from coord import merge_queue as mq
+
+        base = dict(
+            assignment_id="w2045", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2045-fix", target_branch="main", issue_number=2045,
+            issue_title="Fix the thing", state=mq.PENDING, last_attempt=1000.0,
+            # No open PR and an explicit, gate-free required_gates list:
+            # keeps `entry_gate_status` hermetic (no `gh` call at all) so
+            # these tests exercise the LIVE-CONFIRM CONTROL FLOW, not a
+            # live network read.
+            pr_number=None, required_gates=["merge"],
+        )
+        base.update(overrides)
+        return mq.QueuedMerge(**base)
+
+    @staticmethod
+    def _row() -> StuckRow:
+        return StuckRow(
+            queue="merge-queue", key="acme/widgets#2045", state="pending",
+            cause=CAUSE_MERGE_PENDING_STUCK, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+    def test_keeps_the_cause_when_the_live_gate_reads_ready(self) -> None:
+        entry = self._entry()
+        confirmed = _confirm_merge_pending_stuck(
+            [self._row()], [entry], board=Board(), config=_widgets_config(),
+        )
+        assert len(confirmed) == 1
+        assert confirmed[0].cause == CAUSE_MERGE_PENDING_STUCK
+
+    def test_drops_the_row_when_deferred_behind_a_merge_gate_reservation(self) -> None:
+        # #3886: a DIFFERENT entry in the same repo holds the reservation —
+        # `last_attempt` is stale only because this row has been correctly
+        # waiting its turn, not because the merge tick is missing it.
+        from coord.state import reserve_merge_slot
+
+        entry = self._entry()
+        assert reserve_merge_slot("acme/widgets", "acme/widgets#9999", 3600.0)
+
+        confirmed = _confirm_merge_pending_stuck(
+            [self._row()], [entry], board=Board(), config=_widgets_config(),
+        )
+        assert confirmed == []
+
+    def test_drops_the_row_when_no_matching_entry_is_found(self) -> None:
+        confirmed = _confirm_merge_pending_stuck(
+            [self._row()], [], board=Board(), config=_widgets_config(),
+        )
+        assert confirmed == []
+
+    def test_drops_the_row_when_the_live_confirm_raises(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr("coord.merge_queue.entry_gate_status", _boom)
+
+        entry = self._entry()
+        confirmed = _confirm_merge_pending_stuck(
+            [self._row()], [entry], board=Board(), config=_widgets_config(),
+        )
+        assert confirmed == []
+
+    def test_leaves_other_causes_and_queues_untouched(self) -> None:
+        other = _row("acme/widgets#1", queue_diagnose.CAUSE_PR_MERGED, queue="drive-queue")
+        confirmed = _confirm_merge_pending_stuck(
+            [other], [], board=Board(), config=_widgets_config(),
+        )
+        assert confirmed == [other]
+
+
 class TestReclassifyStaleLatch:
     """#3887 case 2, quadraui#2034: a CONFLICT/HUMAN_REQUIRED merge-queue
     row whose approval is already confirmed bound to the current branch
@@ -2624,6 +2706,32 @@ class TestReclassifyStaleLatch:
 
         assert reclassified[0].cause == queue_diagnose.CAUSE_MERGE_CONFLICT
 
+    def test_never_promotes_a_genuine_live_conflict_even_with_bound_approval(
+        self, monkeypatch,
+    ) -> None:
+        # #3887 review: CAUSE_MERGE_CONFLICT means GitHub's own live
+        # `mergeable is False` reading — approval bound to current content
+        # does not establish that a REAL conflict has cleared, so this row
+        # must keep CAUSE_MERGE_CONFLICT (and its own #3769 investigate-lane
+        # conflict-fix remediation) rather than being relabelled into the
+        # mechanical `clear_latch` dead end, even when approval is bound.
+        from coord import merge_queue as mq
+
+        entry = self._entry()
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        row = self._merge_row(queue_diagnose.CAUSE_MERGE_CONFLICT)
+
+        reclassified = _reclassify_stale_latch(
+            [row], [entry], board=Board(), config=Config(repos=[], machines=[]),
+        )
+
+        assert reclassified[0].cause == queue_diagnose.CAUSE_MERGE_CONFLICT
+        # Still routes to the #3769 investigate lane, not the mechanical
+        # clear_latch allowlist entry — the whole point of not relabelling it.
+        assert queue_diagnose.CAUSE_MERGE_CONFLICT in INVESTIGATE_CAUSES
+        assert queue_diagnose.CAUSE_MERGE_CONFLICT not in ALLOWLIST
+        assert policy_tier_of(queue_diagnose.CAUSE_MERGE_CONFLICT) == TIER_AUTO
+
     def test_never_touches_a_drive_queue_row_with_the_same_cause_name(self, monkeypatch) -> None:
         from coord import merge_queue as mq
 
@@ -2668,6 +2776,7 @@ class TestClearStaleLatchEndToEnd:
 
     def test_clears_the_latch_in_one_sweep(self, monkeypatch) -> None:
         from coord import merge_queue as mq
+        from coord.audit import query_audit_log
 
         entry = mq.QueuedMerge(
             assignment_id="w2034", repo_name="acme/widgets", repo_github="acme/widgets",
@@ -2696,6 +2805,12 @@ class TestClearStaleLatchEndToEnd:
 
         assert report.decisions[0].tier == TIER_AUTO
         assert report.decisions[0].action == "auto-dispatch"
+
+        # #3887 review: the audit ROW itself, not just the kwarg this
+        # dispatcher passed, must carry the sweep's own attribution.
+        log = query_audit_log(event_type="investigator_clear_latch", repo="acme/widgets", issue=2034)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
 
     def test_a_second_sweep_on_the_same_row_is_a_noop(self, monkeypatch) -> None:
         # Once cleared, `reconcile_conflict_entries` no longer returns an
@@ -2780,6 +2895,7 @@ class TestMergePendingStuckEndToEnd:
 
     def test_merges_a_stale_pending_green_approved_row(self, monkeypatch) -> None:
         from coord import merge_queue as mq
+        from coord.audit import query_audit_log
 
         entry = mq.QueuedMerge(
             assignment_id="w2045", repo_name="acme/widgets", repo_github="acme/widgets",
@@ -2808,6 +2924,12 @@ class TestMergePendingStuckEndToEnd:
 
         assert report.decisions[0].tier == TIER_AUTO
         assert report.decisions[0].action == "auto-dispatch"
+
+        # #3887 review: the audit ROW itself, not just the kwarg this
+        # dispatcher passed, must carry the sweep's own attribution.
+        log = query_audit_log(event_type="investigator_merge", repo="acme/widgets", issue=2045)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
 
     def test_already_fixed_when_we_act_refuses_with_no_write(self, monkeypatch) -> None:
         # The row merged (by the daemon's own ordinary tick) between this
@@ -3017,3 +3139,98 @@ class TestMechanicalRepairsAuditAsSweep:
         log = query_audit_log(event_type="conflict_fix_redispatched", repo="acme/widgets", issue=2059)
         assert len(log["entries"]) == 1
         assert log["entries"][0]["actor"] == "sweep"
+
+
+class TestMechanicalDispatchersNeverAbortTheSweep:
+    """#3887 review: `coord.board_doctor.sweep` calls ``performed =
+    dispatcher(row)`` with no shield of its own (reintroducing #3805's
+    whole-sweep abort otherwise) — every live-GitHub/network-bound call
+    these four #3887 mechanical dispatchers reach must report an uncaught
+    exception as a confirmed no-op instead of letting it propagate."""
+
+    def test_reconcile_merged_row_reports_instead_of_raising(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", _boom)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#1", queue_diagnose.CAUSE_PR_MERGED, queue="drive-queue")
+        assert _reconcile_merged_row(row) is False
+
+    def test_clear_stale_latch_reports_instead_of_raising(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", _boom)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#2034", CAUSE_LATCH_STALE_MERGEABLE, queue="merge-queue")
+        assert _clear_stale_latch(row) is False
+
+    def test_merge_pending_stuck_reports_instead_of_raising(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", _boom)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#2045", CAUSE_MERGE_PENDING_STUCK, queue="merge-queue")
+        assert _merge_pending_stuck_row(row) is False
+
+    def test_redispatch_head_unmoved_conflict_fix_reports_instead_of_raising(
+        self, monkeypatch,
+    ) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", _boom)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#2059", CAUSE_CONFLICT_FIX_HEAD_UNMOVED, queue="merge-queue")
+        assert _redispatch_head_unmoved_conflict_fix(row) is False
+
+    def test_board_read_failure_also_reports_instead_of_raising(self, monkeypatch) -> None:
+        # #3887 review nit: `_resolve_board_and_config_for_mechanical_action`
+        # used to call `build_board()` outside any guard — a board-read
+        # failure must land exactly like a config-load failure, not
+        # propagate into the (now-shielded, but this still must not rely
+        # on that) dispatcher call above.
+        def _boom_board():
+            raise RuntimeError("db locked")
+
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        monkeypatch.setattr("coord.state.build_board", _boom_board)
+
+        row = _row("acme/widgets#2045", CAUSE_MERGE_PENDING_STUCK, queue="merge-queue")
+        assert _merge_pending_stuck_row(row) is False
+
+    def test_a_raising_dispatcher_does_not_abort_the_rest_of_the_sweep(self, monkeypatch) -> None:
+        # The actual #3805 shape: one row's mechanical action raises; the
+        # sweep must still classify/dispatch every row ordered after it.
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", _boom)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        raising_row = _row("acme/widgets#2034", CAUSE_LATCH_STALE_MERGEABLE, queue="merge-queue")
+        later_row = _row("acme/widgets#99", CAUSE_SMOKE_NO_VERDICT, queue="smoke-no-verdict")
+
+        called: list[str] = []
+
+        def _smoke_ok(row: StuckRow) -> bool:
+            called.append(row.key)
+            return True
+
+        dispatchers = dict(AUTO_DISPATCHERS)
+        dispatchers[CAUSE_SMOKE_NO_VERDICT] = _smoke_ok
+
+        report = sweep(
+            [raising_row, later_row], tier_of=policy_tier_of, auto_dispatchers=dispatchers,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-abort-guard",
+        )
+
+        assert report.decisions[0].action == "auto-dispatch-noop"
+        assert report.decisions[1].action == "auto-dispatch"
+        assert called == ["acme/widgets#99"]
