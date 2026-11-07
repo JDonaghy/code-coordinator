@@ -6062,6 +6062,41 @@ def _is_non_mergeability_human_latch(error: str | None) -> bool:
 # mergeability rather than treating it as permanently parked.
 CONFLICT_FIX_HEAD_UNMOVED_SIGNAL = "branch head did not move"
 
+# #3902: prefix embedded in a head-unmoved HUMAN_REQUIRED entry's own
+# `error` — immediately after CONFLICT_FIX_HEAD_UNMOVED_SIGNAL, by
+# `coord.reconcile.on_conflict_fix_done` — naming the exact just-completed
+# leg (its own `fix_assignment_id`) whose clean-but-unmoved exit produced
+# this park. A LATER caller re-dispatching this row (`coord.
+# board_doctor_permissions.sweep_redispatch_head_unmoved_conflict_fix`)
+# reads this back via `head_unmoved_fix_assignment_id` to exclude exactly
+# that row from the retry-cap walk, rather than guessing "the latest DONE
+# conflict-fix linked to this entry" — a guess a conflict-fix that
+# completes for an unrelated reason AFTER the park (a manual retry, or a
+# different sweep tick) can silently outrank, loosening the cap #3871
+# itself enforces.
+HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX = "head-unmoved-fix-assignment="
+
+_HEAD_UNMOVED_FIX_ASSIGNMENT_RE = re.compile(
+    re.escape(HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX) + r"(\S+)"
+)
+
+
+def head_unmoved_fix_assignment_id(error: str | None) -> str | None:
+    """Parse the #3902 head-unmoved-fix-assignment marker out of *error*.
+
+    ``None`` when absent — a latch parked before this marker existed (and
+    every latch whose shape was never head-unmoved at all) — so a caller
+    reading this always has an honest "not recorded" distinct from a real
+    id, never a fabricated one.
+    """
+    if not error:
+        return None
+    match = _HEAD_UNMOVED_FIX_ASSIGNMENT_RE.search(error)
+    if match is None:
+        return None
+    return match.group(1).rstrip("].;,")
+
+
 # The ONLY phrases that mean a mechanical or semantic conflict-fix worker
 # actually ran and failed to resolve a real conflict. `coord.reconcile`
 # writes each of these verbatim into `entry.error` at the one place that
@@ -6111,7 +6146,9 @@ def conflict_fix_actually_gave_up(error: str | None) -> bool:
     return any(sig in text for sig in CONFLICT_FIX_GAVE_UP_SIGNALS)
 
 
-def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
+def reconcile_conflict_entries(
+    gh_ops: "GhOps", *, only: tuple[str, int] | None = None,
+) -> list["MergeEvent"]:
     """Re-test stale conflict verdicts (``CONFLICT``, and retry-cap-latched
     ``HUMAN_REQUIRED``) against live mergeability and clear them when stale.
 
@@ -6170,11 +6207,24 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
 
     Returns the list of :class:`MergeEvent` for entries that were cleared, so
     callers can echo them the same way they echo ``process()`` events.
+
+    *only* (#3902), when given, is a single ``(repo_name, issue_number)`` —
+    every entry NOT matching it is skipped before the live GitHub probe
+    (``check_pr_mergeable``/``branch_has_merge_commit``) rather than merely
+    excluded from the returned events, so a caller repairing one row (e.g.
+    ``coord.board_doctor_permissions.sweep_clear_latch``) pays for exactly
+    one probe pass, not one per entry in the whole queue. ``None`` (every
+    other caller: the ordinary ``coord merge`` tick, the daemon reconcile
+    loop) preserves the pre-#3902 whole-queue sweep untouched — the full
+    queue is still loaded and saved either way, since persistence here has
+    always meant "write back everything, changed or not".
     """
     items = load_queue()
     events: list[MergeEvent] = []
     changed = False
     for entry in items:
+        if only is not None and (entry.repo_name, entry.issue_number) != only:
+            continue
         if not entry.pr_number:
             continue
         was_human_required = entry.state == HUMAN_REQUIRED

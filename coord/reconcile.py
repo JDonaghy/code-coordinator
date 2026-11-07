@@ -3548,7 +3548,17 @@ def on_conflict_fix_done(
                         "automated conflict-fix could not be dispatched "
                         "(no capable machine, or one already active) — "
                         "push the fix by hand, or re-run `coord merge` "
-                        "once a machine is free."
+                        "once a machine is free. "
+                        # #3902: record exactly WHICH leg produced this park
+                        # so a later periodic redispatch
+                        # (`coord.board_doctor_permissions.
+                        # sweep_redispatch_head_unmoved_conflict_fix`) can
+                        # exclude this one row from the retry-cap walk by id
+                        # rather than guessing "the latest done conflict-fix
+                        # for this entry" — see
+                        # `mq.head_unmoved_fix_assignment_id`.
+                        f"[{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}"
+                        f"{fix_assignment_id}]"
                     )
                     failed_entry = entry
                     # The leg that produced this latch exited ZERO, not

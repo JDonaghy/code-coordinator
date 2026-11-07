@@ -69,18 +69,21 @@ self-edge or a dependency cycle. The CLI `add` command's other checks
 all operate on operator-only parameters that have no parameter here, and
 #2247 overlap advice orders rather than refuses.
 
-Why `merge` has no working handler yet
------------------------------------------
-:data:`SAFE_TIER_ACTIONS` names `"merge_approved_green"` because the issue's
-hard constraints fix its shape now, before any cause is wired to it — but
-actually executing a merge (forge calls, branch-protection polling, the
-`MergeEvent` bookkeeping `coord/merge_queue.py` does) is #3745's C3, a
-separate future issue once a real cause earns auto-action from Phase 0
-evidence (`coord.board_doctor_policy`'s empty `ALLOWLIST`, #2268). Until a
-handler is registered, :func:`dispatch_sweep_action` for this action raises
-:class:`SweepHandlerNotRegisteredError` — a `SweepPermissionError` subclass,
-loud and specific, never a silent no-op, but distinguishable from "not
-allowed" for a caller that wants to tell the two apart.
+Why `dispatch_sweep_action("merge", ...)` still has no working handler
+-------------------------------------------------------------------------
+:data:`SAFE_TIER_ACTIONS` names `"merge"` (#3902; originally the separately
+spelled `"merge_approved_green"`) because the issue's hard constraints fix
+its shape now, before a real C3 `_HANDLERS` dispatcher for it exists.
+`CAUSE_MERGE_PENDING_STUCK` is in fact already wired to a working merge
+(`coord.board_doctor_policy._merge_pending_stuck_row`), but through the
+#3881 investigator path (`dispatch_investigator_action("merge", ...)` →
+:func:`investigator_merge`), never through :func:`dispatch_sweep_action`'s
+own `_HANDLERS` registry — the two are independent routing tables for the
+SAME permission name. A caller that reaches `dispatch_sweep_action("merge",
+...)` directly still raises :class:`SweepHandlerNotRegisteredError` — a
+`SweepPermissionError` subclass, loud and specific, never a silent no-op,
+but distinguishable from "not allowed" for a caller that wants to tell the
+two apart — until a real `_HANDLERS["merge"]` entry is built.
 """
 
 from __future__ import annotations
@@ -169,13 +172,19 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: ``"restage"`` (re-dispatch a missing/unreadable Test or Review stage),
 #: ``"clear_latch"`` (re-test a stale CONFLICT/HUMAN_REQUIRED merge-queue
 #: latch against live mergeability), and ``"mark_done"`` (reconcile a row
-#: whose PR merged out-of-band). The investigator's other three verbs
-#: (``"requeue"``, ``"merge"``, ``"integration_fix"``) deliberately reuse
-#: ``"drive_queue_requeue"``, ``"merge_approved_green"`` and
-#: ``"dispatch_fixit_leg"`` above rather than minting new names —
+#: whose PR merged out-of-band). The investigator's ``"requeue"`` and
+#: ``"integration_fix"`` verbs deliberately reuse ``"drive_queue_requeue"``
+#: and ``"dispatch_fixit_leg"`` above rather than minting new names —
 #: :func:`authorize_investigator_action`'s alias table, not a second grant,
 #: so the sweep and the investigator can never disagree about whether one
-#: of those three is allowed (#2096, one question one answer).
+#: of those two is allowed (#2096, one question one answer). ``"merge"``
+#: needs no such alias (#3902, dropping the earlier ``"merge_approved_
+#: green"`` name): the investigator verb and the permission name are now
+#: the identical string, which is also the audit event's own verb
+#: (``investigator_merge``/``investigator_merge_refused``) and
+#: `coord.board_doctor_policy.ALLOWLIST`'s action name for
+#: `CAUSE_MERGE_PENDING_STUCK` — one name, not three independently
+#: spelled ones for the same underlying action.
 #: #3887 adds ``"conflict_fix_redispatch"``: re-dispatch the ordinary
 #: mechanical conflict-fix for a `HUMAN_REQUIRED` row whose last attempt
 #: completed clean but never actually moved the branch (`coord.merge_queue.
@@ -188,7 +197,7 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: machine right then, never a second or larger budget.
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
-        "merge_approved_green",
+        "merge",
         "drive_queue_add",
         "drive_queue_remove",
         "drive_queue_requeue",
@@ -283,7 +292,6 @@ INVESTIGATOR_ACTIONS: frozenset[str] = frozenset(
 #: absent here authorizes under its own, identical name.
 _INVESTIGATOR_ACTION_ALIAS: dict[str, str] = {
     "requeue": "drive_queue_requeue",
-    "merge": "merge_approved_green",
     "integration_fix": "dispatch_fixit_leg",
 }
 
@@ -2088,11 +2096,13 @@ def sweep_clear_latch(
     :func:`coord.merge_queue.reconcile_conflict_entries` — itself a third,
     independent live-mergeability re-check (GitHub's own
     ``check_pr_mergeable``, plus the rebase-refusal linearity probe) that
-    this function does not duplicate, and which operates over the WHOLE
-    queue rather than one row; that is intentional and safe (its own
-    docstring: "safe to call unconditionally"), not a scope leak — any
-    OTHER row it also clears was equally stale and would have cleared on
-    the next ordinary `coord merge` tick regardless.
+    this function does not duplicate. #3902: scoped to exactly THIS row via
+    ``only=(repo_name, issue_number)`` — a periodic sweep with N latched
+    rows must not pay for N full-queue GitHub probe passes (one per
+    latched row per sweep tick) when it only ever needs this one row's
+    answer; every OTHER row's own latch still clears on its own turn, or
+    on the next ordinary `coord merge` tick, which already probes the
+    whole queue unscoped.
 
     ``cleared=True`` only when *this* row's key appears in the returned
     events — a call that unparks a different sibling row but leaves this
@@ -2135,7 +2145,7 @@ def sweep_clear_latch(
             ),
         )
 
-    events = reconcile_conflict_entries(gh_ops)
+    events = reconcile_conflict_entries(gh_ops, only=(repo_name, issue_number))
     mine = [
         ev
         for ev in events
@@ -2185,22 +2195,48 @@ def _redispatch_result(
 
 
 def _latest_done_conflict_fix_assignment_id(
-    board: "Board", merge_entry_id: str | None,
+    board: "Board", entry: "QueuedMerge",
 ) -> str | None:
-    """The most recently FINISHED ``type="conflict-fix"`` assignment linked
-    to *merge_entry_id*, or ``None`` (#3887).
+    """The ``type="conflict-fix"`` assignment whose clean-but-unmoved exit
+    produced *entry*'s current head-unmoved HUMAN_REQUIRED park, or
+    ``None`` (#3887, precision-fixed by #3902).
 
-    Mirrors how `coord.conflict_fix.has_prior_conflict_fix` finds the SAME
-    conflict-fix assignments for this entry (``a.review_of_assignment_id
-    == merge_entry_id``), picking the one with the latest `finished_at` —
-    the just-completed head-unmoved leg, by construction, since nothing
-    else on this entry can have finished more recently. Passed through to
+    Primary source: :func:`coord.merge_queue.head_unmoved_fix_assignment_id`
+    parsed straight off ``entry.error`` — the EXACT id
+    `coord.reconcile.on_conflict_fix_done` recorded there the moment it
+    detected the park (#3902), never re-derived. This is the only source
+    that can never name the wrong row: a periodic sweep that runs after
+    some OTHER conflict-fix attempt for this same entry finished (a manual
+    retry, or an unrelated earlier sweep tick) cannot shift which leg this
+    answers for.
+
+    Fallback, only when the marker is absent (a latch parked before #3902,
+    predating the recorded marker): the pre-#3902 guess — the most
+    recently FINISHED ``type="conflict-fix"`` assignment linked to this
+    entry (``a.review_of_assignment_id == entry.assignment_id``), picking
+    the one with the latest ``finished_at``. #3902 review: this fallback
+    now also skips stale-rebase-titled rows
+    (:data:`coord.conflict_fix.STALE_REBASE_FIX_TITLE_PREFIX`), the same
+    way :func:`coord.conflict_fix._classify_prior_conflict_fix` does — a
+    stale-rebase attempt never tried the ordinary mechanical resolution
+    this carve-out is about, so it must never be mistaken for the
+    just-completed ordinary leg.
+
+    Either way, the result is passed through to
     :func:`coord.conflict_fix.dispatch_conflict_fix`'s own
     ``after_head_unmoved_fix_assignment_id`` carve-out, which excludes
     exactly this one row from the retry-cap's identical-error walk — the
     same exclusion #3871's own synchronous completion-time redispatch
     applies, never a looser one.
     """
+    from coord.conflict_fix import STALE_REBASE_FIX_TITLE_PREFIX  # noqa: PLC0415
+    from coord.merge_queue import head_unmoved_fix_assignment_id  # noqa: PLC0415
+
+    recorded = head_unmoved_fix_assignment_id(entry.error)
+    if recorded is not None:
+        return recorded
+
+    merge_entry_id = entry.assignment_id
     if merge_entry_id is None:
         return None
     candidates = [
@@ -2209,6 +2245,7 @@ def _latest_done_conflict_fix_assignment_id(
         if a.type == "conflict-fix"
         and a.review_of_assignment_id == merge_entry_id
         and a.status == "done"
+        and not (a.issue_title or "").startswith(STALE_REBASE_FIX_TITLE_PREFIX)
     ]
     if not candidates:
         return None
@@ -2238,6 +2275,16 @@ def sweep_redispatch_head_unmoved_conflict_fix(
        cap genuinely spent by a DIFFERENT prior attempt) is reported
        ``redispatched=False``, never raised.
 
+    #3902: also passes ``status_fetcher=coord.network.fetch_status`` and
+    ``prefer_machine`` (the just-completed leg's own ``machine_name``, read
+    off the board by *ignore_assignment_id*) — the SAME two arguments
+    #3871's own caller (`coord.reconcile._try_ordinary_escalation_after_
+    head_unmoved`) passes. Without ``status_fetcher``, machine selection
+    degrades to busy-only ranking with no liveness probe at all, which can
+    pick a machine that is offline rather than merely busy; without
+    ``prefer_machine`` the redispatch loses the SAME "reuse the original
+    worker's local checkout" preference #3871's own redispatch gets.
+
     On a confirmed dispatch, moves the entry back to ``CONFLICT`` (the
     redispatched worker is now in flight) with an appended, honest error
     trailer — the same shape #3871's own redispatch leaves behind — and
@@ -2255,6 +2302,7 @@ def sweep_redispatch_head_unmoved_conflict_fix(
         load_queue,
         save_queue,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
 
     queue = load_queue()
     entry = next(
@@ -2275,9 +2323,22 @@ def sweep_redispatch_head_unmoved_conflict_fix(
             ),
         )
 
-    ignore_assignment_id = _latest_done_conflict_fix_assignment_id(board, entry.assignment_id)
+    ignore_assignment_id = _latest_done_conflict_fix_assignment_id(board, entry)
+    preferred_machine = next(
+        (
+            a.machine_name
+            for a in list(board.active) + list(board.completed)
+            if a.assignment_id == ignore_assignment_id
+        ),
+        None,
+    ) if ignore_assignment_id is not None else None
     fix = dispatch_conflict_fix(
-        entry, board, config, after_head_unmoved_fix_assignment_id=ignore_assignment_id,
+        entry,
+        board,
+        config,
+        after_head_unmoved_fix_assignment_id=ignore_assignment_id,
+        prefer_machine=preferred_machine,
+        status_fetcher=fetch_status,
     )
     if fix is None:
         return _redispatch_result(
@@ -2456,9 +2517,11 @@ def sweep_bounce(
 #: Looked up by :func:`dispatch_sweep_action` only after
 #: :func:`authorize_sweep_action` has already cleared the action — an
 #: entry missing here for a name that IS on :data:`SAFE_TIER_ACTIONS`
-#: (today: ``"merge_approved_green"``, ``"ci_rerun"``) means the permission
-#: exists but no C3 dispatcher has been built yet, not that the action is
-#: unsafe.
+#: (today: ``"merge"``, ``"ci_rerun"``) means THIS registry has no C3
+#: dispatcher for it, not that the action is unsafe — ``"merge"`` already
+#: has a working dispatcher reached a different way, through the #3881
+#: investigator path (:func:`dispatch_investigator_action`/
+#: :func:`investigator_merge`), which does not consult this dict at all.
 _HANDLERS: dict[str, Callable[..., Any]] = {
     "drive_queue_add": sweep_drive_queue_add,
     "drive_queue_remove": sweep_drive_queue_remove,
@@ -2923,10 +2986,32 @@ def investigator_merge(
     *,
     reason: str,
     actor: str = "board_doctor_investigator",
+    allow_fix_dispatch: bool = True,
 ) -> InvestigatorActionResult:
     """Plain ``coord merge --only`` of an already-approved, CI-green row
-    (#3881) — the investigator's ``merge`` verb, reached through
-    :data:`_INVESTIGATOR_ACTION_ALIAS` as ``"merge_approved_green"``.
+    (#3881) — the investigator's ``merge`` verb, authorized under the
+    identical ``"merge"`` :data:`SAFE_TIER_ACTIONS` name (#3902; no
+    :data:`_INVESTIGATOR_ACTION_ALIAS` indirection needed since dropping
+    the separately-spelled ``"merge_approved_green"``).
+
+    *allow_fix_dispatch* (#3902) gates the post-``process()`` fan-out below
+    (a fresh conflict or CI failure dispatching a conflict-fix/ci-fix
+    worker leg, and the sibling-conflict sweep's own leg dispatch) —
+    defaults ``True``, the pre-#3902 behaviour, for the human-attended
+    `coord drive-queue doctor-act` CLI's call site: an operator who invoked
+    this verb directly is accountable for whatever it dispatches, exactly
+    like `coord merge --only` itself. `coord.board_doctor_policy.
+    _merge_pending_stuck_row` — the UNATTENDED mechanical-tier caller —
+    passes ``False``: that cause (:data:`coord.board_doctor_policy.
+    CAUSE_MERGE_PENDING_STUCK`) is on the C2 allowlist, never routed
+    through :class:`coord.board_doctor_policy.InvestigateCapacityGate` or
+    its `fixit_leg_budget`, so letting it start worker legs of its own
+    would be an UNGATED fan-out from a tier that is supposed to be
+    mechanical-only. With it ``False``, this still lands the merge itself
+    and persists the entry; it just never dispatches a new leg on the
+    strength of what that merge's own live gates turned up — any fresh
+    conflict/CI failure is left for the ordinary C1 investigate tier (which
+    IS capacity-gated) or a later sweep tick to pick up.
 
     Precondition — approval bound to the current branch content
     (:func:`coord.merge_queue.has_approved_review`) — is checked here;
@@ -3036,9 +3121,14 @@ def investigator_merge(
     # confirmed-CI-failure event, and sweep any sibling the merge just
     # broke, BEFORE the save below — each mutates `entry`/its siblings'
     # `.state` in place, and the save has to pick those mutations up.
-    _dispatch_conflict_fixes(events, config, dry_run=False, gh_ops=gh_ops)
-    _dispatch_ci_fixes(events, config, ci_store, dry_run=False)
-    _sweep_sibling_conflicts(events, [entry], config, gh_ops, dry_run=False)
+    # #3902: every one of these three can start a NEW worker leg
+    # (conflict-fix, ci-fix, or a sibling's own conflict-fix) — skip all
+    # three when *allow_fix_dispatch* is False, so the mechanical sweep's
+    # ungated call site lands the merge alone and never fans out.
+    if allow_fix_dispatch:
+        _dispatch_conflict_fixes(events, config, dry_run=False, gh_ops=gh_ops)
+        _dispatch_ci_fixes(events, config, ci_store, dry_run=False)
+        _sweep_sibling_conflicts(events, [entry], config, gh_ops, dry_run=False)
     # Persist only `entry` back over the current on-disk queue — never the
     # whole pre-`process()` snapshot this call started with, which could by
     # now be stale against a concurrent writer.
