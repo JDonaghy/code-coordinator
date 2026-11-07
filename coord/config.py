@@ -1585,6 +1585,29 @@ class BoardDoctorConfig:
     :func:`coord.board_doctor.no_progress_rows`. A row inside this window
     is left alone; one outside it is always classified, down to
     :data:`coord.queue_diagnose.CAUSE_UNKNOWN` when nothing else fits.
+
+    ``log_retention_days`` (#3889) is how long a decision-log entry
+    (``coord drive-queue doctor-log``) survives in the ``board_doctor_log``
+    table before age-based pruning drops it. Default 90 — matches
+    :data:`coord.state.BOARD_DOCTOR_LOG_RETENTION_DAYS`, which is the
+    fallback used when this is unset or unreadable (e.g. a thin client with
+    no loaded config in scope).
+
+    ``backoff_initial_hours``/``backoff_cap_hours`` (#3889, #3875 ask C) are
+    the re-alert schedule for a row stuck on the SAME escalated cause: the
+    wait before the FIRST re-alert, and the ceiling that wait doubles
+    towards on every subsequent one. Defaults (1h / 24h) match
+    :data:`coord.state.BOARD_DOCTOR_BACKOFF_INITIAL_HOURS` /
+    :data:`coord.state.BOARD_DOCTOR_BACKOFF_CAP_HOURS`, the fallbacks used
+    on the same read failure.
+
+    ``fixit_leg_budget`` (#3889, #3875 ask B) is the investigate tier's own
+    per-repo dispatch budget for fix-it worker legs, independent of a
+    repo's ordinary ``max_parallel`` ceiling — see
+    :data:`coord.board_doctor_policy.FIXIT_LEG_BUDGET_DEFAULT`, the
+    fallback used on the same read failure. Read fresh every sweep
+    (:func:`coord.board_doctor_policy.make_investigate_capacity_check`), so
+    a change here needs no daemon restart to take effect.
     """
 
     investigate: bool = True
@@ -1593,6 +1616,10 @@ class BoardDoctorConfig:
     followthrough: bool = True
     followthrough_cap: int = 5
     no_progress_minutes: int = 60
+    log_retention_days: int = 90
+    backoff_initial_hours: float = 1.0
+    backoff_cap_hours: float = 24.0
+    fixit_leg_budget: int = 1
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3601,6 +3628,42 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         ):
             raise ConfigError("board_doctor.no_progress_minutes must be a positive integer")
         cfg.no_progress_minutes = no_progress_minutes
+    if "log_retention_days" in raw:
+        log_retention_days = raw["log_retention_days"]
+        if (
+            isinstance(log_retention_days, bool)
+            or not isinstance(log_retention_days, int)
+            or log_retention_days < 1
+        ):
+            raise ConfigError("board_doctor.log_retention_days must be a positive integer")
+        cfg.log_retention_days = log_retention_days
+    if "backoff_initial_hours" in raw:
+        backoff_initial_hours = raw["backoff_initial_hours"]
+        if isinstance(backoff_initial_hours, bool) or not isinstance(
+            backoff_initial_hours, (int, float)
+        ) or backoff_initial_hours <= 0:
+            raise ConfigError("board_doctor.backoff_initial_hours must be a positive number")
+        cfg.backoff_initial_hours = float(backoff_initial_hours)
+    if "backoff_cap_hours" in raw:
+        backoff_cap_hours = raw["backoff_cap_hours"]
+        if isinstance(backoff_cap_hours, bool) or not isinstance(
+            backoff_cap_hours, (int, float)
+        ) or backoff_cap_hours <= 0:
+            raise ConfigError("board_doctor.backoff_cap_hours must be a positive number")
+        cfg.backoff_cap_hours = float(backoff_cap_hours)
+    if cfg.backoff_cap_hours < cfg.backoff_initial_hours:
+        raise ConfigError(
+            "board_doctor.backoff_cap_hours must be >= board_doctor.backoff_initial_hours"
+        )
+    if "fixit_leg_budget" in raw:
+        fixit_leg_budget = raw["fixit_leg_budget"]
+        if (
+            isinstance(fixit_leg_budget, bool)
+            or not isinstance(fixit_leg_budget, int)
+            or fixit_leg_budget < 1
+        ):
+            raise ConfigError("board_doctor.fixit_leg_budget must be a positive integer")
+        cfg.fixit_leg_budget = fixit_leg_budget
     return cfg
 
 
