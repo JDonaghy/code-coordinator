@@ -15990,3 +15990,34 @@ class TestProcessHonorsMergeGateReservation:
 
         assert any(e.kind == "merged" for e in events)
         assert items[0].state == MERGED
+
+
+class TestHeadUnmovedFixAssignmentId:
+    """#3902 review: `entry.error` ACCUMULATES a new head-unmoved marker
+    on every repeat park of the same row (`coord.reconcile` and
+    `coord.board_doctor_permissions` both append rather than replace), so
+    reading it back must return the id from the LATEST marker -- the leg
+    that produced the row's current park -- never the oldest one."""
+
+    def test_returns_the_last_marker_when_a_row_parks_twice(self) -> None:
+        error = (
+            f"conflict-fix failed; {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+            "(still deadbeef), and a fresh automated conflict-fix could "
+            "not be dispatched -- push the fix by hand. "
+            f"[{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}legA]; "
+            f"{mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} (still deadbeef) again, "
+            "and redispatch was refused once more. "
+            f"[{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}legB]"
+        )
+
+        assert mq.head_unmoved_fix_assignment_id(error) == "legB"
+
+    def test_returns_none_without_a_marker(self) -> None:
+        assert mq.head_unmoved_fix_assignment_id("some other error") is None
+        assert mq.head_unmoved_fix_assignment_id(None) is None
+        assert mq.head_unmoved_fix_assignment_id("") is None
+
+    def test_returns_none_for_an_empty_captured_id(self) -> None:
+        error = f"parked. [{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}]"
+
+        assert mq.head_unmoved_fix_assignment_id(error) is None

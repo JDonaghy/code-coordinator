@@ -3175,7 +3175,7 @@ def drive_queue_sweep(
     (`coord.state.board_doctor_decisions`), in the spirit of #1478's board
     comments.
 
-    #3887 (#3875 ask A): the allowlist's mechanical actions include four
+    #3887 (#3875 ask A): the allowlist's mechanical actions include five
     queue repairs the sweep applies itself. Three go through the SAME
     closed #3881 investigator wrapper (`coord.board_doctor_permissions.
     dispatch_investigator_action`) a daemon-host investigator session

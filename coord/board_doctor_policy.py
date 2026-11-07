@@ -1028,12 +1028,11 @@ _register_auto_action(
 )
 _register_auto_action(
     CAUSE_MERGE_PENDING_STUCK,
-    # #3902: named "merge", not the historical "merge_approved_green" —
-    # the SAME verb name `_merge_pending_stuck_row` → `dispatch_
-    # investigator_action` → `investigator_merge` already audits this
-    # action under (`investigator_merge`/`investigator_merge_refused`),
-    # so `ALLOWLIST` and the audit trail never disagree about this
-    # cause's action name.
+    # Named "merge" — the SAME verb name `_merge_pending_stuck_row` →
+    # `dispatch_investigator_action` → `investigator_merge` already
+    # audits this action under (`investigator_merge`/
+    # `investigator_merge_refused`), so `ALLOWLIST` and the audit trail
+    # never disagree about this cause's action name.
     "merge",
     _merge_pending_stuck_row,
 )

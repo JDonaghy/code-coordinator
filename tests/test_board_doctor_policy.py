@@ -2882,10 +2882,13 @@ class TestClearStaleLatchEndToEnd:
 
         monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
         monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
-        monkeypatch.setattr(
-            mq, "reconcile_conflict_entries",
-            lambda gh_ops, **kwargs: [mq.MergeEvent(entry, "reopened", "cleared for real")],
-        )
+        captured: dict = {}
+
+        def _fake_reconcile(gh_ops, **kwargs):
+            captured.update(kwargs)
+            return [mq.MergeEvent(entry, "reopened", "cleared for real")]
+
+        monkeypatch.setattr(mq, "reconcile_conflict_entries", _fake_reconcile)
 
         row = StuckRow(
             queue="merge-queue", key="acme/widgets#2034", state="human_required",
@@ -2906,6 +2909,10 @@ class TestClearStaleLatchEndToEnd:
         log = query_audit_log(event_type="investigator_clear_latch", repo="acme/widgets", issue=2034)
         assert len(log["entries"]) == 1
         assert log["entries"][0]["actor"] == "sweep"
+        # #3902 review: pin the `only=` SCOPE itself — a caller that
+        # dropped it (or named the wrong row) would pass this test as
+        # written before this assertion.
+        assert captured.get("only") == ("acme/widgets", 2034)
 
     def test_a_second_sweep_on_the_same_row_is_a_noop(self, monkeypatch) -> None:
         # Once cleared, `reconcile_conflict_entries` no longer returns an
@@ -2924,8 +2931,10 @@ class TestClearStaleLatchEndToEnd:
 
         monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
         monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        reconcile_only_calls: list = []
 
         def _reconcile(gh_ops, **kwargs):
+            reconcile_only_calls.append(kwargs.get("only"))
             queue = mq.load_queue()
             live = next(e for e in queue if e.assignment_id == "w2034b")
             if live.state != mq.HUMAN_REQUIRED:
@@ -2948,6 +2957,9 @@ class TestClearStaleLatchEndToEnd:
         )
         assert first.decisions[0].action == "auto-dispatch"
         assert mq.load_queue()[0].state == mq.PENDING
+        # #3902 review: pin the `only=` SCOPE this dispatcher passed, not
+        # merely that the fake tolerated whatever kwarg arrived.
+        assert reconcile_only_calls[-1] == ("acme/widgets", 20342)
 
         second = sweep(
             [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
@@ -3217,6 +3229,7 @@ class TestMechanicalRepairsAuditAsSweep:
         def fake_dispatch(action, repo_name, issue_number, *args, **kwargs):
             captured["action"] = action
             captured["actor"] = kwargs.get("actor")
+            captured["allow_fix_dispatch"] = kwargs.get("allow_fix_dispatch")
             return {"acted": True, "action": action, "repo": repo_name, "issue": issue_number, "detail": "ok"}
 
         monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", fake_dispatch)
@@ -3226,6 +3239,11 @@ class TestMechanicalRepairsAuditAsSweep:
         assert _merge_pending_stuck_row(row) is True
         assert captured["action"] == "merge"
         assert captured["actor"] == "sweep"
+        # #3902 item 3: this unattended mechanical-tier caller must pass
+        # `allow_fix_dispatch=False` — never routed through
+        # `InvestigateCapacityGate`/`fixit_leg_budget`, so it must not let
+        # `investigator_merge`'s own post-merge fan-out start a leg.
+        assert captured["allow_fix_dispatch"] is False
 
     def test_redispatch_head_unmoved_conflict_fix_audits_as_sweep(self, monkeypatch) -> None:
         # No #3881 investigator verb exists for this shape (#3871 built it

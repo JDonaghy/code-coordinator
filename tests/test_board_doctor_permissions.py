@@ -169,7 +169,7 @@ class TestOutOfAllowlistActionsAreRejected:
         authorize_sweep_action("merge")  # does not raise
         assert "merge" in SAFE_TIER_ACTIONS
 
-        with pytest.raises(SweepHandlerNotRegisteredError, match="merge"):
+        with pytest.raises(SweepHandlerNotRegisteredError, match=r"'merge'"):
             dispatch_sweep_action("merge", "acme/widgets", 1)
 
         assert state.list_drive_queue("acme/widgets") == []
@@ -2382,10 +2382,13 @@ class TestInvestigatorClearLatchAndMerge:
         mq.save_queue([entry])
 
         monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
-        monkeypatch.setattr(
-            mq, "reconcile_conflict_entries",
-            lambda gh_ops, **kwargs: [mq.MergeEvent(entry, "reopened", "cleared for real")],
-        )
+        captured: dict = {}
+
+        def _fake_reconcile(gh_ops, **kwargs):
+            captured.update(kwargs)
+            return [mq.MergeEvent(entry, "reopened", "cleared for real")]
+
+        monkeypatch.setattr(mq, "reconcile_conflict_entries", _fake_reconcile)
 
         result = investigator_clear_latch(
             "api", 1, board, config, gh_ops=object(), reason="rebase landed clean",
@@ -2393,6 +2396,10 @@ class TestInvestigatorClearLatchAndMerge:
 
         assert result["acted"] is True
         assert result["detail"] == "cleared for real"
+        # #3902 review: pin the `only=` SCOPE itself, not merely that the
+        # kwarg was passed somehow — a caller that dropped it (or passed
+        # the wrong row) would pass this test as written before.
+        assert captured.get("only") == ("api", 1)
 
     def test_merge_acts_once_approval_confirms_and_process_reports_merged(
         self, monkeypatch,
@@ -2471,6 +2478,138 @@ class TestInvestigatorClearLatchAndMerge:
         assert captured.get("ci_store") is not None
         queue_after = mq.load_queue()
         assert {e.assignment_id for e in queue_after} == {"w1", "w9"}
+
+
+class TestSweepClearLatchScope:
+    """#3902 item 4: `sweep_clear_latch` must probe ONLY the row it is
+    repairing — a periodic sweep with N latched rows must not pay for N
+    full-queue GitHub probe passes."""
+
+    def test_probes_only_its_own_row_not_every_latched_row(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import sweep_clear_latch
+        from tests.test_merge_queue import FakeGh
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        target = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.CONFLICT, pr_number=11,
+        )
+        sibling = mq.QueuedMerge(
+            assignment_id="w2", repo_name="api", repo_github="acme/api",
+            branch="issue-2-fix", target_branch="main", issue_number=2,
+            issue_title="Other latched row", state=mq.CONFLICT, pr_number=22,
+        )
+        mq.save_queue([target, sibling])
+
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        gh = FakeGh(mergeable_results={11: True, 22: True})
+
+        result = sweep_clear_latch("api", 1, board, config, gh)
+
+        assert result["cleared"] is True
+        assert gh.mergeable_calls == [("acme/api", 11)]
+
+
+class TestInvestigatorMergeAllowFixDispatch:
+    """#3902 item 3: `allow_fix_dispatch=False` must actually stop the
+    post-``process()`` fan-out — a fresh conflict/CI-failure event must
+    start no new worker leg when the unattended mechanical-tier caller
+    (`_merge_pending_stuck_row`) passes it, since that cause is never
+    routed through `InvestigateCapacityGate` or `fixit_leg_budget`."""
+
+    def test_allow_fix_dispatch_false_skips_conflict_and_ci_fix_dispatch(
+        self, monkeypatch,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import investigator_merge
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.PENDING,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mq, "process",
+            lambda items, gh_ops, **kwargs: [
+                mq.MergeEvent(entry, "conflict", "GitHub reports CONFLICTING"),
+            ],
+        )
+
+        def _must_not_be_called(*a, **k):
+            raise AssertionError("fix dispatch must not run when allow_fix_dispatch=False")
+
+        monkeypatch.setattr(
+            "coord.commands.merge._dispatch_conflict_fixes", _must_not_be_called,
+        )
+        monkeypatch.setattr(
+            "coord.commands.merge._dispatch_ci_fixes", _must_not_be_called,
+        )
+        monkeypatch.setattr(
+            "coord.commands.merge._sweep_sibling_conflicts", _must_not_be_called,
+        )
+
+        result = investigator_merge(
+            "api", 1, board, config, gh_ops=object(), reason="x",
+            allow_fix_dispatch=False,
+        )
+
+        assert result["acted"] is False
+
+    def test_allow_fix_dispatch_true_still_runs_the_fan_out(self, monkeypatch) -> None:
+        """The human-attended default (`allow_fix_dispatch=True`) is
+        unchanged — the fan-out must still run so this gate actually
+        distinguishes the two callers rather than always skipping it."""
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import investigator_merge
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.PENDING,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mq, "process",
+            lambda items, gh_ops, **kwargs: [
+                mq.MergeEvent(entry, "conflict", "GitHub reports CONFLICTING"),
+            ],
+        )
+
+        calls: dict = {"conflict": 0, "ci": 0, "sibling": 0}
+
+        monkeypatch.setattr(
+            "coord.commands.merge._dispatch_conflict_fixes",
+            lambda *a, **k: calls.__setitem__("conflict", calls["conflict"] + 1),
+        )
+        monkeypatch.setattr(
+            "coord.commands.merge._dispatch_ci_fixes",
+            lambda *a, **k: calls.__setitem__("ci", calls["ci"] + 1),
+        )
+        monkeypatch.setattr(
+            "coord.commands.merge._sweep_sibling_conflicts",
+            lambda *a, **k: calls.__setitem__("sibling", calls["sibling"] + 1),
+        )
+
+        investigator_merge(
+            "api", 1, board, config, gh_ops=object(), reason="x",
+        )
+
+        assert calls == {"conflict": 1, "ci": 1, "sibling": 1}
 
 
 class TestLatestDoneConflictFixAssignmentId:
