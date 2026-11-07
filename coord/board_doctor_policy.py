@@ -1959,7 +1959,7 @@ def _stuck_since_text(queue: str, key: str) -> str:
     matching = [e for e in entries if e.get("queue") == queue and e.get("key") == key]
     if not matching:
         return "since this sweep"
-    timestamps = [state._board_doctor_decision_ts(e) for e in matching]  # noqa: SLF001
+    timestamps = [state.board_doctor_decision_ts(e) for e in matching]
     timestamps = [t for t in timestamps if t is not None]
     if not timestamps:
         return "since this sweep"

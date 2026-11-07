@@ -87,7 +87,7 @@ def _always(tier: str):
 @pytest.fixture(autouse=True)
 def _isolated_block_log(tmp_path, monkeypatch):
     """#3889: `sweep`'s outcome-backfill now also reads `coord.block_log`
-    (:func:`coord.board_doctor._board_doctor_human_resolutions`) for
+    (:func:`coord.board_doctor._board_doctor_other_resolutions`) for
     attribution evidence whenever a decision is still pending a verdict.
     Isolate it for every test in this module so none of them can read —
     or be made flaky by — whatever happens to be in the real operator log
@@ -1203,6 +1203,22 @@ class TestEvaluateBoardDoctorOutcomeAttribution:
         ) == "regressed"
 
 
+class TestRecordBoardDoctorOutcomeValidatesVocabulary:
+    """#3889 review nit: :data:`coord.state.BOARD_DOCTOR_OUTCOME_VALUES` is
+    a declared vocabulary — :func:`coord.state.record_board_doctor_outcome`
+    must actually enforce it rather than silently accepting any string."""
+
+    def test_a_value_outside_the_frozenset_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="BOARD_DOCTOR_OUTCOME_VALUES"):
+            state.record_board_doctor_outcome("sweep-1", "drive-queue", "repo#1", "bogus")
+
+    def test_every_declared_value_is_accepted(self) -> None:
+        for outcome in state.BOARD_DOCTOR_OUTCOME_VALUES:
+            # No matching row exists — this is a no-op, not an error; the
+            # point is that a VALID outcome never raises.
+            state.record_board_doctor_outcome("sweep-x", "drive-queue", "repo#9", outcome)
+
+
 class TestSweepAttributesOutcomesHonestly:
     """#3889 end-to-end: the row that actually decides ``attributed_to_other``
     comes from :mod:`coord.block_log`, consulted by :func:`sweep`'s own
@@ -1319,6 +1335,140 @@ class TestSweepAttributesOutcomesHonestly:
             if d["sweep_id"] == "sweep-1" and d["key"] == key
         ]
         assert logged[0]["outcome"] == "progressed"
+
+    def test_an_operator_requeue_add_before_the_next_sweep_is_progressed_by_other(
+        self,
+    ) -> None:
+        """#3889 review: `coord drive-queue add` re-queuing a stalled row is
+        the SAME operator intervention `remove` already logs (see
+        :func:`coord.commands.drive_queue._record_operator_release_entry`)
+        — it must downgrade the verdict exactly like a `remove` does, not
+        silently keep crediting the doctor."""
+        from datetime import datetime, timezone
+
+        from coord.block_log import enter_event, operator_resolution_event, record
+        from coord.drive_queue import QueueEntry as _QE
+
+        key = "acme/widgets#304"
+        cause = "ci_red"
+        dispatch = _Recorder()
+        t0 = 1_800_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+        )
+        assert dispatch.count == 1
+
+        # An operator ran `coord drive-queue add` over the stalled entry
+        # (the #2972 "bump --max-fix-rounds and re-add" remedy) AFTER the
+        # decision above was recorded — `_record_operator_release_entry`
+        # logs this with `resolution="operator_requeued"`, not
+        # `"operator_removed"`.
+        entry = _QE(
+            repo="acme/widgets", issue=304, state="blocked", attempts=1,
+            last_reason="ci red",
+        )
+        record(
+            [
+                enter_event(entry, state="blocked", reason="ci red", now=t0 - 10.0),
+                operator_resolution_event(
+                    entry, resolution="operator_requeued", now=t0 + 60.0,
+                ),
+            ]
+        )
+
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 120.0, tz=timezone.utc),
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "progressed_by_other"
+
+    def test_a_hand_merge_landed_resolution_before_the_next_sweep_is_progressed_by_other(
+        self,
+    ) -> None:
+        """#3889 review: a hand merge / unrelated branch landing while the
+        row sat blocked is `coord.block_log`'s ``_LANDED_CAUSE`` —
+        ``human_acted=False`` but ``resolution == "landed"``. That is still
+        "something other than the doctor's own confirmed action" (see
+        `_LANDED_CAUSE`'s own docstring), so it must downgrade the verdict
+        too, not just the `human_acted=True` releases."""
+        from datetime import datetime, timezone
+
+        from coord.block_log import enter_event, plan_events, record
+        from coord.drive_queue import (
+            QueueEntry as _QE,
+            Reconcile,
+            STATE_DONE,
+            TickPlan,
+        )
+
+        key = "acme/widgets#305"
+        cause = "ci_red"
+        dispatch = _Recorder()
+        t0 = 1_800_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+        )
+        assert dispatch.count == 1
+
+        # Something else (a hand merge, an unrelated branch) landed the
+        # work while the entry sat `blocked` — the tick's own `done`
+        # reconcile, recorded AFTER the decision above.
+        reason = "done — merged by hand while blocked"
+        entry = _QE(
+            repo="acme/widgets", issue=305, state="blocked", attempts=1,
+            last_reason="ci red",
+        )
+        plan = TickPlan(
+            reconciles=(
+                Reconcile(key, "done", reason,
+                           updates={"state": STATE_DONE, "last_reason": reason}),
+            ),
+        )
+        events = plan_events([entry], plan, now=t0 + 60.0)
+        assert [e["resolution"] for e in events] == ["landed"]
+        record(
+            [enter_event(entry, state="blocked", reason="ci red", now=t0 - 10.0), *events]
+        )
+
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 120.0, tz=timezone.utc),
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "progressed_by_other"
 
 
 class TestDecisionLogRetentionAndFilters:
@@ -1603,6 +1753,16 @@ class TestParseBoardDoctorLogAndBackoffKnobs:
         with pytest.raises(ConfigError, match="backoff_cap_hours"):
             _parse_board_doctor({"backoff_initial_hours": 10.0, "backoff_cap_hours": 5.0})
 
+    def test_a_config_setting_only_initial_above_the_default_cap_names_the_default(
+        self,
+    ) -> None:
+        """#3889 review nit: a config that sets ONLY
+        ``backoff_initial_hours`` above the untouched ``backoff_cap_hours``
+        default must say the cap is the UNTOUCHED side, not just restate
+        the invariant and leave an operator guessing which knob to fix."""
+        with pytest.raises(ConfigError, match=r"defaults to 24\.0"):
+            _parse_board_doctor({"backoff_initial_hours": 48.0})
+
     def test_fixit_leg_budget_rejects_non_positive(self) -> None:
         with pytest.raises(ConfigError, match="fixit_leg_budget"):
             _parse_board_doctor({"fixit_leg_budget": 0})
@@ -1665,6 +1825,48 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
             None, "ci_red", backoff_initial_hours=6.0,
         )
         assert counter["backoff_hours"] == 6.0
+
+    def test_run_sweep_threads_config_knobs_into_sweep(self, monkeypatch) -> None:
+        """#3889 review non-blocking: the above prove the PARAMETERS work —
+        nothing proved :func:`coord.board_doctor.run_sweep` actually reads
+        them off ``config.board_doctor`` and passes them down. Stub
+        ``collect_rows``/``sweep`` (both module-level names `run_sweep`
+        resolves fresh on every call, so monkeypatching the module wins)
+        and assert the four knobs the production entry point owns —
+        ``log_retention_days``/``backoff_initial_hours``/
+        ``backoff_cap_hours`` plus the already-threaded ``capacity_check``
+        — arrive at `sweep` unchanged."""
+        import coord.board_doctor as board_doctor_mod
+        from coord.config import BoardDoctorConfig, Config
+
+        captured: dict = {}
+
+        def _fake_sweep(rows, **kwargs):
+            captured.update(kwargs)
+            captured["rows"] = rows
+            return "sentinel-report"
+
+        monkeypatch.setattr(board_doctor_mod, "collect_rows", lambda *, config: [])
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        cfg = Config(
+            repos=[],
+            machines=[],
+            board_doctor=BoardDoctorConfig(
+                log_retention_days=7,
+                backoff_initial_hours=6.0,
+                backoff_cap_hours=12.0,
+                fixit_leg_budget=2,
+            ),
+        )
+
+        result = board_doctor_mod.run_sweep(config=cfg, capacity_check=None)
+
+        assert result == "sentinel-report"
+        assert captured["log_retention_days"] == 7
+        assert captured["backoff_initial_hours"] == 6.0
+        assert captured["backoff_cap_hours"] == 12.0
+        assert captured["capacity_check"] is None
 
 
 class TestNoProgressRows:
