@@ -9122,6 +9122,43 @@ class TestPlan:
         assert plan[0].rank == 1
         assert plan[0].size == 100
 
+    def test_blocked_by_another_rows_merge_gate_reservation(self, coord_db) -> None:
+        """#3886: `plan()` (the `coord merge --plan`/TUI panel read) must
+        render the SAME reservation block `process()` would apply live —
+        otherwise an operator sees PLAN_READY for an entry a live merge
+        attempt actually defers."""
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#99", ttl_seconds=600) is True
+        items = [_q("w1", size=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg)
+        assert len(plan) == 1
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "api#99" in plan[0].reason
+
+    def test_not_blocked_by_its_own_merge_gate_reservation(self, coord_db) -> None:
+        """The holder's own entry must keep reading READY — only a
+        DIFFERENT entry in the same repo defers."""
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("w1", size=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg)
+        assert len(plan) == 1
+        assert plan[0].status == mq.PLAN_READY
+
     def test_ready_when_gh_ops_backfills_null_branch_patch_id(self, coord_db) -> None:
         """#1506: an entry whose approved review predates #1475
         (review_patch_id set, but the entry's own branch_patch_id was never
@@ -15670,6 +15707,26 @@ class TestAttemptDirectMergeForInertBaseMove:
         assert gh.close_calls == [(entry.repo_github, entry.issue_number)]
         assert any(e.kind == "merged" for e in events)
 
+    def test_confirmed_success_releases_the_entrys_own_merge_gate_reservation(
+        self, coord_db,
+    ) -> None:
+        """#3886: this takeover is a real landing just like `process()`'s
+        own success path — it must release a reservation THIS entry holds
+        too, via the shared `_finalize_merged_entry`, not leave it held for
+        the rest of its TTL."""
+        from coord.state import get_merge_reservation, reserve_merge_slot
+
+        entry = _q("w1", pr=42, state=CONFLICT, issue_number=1)
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        mq.attempt_direct_merge_for_inert_base_move(
+            entry, gh, None, None,
+            issue_resolution=self._resolved, issue_close_block_reason=None,
+        )
+
+        assert get_merge_reservation("api") is None
+
     def test_declined_merge_returns_none_and_leaves_entry_untouched(self) -> None:
         entry = _q("w1", pr=42, state=CONFLICT)
         entry.error = "original conflict error"
@@ -15838,10 +15895,20 @@ class TestProcessHonorsMergeGateReservation:
                     )]
                 return [SimpleNamespace(
                     name="build", status="completed", conclusion="success",
-                    started_at=None, completed_at=None,
+                    started_at=2000.0, completed_at=None,
                 )]
 
-        gh = FakeGh()
+        class _Gh(FakeGh):
+            # #3886: the reservation gate now runs AFTER the CI-staleness
+            # gate (`_ci_checks_are_stale`) rather than before it, so B's
+            # green check must actually read as FRESH to reach it — a plain
+            # `FakeGh` has no `get_branch_commit_timestamp` at all, which
+            # fails CLOSED (stale) regardless of `started_at` (see that
+            # function's docstring).
+            def get_branch_commit_timestamp(self, repo, branch):
+                return 1000.0
+
+        gh = _Gh()
         events = process(items, gh, ci_store=_Ci())
 
         kinds = {e.entry.assignment_id: e.kind for e in events}
@@ -15855,3 +15922,71 @@ class TestProcessHonorsMergeGateReservation:
         assert items[0].state == PENDING
         assert items[1].state == PENDING
         assert gh.merge_calls == []
+
+    def test_a_real_block_reason_wins_over_the_reservation_text(
+        self, coord_db,
+    ) -> None:
+        """The reservation is evaluated LAST, after every other gate — a
+        sibling that is ALSO missing a required review must keep showing
+        the review block, not have it hidden behind the reservation text
+        for the length of the reservation's TTL."""
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("b", issue_number=2, pr=201)]
+        gh = FakeGh()
+        config = TestPlan._config(gates=["review"])
+
+        events = process(items, gh, config=config, board=None)
+
+        by_kind = {e.kind for e in events}
+        assert "review_required" in by_kind
+        assert "merge_gate_reserved" not in by_kind
+        assert items[0].error == "review required but board unavailable to confirm approval"
+
+    def test_already_merged_by_another_driver_releases_its_own_reservation(
+        self, coord_db,
+    ) -> None:
+        """#3886: the #2143 'already merged by another driver' arm observes
+        a landing it did not itself perform — it must never repeat
+        `_finalize_merged_entry`'s bookkeeping (some other `process()` call
+        already did that), but it must still release a reservation THIS
+        entry might hold, the same as every other landing path."""
+        from coord.state import get_merge_reservation, reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("a", issue_number=1)]
+        gh = FakeGh(merged_branches={items[0].branch})
+
+        events = process(items, gh)
+
+        assert any(e.kind == "already_merged" for e in events)
+        assert items[0].state == MERGED
+        assert get_merge_reservation("api") is None
+
+    def test_a_reservation_with_no_holder_is_treated_as_no_reservation(
+        self, coord_db,
+    ) -> None:
+        """A malformed reservation row (missing `holder`) must fail open
+        rather than render `merge gate reserved for None until ...` and
+        defer a sibling against a claim nobody actually holds."""
+        from coord import sql
+        from coord.state import get_connection
+
+        conn = get_connection()
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (
+                "checks_stale_merge_reservations",
+                '{"api": {"expires_at": 9999999999}}',
+            ),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+        items = [_q("b", issue_number=2)]
+        gh = FakeGh()
+        events = process(items, gh)
+
+        assert any(e.kind == "merged" for e in events)
+        assert items[0].state == MERGED

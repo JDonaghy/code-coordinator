@@ -170,6 +170,7 @@ from coord.merge_queue import (
     is_ci_infra_reason,
     is_ci_pending_reason,
     is_ci_unreadable_reason,
+    is_merge_gate_reserved_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
 )
 
@@ -4320,12 +4321,13 @@ def _effective_merge_gate_reason(
       own resolution path (#1474/#241's conflict-fix dispatch, reached
       through the bounded retry below). A re-test does not rebase a branch,
       and diverting to one is the same stall this issue is about, inverted.
-    - a CI reason (#1891/#1892/#2252/#2347) — `merge_reason` already carries
-      a live, recognised signal whose only resolution is more real time
-      (#1891/#2814's own arm now spends that time on a real, budget-exempt
-      `coord merge --only` re-check rather than a bare wait — see that
-      branch's docstring — but the "board's own reading wins over the
-      diagnostic fallback" contract here is unchanged). These CI-reason
+    - a CI reason (#1891/#1892/#2252/#2347) or the #3886 merge-gate
+      reservation — `merge_reason` already carries a live, recognised
+      signal whose only resolution is more real time (#1891/#2814's own
+      arm now spends that time on a real, budget-exempt `coord merge
+      --only` re-check rather than a bare wait — see that branch's
+      docstring — but the "board's own reading wins over the diagnostic
+      fallback" contract here is unchanged). These self-refreshing-reason
       checks sit right after the divergence check and must keep winning.
 
     The bool is the caller's warning label: a diagnostic-derived reason is a
@@ -4344,6 +4346,7 @@ def _effective_merge_gate_reason(
         or is_ci_infra_reason(state.merge_reason)
         or is_ci_flaky_reason(state.merge_reason)
         or is_ci_unreadable_reason(state.merge_reason)
+        or is_merge_gate_reserved_reason(state.merge_reason)
     ):
         return state.merge_reason, False
     fallback = _extract_gate_refusal_reason(counters.last_merge_diagnostic)
@@ -5100,6 +5103,39 @@ def _decide_merge(
                 "coord merge returned non-zero (or the merge lock timed out) "
                 "while re-checking a possible CI flake — re-checking next "
                 "poll"
+            ),
+            serialize_merge=True,
+        )
+
+    # #3886: not a CI reason, but the identical self-refreshing shape — a
+    # DIFFERENT entry in this repo holds the per-repo merge-gate reservation
+    # (`coord.merge_queue.is_merge_gate_reserved_reason`), so this entry
+    # defers until the holder merges, leaves the queue, or the reservation's
+    # own TTL expires. Nothing about retrying resolves it faster, but
+    # nothing else on the standalone drive path (same #2814 gap the four CI
+    # siblings above close) ever re-reads the board to notice it cleared
+    # either — so this dispatches the same real, attempt-exempt `coord
+    # merge --only` re-check every poll, never a bare wait. Checked before
+    # `status.upper() not in _RETRYABLE_MERGE_STATUSES` below: `merge_status`
+    # stays PENDING/READY while this holds, which is retryable but would
+    # otherwise spend `counters.merge_attempts` on every poll for up to the
+    # reservation's 2h TTL and kill the drive session on
+    # `--max-merge-attempts` — the opposite of deferring.
+    if is_merge_gate_reserved_reason(state.merge_reason):
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: another entry in this repo holds the merge-gate "
+                f"reservation — re-checking, not spending an attempt "
+                f"(#3886): {state.merge_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed out) "
+                "while re-checking the merge-gate reservation — re-checking "
+                "next poll"
             ),
             serialize_merge=True,
         )
