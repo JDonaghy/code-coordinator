@@ -18,11 +18,17 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_CONFLICT_FIX_HEAD_UNMOVED,
+    CAUSE_LATCH_STALE_MERGEABLE,
+    CAUSE_MERGE_PENDING_STUCK,
     CAUSE_SMOKE_NO_VERDICT,
     CONVERGENCE_LIMIT,
+    MERGE_PENDING_STALE_AFTER_SECONDS,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
+    _reclassify_stale_latch,
+    merge_queue_rows,
     sweep,
 )
 from coord.board_doctor_permissions import SweepPermissionError
@@ -30,9 +36,13 @@ from coord.board_doctor_policy import (
     ALLOWLIST,
     AUTO_DISPATCHERS,
     INVESTIGATE_CAUSES,
+    _clear_stale_latch,
     _fixit_rebudget_eligible,
     _fixit_rebudget_environmental,
     _investigate,
+    _merge_pending_stuck_row,
+    _reconcile_merged_row,
+    _redispatch_head_unmoved_conflict_fix,
     _register_auto_action,
     _requeue_ceiling_blocked_mergeable,
     _requeue_never_dispatched,
@@ -43,7 +53,7 @@ from coord.board_doctor_policy import (
 )
 from coord.config import Config
 from coord.drive_queue import parse_key
-from coord.models import Assignment, Board, Repo
+from coord.models import Assignment, Board, Machine, Repo
 
 _IN_FLIGHT_DETAIL = (
     "acme/widgets#40 already has a running or pending assignment — a "
@@ -96,17 +106,23 @@ class TestPolicyTierOf:
         # No cause is pre-approved for auto-action without a reviewed,
         # known-safe fix behind it. #3760 names three: a
         # ceiling-blocked-but-mergeable row gets a fresh fix-round budget,
-        # a row whose PR already merged gets cleared, and a row whose smoke
-        # leg produced no parseable verdict gets its Test verdict cleared so
-        # it re-dispatches (Action 5, #2244). #3874 adds a fourth: a row
-        # that was never dispatched at all gets requeued, the mechanical
-        # equivalent of the operator remove+add that shape otherwise needs.
-        # Every other cause stays alert-tier.
+        # a row whose PR already merged gets reconciled, and a row whose
+        # smoke leg produced no parseable verdict gets its Test verdict
+        # cleared so it re-dispatches (Action 5, #2244). #3874 adds a
+        # fourth: a row that was never dispatched at all gets requeued, the
+        # mechanical equivalent of the operator remove+add that shape
+        # otherwise needs. #3887 adds three more mechanical queue repairs,
+        # each applied via the SAME #3881 investigator wrapper a
+        # human-attended session would use. Every other cause stays
+        # alert-tier.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
-            queue_diagnose.CAUSE_PR_MERGED: "drive_queue_remove",
+            queue_diagnose.CAUSE_PR_MERGED: "mark_done",
             CAUSE_SMOKE_NO_VERDICT: "smoke_requeue",
             queue_diagnose.CAUSE_NEVER_DISPATCHED: "drive_queue_requeue",
+            CAUSE_LATCH_STALE_MERGEABLE: "clear_latch",
+            CAUSE_MERGE_PENDING_STUCK: "merge_approved_green",
+            CAUSE_CONFLICT_FIX_HEAD_UNMOVED: "conflict_fix_redispatch",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:
@@ -2468,3 +2484,536 @@ class TestRecommendInvestigatorAction:
 
         assert result["acted"] is False
         assert "not in the drive queue" in result["detail"]
+
+
+# ── #3887 (#3875 ask A): the sweep applies the commonest queue repairs ─────
+# itself, via the SAME #3881 wrapper, with no agent session and no
+# `max_parallel` slot — replaying the cases the issue's own evidence table
+# names.
+
+
+class TestMergeQueueRowHeadUnmovedAndStalePendingClassification:
+    """`coord.board_doctor.merge_queue_rows`'s two #3887 refinements: a
+    sharper reading of live evidence it already has (the HUMAN_REQUIRED
+    head-unmoved shape), and a first classification for a shape it
+    otherwise never looks at at all (a PENDING entry stale since its last
+    attempt)."""
+
+    @staticmethod
+    def _entry(**overrides):
+        from coord import merge_queue as mq
+
+        base = dict(
+            assignment_id="w1", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing",
+        )
+        base.update(overrides)
+        return mq.QueuedMerge(**base)
+
+    def test_head_unmoved_human_required_gets_the_sharper_cause(self) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry(
+            state=mq.HUMAN_REQUIRED,
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef) — the push appears to be missing, and a "
+                "fresh automated conflict-fix could not be dispatched"
+            ),
+        )
+
+        rows = merge_queue_rows([entry])
+
+        assert len(rows) == 1
+        assert rows[0].cause == CAUSE_CONFLICT_FIX_HEAD_UNMOVED
+
+    def test_ordinary_human_required_keeps_the_generic_cause(self) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry(state=mq.HUMAN_REQUIRED, error="conflict-fix worker did not resolve")
+
+        rows = merge_queue_rows([entry])
+
+        assert len(rows) == 1
+        assert rows[0].cause == queue_diagnose.CAUSE_GATE_BLOCKED
+
+    def test_stale_pending_entry_gets_flagged(self) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry(state=mq.PENDING, last_attempt=1000.0)
+
+        rows = merge_queue_rows([entry], now=1000.0 + MERGE_PENDING_STALE_AFTER_SECONDS)
+
+        assert len(rows) == 1
+        assert rows[0].cause == CAUSE_MERGE_PENDING_STUCK
+
+    def test_freshly_attempted_pending_entry_is_not_this_doctors_problem(self) -> None:
+        # Waiting its ordinary turn — must never be flagged, or every
+        # routine PENDING row would alert after a few sweeps.
+        from coord import merge_queue as mq
+
+        entry = self._entry(state=mq.PENDING, last_attempt=1000.0)
+
+        rows = merge_queue_rows([entry], now=1000.0 + 60.0)
+
+        assert rows == []
+
+    def test_pending_entry_never_attempted_is_not_this_doctors_problem(self) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry(state=mq.PENDING, last_attempt=None)
+
+        rows = merge_queue_rows([entry], now=1_000_000.0)
+
+        assert rows == []
+
+
+class TestReclassifyStaleLatch:
+    """#3887 case 2, quadraui#2034: a CONFLICT/HUMAN_REQUIRED merge-queue
+    row whose approval is already confirmed bound to the current branch
+    content gets promoted to the mechanical `clear_latch` cause — a row
+    whose approval is NOT confirmed, or a drive-queue row carrying the
+    same cause NAME by coincidence, is left alone."""
+
+    @staticmethod
+    def _merge_row(cause: str) -> StuckRow:
+        return StuckRow(
+            queue="merge-queue",
+            key="acme/widgets#2034",
+            state="human_required",
+            cause=cause,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=("merge_queue.state=human_required",),
+            fresh=True,
+        )
+
+    @staticmethod
+    def _entry():
+        from coord import merge_queue as mq
+
+        return mq.QueuedMerge(
+            assignment_id="w1", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2034-fix", target_branch="main", issue_number=2034,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+        )
+
+    def test_promotes_once_approval_is_bound_to_current_content(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry()
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        row = self._merge_row(queue_diagnose.CAUSE_GATE_BLOCKED)
+
+        reclassified = _reclassify_stale_latch(
+            [row], [entry], board=Board(), config=Config(repos=[], machines=[]),
+        )
+
+        assert reclassified[0].cause == CAUSE_LATCH_STALE_MERGEABLE
+
+    def test_leaves_the_row_alone_when_approval_is_not_bound(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry()
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: False)
+        row = self._merge_row(queue_diagnose.CAUSE_MERGE_CONFLICT)
+
+        reclassified = _reclassify_stale_latch(
+            [row], [entry], board=Board(), config=Config(repos=[], machines=[]),
+        )
+
+        assert reclassified[0].cause == queue_diagnose.CAUSE_MERGE_CONFLICT
+
+    def test_never_touches_a_drive_queue_row_with_the_same_cause_name(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+
+        entry = self._entry()
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#2034",
+            state="blocked",
+            cause=queue_diagnose.CAUSE_GATE_BLOCKED,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(),
+            fresh=True,
+        )
+
+        reclassified = _reclassify_stale_latch(
+            [row], [entry], board=Board(), config=Config(repos=[], machines=[]),
+        )
+
+        assert reclassified[0].cause == queue_diagnose.CAUSE_GATE_BLOCKED
+
+
+def _widgets_config() -> Config:
+    repo = Repo(
+        name="acme/widgets", github="acme/widgets",
+        default_branch="main", test_command="pytest",
+    )
+    return Config(
+        repos=[repo],
+        machines=[
+            Machine(
+                name="laptop", host="laptop.tail",
+                repos=["acme/widgets"], repo_paths={"acme/widgets": "/work"},
+            ),
+        ],
+    )
+
+
+class TestClearStaleLatchEndToEnd:
+    """#3887 case 2: the sweep clears a stale latch itself, via the SAME
+    #3881 wrapper a human-attended investigator session would use."""
+
+    def test_clears_the_latch_in_one_sweep(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2034", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2034-fix", target_branch="main", issue_number=2034,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED, pr_number=9,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mq, "reconcile_conflict_entries",
+            lambda gh_ops: [mq.MergeEvent(entry, "reopened", "cleared for real")],
+        )
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#2034", state="human_required",
+            cause=CAUSE_LATCH_STALE_MERGEABLE, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        report = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-2034-latch",
+        )
+
+        assert report.decisions[0].tier == TIER_AUTO
+        assert report.decisions[0].action == "auto-dispatch"
+
+    def test_a_second_sweep_on_the_same_row_is_a_noop(self, monkeypatch) -> None:
+        # Once cleared, `reconcile_conflict_entries` no longer returns an
+        # event for this row (it is PENDING, not latched) — a second sweep
+        # pass re-handed the SAME StuckRow (production would have stopped
+        # classifying this cause for it by now; this pins the handler's
+        # own idempotence regardless) must not re-mutate or re-report it.
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2034b", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2034b-fix", target_branch="main", issue_number=20342,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED, pr_number=9,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+
+        def _reconcile(gh_ops):
+            queue = mq.load_queue()
+            live = next(e for e in queue if e.assignment_id == "w2034b")
+            if live.state != mq.HUMAN_REQUIRED:
+                return []
+            live.state = mq.PENDING
+            mq.save_queue(queue)
+            return [mq.MergeEvent(live, "reopened", "cleared for real")]
+
+        monkeypatch.setattr(mq, "reconcile_conflict_entries", _reconcile)
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#20342", state="human_required",
+            cause=CAUSE_LATCH_STALE_MERGEABLE, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        first = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-20342-latch-first",
+        )
+        assert first.decisions[0].action == "auto-dispatch"
+        assert mq.load_queue()[0].state == mq.PENDING
+
+        second = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-20342-latch-second",
+        )
+        assert second.decisions[0].action == "auto-dispatch-noop"
+        assert mq.load_queue()[0].state == mq.PENDING
+
+    def test_already_fixed_when_we_act_refuses_with_no_write(self, monkeypatch) -> None:
+        # A human (or an earlier sweep) already un-latched this row by the
+        # time this one acts — no write, no false success.
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2035", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2035-fix", target_branch="main", issue_number=2035,
+            issue_title="Fix the thing", state=mq.PENDING,
+        )
+        mq.save_queue([entry])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#2035", state="human_required",
+            cause=CAUSE_LATCH_STALE_MERGEABLE, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        report = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-2035-already-fixed",
+        )
+
+        assert report.decisions[0].action == "auto-dispatch-noop"
+        assert mq.load_queue()[0].state == mq.PENDING
+
+
+class TestMergePendingStuckEndToEnd:
+    """#3887 case 5: the sweep merges a stale, green/approved PENDING row
+    itself, via plain `coord merge --only` (#3881's wrapper)."""
+
+    def test_merges_a_stale_pending_green_approved_row(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2045", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2045-fix", target_branch="main", issue_number=2045,
+            issue_title="Fix the thing", state=mq.PENDING, last_attempt=1.0,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mq, "process",
+            lambda items, gh_ops, **kwargs: [mq.MergeEvent(entry, "merged", "merged cleanly")],
+        )
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#2045", state="pending",
+            cause=CAUSE_MERGE_PENDING_STUCK, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        report = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-2045-pending",
+        )
+
+        assert report.decisions[0].tier == TIER_AUTO
+        assert report.decisions[0].action == "auto-dispatch"
+
+    def test_already_fixed_when_we_act_refuses_with_no_write(self, monkeypatch) -> None:
+        # The row merged (by the daemon's own ordinary tick) between this
+        # sweep's diagnosis and its act — `investigator_merge`'s own
+        # `entry.state != PENDING` precondition refuses cleanly.
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2046", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2046-fix", target_branch="main", issue_number=2046,
+            issue_title="Fix the thing", state=mq.MERGED, last_attempt=1.0,
+        )
+        mq.save_queue([entry])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#2046", state="pending",
+            cause=CAUSE_MERGE_PENDING_STUCK, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        report = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-2046-already-fixed",
+        )
+
+        assert report.decisions[0].action == "auto-dispatch-noop"
+        assert mq.load_queue()[0].state == mq.MERGED
+
+
+class TestRedispatchHeadUnmovedConflictFixEndToEnd:
+    """#3887 case 3, pairs with #3871: the periodic net for #3871's own
+    synchronous completion-time redispatch, for when that one-shot
+    attempt had no capable machine right then — still within the SAME
+    retry cap, never a fresh budget."""
+
+    def test_redispatches_within_the_existing_retry_cap(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2059", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2059-fix", target_branch="main", issue_number=2059,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef) — the push appears to be missing, and a "
+                "fresh automated conflict-fix could not be dispatched"
+            ),
+        )
+        mq.save_queue([entry])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        fake_fix = Assignment(
+            machine_name="laptop", repo_name="acme/widgets", issue_number=2059,
+            issue_title="t", assignment_id="fix-2", type="conflict-fix", status="pending",
+        )
+        monkeypatch.setattr(
+            "coord.conflict_fix.dispatch_conflict_fix",
+            lambda entry_, board, config, **kwargs: fake_fix,
+        )
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#2059", state="human_required",
+            cause=CAUSE_CONFLICT_FIX_HEAD_UNMOVED, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        report = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-2059-head-unmoved",
+        )
+
+        assert report.decisions[0].tier == TIER_AUTO
+        assert report.decisions[0].action == "auto-dispatch"
+        after = mq.load_queue()[0]
+        assert after.state == mq.CONFLICT
+        assert "fix-2" in after.error
+
+    def test_already_fixed_when_we_act_refuses_with_no_write(self, monkeypatch) -> None:
+        # #3871's own synchronous redispatch already fired by the time
+        # this sweep acts — the row is no longer the head-unmoved shape,
+        # so the periodic net must not attempt a second dispatch.
+        from coord import merge_queue as mq
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2060", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2060-fix", target_branch="main", issue_number=2060,
+            issue_title="Fix the thing", state=mq.CONFLICT,
+            error="conflict-fix failed",
+        )
+        mq.save_queue([entry])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        def _must_not_dispatch(*a, **k):
+            raise AssertionError(
+                "must not attempt a redispatch once the row is no longer "
+                "the head-unmoved HUMAN_REQUIRED shape"
+            )
+
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _must_not_dispatch)
+
+        row = StuckRow(
+            queue="merge-queue", key="acme/widgets#2060", state="conflict",
+            cause=CAUSE_CONFLICT_FIX_HEAD_UNMOVED, confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(), fresh=True,
+        )
+
+        report = sweep(
+            [row], tier_of=policy_tier_of, auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False, sweep_id="sweep-2060-already-fixed",
+        )
+
+        assert report.decisions[0].action == "auto-dispatch-noop"
+        assert mq.load_queue()[0].state == mq.CONFLICT
+
+
+class TestMechanicalRepairsAuditAsSweep:
+    """#3887 acceptance: audit events this module's four new/changed
+    dispatchers write must carry ``actor="sweep"`` — never
+    ``"board_doctor_investigator"`` (the human-attended CLI's own
+    attribution) — so #3875's outcome tracking credits the doctor, not a
+    session that never ran."""
+
+    def test_reconcile_merged_row_dispatches_mark_done_as_sweep(self, monkeypatch) -> None:
+        captured: dict = {}
+
+        def fake_dispatch(action, repo_name, issue_number, *args, **kwargs):
+            captured["action"] = action
+            captured["actor"] = kwargs.get("actor")
+            return {"acted": True, "action": action, "repo": repo_name, "issue": issue_number, "detail": "ok"}
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", fake_dispatch)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#1", queue_diagnose.CAUSE_PR_MERGED, queue="drive-queue")
+        assert _reconcile_merged_row(row) is True
+        assert captured["action"] == "mark_done"
+        assert captured["actor"] == "sweep"
+
+    def test_clear_stale_latch_dispatches_clear_latch_as_sweep(self, monkeypatch) -> None:
+        captured: dict = {}
+
+        def fake_dispatch(action, repo_name, issue_number, *args, **kwargs):
+            captured["action"] = action
+            captured["actor"] = kwargs.get("actor")
+            return {"acted": True, "action": action, "repo": repo_name, "issue": issue_number, "detail": "ok"}
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", fake_dispatch)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#2034", CAUSE_LATCH_STALE_MERGEABLE, queue="merge-queue")
+        assert _clear_stale_latch(row) is True
+        assert captured["action"] == "clear_latch"
+        assert captured["actor"] == "sweep"
+
+    def test_merge_pending_stuck_dispatches_merge_as_sweep(self, monkeypatch) -> None:
+        captured: dict = {}
+
+        def fake_dispatch(action, repo_name, issue_number, *args, **kwargs):
+            captured["action"] = action
+            captured["actor"] = kwargs.get("actor")
+            return {"acted": True, "action": action, "repo": repo_name, "issue": issue_number, "detail": "ok"}
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_investigator_action", fake_dispatch)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+
+        row = _row("acme/widgets#2045", CAUSE_MERGE_PENDING_STUCK, queue="merge-queue")
+        assert _merge_pending_stuck_row(row) is True
+        assert captured["action"] == "merge"
+        assert captured["actor"] == "sweep"
+
+    def test_redispatch_head_unmoved_conflict_fix_audits_as_sweep(self, monkeypatch) -> None:
+        # No #3881 investigator verb exists for this shape (#3871 built it
+        # as a sweep-only primitive), so this one dispatches via
+        # `dispatch_sweep_action` and audits itself, directly, with
+        # ``actor="sweep"`` — not through `_investigator_result` at all.
+        # Drives the real handler (not a mocked dispatch boundary, unlike
+        # the three tests above) so the audit row under test is the one
+        # `sweep_redispatch_head_unmoved_conflict_fix` itself writes.
+        from coord import merge_queue as mq
+        from coord.audit import query_audit_log
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2059", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2059-fix", target_branch="main", issue_number=2059,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef) — the push appears to be missing, and a "
+                "fresh automated conflict-fix could not be dispatched"
+            ),
+        )
+        mq.save_queue([entry])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        fake_fix = Assignment(
+            machine_name="laptop", repo_name="acme/widgets", issue_number=2059,
+            issue_title="t", assignment_id="fix-2", type="conflict-fix", status="pending",
+        )
+        monkeypatch.setattr(
+            "coord.conflict_fix.dispatch_conflict_fix",
+            lambda entry_, board, config, **kwargs: fake_fix,
+        )
+
+        row = _row("acme/widgets#2059", CAUSE_CONFLICT_FIX_HEAD_UNMOVED, queue="merge-queue")
+        assert _redispatch_head_unmoved_conflict_fix(row) is True
+
+        log = query_audit_log(event_type="conflict_fix_redispatched", repo="acme/widgets", issue=2059)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"

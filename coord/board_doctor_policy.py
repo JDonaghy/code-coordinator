@@ -12,9 +12,11 @@ Why the allowlist below is NOT empty
 A cause belongs on the auto-action allowlist only once there is a
 known-safe, reviewed-in-advance fix for it — never as a pre-approved
 guess. #3760 (C3) started this allowlist with two such causes; a third
-(``CAUSE_SMOKE_NO_VERDICT``, #3810) and a fourth
-(``queue_diagnose.CAUSE_NEVER_DISPATCHED``, #3874) have since joined it
-the same way, each wired below via :func:`_register_auto_action`:
+(``CAUSE_SMOKE_NO_VERDICT``, #3810), a fourth
+(``queue_diagnose.CAUSE_NEVER_DISPATCHED``, #3874) and three more
+(``CAUSE_LATCH_STALE_MERGEABLE``/``CAUSE_MERGE_PENDING_STUCK``/
+``CAUSE_CONFLICT_FIX_HEAD_UNMOVED``, #3887) have since joined it the same
+way, each wired below via :func:`_register_auto_action`:
 
 * ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (minted by
   `coord.board_doctor._reclassify_ceiling_blocked`, never by
@@ -23,9 +25,11 @@ the same way, each wired below via :func:`_register_auto_action`:
   every check green, PR mergeable). ``drive_queue_requeue`` hands it a
   fresh fix-round budget without touching the PR itself, and without
   re-running Work/Test/Review.
-* ``queue_diagnose.CAUSE_PR_MERGED`` — the row's PR already merged, so
-  there is nothing left for the queue to track; ``drive_queue_remove``
-  clears it.
+* ``queue_diagnose.CAUSE_PR_MERGED`` — the row's PR already merged while
+  it sat ``running``/``blocked``/``waiting`` (quadraui#2038); ``mark_done``
+  (#3881's investigator wrapper, `actor="sweep"` — #3887) reconciles the
+  stale assignment to ``status="merged"``, freeing its machine/concurrency
+  slot without deleting the drive-queue row's own declaration.
 * ``CAUSE_SMOKE_NO_VERDICT`` — a smoke leg that exhausted #2272's
   mute-leg retry budget without ever producing a parseable verdict.
   ``sweep_smoke_requeue`` clears it, bounded by its own
@@ -45,6 +49,27 @@ the same way, each wired below via :func:`_register_auto_action`:
   diagnosis can be arbitrarily old (`coord.board_doctor.StuckRow.fresh`),
   :func:`_never_dispatched_still_true` re-confirms it from the board
   immediately before the requeue fires.
+* ``CAUSE_LATCH_STALE_MERGEABLE`` (minted by `coord.board_doctor.
+  _reclassify_stale_latch`, #3887) — a `CONFLICT`/`HUMAN_REQUIRED`
+  merge-queue latch whose approval is already confirmed bound to the
+  current branch content (quadraui#2034). ``clear_latch`` (#3881's
+  wrapper) re-tests live mergeability before clearing anything; a latch
+  that still refuses is a confirmed no-op, not a false success.
+* ``CAUSE_MERGE_PENDING_STUCK`` (`coord.board_doctor.merge_queue_rows`) —
+  a `PENDING` merge-queue entry that has sat past
+  `coord.board_doctor.MERGE_PENDING_STALE_AFTER_SECONDS` since its last
+  attempt — the ordinary merge tick keeps missing a row that already
+  reads green/approved/mergeable. ``merge`` (#3881's wrapper, plain
+  ``coord merge --only``) re-confirms every gate live via `coord.
+  merge_queue.process()` itself.
+* ``CAUSE_CONFLICT_FIX_HEAD_UNMOVED`` (`coord.board_doctor.
+  merge_queue_rows`) — a `HUMAN_REQUIRED` row whose last conflict-fix
+  completed clean but never moved the branch (#3871's own
+  `CONFLICT_FIX_HEAD_UNMOVED_SIGNAL`). ``conflict_fix_redispatch``
+  re-dispatches the ordinary conflict-fix within the SAME retry cap
+  #3871's own synchronous completion-time redispatch already enforces —
+  this is the periodic net for when that one-shot attempt had no capable
+  machine right then, never a second or larger budget.
 
 Every other mechanical cause stays off this allow-list until it has the
 same kind of reviewed, narrowly-scoped evidence behind it — a wrong
@@ -153,6 +178,9 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_CONFLICT_FIX_HEAD_UNMOVED,
+    CAUSE_LATCH_STALE_MERGEABLE,
+    CAUSE_MERGE_PENDING_STUCK,
     CAUSE_SMOKE_NO_VERDICT,
     TIER_ALERT,
     TIER_AUTO,
@@ -163,6 +191,7 @@ from coord.board_doctor_permissions import (
     SweepPermissionError,
     SweepWriteNotConfirmedError,
     authorize_sweep_action,
+    dispatch_investigator_action,
     dispatch_sweep_action,
 )
 from coord.drive_queue import parse_key as _parse_row_key
@@ -376,55 +405,232 @@ def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> bool:
     return True
 
 
-def _clear_merged_row(row: StuckRow) -> bool:
-    """#3760 Action 4: drop a drive-queue row whose PR already merged.
+def _resolve_board_and_config_for_mechanical_action(
+    repo_name: str, issue_number: int, *, action: str,
+):
+    """Build the ``(board, config)`` pair the #3887 mechanical dispatchers
+    below need to call :func:`coord.board_doctor_permissions.
+    dispatch_investigator_action` — the same deferred-import, fail-soft
+    shape :func:`_investigate` already uses for the SAME reason (this
+    harness never threads a board/config through to an auto-dispatcher,
+    only a bare :class:`~coord.board_doctor.StuckRow`).
+
+    Returns ``None`` (after printing a warning) on a config load failure —
+    never raises — so a caller treats that exactly like any other
+    "precondition did not hold" no-op: the row stays for a later sweep
+    (or, past the convergence limit, the alert tier) rather than this
+    taking the whole sweep down.
+    """
+    import click  # noqa: PLC0415
+
+    from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    try:
+        config = resolve_and_load_config(None)
+    except ConfigError as exc:
+        click.echo(
+            f"warning: board-doctor could not load config to {action} "
+            f"{repo_name}#{issue_number}: {exc}",
+            err=True,
+        )
+        return None
+    return build_board(), config
+
+
+#: #3887's own attribution for every `reason=` this module passes to
+#: :func:`coord.board_doctor_permissions.dispatch_investigator_action` —
+#: named once so the five mechanical dispatchers below never drift on the
+#: wording, and so `coord audit`/`coord log` readers see one consistent
+#: phrase for "the deterministic sweep decided this, not a human session".
+_SWEEP_REASON = "board-doctor sweep: unambiguous queue-repair precondition held (#3887)"
+
+
+def _reconcile_merged_row(row: StuckRow) -> bool:
+    """#3760 Action 4 / #3887 case 1: reconcile a row whose PR already
+    merged while it sat ``running``/``blocked``/``waiting`` (quadraui#2038).
 
     `queue_diagnose`'s highest-priority rule already fires
     :data:`coord.queue_diagnose.CAUSE_PR_MERGED` straight off live PR state
     — no reclassification needed, unlike Action 1 — so this only has to
-    remove the now-stale row.
+    call the SAME `mark_done` wrapper #3881's investigator session would
+    (:data:`INVESTIGATOR_RECOMMENDED_ACTION`), with ``actor="sweep"``: it
+    reconciles the STALE assignment on the board to ``status="merged"``
+    (`coord.reconcile.reconcile_board_merges`), freeing whatever
+    machine/concurrency slot still thought this work was running, without
+    deleting the drive-queue row's own declaration or history the way a
+    bare removal would.
 
-    Returns ``True`` only when `sweep_drive_queue_remove` confirms
-    ``removed=True``. A row no longer present (or an unparseable key) is a
-    no-op, not a success, so :func:`coord.board_doctor.sweep` records
-    ``"auto-dispatch-noop"`` rather than claiming the action fired; a
-    confirmed remove whose driver session could not be stopped
-    (``driver_ok=False``) still counts as a successful removal here —
-    `sweep_drive_queue_remove` already logged that loudly on its own.
-
-    A row whose #1757 deploy gate is armed or fired but not yet released
-    makes `sweep_drive_queue_remove` raise :class:`SweepPermissionError`
-    (`_refuse_if_remove_would_release_gate`) rather than remove anything.
-    That refusal is caught HERE, not left to propagate: `sweep`'s dispatch
-    call site (`coord.board_doctor.sweep`) has no `try` around it — unlike
-    its own `_alert_action` — so an uncaught exception would abort the
-    entire sweep, leaving every row ordered after this one unclassified and
-    `clear_absent_rows` never run. Swallowing it and returning `False`
-    instead reports `"auto-dispatch-noop"` for this row (recorded as a
-    decision, same as any other no-op) and lets the rest of the sweep
-    proceed; the row's own count keeps climbing toward the convergence
-    limit, where C4 escalates it to a human instead of this action
-    silently starving the sweep on every run until someone notices.
+    Returns ``True`` only when the wrapper confirms ``acted=True``. An
+    unparseable key, a config load failure, or the wrapper's own refusal
+    (no candidate row, or its PR/issue does not read as terminal yet) all
+    report ``False`` so :func:`coord.board_doctor.sweep` records
+    ``"auto-dispatch-noop"`` rather than a false success.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
         return False
     repo_name, issue_number = parsed
-    import click  # noqa: PLC0415
 
-    try:
-        result = dispatch_sweep_action("drive_queue_remove", repo_name, issue_number)
-    except SweepPermissionError as exc:
+    resolved = _resolve_board_and_config_for_mechanical_action(
+        repo_name, issue_number, action="mark_done",
+    )
+    if resolved is None:
+        return False
+    board, config = resolved
+
+    result = dispatch_investigator_action(
+        "mark_done", repo_name, issue_number, board, config,
+        reason=_SWEEP_REASON, actor="sweep",
+    )
+    if not result["acted"]:
+        import click  # noqa: PLC0415
+
         click.echo(
-            f"warning: board-doctor remove refused for {repo_name}#"
-            f"{issue_number}: {exc}",
+            f"warning: board-doctor mark_done no-op for {repo_name}#"
+            f"{issue_number}: {result['detail']}",
             err=True,
         )
         return False
-    if not result.get("removed"):
+    return True
+
+
+def _clear_stale_latch(row: StuckRow) -> bool:
+    """#3887 case 2: clear a stale `CONFLICT`/`HUMAN_REQUIRED` merge-queue
+    latch whose approval is already confirmed bound to the current branch
+    content (quadraui#2034).
+
+    :data:`CAUSE_LATCH_STALE_MERGEABLE` is only minted by
+    :func:`coord.board_doctor._reclassify_stale_latch` once that
+    independent confirmation already holds, so this dispatcher's own job
+    is just to call the SAME `clear_latch` wrapper #3881's investigator
+    session would, with ``actor="sweep"`` — its own three gates (latched,
+    approval bound to current content, live mergeability via
+    `coord.merge_queue.reconcile_conflict_entries`) are re-checked live at
+    this call, never trusted from the reclassifier's earlier read.
+
+    Returns ``True`` only when the wrapper confirms ``acted=True`` — a
+    latch that does not actually clear (live mergeability still refuses
+    it) is a confirmed no-op, not a success.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, issue_number = parsed
+
+    resolved = _resolve_board_and_config_for_mechanical_action(
+        repo_name, issue_number, action="clear_latch",
+    )
+    if resolved is None:
+        return False
+    board, config = resolved
+
+    from coord import github_ops as gh_ops  # noqa: PLC0415
+
+    result = dispatch_investigator_action(
+        "clear_latch", repo_name, issue_number, board, config, gh_ops,
+        reason=_SWEEP_REASON, actor="sweep",
+    )
+    if not result["acted"]:
+        import click  # noqa: PLC0415
+
         click.echo(
-            f"warning: board-doctor remove no-op for {repo_name}#"
-            f"{issue_number} — row was not found in the drive queue",
+            f"warning: board-doctor clear_latch no-op for {repo_name}#"
+            f"{issue_number}: {result['detail']}",
+            err=True,
+        )
+        return False
+    return True
+
+
+def _merge_pending_stuck_row(row: StuckRow) -> bool:
+    """#3887 case 5: merge a `PENDING` merge-queue row that already looks
+    fully green/approved/mergeable but the ordinary merge tick keeps
+    missing.
+
+    :data:`CAUSE_MERGE_PENDING_STUCK` only fires
+    (:func:`coord.board_doctor.merge_queue_rows`) once the entry has sat
+    past :data:`coord.board_doctor.MERGE_PENDING_STALE_AFTER_SECONDS`
+    since its last attempt, so this calls the SAME `merge` wrapper #3881's
+    investigator session would — plain ``coord merge --only`` of an
+    already-approved row (`coord.board_doctor_permissions.
+    investigator_merge`) — with ``actor="sweep"``. Every live gate (CI
+    green, approval still bound to current content, mergeable) is
+    re-confirmed by `coord.merge_queue.process()` itself the moment it
+    runs; a fresh conflict or CI failure there is reported ``acted=False``,
+    never treated as this call's own failure.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, issue_number = parsed
+
+    resolved = _resolve_board_and_config_for_mechanical_action(
+        repo_name, issue_number, action="merge",
+    )
+    if resolved is None:
+        return False
+    board, config = resolved
+
+    from coord import github_ops as gh_ops  # noqa: PLC0415
+
+    result = dispatch_investigator_action(
+        "merge", repo_name, issue_number, board, config, gh_ops,
+        reason=_SWEEP_REASON, actor="sweep",
+    )
+    if not result["acted"]:
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor merge no-op for {repo_name}#"
+            f"{issue_number}: {result['detail']}",
+            err=True,
+        )
+        return False
+    return True
+
+
+def _redispatch_head_unmoved_conflict_fix(row: StuckRow) -> bool:
+    """#3887 case 3, pairs with #3871: re-dispatch the ordinary
+    conflict-fix for a `HUMAN_REQUIRED` row whose last attempt completed
+    clean but never moved the branch.
+
+    Unlike the three dispatchers above, this calls `coord.
+    board_doctor_permissions.dispatch_sweep_action` directly rather than
+    the #3881 investigator wrapper: there is no human-attended verb for
+    this shape (#3871's own completion-time redispatch is the ONLY other
+    caller of the underlying primitive, and it is synchronous, not an
+    operator-invoked action), so `sweep_redispatch_head_unmoved_
+    conflict_fix` audits ``actor="sweep"`` itself rather than through
+    `_investigator_result`.
+
+    Returns ``True`` only when the primitive confirms ``redispatched=True``
+    — "no capable machine right now" (the same reason #3871's own
+    synchronous attempt may have declined) is a confirmed no-op, so the
+    row stays eligible for another attempt next sweep, still within the
+    SAME retry cap #3871 already enforces.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, issue_number = parsed
+
+    resolved = _resolve_board_and_config_for_mechanical_action(
+        repo_name, issue_number, action="conflict_fix_redispatch",
+    )
+    if resolved is None:
+        return False
+    board, config = resolved
+
+    result = dispatch_sweep_action(
+        "conflict_fix_redispatch", repo_name, issue_number, board, config,
+    )
+    if not result["redispatched"]:
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor conflict-fix redispatch no-op for "
+            f"{repo_name}#{issue_number}: {result['detail']}",
             err=True,
         )
         return False
@@ -589,8 +795,8 @@ _register_auto_action(
 )
 _register_auto_action(
     queue_diagnose.CAUSE_PR_MERGED,
-    "drive_queue_remove",
-    _clear_merged_row,
+    "mark_done",
+    _reconcile_merged_row,
 )
 _register_auto_action(
     CAUSE_SMOKE_NO_VERDICT,
@@ -601,6 +807,25 @@ _register_auto_action(
     queue_diagnose.CAUSE_NEVER_DISPATCHED,
     "drive_queue_requeue",
     _requeue_never_dispatched,
+)
+# #3887 (#3875 ask A): the sweep applies these four unambiguous queue
+# repairs itself, via the SAME #3881 investigator wrapper a human-attended
+# session would use (`actor="sweep"` distinguishes the two in the audit
+# trail) — no agent session, no `max_parallel` slot spent.
+_register_auto_action(
+    CAUSE_LATCH_STALE_MERGEABLE,
+    "clear_latch",
+    _clear_stale_latch,
+)
+_register_auto_action(
+    CAUSE_MERGE_PENDING_STUCK,
+    "merge_approved_green",
+    _merge_pending_stuck_row,
+)
+_register_auto_action(
+    CAUSE_CONFLICT_FIX_HEAD_UNMOVED,
+    "conflict_fix_redispatch",
+    _redispatch_head_unmoved_conflict_fix,
 )
 
 
