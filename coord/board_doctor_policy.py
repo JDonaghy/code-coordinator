@@ -83,10 +83,16 @@ way, each wired below via :func:`_register_auto_action`:
   premise) — a `blocked`/`parked` row that WAS dispatched at least once
   whose stored block reason is still `coord.drive_queue._resolve_
   prereqs`'s own unsatisfiable-`after=` verdict even though every named
-  pre-req now reads terminal. Reuses the SAME ``drive_queue_requeue``
-  action the other two mechanical-requeue causes above dispatch, since
-  the safety argument is identical: nothing here mutates the PR, only the
-  queue row's own `waiting`/`blocked` bookkeeping. `coord.drive_queue.
+  pre-req now reads terminal. Dispatches through the SAME audited,
+  in-flight-guarded ``"requeue"`` investigator verb the four #3887
+  mechanical dispatchers already use (`coord.board_doctor_permissions.
+  investigator_requeue`, ``actor="sweep"``) rather than the bare
+  ``drive_queue_requeue`` primitive the OTHER two mechanical-requeue
+  causes above call directly — unlike them, this cause's own precondition
+  REQUIRES at least one assignment to exist (`coord.board_doctor.
+  after_prereqs_landed_for_entry`), so the row can genuinely have live
+  work in flight against it, which only `investigator_requeue`'s
+  `_in_flight_work_detail` guard refuses. `coord.drive_queue.
   _reconcile_blocked_after` already resumes a LIVE `blocked` row matching
   this shape on every ordinary tick with no board-doctor involvement at
   all; this cause only ever matters for a row that tick's own walk is no
@@ -904,12 +910,34 @@ def _requeue_after_prereqs_landed(row: StuckRow) -> bool:
     as "no longer this shape" and refuses rather than requeuing a row that
     does not need it.
 
-    Returns ``True`` only when `sweep_drive_queue_requeue` (via
-    ``drive_queue_requeue``) confirms ``requeued=True`` — preserving
-    ``--machine``, ``--after``, position and fix-round state exactly like
-    the other two callers of the same primitive. An unparseable key, a row
-    that no longer matches the live predicate, or a reported no-op all
-    report ``False`` so :func:`coord.board_doctor.sweep` records
+    Dispatches through :func:`coord.board_doctor_permissions.
+    dispatch_investigator_action`'s ``"requeue"`` verb — the SAME audited,
+    in-flight-guarded wrapper the other three mechanical dispatchers in this
+    module use — rather than calling `dispatch_sweep_action` on the bare
+    `drive_queue_requeue` primitive directly. Two reasons that is not
+    optional here, unlike the other two ``drive_queue_requeue`` callers in
+    this module: (1) `investigator_requeue` is the only path that writes a
+    `coord.audit.record_audit` row with `actor="sweep"`, which the issue's
+    Expected #1 names and `sweep_drive_queue_requeue` itself never does; and
+    (2) it refuses via `_in_flight_work_detail` when a running/pending
+    assignment or a live `coord drive` session already exists for the row —
+    the guard this cause's own precondition needs and the other two
+    `drive_queue_requeue` callers do not, because THEIR safety argument
+    (`_requeue_never_dispatched` requires zero assignments;
+    `_requeue_ceiling_blocked_mergeable` acts on a row that already gave up
+    on fix rounds) does not transfer to this cause, whose predicate
+    (`after_prereqs_landed_for_entry`) requires at least one assignment to
+    exist. Without that guard a row reading `blocked`/`parked` in the queue
+    while its OWN work assignment still reads `running`/`pending` on the
+    board — exactly the board/queue divergence this sweep exists to catch —
+    would get yanked out from under the live leg using it.
+
+    Returns ``True`` only when `investigator_requeue` confirms
+    ``acted=True`` — preserving ``--machine``, ``--after``, position and
+    fix-round state exactly like the other two callers of the underlying
+    `drive_queue_requeue` primitive. An unparseable key, a row that no
+    longer matches the live predicate, an in-flight refusal, or a reported
+    no-op all report ``False`` so :func:`coord.board_doctor.sweep` records
     ``"auto-dispatch-noop"`` rather than a false success.
     """
     def _body() -> bool:
@@ -944,10 +972,13 @@ def _requeue_after_prereqs_landed(row: StuckRow) -> bool:
             )
             return False
 
-        result = dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
-        if not result.get("requeued"):
+        result = dispatch_investigator_action(
+            "requeue", repo_name, issue_number, board,
+            reason=_SWEEP_REASON, actor="sweep",
+        )
+        if not result["acted"]:
             return _warn_noop(
-                "drive_queue_requeue", repo_name, issue_number, result.get("detail"),
+                "drive_queue_requeue", repo_name, issue_number, result["detail"],
             )
         return True
 

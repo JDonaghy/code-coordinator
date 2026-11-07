@@ -3397,6 +3397,54 @@ class TestReclassifyAfterPrereqsLanded:
 
         assert reclassified[0].cause == CAUSE_AFTER_PREREQS_LANDED
 
+    def test_promotes_a_row_whose_incoming_cause_is_no_pr(self) -> None:
+        # #3901 review: `CAUSE_NO_PR` is the OTHER safe incoming cause —
+        # the PR probe ran and positively confirmed no PR exists, which is
+        # not a competing, already-actionable verdict about the entry's own
+        # PR lifecycle (unlike `CAUSE_PR_MERGED`/`CAUSE_MERGE_CONFLICT`/etc).
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="done", last_reason="")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        row = self._row(
+            cause=queue_diagnose.CAUSE_NO_PR, confidence=queue_diagnose.CONFIDENCE_MEDIUM,
+        )
+        reclassified = _reclassify_after_prereqs_landed(
+            [row], entries_by_key, board=_dispatched_board(),
+        )
+
+        assert reclassified[0].cause == CAUSE_AFTER_PREREQS_LANDED
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            queue_diagnose.CAUSE_PR_MERGED,
+            queue_diagnose.CAUSE_MERGE_CONFLICT,
+            queue_diagnose.CAUSE_CI_RED,
+            queue_diagnose.CAUSE_CI_PENDING,
+            queue_diagnose.CAUSE_GATE_BLOCKED,
+        ],
+    )
+    def test_never_overwrites_an_already_actionable_incoming_cause(self, cause) -> None:
+        # #3901 review: a row matching the after=-landed SHAPE can still
+        # carry live evidence about a DIFFERENT, already-actionable blocker
+        # on its own PR (e.g. `CAUSE_PR_MERGED` -> `mark_done`, which frees
+        # the stale assignment slot). Promoting it to
+        # `CAUSE_AFTER_PREREQS_LANDED` instead would relabel it into a
+        # blunt remove+re-add, losing the dispatch that cause exists to
+        # trigger — exactly the failure mode `_reclassify_stale_latch`
+        # excludes `CAUSE_MERGE_CONFLICT` for.
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="done", last_reason="")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        row = self._row(cause=cause, confidence=queue_diagnose.CONFIDENCE_HIGH)
+        reclassified = _reclassify_after_prereqs_landed(
+            [row], entries_by_key, board=_dispatched_board(),
+        )
+
+        assert reclassified[0].cause == cause
+
     def test_leaves_a_stale_episode_row_alone(self) -> None:
         # `fresh=False` — a reconstructed episode diagnosis — must never be
         # promoted: the live entry could have changed shape since whatever
@@ -3462,15 +3510,78 @@ class TestRequeueAfterPrereqsLanded:
         calls: list[tuple] = []
         monkeypatch.setattr(
             board_doctor_policy,
-            "dispatch_sweep_action",
-            lambda action, repo_name, issue_number: (
-                calls.append((action, repo_name, issue_number))
-                or {"requeued": True, "detail": "requeued"}
+            "dispatch_investigator_action",
+            lambda action, repo_name, issue_number, board, **kwargs: (
+                calls.append((action, repo_name, issue_number, kwargs.get("actor")))
+                or {"acted": True, "detail": "requeued"}
             ),
         )
 
         assert _requeue_after_prereqs_landed(self._row()) is True
-        assert calls == [("drive_queue_requeue", "acme/widgets", 40)]
+        assert calls == [("requeue", "acme/widgets", 40, "sweep")]
+
+    def test_dispatches_through_the_audited_investigator_requeue_verb(
+        self, monkeypatch,
+    ) -> None:
+        # #3901 review: the sweep's own board mutation must be audited
+        # `actor="sweep"` (Expected #1) — the real `investigator_requeue`
+        # (never a mocked `dispatch_investigator_action`) is what writes
+        # that `coord.audit.record_audit` row, so this drives it for real
+        # and reads the audit log back, the same pattern
+        # `TestMechanicalRepairsAuditAsSweep` uses for the other three
+        # mechanical dispatchers.
+        from coord.audit import query_audit_log
+
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="done", last_reason="")
+        self._patch_live_reads(monkeypatch, entries=[entry, dep])
+        monkeypatch.setattr(
+            "coord.board_doctor_permissions.sweep_drive_queue_requeue",
+            lambda repo_name, issue_number: {
+                "requeued": True, "detail": "requeued",
+            },
+        )
+
+        assert _requeue_after_prereqs_landed(self._row()) is True
+
+        log = query_audit_log(
+            event_type="investigator_requeue", repo="acme/widgets", issue=40,
+        )
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
+
+    def test_refuses_when_the_board_shows_in_flight_work(self, monkeypatch) -> None:
+        # #3901 review: this cause's own precondition REQUIRES a dispatch
+        # (`after_prereqs_landed_for_entry` needs a non-empty
+        # `assignments_for_issue`), unlike the two other `drive_queue_
+        # requeue` callers — so unlike them, this one MUST refuse a row
+        # whose work assignment still reads `running`/`pending`, or it
+        # would yank the row out from under a leg actively using it.
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="done", last_reason="")
+        self._patch_live_reads(monkeypatch, entries=[entry, dep])
+        monkeypatch.setattr(
+            state,
+            "build_board",
+            lambda: Board(
+                active=[
+                    Assignment(
+                        machine_name="laptop", repo_name="acme/widgets",
+                        issue_number=40, issue_title="t", status="running",
+                        type="work", branch="issue-40-fix", assignment_id="w40",
+                    ),
+                ],
+            ),
+        )
+
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            "coord.board_doctor_permissions.sweep_drive_queue_requeue",
+            lambda *a, **k: calls.append(a) or {"requeued": True, "detail": "requeued"},
+        )
+
+        assert _requeue_after_prereqs_landed(self._row()) is False
+        assert calls == []
 
     def test_a_second_sweep_on_an_already_resumed_row_is_a_noop(self, monkeypatch) -> None:
         # Simulates the SAME row, re-read live, the tick after the first
@@ -3483,8 +3594,8 @@ class TestRequeueAfterPrereqsLanded:
         calls: list[tuple] = []
         monkeypatch.setattr(
             board_doctor_policy,
-            "dispatch_sweep_action",
-            lambda *a, **k: calls.append(a) or {"requeued": True},
+            "dispatch_investigator_action",
+            lambda *a, **k: calls.append(a) or {"acted": True, "detail": "requeued"},
         )
 
         assert _requeue_after_prereqs_landed(self._row()) is False
@@ -3500,8 +3611,8 @@ class TestRequeueAfterPrereqsLanded:
         calls: list[tuple] = []
         monkeypatch.setattr(
             board_doctor_policy,
-            "dispatch_sweep_action",
-            lambda *a, **k: calls.append(a) or {"requeued": True},
+            "dispatch_investigator_action",
+            lambda *a, **k: calls.append(a) or {"acted": True, "detail": "requeued"},
         )
 
         assert _requeue_after_prereqs_landed(self._row()) is False
@@ -3513,8 +3624,8 @@ class TestRequeueAfterPrereqsLanded:
         self._patch_live_reads(monkeypatch, entries=[entry, dep])
         monkeypatch.setattr(
             board_doctor_policy,
-            "dispatch_sweep_action",
-            lambda *a, **k: {"requeued": False, "detail": "no longer queued"},
+            "dispatch_investigator_action",
+            lambda *a, **k: {"acted": False, "detail": "no longer queued"},
         )
 
         assert _requeue_after_prereqs_landed(self._row()) is False
@@ -3606,4 +3717,58 @@ class TestSweepMarkDoneThenTickWritesMergedPartial:
 
         reconcile = next(r for r in plan.reconciles if r.key == "acme/widgets#80")
         assert reconcile.updates["state"] == STATE_MERGED_PARTIAL
-        assert reconcile.updates["state"] != STATE_DONE
+
+    def test_sweep_mark_done_dispatcher_then_a_tick_lands_merged_partial(
+        self, monkeypatch,
+    ) -> None:
+        # #3901 review: the test above confirms the #3863 tick self-heal in
+        # isolation; this one additionally confirms the SWEEP's own
+        # `mark_done` dispatcher (`_reconcile_merged_row`, which the issue's
+        # acceptance item actually names) reaches that same self-heal —
+        # never a bare `reconcile_board_merges` call this class's name
+        # otherwise implies was already covered.
+        from coord import github_ops
+        from coord.drive_queue import (
+            STATE_DONE,
+            STATE_MERGED_PARTIAL,
+            QueueEntry,
+            build_board_view,
+            plan_tick,
+        )
+
+        assignment = Assignment(
+            machine_name="laptop", repo_name="acme/widgets", issue_number=81,
+            issue_title="t", status="done", type="work", branch="issue-81-fix",
+            assignment_id="w81",
+            completion_summary=(
+                "All done.\n\nISSUE_RESOLUTION: partial — blocked on upstream\n"
+            ),
+        )
+        board = Board(completed=[assignment])
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: True)
+        monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        monkeypatch.setattr(state, "build_board", lambda: board)
+
+        row = _row("acme/widgets#81", queue_diagnose.CAUSE_PR_MERGED, queue="drive-queue")
+        assert _reconcile_merged_row(row) is True
+        assert board.completed[0].status == "merged"
+
+        payload = {
+            "assignments": [
+                {
+                    "repo_name": "acme/widgets",
+                    "issue_number": 81,
+                    "type": "work",
+                    "status": board.completed[0].status,
+                    "completion_summary": board.completed[0].completion_summary,
+                },
+            ],
+        }
+        board_view = build_board_view(payload)
+        entries = [QueueEntry(repo="acme/widgets", issue=81, position=1, state=STATE_DONE)]
+
+        plan = plan_tick(entries, board_view, capacity=1)
+
+        reconcile = next(r for r in plan.reconciles if r.key == "acme/widgets#81")
+        assert reconcile.updates["state"] == STATE_MERGED_PARTIAL
