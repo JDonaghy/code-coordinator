@@ -17,6 +17,7 @@ from coord.db import (
     _ensure_schema,
     override_connection,
     close,
+    _migrate_board_doctor_log_table,
     _migrate_gate_order,
     is_lock_contention_error,
     retry_on_locked,
@@ -1974,6 +1975,117 @@ class TestMigrateGateOrder:
         assert row is None
 
 
+# ── #3889: board-doctor log, JSON blob -> dedicated table ──────────────────
+
+
+class TestMigrateBoardDoctorLogTable:
+    """``_migrate_board_doctor_log_table`` moves every entry out of the old
+    single-``board_meta``-row JSON blob the board-doctor decision log used
+    to live in, into the dedicated ``board_doctor_log`` table — losslessly,
+    exactly once.
+    """
+
+    _ENTRIES = [
+        {
+            "sweep_id": "sweep-1", "queue": "drive-queue", "key": "acme/x#1",
+            "cause": "ci_red", "tier": "auto", "action": "auto-dispatch",
+            "count": 2, "escalated": False, "confidence": "high",
+            "evidence": ["cause=ci_red", "attempts=2"], "outcome": "progressed",
+            "recorded_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "sweep_id": "sweep-2", "queue": "merge-queue", "key": "acme/y#2",
+            "cause": "merge-conflict", "tier": "alert", "action": "alert",
+            "count": 5, "escalated": True, "confidence": "medium",
+            "evidence": [], "outcome": None,
+            "recorded_at": "2026-02-02T00:00:00+00:00",
+        },
+    ]
+
+    def _seed_blob(self, conn: sqlite3.Connection, entries: list[dict]) -> None:
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            ("board_doctor_log", json.dumps(entries)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    def test_every_entry_lands_in_the_table_losslessly(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        self._seed_blob(isolated_conn, self._ENTRIES)
+
+        migrated = _migrate_board_doctor_log_table(isolated_conn)
+        assert migrated == 2
+
+        rows = {
+            r["key"]: r
+            for r in isolated_conn.execute(
+                "SELECT * FROM board_doctor_log ORDER BY id"
+            ).fetchall()
+        }
+        first = rows["acme/x#1"]
+        assert first["sweep_id"] == "sweep-1"
+        assert first["queue"] == "drive-queue"
+        assert first["cause"] == "ci_red"
+        assert first["tier"] == "auto"
+        assert first["action"] == "auto-dispatch"
+        assert first["count"] == 2
+        assert first["escalated"] == 0
+        assert first["confidence"] == "high"
+        assert json.loads(first["evidence_json"]) == ["cause=ci_red", "attempts=2"]
+        assert first["outcome"] == "progressed"
+        assert first["recorded_at"] == "2026-01-01T00:00:00+00:00"
+
+        second = rows["acme/y#2"]
+        assert second["queue"] == "merge-queue"
+        assert second["escalated"] == 1
+        assert second["outcome"] is None
+
+    def test_old_blob_is_removed_after_migrating(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        self._seed_blob(isolated_conn, self._ENTRIES)
+        _migrate_board_doctor_log_table(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT value FROM board_meta WHERE key='board_doctor_log'"
+        ).fetchone()
+        assert row is None
+
+    def test_idempotent_second_call_migrates_nothing(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        self._seed_blob(isolated_conn, self._ENTRIES)
+        _migrate_board_doctor_log_table(isolated_conn)
+        assert _migrate_board_doctor_log_table(isolated_conn) == 0
+        count = isolated_conn.execute(
+            "SELECT COUNT(*) FROM board_doctor_log"
+        ).fetchone()[0]
+        assert count == 2
+
+    def test_no_blob_is_a_noop(self, isolated_conn: sqlite3.Connection) -> None:
+        assert _migrate_board_doctor_log_table(isolated_conn) == 0
+        count = isolated_conn.execute(
+            "SELECT COUNT(*) FROM board_doctor_log"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_corrupt_blob_is_dropped_without_raising(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        sql.upsert(
+            isolated_conn, "board_meta", ["key", "value"],
+            ("board_doctor_log", "not valid json"),
+            conflict_columns=["key"],
+        )
+        isolated_conn.commit()
+        assert _migrate_board_doctor_log_table(isolated_conn) == 0
+        row = isolated_conn.execute(
+            "SELECT value FROM board_meta WHERE key='board_doctor_log'"
+        ).fetchone()
+        assert row is None
+
+
 # ── #1663: stranded review verdicts ───────────────────────────────────────────
 
 
@@ -2512,7 +2624,16 @@ class TestUatStateAndReasonColumns:
 # `branch_head_sha` the CI-flaky/infra/unreadable rerun budgets were last
 # accrued against, so a new commit landing while CI is still red gets its
 # own fair rerun-once chance instead of inheriting an exhausted budget.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (25, 101)
+# #3889 bumped this to (26, 101): a new `board_doctor_log` TABLE (not a
+# column — `_MIGRATE_ADD_COLUMNS`'s length is unchanged at 101, so only the
+# version moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to
+# run once more on an existing database) — same shape as #3113's
+# `review_claims` / #3333's `smoke_claims` / #2468's `review_post_claims`
+# bumps above. Replaces the single `board_meta` JSON blob the board-doctor
+# decision log used to live in with a real table that has its own
+# age-based retention prune; `coord.db._migrate_board_doctor_log_table`
+# moves every existing blob entry across losslessly.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (26, 101)
 
 
 class TestMigrateAddColumnsVersionGuard:

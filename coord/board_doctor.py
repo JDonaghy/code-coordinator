@@ -1460,6 +1460,74 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     return rows
 
 
+def _board_doctor_human_resolutions() -> dict[str, list[float]]:
+    """``key`` -> every ``resolved_at`` timestamp this host's
+    :mod:`coord.block_log` records with ``human_acted=True`` for it (#3889).
+
+    Read ONCE per sweep (:func:`sweep`'s outcome-backfill section), not
+    once per pending decision — the block log can hold weeks of episodes
+    and every pending decision would otherwise re-parse it. Deliberately
+    reads the WHOLE log rather than filtering by a ``since`` cutoff at the
+    :func:`coord.block_log.read_events` layer: an episode's own ``enter``
+    record (needed to pair with its ``resolve`` and populate
+    ``resolved_at``) is almost always well before any cutoff worth passing
+    here, since the row was already stuck when the doctor's decision was
+    recorded — filtering it away would silently drop the very resolution
+    this exists to find.
+
+    Best-effort: an unreadable block log (missing file, corrupt line) reads
+    as "no evidence of human action anywhere" — this must never block a
+    sweep's outcome backfill, only decide which string an outcome gets.
+    """
+    try:
+        from coord.block_log import episodes, read_events  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        items = episodes(read_events())
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, list[float]] = {}
+    for item in items:
+        if not item.get("human_acted"):
+            continue
+        resolved_at = item.get("resolved_at")
+        if resolved_at is None:
+            continue
+        try:
+            out.setdefault(str(item.get("key") or ""), []).append(float(resolved_at))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _board_doctor_attributed_to_other(
+    human_resolutions: Mapping[str, Sequence[float]],
+    key: str,
+    since_ts: float | None,
+) -> bool:
+    """Did a human-attributed :mod:`coord.block_log` resolution for *key*
+    land at/after *since_ts* (#3889)?
+
+    *since_ts* is the PAST decision's own ``recorded_at`` — ``None`` (an
+    unparseable timestamp) reads as "no evidence either way" rather than
+    matching everything. This answers "did an OPERATOR action resolve the
+    row" (``remove``/``add``, ``log-intervention``, a Gate-A sign-off —
+    anything `human_acted` already recognises); it cannot distinguish that
+    from "the ordinary drive loop resolved it with no operator action", so
+    a row that simply retried its way out on its own, with no logged human
+    action, still reads as the doctor's own `"progressed"` credit — the
+    one case this signal cannot see is exactly the one #3875's wording
+    ("the normal drive loop moved it") also cannot be told apart from "the
+    doctor's own dispatched leg is what the normal drive loop was carrying
+    to completion," so crediting the doctor there is the defensible
+    default rather than a gap.
+    """
+    if since_ts is None:
+        return False
+    return any(ts >= since_ts for ts in human_resolutions.get(key, ()))
+
+
 def sweep(
     rows: Sequence[StuckRow],
     *,
@@ -1473,6 +1541,9 @@ def sweep(
     clear_absent_rows: bool = True,
     escalation_resolver: Callable[[str, str], None] | None = None,
     capacity_check: Callable[[StuckRow], bool] | None = None,
+    log_retention_days: float | None = None,
+    backoff_initial_hours: float | None = None,
+    backoff_cap_hours: float | None = None,
 ) -> SweepReport:
     """The pure harness core: classify-already-done rows in, decisions out.
 
@@ -1568,6 +1639,17 @@ def sweep(
     fallback, or an in-flight no-op never holds a slot it never used, so
     the next row in *rows* — not the same row again next sweep — is the
     one that gets the freed capacity.
+
+    *log_retention_days*/*backoff_initial_hours*/*backoff_cap_hours*
+    (#3889, #3875 asks B/C) default to ``None``, resolved below to
+    :mod:`coord.state`'s module constants — the fleet's live
+    ``coordinator.yml`` ``board_doctor:`` knobs when a caller threads them
+    through (:func:`run_sweep` does, every real sweep), otherwise today's
+    hardcoded defaults. *log_retention_days* governs
+    :func:`coord.state.prune_board_doctor_log`, run once at the end of this
+    sweep (never per-decision); the backoff hours govern
+    :func:`coord.state.board_doctor_alert_due`/
+    :func:`coord.state.mark_board_doctor_escalated`'s re-alert schedule.
     """
     moment = (now or _utcnow)()
     sweep_id = sweep_id or f"sweep-{moment.strftime('%Y%m%dT%H%M%SZ')}"
@@ -1577,6 +1659,17 @@ def sweep(
 
     from coord import state  # noqa: PLC0415 — deferred so dry-run callers need no DB.
 
+    backoff_initial_hours = (
+        backoff_initial_hours
+        if backoff_initial_hours is not None
+        else state.BOARD_DOCTOR_BACKOFF_INITIAL_HOURS
+    )
+    backoff_cap_hours = (
+        backoff_cap_hours
+        if backoff_cap_hours is not None
+        else state.BOARD_DOCTOR_BACKOFF_CAP_HOURS
+    )
+
     touched: set[tuple[str, str]] = set()
     # Outcome backfill: decisions from EARLIER sweeps still
     # waiting on a verdict, read once up front so this sweep's own
@@ -1584,6 +1677,15 @@ def sweep(
     # below as rows are classified (`current_by_row`) and consumed after
     # the main loop and again inside the `clear_absent_rows` pass.
     pending_outcomes = state.pending_board_doctor_outcomes() if not dry_run else []
+    # #3889: evidence an operator action (or the ordinary drive loop, which
+    # this same `human_acted` signal does NOT distinguish from — see
+    # `_board_doctor_attributed_to_other`'s docstring) moved a row BEFORE
+    # this sweep's own confirmed action could have — read ONCE here rather
+    # than once per pending decision, same rationale as `pending_outcomes`
+    # above. Empty (and never read) when there is nothing pending.
+    human_resolutions = (
+        _board_doctor_human_resolutions() if pending_outcomes else {}
+    )
     current_by_row: dict[tuple[str, str], dict] = {}
 
     def _alert_action(row: StuckRow) -> tuple[bool, str]:
@@ -1607,7 +1709,11 @@ def sweep(
             return False, "alert-skipped"
         if not outcome:
             return False, "alert-failed"
-        state.mark_board_doctor_escalated(row.queue, row.key, now=moment)
+        state.mark_board_doctor_escalated(
+            row.queue, row.key, now=moment,
+            backoff_initial_hours=backoff_initial_hours,
+            backoff_cap_hours=backoff_cap_hours,
+        )
         return True, "alert"
 
     for row in rows:
@@ -1689,9 +1795,14 @@ def sweep(
             continue
         if dry_run:
             prior = state.board_doctor_row_state(row.queue, row.key) or None
-            counter_state = state.next_board_doctor_counter(prior, row.cause)
+            counter_state = state.next_board_doctor_counter(
+                prior, row.cause, backoff_initial_hours=backoff_initial_hours,
+            )
         else:
-            counter_state = state.record_board_doctor_observation(row.queue, row.key, row.cause)
+            counter_state = state.record_board_doctor_observation(
+                row.queue, row.key, row.cause,
+                backoff_initial_hours=backoff_initial_hours,
+            )
         count, escalated = counter_state["count"], counter_state["escalated"]
         # A row already escalated for this SAME cause is not
         # re-acted on forever — `board_doctor_alert_due` re-opens the
@@ -1699,7 +1810,9 @@ def sweep(
         # row keeps getting flagged (just less often over time) rather
         # than converging to permanent silence once its first alert
         # fires.
-        alert_due = not escalated or state.board_doctor_alert_due(counter_state, now=moment)
+        alert_due = not escalated or state.board_doctor_alert_due(
+            counter_state, now=moment, backoff_initial_hours=backoff_initial_hours,
+        )
 
         tier = tier_of(row.cause)
         action = "converged-noop"
@@ -1777,7 +1890,12 @@ def sweep(
             current = current_by_row.get(row_key)
             if current is None:
                 continue
-            outcome = state.evaluate_board_doctor_outcome(pending, current)
+            attributed_to_other = _board_doctor_attributed_to_other(
+                human_resolutions, row_key[1], state._board_doctor_decision_ts(pending),  # noqa: SLF001
+            )
+            outcome = state.evaluate_board_doctor_outcome(
+                pending, current, attributed_to_other=attributed_to_other,
+            )
             state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
 
     if not dry_run and clear_absent_rows:
@@ -1786,14 +1904,21 @@ def sweep(
                 state.clear_board_doctor_row(queue, key)
                 # The row dropped out of the stuck set entirely — resolved,
                 # which is unambiguous progress for any decision on it
-                # still waiting on a verdict.
+                # still waiting on a verdict, UNLESS #3889's attribution
+                # evidence says an operator action (or the ordinary drive
+                # loop) got there first.
                 for pending in pending_outcomes:
                     if (pending.get("queue"), pending.get("key")) == (
                         queue,
                         key,
                     ) and pending.get("sweep_id") is not None:
+                        attributed_to_other = _board_doctor_attributed_to_other(
+                            human_resolutions, key,
+                            state._board_doctor_decision_ts(pending),  # noqa: SLF001
+                        )
                         state.record_board_doctor_outcome(
-                            pending["sweep_id"], queue, key, "progressed"
+                            pending["sweep_id"], queue, key,
+                            "progressed_by_other" if attributed_to_other else "progressed",
                         )
                 if escalation_resolver is not None:
                     try:
@@ -1802,6 +1927,9 @@ def sweep(
                         # failing must not abort the walk and leave the
                         # remaining tracked rows' counters uncleared.
                         pass
+
+    if not dry_run:
+        state.prune_board_doctor_log(retention_days=log_retention_days)
 
     return report
 
@@ -1831,6 +1959,13 @@ def run_sweep(
     :func:`default_investigate_capacity`, while "caller explicitly passed
     ``capacity_check=None``" disables capacity-gating entirely — a plain
     ``None`` default could not tell those two cases apart.
+
+    #3889: *config*'s ``board_doctor.log_retention_days`` /
+    ``backoff_initial_hours`` / ``backoff_cap_hours`` are read fresh HERE,
+    every call — this is the per-sweep production entry point, so a
+    ``coordinator.yml`` edit takes effect on the very next sweep with no
+    daemon restart, same posture as every other `coord.board_doctor_policy`
+    knob this module already reads live from *config*.
     """
     rows = collect_rows(config=config)
     resolved_capacity_check = (
@@ -1838,6 +1973,7 @@ def run_sweep(
         if capacity_check is _CAPACITY_CHECK_UNSET
         else capacity_check
     )
+    board_doctor_cfg = getattr(config, "board_doctor", None)
     return sweep(
         rows,
         tier_of=tier_of,
@@ -1847,6 +1983,9 @@ def run_sweep(
         convergence_limit=convergence_limit,
         escalation_resolver=escalation_resolver,
         capacity_check=resolved_capacity_check,
+        log_retention_days=getattr(board_doctor_cfg, "log_retention_days", None),
+        backoff_initial_hours=getattr(board_doctor_cfg, "backoff_initial_hours", None),
+        backoff_cap_hours=getattr(board_doctor_cfg, "backoff_cap_hours", None),
     )
 
 
