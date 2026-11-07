@@ -1470,6 +1470,70 @@ class TestSweepAttributesOutcomesHonestly:
         ]
         assert logged[0]["outcome"] == "progressed_by_other"
 
+    def test_an_override_human_required_before_the_next_sweep_is_progressed_by_other(
+        self,
+    ) -> None:
+        """`coord merge --override-human-required` releasing a latched
+        merge-queue row is the SAME operator intervention `remove`/
+        `add` already log (:func:`coord.commands.drive_queue.
+        _record_operator_release_entry`, which that command reuses with the
+        merge queue's own ``human_required`` in place of the drive queue's
+        ``blocked``/``parked``) — it must downgrade the verdict exactly
+        like those do, not leave the doctor crediting itself for a human's
+        override."""
+        from datetime import datetime, timezone
+
+        from coord.block_log import enter_event, operator_resolution_event, record
+        from coord.drive_queue import QueueEntry as _QE
+
+        key = "acme/widgets#306"
+        cause = "ci_red"
+        dispatch = _Recorder()
+        t0 = 1_800_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+        )
+        assert dispatch.count == 1
+
+        # An operator ran `coord merge --only --override-human-required`
+        # on the latched entry AFTER the decision above was recorded.
+        entry = _QE(
+            repo="acme/widgets", issue=306, state="human_required",
+            last_reason="gh pr merge ... not mergeable",
+        )
+        record(
+            [
+                enter_event(entry, state="human_required", reason="not mergeable",
+                             now=t0 - 10.0),
+                operator_resolution_event(
+                    entry, resolution="operator_override", now=t0 + 60.0,
+                ),
+            ]
+        )
+
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 120.0, tz=timezone.utc),
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "progressed_by_other"
+
 
 class TestDecisionLogRetentionAndFilters:
     """A durable, filterable log — trimmed by AGE rather than

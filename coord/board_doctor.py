@@ -1679,10 +1679,11 @@ def _board_doctor_other_resolutions() -> dict[str, list[float]]:
     Two kinds of evidence qualify, either one on its own:
 
     * ``human_acted=True`` — an operator ``remove``, an ``add`` that
-      requeued a stalled row (:func:`coord.commands.drive_queue.
-      _record_operator_release_entry`), a logged intervention, or a Gate-A
-      sign-off. All of these run through :mod:`coord.block_log`'s own
-      command surface and are already flagged there.
+      requeued a stalled row, or a ``coord merge --override-human-required``
+      that cleared a latched entry (all three via :func:`coord.commands.
+      drive_queue._record_operator_release_entry`), a logged intervention,
+      or a Gate-A sign-off. All of these run through :mod:`coord.block_log`'s
+      own command surface and are already flagged there.
     * ``resolution == "landed"`` — :mod:`coord.block_log`'s
       ``_LANDED_CAUSE``, which its own docstring already distinguishes from
       ``_AUTO_MERGED_CAUSE``: "the entry sat here and something ELSE

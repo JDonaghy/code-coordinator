@@ -2846,16 +2846,13 @@ BOARD_DOCTOR_OUTCOME_ACTIONS = frozenset({"auto-dispatch", "alert"})
 
 #: Outcomes :func:`evaluate_board_doctor_outcome` can return. Includes
 #: ``"progressed_by_other"`` (#3889) alongside the original three — a row
-#: that unstuck itself via an operator action (``remove``/``add``), a hand
-#: merge/unrelated branch landing, or the ordinary drive loop, not this
-#: doctor's own confirmed action, so crediting it as plain ``"progressed"``
-#: would let `coord drive-queue doctor-log --summary` take credit for a
-#: human's fix. The evidence for this (:mod:`coord.block_log`'s
-#: ``human_acted``/``resolution`` fields — see
-#: :func:`coord.board_doctor._board_doctor_other_resolutions`) does NOT yet
-#: cover ``coord merge --override-human-required``: that command logs
-#: nothing to the block log, so an override still reads as plain
-#: ``"progressed"`` today.
+#: that unstuck itself via an operator action (``remove``/``add``/``merge
+#: --override-human-required``), a hand merge/unrelated branch landing, or
+#: the ordinary drive loop, not this doctor's own confirmed action, so
+#: crediting it as plain ``"progressed"`` would let `coord drive-queue
+#: doctor-log --summary` take credit for a human's fix. The evidence for
+#: this is :mod:`coord.block_log`'s ``human_acted``/``resolution`` fields —
+#: see :func:`coord.board_doctor._board_doctor_other_resolutions`.
 BOARD_DOCTOR_OUTCOME_VALUES = frozenset(
     {"progressed", "progressed_by_other", "unchanged", "regressed"}
 )

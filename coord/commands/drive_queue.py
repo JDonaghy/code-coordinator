@@ -2146,19 +2146,32 @@ def _record_block_log(events: list[dict[str, Any]]) -> int:
     return block_log.record(events)
 
 
-def _record_operator_release_entry(entry: QueueEntry | None, *, resolution: str) -> None:
+def _record_operator_release_entry(
+    entry: QueueEntry | None,
+    *,
+    resolution: str,
+    latched_states: frozenset[str] = STALL_STATES,
+) -> None:
     """Log a stall a HUMAN just cleared, given the PRE-mutation entry.
 
     Shared tail of :func:`_record_operator_release` (``remove``, which only
     has a raw row) and ``coord drive-queue add`` (#3889 review — which
     already has a parsed :class:`~coord.drive_queue.QueueEntry` via
     ``entries_from_rows(list_drive_queue())``, so converting it to a row and
-    back would be pure overhead). An entry that was not ``blocked``/
-    ``parked`` logs nothing: re-adding a ``waiting``/``running`` entry is a
-    routine metadata edit, and counting it as an intervention would inflate
-    the one number #2235 wants to watch fall.
+    back would be pure overhead). An entry whose state is not in
+    *latched_states* logs nothing: re-adding a ``waiting``/``running`` entry
+    is a routine metadata edit, and counting it as an intervention would
+    inflate the one number #2235 wants to watch fall.
+
+    *latched_states* defaults to the drive-queue's own ``blocked``/
+    ``parked`` vocabulary (:data:`STALL_STATES`). ``coord merge
+    --override-human-required`` passes a merge-queue-shaped stand-in
+    :class:`~coord.drive_queue.QueueEntry` whose ``state`` is the merge
+    queue's own ``human_required`` — a different vocabulary this function
+    has no business hardcoding — so that caller supplies its own
+    single-member set instead.
     """
-    if entry is None or entry.state not in STALL_STATES:
+    if entry is None or entry.state not in latched_states:
         return
     from coord.block_log import operator_resolution_event  # noqa: PLC0415
 
