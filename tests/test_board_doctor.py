@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from coord import queue_diagnose, state
 from coord.board_doctor import (
     ALERT_SKIPPED,
@@ -33,8 +35,8 @@ from coord.board_doctor import (
     smoke_no_verdict_rows,
     sweep,
 )
-from coord.config import BoardDoctorConfig, Config
-from coord.drive_queue import IssueFacts, QueueEntry
+from coord.config import BoardDoctorConfig, Config, ConfigError, _parse_board_doctor
+from coord.drive_queue import BoardView, IssueFacts, QueueEntry
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Repo
 from coord.queue_diagnose import LiveState
 from coord.smoke import (
@@ -1336,6 +1338,27 @@ class TestNeverDispatchedRowReachesTheSweep:
         assert alert.count == 0
 
 
+class TestParseNoProgressMinutes:
+    """#3888 review: `no_progress_minutes` validates the same way its
+    sibling `followthrough_cap` already does — tested here since
+    `_parse_board_doctor` had no coverage of this branch at all."""
+
+    def test_default_is_sixty(self) -> None:
+        assert _parse_board_doctor(None).no_progress_minutes == 60
+
+    def test_custom_value_is_accepted(self) -> None:
+        cfg = _parse_board_doctor({"no_progress_minutes": 30})
+        assert cfg.no_progress_minutes == 30
+
+    def test_zero_is_rejected(self) -> None:
+        with pytest.raises(ConfigError):
+            _parse_board_doctor({"no_progress_minutes": 0})
+
+    def test_non_integer_is_rejected(self) -> None:
+        with pytest.raises(ConfigError):
+            _parse_board_doctor({"no_progress_minutes": "60"})
+
+
 class TestNoProgressRows:
     """#3888: classify every no-progress drive-queue row, not just the
     subset `block_log`'s episode walk and :func:`merge_queue_rows` already
@@ -1364,7 +1387,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1374,6 +1397,33 @@ class TestNoProgressRows:
         assert row.key == entry.key
         assert row.cause == queue_diagnose.CAUSE_PR_MERGED
         assert "running-no-session-no-activity" in row.evidence[-1]
+
+    def test_foreign_running_row_is_not_classified_dead(self) -> None:
+        # #3888 review: a `running` row launched on another host must never
+        # be judged dead off this (local) tmux read alone — the quadraui
+        # cross-host shape the blocking review finding named.
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2039,
+            state="running",
+            launch_host="otherhost",
+            launched_at=0.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+            local_host="thishost",
+        )
+
+        assert rows == []
+        assert probe.calls == []
 
     def test_blocked_row_with_no_episode_is_classified_unknown_and_alerts(self) -> None:
         # quadraui#2035 shape: no probe evidence at all survives to explain
@@ -1391,7 +1441,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1402,6 +1452,10 @@ class TestNoProgressRows:
         assert row.cause == queue_diagnose.CAUSE_UNKNOWN
         assert row.confidence == queue_diagnose.CONFIDENCE_NONE
         assert "pre-req acme/widgets#2000 is queued but blocked" in row.evidence[-1]
+        # #3888 review nit: a `blocked` row's evidence must not claim no
+        # episode exists at all — one may well exist, just dropped for a
+        # stored `unknown` cause.
+        assert "dropped" in row.evidence[-1]
 
     def test_waiting_with_prereqs_landed_and_free_slot_is_classified(self) -> None:
         # quadraui#2047 shape.
@@ -1418,7 +1472,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(issue_state="closed"),  # noqa: ARG005
+            board_view=BoardView(issues={"acme/widgets#2000": IssueFacts(issue_state="closed")}),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1429,11 +1483,43 @@ class TestNoProgressRows:
         assert row.cause == queue_diagnose.CAUSE_UNKNOWN
         assert "waiting-ready-not-launched" in row.evidence[-1]
 
+    def test_waiting_with_prereq_done_in_queue_but_not_yet_landed_on_board(self) -> None:
+        # #3888 review (non-blocking): `_resolve_prereqs` itself (#2715)
+        # treats a dep as satisfied on EITHER `facts.landed` OR the dep's
+        # own drive-queue row already reading `STATE_DONE_LIKE` — the
+        # `issues` cache backing `landed` can run minutes behind a merge
+        # the queue performed itself. This dep's row is `done`, not yet
+        # reflected as `landed` on the board.
+        from coord.drive_queue import STATE_DONE
+
+        dep = QueueEntry(repo="acme/widgets", issue=2000, state=STATE_DONE)
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2047,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({"acme/widgets#2047": LiveState()})
+
+        rows = no_progress_rows(
+            [dep, entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert {row.key for row in rows} == {entry.key}
+
     def test_all_three_2026_11_05_shapes_reach_one_sweep_output(self) -> None:
         # Three different repos — each shape's own fixture is independently
         # the ONLY row that could occupy its own repo's capacity, so a
         # free-slot check on one shape can never accidentally exclude
-        # another.
+        # another. See `test_same_repo_2026_11_05_shapes_reach_one_sweep_
+        # output` below for the actual incident shape, all in one repo.
         running = QueueEntry(
             repo="acme/widgets",
             issue=2038,
@@ -1467,7 +1553,66 @@ class TestNoProgressRows:
             [running, blocked, waiting],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(issue_state="closed"),  # noqa: ARG005
+            board_view=BoardView(issues={"acme/gadgets#2000": IssueFacts(issue_state="closed")}),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert {row.key for row in rows} == {running.key, blocked.key, waiting.key}
+
+    def test_same_repo_2026_11_05_shapes_reach_one_sweep_output(self) -> None:
+        # #3888 review blocking finding: the real 2026-11-05 incident put
+        # all three rows in ONE repo (`DEFAULT_MAX_PARALLEL_PER_REPO == 1`),
+        # with the `running` row itself the phantom quadraui#2038 shape (PR
+        # merged by hand). A raw `state == running` occupancy count would
+        # keep counting that phantom row as occupying the repo's only slot
+        # forever, permanently excluding the `waiting` row from
+        # classification — reproducing the incident rather than replaying
+        # it as a fixed regression test. Taking occupancy from
+        # `compute_running_occupancy` (the scheduler's own verdict) instead
+        # sees `facts.landed` on the phantom row and frees the slot.
+        running = QueueEntry(
+            repo="acme/widgets",
+            issue=2038,
+            state="running",
+            session_name="drive-acme-widgets-2038",
+            launched_at=0.0,
+        )
+        blocked = QueueEntry(
+            repo="acme/widgets",
+            issue=2035,
+            state="blocked",
+            last_reason="pre-req acme/widgets#2000 is queued but blocked",
+            reason_at=0.0,
+        )
+        waiting = QueueEntry(
+            repo="acme/widgets",
+            issue=2047,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe(
+            {
+                "acme/widgets#2038": LiveState(pr_state="MERGED"),
+                "acme/widgets#2035": LiveState(),
+                "acme/widgets#2047": LiveState(),
+            }
+        )
+
+        rows = no_progress_rows(
+            [running, blocked, waiting],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(
+                issues={
+                    # The phantom `running` row's own key reads `landed`
+                    # (merged by hand) — this is what frees its repo slot.
+                    "acme/widgets#2038": IssueFacts(issue_state="closed"),
+                    "acme/widgets#2000": IssueFacts(issue_state="closed"),
+                }
+            ),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1483,7 +1628,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1500,7 +1645,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset({entry.key}),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1523,7 +1668,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(issue_state="open"),  # noqa: ARG005
+            board_view=BoardView(issues={"acme/widgets#2000": IssueFacts(issue_state="open")}),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1548,7 +1693,7 @@ class TestNoProgressRows:
             [running_entry, waiting_entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1571,7 +1716,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset({"drive-acme-widgets-2051"}),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1588,7 +1733,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(active_work=True),  # noqa: ARG005
+            board_view=BoardView(issues={entry.key: IssueFacts(active_work=True)}),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1605,7 +1750,7 @@ class TestNoProgressRows:
             [entry],
             covered_keys=frozenset(),
             live_sessions=frozenset(),
-            facts_of=lambda key: IssueFacts(),  # noqa: ARG005
+            board_view=BoardView(),
             probe=probe,
             config=self._config(),
             now=100_000.0,
@@ -1613,6 +1758,80 @@ class TestNoProgressRows:
 
         [row] = rows
         assert row.cause == queue_diagnose.CAUSE_UNKNOWN
+
+    def test_probe_budget_exhaustion_still_classifies_unknown_not_dropped(self) -> None:
+        # #3888 review nit: once the per-sweep probe cap is spent, a
+        # further matching row must still be returned (never silently
+        # dropped) — just unprobed, as `unknown`, for the next sweep to
+        # pick up.
+        from coord.board_doctor import _NO_PROGRESS_PROBE_CAP
+
+        entries = [
+            QueueEntry(
+                repo="acme/widgets", issue=3000 + i, state="blocked", reason_at=0.0,
+            )
+            for i in range(_NO_PROGRESS_PROBE_CAP + 1)
+        ]
+        probe = _FakeProbe(
+            {e.key: LiveState() for e in entries}
+        )
+
+        rows = no_progress_rows(
+            entries,
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert len(rows) == len(entries)
+        assert len(probe.calls) == _NO_PROGRESS_PROBE_CAP
+        unprobed = [row for row in rows if row.key not in probe.calls]
+        assert len(unprobed) == 1
+        assert unprobed[0].cause == queue_diagnose.CAUSE_UNKNOWN
+
+    def test_no_progress_blocked_row_is_reclassified_as_ceiling_blocked(self) -> None:
+        # #3888 review blocking finding: `collect_rows` must run the SAME
+        # #2972 fix-round-ceiling reclassifier over a no-progress row that
+        # it already runs over an episode-sourced row. This composes the
+        # two pure building blocks the way the fixed `collect_rows` now
+        # orders them, standing in for that (otherwise untestable, fully
+        # impure) wiring.
+        _seed_ceiling_blocked_entry("acme/widgets", 2972)
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2972,
+            state="blocked",
+            last_reason="giving up after 2 fix rounds (#2972)",
+            reason_at=0.0,
+        )
+        live = LiveState(
+            pr_number=1,
+            pr_state="OPEN",
+            mergeable=True,
+            checks=(queue_diagnose.CheckReading("test", "success"),),
+            gate_ready=True,
+            agent_reachable=True,
+        )
+        probe = _FakeProbe({"acme/widgets#2972": live})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+        [row] = rows
+        assert row.cause == queue_diagnose.CAUSE_NOTHING_BLOCKING
+        assert row.fresh is True
+
+        [reclassified] = _reclassify_ceiling_blocked(rows)
+        assert reclassified.cause == CAUSE_CEILING_BLOCKED_MERGEABLE
 
 
 class TestIntegrationRedClassification:

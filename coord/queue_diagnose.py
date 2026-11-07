@@ -80,6 +80,7 @@ __all__ = [
     "LiveProbe",
     "LiveState",
     "diagnose",
+    "is_foreign_launch",
     "needs_diagnosis",
     "run_pass",
     "stalled_keys",
@@ -807,6 +808,37 @@ def _row_reachable(row: Mapping[str, Any]) -> bool | None:
     return state == network.ONLINE
 
 
+def is_foreign_launch(entry: QueueEntry, local_host: str | None) -> bool:
+    """Was *entry* launched by a host whose tmux *local_host* cannot read?
+
+    #1870: a ``tmux list-sessions`` read is always LOCAL.  For an entry
+    launched on a DIFFERENT machine, "not in that set" means *"not mine to
+    see"*, not *"dead"* — treating it as dead would manufacture a
+    confidently-wrong verdict for a perfectly healthy remote session.
+    ``False`` (never foreign) whenever either side of the comparison is
+    unknown: *local_host* unset (the check disabled, same posture as
+    ``now=None`` disabling a grace window), or *entry* predates the
+    ``launch_host`` column / was hand-edited (degrades to the pre-#1870
+    behaviour exactly).
+
+    One answer, shared by every caller that needs this guard
+    (:meth:`GhLiveProbe._foreign`, :func:`coord.board_doctor._no_progress_
+    shape`) rather than each re-deriving it (#2096) — the #3888 review
+    finding that the board-doctor no-progress pass had grown a THIRD,
+    guardless copy of this exact question.
+    """
+    if not local_host or not entry.launch_host:
+        return False
+
+    # Short hostname, lowercased, domain suffix dropped — so a machine
+    # addressed as `dellserver` in the queue row and `dellserver.local` by
+    # DNS still compares equal to itself and does NOT read as foreign.
+    def short(name: str) -> str:
+        return name.split(".")[0].strip().lower()
+
+    return short(entry.launch_host) != short(local_host)
+
+
 class LiveProbe(Protocol):
     """Gathers :class:`LiveState` for one entry.  Read-only, by contract."""
 
@@ -1025,17 +1057,11 @@ class GhLiveProbe:
         ``_rule_dead_leg`` would manufacture a high-confidence ``dead-leg``
         for a perfectly healthy remote session.  Leave ``agent_has_session``
         at ``None`` instead, which disables the rule.
-        """
-        if not self.local_host or not entry.launch_host:
-            return False
-        # Same normalisation `_local_host_id()` documents: short hostname,
-        # lowercased, domain suffix dropped — so a machine addressed as
-        # `dellserver` in the queue row and `dellserver.local` by DNS still
-        # compares equal to itself and does NOT read as foreign.
-        def short(name: str) -> str:
-            return name.split(".")[0].strip().lower()
 
-        return short(entry.launch_host) != short(self.local_host)
+        Delegates to :func:`is_foreign_launch`, the one place this question
+        is answered (#2096/#3888).
+        """
+        return is_foreign_launch(entry, self.local_host)
 
     def _health(
         self, entry: QueueEntry

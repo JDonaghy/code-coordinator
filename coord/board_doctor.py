@@ -946,21 +946,33 @@ _NO_PROGRESS_BLOCKED = "blocked"
 _NO_PROGRESS_WAITING_READY = "waiting-ready-not-launched"
 
 
-def _repo_running_counts(entries: Sequence[Any]) -> dict[str, int]:
-    """How many *entries* currently sit ``running``, keyed by repo (#3888).
+def _repo_running_counts(
+    entries: Sequence[Any], board_view: Any, *, now: float, local_host: str | None
+) -> dict[str, int]:
+    """Per-repo slot occupancy among *entries*' ``running`` rows (#3888).
 
-    A fact about the WHOLE queue, computed once per sweep and shared by
-    every entry's "is there a free repo slot" check below — never
-    recomputed per-row, so the answer cannot drift between two rows of the
-    same repo examined in the same pass.
+    Delegates to :func:`coord.drive_queue.compute_running_occupancy` — the
+    SAME "does this `running` row still occupy a slot?" verdict a real
+    launch tick asks (via ``_reconcile_running``) — rather than a second,
+    board-doctor-local count of raw ``state == running`` rows (#2096 "one
+    question, one answer").
+
+    That distinction is exactly the quadraui#2038 incident shape: a
+    `running` row whose PR was merged by hand reads ``state == running``
+    (the raw count's answer: occupied) but ``_reconcile_running`` sees
+    ``facts.landed`` and returns ``occupies=False`` — the slot is actually
+    free. A raw count would have kept a same-repo `waiting` row's "is there
+    room" check pinned at the ceiling forever, the #3888 review finding
+    that reproduced the 2026-11-05 incident. Using the scheduler's own
+    verdict here means a phantom `running` row no longer blocks the
+    `waiting`-ready classification for its own repo.
     """
-    from coord.drive_queue import STATE_RUNNING  # noqa: PLC0415
+    from coord.drive_queue import DEFAULT_MAX_ATTEMPTS, compute_running_occupancy  # noqa: PLC0415
 
-    counts: dict[str, int] = {}
-    for entry in entries:
-        if entry.state == STATE_RUNNING:
-            counts[entry.repo] = counts.get(entry.repo, 0) + 1
-    return counts
+    _occupied, repo_occupied = compute_running_occupancy(
+        entries, board_view, DEFAULT_MAX_ATTEMPTS, now=now, local_host=local_host
+    )
+    return repo_occupied
 
 
 def _repo_parallel_ceiling(repo_name: str, *, config) -> int:
@@ -996,17 +1008,24 @@ def _no_progress_shape(
     facts_of: Callable[[str], Any],
     repo_ceiling: Callable[[str], int],
     running_counts: Mapping[str, int],
+    dep_states: Mapping[str, str],
+    local_host: str | None,
 ) -> str | None:
     """Which of the #3888 no-progress shapes *entry* matches, or ``None``.
 
-    ``running``: no live tmux session (*live_sessions*, the same local read
-    :func:`collect_rows` already takes) AND no non-terminal work-like
-    assignment on the board (``facts_of(entry.key).active_work`` —
-    :attr:`coord.drive_queue.IssueFacts.active_work`, the one existing
-    "is there live work in flight" answer, never re-derived here) — the
-    quadraui#2038 shape: a row the queue still calls ``running`` whose real
-    work already finished (by hand or otherwise) with nobody telling the
-    queue.
+    ``running``: launched on *this* host — a foreign-launched row
+    (:func:`coord.queue_diagnose.is_foreign_launch`) is never judged dead
+    from here, same guard :meth:`coord.queue_diagnose.GhLiveProbe._foreign`
+    and :func:`coord.drive_queue._reconcile_running`'s own #1870 branch
+    already apply, because an absent LOCAL tmux session proves nothing
+    about a session another machine launched — AND no live tmux session
+    (*live_sessions*, the same local read :func:`collect_rows` already
+    takes) AND no non-terminal work-like assignment on the board
+    (``facts_of(entry.key).active_work`` — :attr:`coord.drive_queue.
+    IssueFacts.active_work`, the one existing "is there live work in
+    flight" answer, never re-derived here) — the quadraui#2038 shape: a row
+    the queue still calls ``running`` whose real work already finished (by
+    hand or otherwise) with nobody telling the queue.
 
     ``blocked``/``parked``: always a candidate — unlike the other two
     shapes this one needs no extra evidence to be WORTH a fresh look, since
@@ -1016,21 +1035,29 @@ def _no_progress_shape(
 
     ``waiting``: every ``after=`` pre-req reads ``landed`` off the SAME
     :attr:`coord.drive_queue.IssueFacts.landed` property `_resolve_prereqs`
-    itself consults (#2096 again), AND the repo has room under its own
-    ceiling right now. A ``waiting`` row failing either check is correctly
-    explained already (still waiting on a dep, or waiting its turn for
-    capacity) — this only flags the quadraui#2047 shape, a row the
-    scheduler should have launched by now and, for whatever reason, did
-    not.
+    itself consults (#2096 again) — OR, like `_resolve_prereqs` itself
+    (#2715), the dep's OWN drive-queue row already reading
+    :data:`coord.drive_queue.STATE_DONE_LIKE` in *dep_states*, since the
+    ``issues`` cache backing ``landed`` can run minutes behind a merge the
+    queue performed itself — AND the repo has room under its own ceiling
+    right now, per *running_counts* (the scheduler's own occupancy
+    verdict — see :func:`_repo_running_counts`). A ``waiting`` row failing
+    either check is correctly explained already (still waiting on a dep,
+    or waiting its turn for capacity) — this only flags the quadraui#2047
+    shape, a row the scheduler should have launched by now and, for
+    whatever reason, did not.
     """
     from coord.drive_queue import (  # noqa: PLC0415
         STATE_BLOCKED,
+        STATE_DONE_LIKE,
         STATE_PARKED,
         STATE_RUNNING,
         STATE_WAITING,
     )
 
     if entry.state == STATE_RUNNING:
+        if queue_diagnose.is_foreign_launch(entry, local_host):
+            return None
         if entry.session_name and entry.session_name in live_sessions:
             return None
         if facts_of(entry.key).active_work:
@@ -1039,7 +1066,10 @@ def _no_progress_shape(
     if entry.state in (STATE_BLOCKED, STATE_PARKED):
         return _NO_PROGRESS_BLOCKED
     if entry.state == STATE_WAITING:
-        if not all(facts_of(dep).landed for dep in entry.after):
+        if not all(
+            facts_of(dep).landed or dep_states.get(dep) in STATE_DONE_LIKE
+            for dep in entry.after
+        ):
             return None
         ceiling = repo_ceiling(entry.repo)
         if ceiling > 0 and running_counts.get(entry.repo, 0) >= ceiling:
@@ -1058,6 +1088,21 @@ def _no_progress_age_seconds(entry: Any, *, now: float) -> float | None:
     now" (the same rule :class:`coord.drive_queue.QueueEntry` documents for
     ``reason_at`` itself): the caller treats an unknown age as past the
     grace window rather than silently exempting it.
+
+    #3888 review: ``reason_at`` is re-stamped on every ``last_reason``
+    write, not only on a real state change (:class:`coord.drive_queue.
+    QueueEntry`'s own #2273 comment) — a ``blocked`` row whose per-tick
+    re-derived reason text wiggles (a gate listing different check names,
+    a shifting backoff suffix) keeps resetting this clock and can stay
+    under ``no_progress_minutes`` indefinitely, the exact "moving target"
+    defect #2273 already named and fixed for the RETRY backoff window by
+    switching that ONE caller onto its own dedicated, write-once stamp
+    (``QueueEntry.retry_backoff_at`` — never touched again until the next
+    death) instead of ``reason_at``. This pass is accepted to carry the
+    same risk for now rather than grow a fourth stamp: giving every
+    no-progress shape its own write-once anchor the way #2273 did for
+    retry backoff is a follow-up, not required for this issue's three
+    shapes to stop being silently invisible.
     """
     from coord.drive_queue import STATE_RUNNING  # noqa: PLC0415
 
@@ -1067,16 +1112,29 @@ def _no_progress_age_seconds(entry: Any, *, now: float) -> float | None:
     return max(0.0, now - stamp)
 
 
+#: #3888 review nit: unlike :func:`coord.queue_diagnose.needs_diagnosis`'s
+#: per-episode budget, this pass has no cap of its own — the first sweep
+#: after deploy could otherwise fan out one `gh` probe per legacy
+#: `blocked`/`parked` row all at once, the exact synchronized-poll shape
+#: #3536 already had to guard against elsewhere in this fleet. A row that
+#: matches a shape but loses the race for this budget is still returned
+#: (never silently dropped, #3888's whole point) — just as `unknown`, with
+#: evidence saying so, so the NEXT sweep (which re-derives this budget from
+#: scratch) gets first claim on probing it.
+_NO_PROGRESS_PROBE_CAP = 25
+
+
 def no_progress_rows(
     entries: Sequence[Any],
     *,
     covered_keys: Collection[str],
     live_sessions: Collection[str],
-    facts_of: Callable[[str], Any],
+    board_view: Any,
     probe: queue_diagnose.LiveProbe,
     config,
     trigger: str = "board-doctor-sweep",
     now: float | None = None,
+    local_host: str | None = None,
 ) -> list[StuckRow]:
     """Classify every drive-queue row #3888 says the episode walk misses.
 
@@ -1094,16 +1152,24 @@ def no_progress_rows(
     ``config.board_doctor.no_progress_minutes`` (#2096: one threshold, read
     from one place).
 
+    *board_view* is the same :class:`coord.drive_queue.BoardView`
+    :func:`collect_rows` already builds for its own probe — its
+    ``.facts(key)`` is this pass's ONLY "is this issue landed / is there
+    live work" reading, and (#3888 review) it is also handed to
+    :func:`coord.drive_queue.compute_running_occupancy` to answer "is
+    there a free repo slot" with the scheduler's own verdict rather than a
+    second count (see :func:`_repo_running_counts`). *local_host* gates the
+    `running` shape the same way :func:`coord.queue_diagnose.
+    is_foreign_launch` gates every other liveness call in this fleet: a
+    row launched on a different host is never judged dead from an absent
+    LOCAL tmux session.
+
     A matching, aged-out row is diagnosed through the SAME `probe` +
     :func:`queue_diagnose.diagnose` pair every other fresh row in this
     module uses — never a second classifier — so a row that DOES still have
     live PR/CI evidence gets a real cause, and only a genuinely thin picture
-    falls through to :data:`queue_diagnose.CAUSE_UNKNOWN`. Unlike
-    :func:`coord.queue_diagnose.needs_diagnosis`'s per-episode budget, there
-    is no cap here: this sweep's own cadence (hourly-ish, not the 30s
-    notifier tick) is the rate limit, the same trade :func:`_refresh_
-    ceiling_blocked_settled_rows` already makes for its own out-of-band
-    probe.
+    falls through to :data:`queue_diagnose.CAUSE_UNKNOWN`. Bounded by
+    :data:`_NO_PROGRESS_PROBE_CAP` probes per call — see its own docstring.
 
     `unknown` is returned as an ordinary :class:`StuckRow`, never dropped —
     the #3888 fix for :func:`_episode_stuck_row`'s silent abstention-skip:
@@ -1114,7 +1180,11 @@ def no_progress_rows(
     """
     stamp = _utcnow().timestamp() if now is None else now
     threshold_seconds = config.board_doctor.no_progress_minutes * 60
-    running_counts = _repo_running_counts(entries)
+    facts_of = board_view.facts
+    dep_states = {entry.key: entry.state for entry in entries}
+    running_counts = _repo_running_counts(
+        entries, board_view, now=stamp, local_host=local_host
+    )
     ceilings: dict[str, int] = {}
 
     def repo_ceiling(repo_name: str) -> int:
@@ -1123,6 +1193,7 @@ def no_progress_rows(
         return ceilings[repo_name]
 
     rows: list[StuckRow] = []
+    probes_spent = 0
     for entry in entries:
         if entry.key in covered_keys:
             continue
@@ -1132,6 +1203,8 @@ def no_progress_rows(
             facts_of=facts_of,
             repo_ceiling=repo_ceiling,
             running_counts=running_counts,
+            dep_states=dep_states,
+            local_host=local_host,
         )
         if shape is None:
             continue
@@ -1139,33 +1212,64 @@ def no_progress_rows(
         if age is not None and age < threshold_seconds:
             continue
 
-        try:
-            live = probe.probe(entry)
-        except Exception:  # noqa: BLE001 — a probe failure must never crash the sweep
-            _log.debug(
-                "board-doctor: no-progress probe failed for %s", entry.key, exc_info=True
-            )
-            live = None
-
-        if live is not None:
-            diagnosis = queue_diagnose.diagnose(entry, live, trigger=trigger)
-            cause, confidence, extra_evidence = (
-                diagnosis.cause,
-                diagnosis.confidence,
-                diagnosis.evidence,
+        # #3888 review nit: an episode can exist for the `blocked`/`parked`
+        # shape and still have been dropped by `_episode_stuck_row` (its
+        # stored cause is still `CAUSE_UNKNOWN` — budget-exhausted or never
+        # diagnosed); the other two shapes genuinely carry no episode at
+        # all. Phrasing this one sentence per shape keeps the alert from
+        # pointing an operator at "no episode exists" when one does, just
+        # an unresolved one.
+        if shape == _NO_PROGRESS_BLOCKED:
+            coverage_note = (
+                "board_doctor: any block_log episode for this entry was "
+                "dropped (its stored cause is still unresolved) or none "
+                "was ever opened, and no merge-queue row covers it either"
             )
         else:
+            coverage_note = (
+                "board_doctor: no block_log episode or merge-queue row "
+                "covers this entry"
+            )
+
+        if probes_spent >= _NO_PROGRESS_PROBE_CAP:
             cause, confidence, extra_evidence = (
                 queue_diagnose.CAUSE_UNKNOWN,
                 queue_diagnose.CONFIDENCE_NONE,
-                (),
+                (
+                    f"board_doctor: this sweep's no-progress probe budget "
+                    f"({_NO_PROGRESS_PROBE_CAP}) is spent — unprobed this "
+                    "round, re-checked next sweep",
+                ),
             )
+        else:
+            probes_spent += 1
+            try:
+                live = probe.probe(entry)
+            except Exception:  # noqa: BLE001 — a probe failure must never crash the sweep
+                _log.debug(
+                    "board-doctor: no-progress probe failed for %s", entry.key, exc_info=True
+                )
+                live = None
+
+            if live is not None:
+                diagnosis = queue_diagnose.diagnose(entry, live, trigger=trigger)
+                cause, confidence, extra_evidence = (
+                    diagnosis.cause,
+                    diagnosis.confidence,
+                    diagnosis.evidence,
+                )
+            else:
+                cause, confidence, extra_evidence = (
+                    queue_diagnose.CAUSE_UNKNOWN,
+                    queue_diagnose.CONFIDENCE_NONE,
+                    (),
+                )
 
         evidence = extra_evidence + (
-            "board_doctor: no block_log episode or merge-queue row covers "
-            f"this entry, and it has made no progress for over "
-            f"{config.board_doctor.no_progress_minutes}m ({shape}); last "
-            f"queue reason: {entry.last_reason or '(none)'}",
+            f"{coverage_note}, and it has made no progress for over "
+            f"{config.board_doctor.no_progress_minutes}m ({shape}, "
+            f"queue-state={entry.state}); last queue reason: "
+            f"{entry.last_reason or '(none)'}",
         )
         rows.append(
             StuckRow(
@@ -1204,20 +1308,32 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     recorded before the PR actually merged) would otherwise park forever,
     since nothing else ever re-probes a concluded episode.
 
-    #3888 adds a THIRD pass after both: :func:`no_progress_rows` walks every
-    current *entries* row, including ones neither the episode walk nor
+    #3888 adds a THIRD pass, BEFORE the two reclassifiers below rather than
+    after them (review fix): :func:`no_progress_rows` walks every current
+    *entries* row, including ones neither the episode walk nor
     :func:`merge_queue_rows` ever looked at (a `running` row with no
     episode at all, a `waiting` row with nothing blocking it), and flags
     any that have sat with no progress past ``no_progress_minutes`` —
     classified through the same probe, or `unknown` when nothing fits, but
-    never silently dropped.
+    never silently dropped. Running it first means a no-progress row that
+    happens to diagnose to `nothing-blocking` or a checks-stale-race shape
+    gets exactly the same second look an episode-sourced row does — one row
+    shape, one answer, instead of two depending on which pass found it
+    first. ``covered_keys`` is taken from the FULL row list built so far
+    (both queues, not just drive-queue — :func:`merge_queue_rows` already
+    covers a drive-queue dependent's merge the moment it enters that
+    queue), so a row already explained by either walk is never
+    double-classified or double-alerted.
 
     Deferred imports, same reason ``drive_queue_diagnose`` defers them: this
     module is imported by the CLI's thin registration layer, and these
     pull in `gh`-touching modules this harness's own tests must not need.
     """
     from coord import block_log  # noqa: PLC0415
-    from coord.commands.drive_queue import _fetch_board_view, _local_host_id  # noqa: PLC0415
+    from coord.commands.drive_queue import (  # noqa: PLC0415
+        _fetch_board_view_with_retry,
+        _local_host_id,
+    )
     from coord.drive import list_drive_sessions  # noqa: PLC0415
     from coord.drive_queue import entries_from_rows  # noqa: PLC0415
     from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
@@ -1244,12 +1360,13 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
         if row.get("session_name")
     )
     board = build_board()
+    local_host = _local_host_id()
     probe = queue_diagnose.GhLiveProbe(
         config=config,
         board=board,
         fleet_health=fleet_health,
         live_sessions=live_sessions,
-        local_host=_local_host_id(),
+        local_host=local_host,
     )
     triggers = {str(ep["key"]): trigger for ep in fresh_episodes if ep.get("key")}
     diagnoses = queue_diagnose.run_pass(
@@ -1261,24 +1378,21 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows = drive_queue_rows(diagnoses)
     rows.extend(refreshed_rows)
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
-    rows = _reclassify_ceiling_blocked(rows)
-    rows = _reclassify_checks_stale_race(rows, config=config)
     merge_entries = load_merge_queue()
     rows.extend(merge_queue_rows(merge_entries))
-    rows = _reclassify_stale_latch(rows, merge_entries, board=board, config=config)
-    rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
-    rows.extend(smoke_no_verdict_rows(board))
 
     # #3888: the episode/merge-queue walk above only ever covers a
     # `blocked`/`parked` transition or a merge-queue row — this is the
     # three-shape sweep over the whole queue that catches everything else.
     # A read failure here is advisory-only (the same posture
-    # `_fetch_board_view`'s own docstring documents for its *leg_counts*
-    # read): this pass is additive on top of an already-complete sweep, so
-    # losing it for one tick must never take the rest of the sweep down
-    # with it.
+    # `_fetch_board_view_with_retry`'s own docstring documents for its
+    # *leg_counts* read): this pass is additive on top of an already-
+    # complete sweep, so losing it for one tick must never take the rest
+    # of the sweep down with it. Run BEFORE the reclassifiers below (review
+    # fix) so a no-progress row gets the same second look any other fresh
+    # row does.
     try:
-        board_view = _fetch_board_view()
+        board_view = _fetch_board_view_with_retry()
     except Exception:  # noqa: BLE001 — see comment above
         _log.warning(
             "board-doctor: could not build a board view for the no-progress "
@@ -1287,18 +1401,25 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
             exc_info=True,
         )
     else:
-        covered_keys = frozenset(row.key for row in rows if row.queue == "drive-queue")
+        covered_keys = frozenset(row.key for row in rows)
         rows.extend(
             no_progress_rows(
                 entries,
                 covered_keys=covered_keys,
                 live_sessions=live_sessions,
-                facts_of=board_view.facts,
+                board_view=board_view,
                 probe=probe,
                 config=config,
                 trigger=trigger,
+                local_host=local_host,
             )
         )
+
+    rows = _reclassify_ceiling_blocked(rows)
+    rows = _reclassify_checks_stale_race(rows, config=config)
+    rows = _reclassify_stale_latch(rows, merge_entries, board=board, config=config)
+    rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
+    rows.extend(smoke_no_verdict_rows(board))
 
     blocked_streaks = {
         repo_name: streak
