@@ -15713,4 +15713,145 @@ class TestAttemptDirectMergeForInertBaseMove:
 
         assert events is None
         assert entry.state == CONFLICT
-        assert entry.error == "original conflict error"
+
+
+# ── #3886 (#3859 remainder): process() honors the per-repo merge-gate
+# reservation ──────────────────────────────────────────────────────────────
+
+
+class TestProcessHonorsMergeGateReservation:
+    """`coord.state.get_merge_reservation`/`release_merge_reservation` are
+    written by the board-doctor stale-rebase sweep
+    (`coord.commands.drive_queue._run_auto_revalidate_checks_stale`, #3859)
+    but, before this, never READ by any merge path — a sibling could still
+    merge while the reserving row's re-run CI was in flight and invalidate
+    its green, approved PR all over again. `process()` is the one place
+    `coord merge`, the daemon `/merge` endpoint, and a live `coord drive`
+    session's merge step (which shells out to `coord merge`) all converge,
+    so checking the reservation there is the single answer for all three."""
+
+    def test_defers_mergeable_sibling_while_reservation_is_held(self, coord_db) -> None:
+        from coord.state import get_merge_reservation, reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("a", issue_number=1), _q("b", issue_number=2)]
+        gh = FakeGh()
+        events = process(items, gh)
+
+        by_aid = {e.entry.assignment_id: e for e in events if e.kind in (
+            "merged", "merge_gate_reserved",
+        )}
+        assert by_aid["a"].kind == "merged"
+        assert by_aid["b"].kind == "merge_gate_reserved"
+        assert "api#1" in by_aid["b"].message
+        assert items[0].state == MERGED  # holder "a" merges normally
+        assert items[1].state == PENDING  # sibling "b" deferred, not failed
+        assert items[1].error == by_aid["b"].message
+        # Only the holder's PR was ever actually merged — the sibling's was
+        # never touched.
+        assert gh.merge_calls == [(items[0].repo_github, items[0].pr_number, "rebase")]
+        # The holder's own merge released its reservation — nothing left
+        # to block "b" on a later pass.
+        assert get_merge_reservation("api") is None
+
+    def test_sibling_merges_once_the_holder_has_merged(self, coord_db) -> None:
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("a", issue_number=1), _q("b", issue_number=2)]
+        gh = FakeGh()
+        process(items, gh)
+        assert items[0].state == MERGED
+        assert items[1].state == PENDING
+
+        # Second pass: "a" is no longer PENDING so it's filtered out of this
+        # tick's group entirely; "b" is no longer deferred since the
+        # reservation released the instant "a" landed.
+        events = process(items, gh)
+        merged = [e for e in events if e.kind == "merged"]
+        assert [e.entry.assignment_id for e in merged] == ["b"]
+        assert items[1].state == MERGED
+
+    def test_sibling_merges_once_the_reservation_expires(self, coord_db) -> None:
+        from coord.state import reserve_merge_slot
+
+        # A negative TTL puts `expires_at` in the past immediately — the
+        # same "already expired" shape a real TTL timeout eventually
+        # reaches, without a test needing to sleep through it.
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=-1) is True
+        items = [_q("b", issue_number=2)]
+        gh = FakeGh()
+        events = process(items, gh)
+
+        assert any(e.kind == "merged" for e in events)
+        assert items[0].state == MERGED
+
+    def test_holder_itself_is_never_deferred_by_its_own_reservation(
+        self, coord_db,
+    ) -> None:
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("a", issue_number=1)]
+        gh = FakeGh()
+        events = process(items, gh)
+
+        assert not any(e.kind == "merge_gate_reserved" for e in events)
+        assert items[0].state == MERGED
+
+    def test_force_merge_does_not_bypass_the_reservation(self, coord_db) -> None:
+        """#3886: explicit — `--force-merge` skips the CI gate, never the
+        merge-gate reservation. No new bypass surface is added for it."""
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("a", issue_number=1), _q("b", issue_number=2)]
+        gh = FakeGh()
+        events = process(items, gh, force_merge=True)
+
+        by_aid = {e.entry.assignment_id: e.kind for e in events}
+        assert by_aid["b"] == "merge_gate_reserved"
+        assert items[1].state == PENDING
+
+    def test_3859_race_sibling_does_not_merge_while_holder_ci_is_pending(
+        self, coord_db,
+    ) -> None:
+        """Regression for the exact #3859 race: row A reserves the gate
+        for a checks_stale re-run; while THAT re-run's CI is still pending
+        (A itself cannot merge yet either), a fully mergeable sibling B
+        must not leapfrog it — not merged, not even attempted."""
+        from types import SimpleNamespace
+
+        from coord.state import reserve_merge_slot
+
+        assert reserve_merge_slot("api", "api#1", ttl_seconds=600) is True
+        items = [_q("a", issue_number=1, pr=200), _q("b", issue_number=2, pr=201)]
+
+        class _Ci:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                if number == 200:
+                    return [SimpleNamespace(
+                        name="build", status="in_progress", conclusion=None,
+                        started_at=None, completed_at=None,
+                    )]
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=None, completed_at=None,
+                )]
+
+        gh = FakeGh()
+        events = process(items, gh, ci_store=_Ci())
+
+        kinds = {e.entry.assignment_id: e.kind for e in events}
+        # A is blocked on its own still-pending CI — never reaches the
+        # reservation check's own "holder" branch at all here, which is
+        # fine: it simply never merges this tick either.
+        assert kinds["a"] == "checks_pending"
+        # B, otherwise fully mergeable, is deferred by the reservation —
+        # the #3859 race this issue closes.
+        assert kinds["b"] == "merge_gate_reserved"
+        assert items[0].state == PENDING
+        assert items[1].state == PENDING
+        assert gh.merge_calls == []

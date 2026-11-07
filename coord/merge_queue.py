@@ -64,7 +64,9 @@ from coord.state import (
     baseline_red_streak,
     comment_on_issue,
     dismiss_drive_escalation,
+    get_merge_reservation,
     record_uat_verdict,
+    release_merge_reservation,
     upsert_issue_comment,
 )
 from coord.uat_checks import UatCheckResult, evaluate_uat_checks
@@ -8804,6 +8806,19 @@ def process(
         groups.setdefault((entry.repo_github, entry.target_branch), []).append(entry)
 
     _unset = object()
+    # #3886: a per-repo snapshot of `get_merge_reservation`, taken the FIRST
+    # time this call encounters that repo and reused for every entry after
+    # — never re-read live per entry. A live re-read would let the holder's
+    # OWN successful merge (which releases its reservation immediately
+    # below) un-defer a sibling sequenced right after it in this exact same
+    # `ordered` loop, inside this exact same call — exactly the shape the
+    # acceptance bar for #3886 rules out ("process() skips a mergeable
+    # sibling B … and merges A. After A merges … B merges on the next
+    # pass" — next PASS, i.e. the next call to `process()`, not later in
+    # this one). `_unset` (not `None`) marks "not yet fetched" so a repo
+    # with genuinely no reservation is cached too, rather than re-querying
+    # the DB for every one of its entries in a large group.
+    _reservation_snapshot: dict[str, dict | None | object] = {}
 
     for group in groups.values():
         # #1479-review: every entry in a group shares the same target_branch
@@ -9328,6 +9343,50 @@ def process(
         for entry in ordered:
             if entry.pr_number is None:
                 continue
+            # #3886 (#3859 remainder): the per-repo merge-gate reservation
+            # `coord.state.get_merge_reservation` tracks is honored here,
+            # the one place every merge path (`coord merge`, the daemon
+            # `/merge` endpoint, and a live `coord drive` session's merge
+            # step, which shells out to `coord merge`) converges — #3859
+            # itself only had the board-doctor stale-rebase sweep
+            # (`coord.commands.drive_queue._run_auto_revalidate_checks_
+            # stale`) READ the reservation it also writes; nothing on the
+            # actual merge path checked it, so a sibling could still merge
+            # while the reserving row's re-run CI was in flight and
+            # invalidate its green, approved PR all over again — the exact
+            # race #3859 was filed to close. The holder itself is
+            # unaffected (its own key matches `holder` below, so it falls
+            # straight through to its normal gates); only a DIFFERENT
+            # entry in the same repo defers, every tick, until the holder
+            # merges (released right after a successful merge below, but
+            # — see `_reservation_snapshot`'s comment — only as observed
+            # by the NEXT call to this function), stops being a live
+            # candidate (the board-doctor cleanup sweep already does
+            # this), or the reservation's own TTL expires
+            # (`get_merge_reservation`'s existing expiry rule — no new
+            # knob here). Deliberately NOT short-circuited by
+            # `force_merge`/`skip_review`/`skip_smoke` — #3886 is explicit
+            # that this is not a new bypass surface.
+            if entry.repo_name not in _reservation_snapshot:
+                _reservation_snapshot[entry.repo_name] = get_merge_reservation(
+                    entry.repo_name
+                )
+            reservation = _reservation_snapshot[entry.repo_name]
+            if reservation is not None:
+                holder = reservation.get("holder")
+                if holder != f"{entry.repo_name}#{entry.issue_number}":
+                    expires_at = reservation.get("expires_at")
+                    expires_str = (
+                        datetime.fromtimestamp(
+                            expires_at, tz=timezone.utc,
+                        ).isoformat(timespec="seconds")
+                        if isinstance(expires_at, (int, float))
+                        else "unknown"
+                    )
+                    msg = f"merge gate reserved for {holder} until {expires_str}"
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "merge_gate_reserved", msg))
+                    continue  # #292: skip this entry; try the next in the group
             # #821: populate branch_head_sha for the commit-bound approval
             # staleness check in has_approved_review.  Only when the board
             # is live (board=None blocks unconditionally; no SHA needed).
@@ -10362,6 +10421,15 @@ def process(
                     issue_resolution=issue_resolution,
                     issue_close_block_reason=issue_close_block_reason,
                 ))
+                # #3886: release this entry's own merge-gate reservation (if
+                # any) now that it has actually landed — `holder_key` scopes
+                # the release to a reservation held by THIS exact entry, so
+                # a merge that was never the holder (the common case: most
+                # repos never have an active reservation at all) is a cheap,
+                # harmless no-op rather than touching someone else's claim.
+                release_merge_reservation(
+                    entry.repo_name, f"{entry.repo_name}#{entry.issue_number}",
+                )
                 continue
             entry.state = CONFLICT
             entry.error = msg
