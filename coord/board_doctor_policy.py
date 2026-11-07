@@ -1787,19 +1787,22 @@ def _fixit_leg_in_flight_count(repo_name: str, board: "Board") -> int:
 
 
 def _at_fixit_leg_capacity(
-    repo_name: str, board: "Board", *, claimed: int = 0
+    repo_name: str, board: "Board", *, claimed: int = 0, budget: int | None = None
 ) -> bool:
     """Is *repo_name* at or over its OWN fix-it-leg budget?
 
     Unlike :func:`_at_repo_capacity` (still shared with the finisher tier,
     keyed off `max_parallel`), this is the investigate tier's dedicated
-    cap — :data:`FIXIT_LEG_BUDGET_DEFAULT`, never a repo's ordinary
-    concurrency ceiling. *claimed* is the caller's own additional
-    in-flight count not yet reflected in *board*, same meaning as
-    :func:`_at_repo_capacity`'s own *claimed* parameter.
+    cap — *budget* (:data:`FIXIT_LEG_BUDGET_DEFAULT` when ``None`` — the
+    fallback also used when ``coordinator.yml``'s
+    ``board_doctor.fixit_leg_budget`` is unset or unreadable), never a
+    repo's ordinary concurrency ceiling. *claimed* is the caller's own
+    additional in-flight count not yet reflected in *board*, same meaning
+    as :func:`_at_repo_capacity`'s own *claimed* parameter.
     """
+    resolved_budget = budget if budget is not None else FIXIT_LEG_BUDGET_DEFAULT
     in_flight = _fixit_leg_in_flight_count(repo_name, board) + claimed
-    return in_flight >= FIXIT_LEG_BUDGET_DEFAULT
+    return in_flight >= resolved_budget
 
 
 class InvestigateCapacityGate:
@@ -1837,11 +1840,17 @@ class InvestigateCapacityGate:
     def __init__(self, config: "Config") -> None:
         from coord.state import build_board  # noqa: PLC0415
 
-        # *config* is accepted (and `make_investigate_capacity_check` keeps
-        # taking it) so the factory signature stays stable for every
-        # existing call site even though this gate's own budget is now a
-        # fixed constant rather than anything read out of `coordinator.yml`.
+        # #3889 (#3875 ask B): *config*'s `board_doctor.fixit_leg_budget`
+        # is read HERE, once per sweep (`make_investigate_capacity_check`
+        # is called fresh every sweep) — the live knob when set,
+        # `FIXIT_LEG_BUDGET_DEFAULT` on any read failure (missing section,
+        # unloadable config) so a bad config never widens this budget
+        # silently.
         self._config = config
+        try:
+            self._fixit_leg_budget = int(config.board_doctor.fixit_leg_budget)
+        except Exception:  # noqa: BLE001 — fail closed to the known-safe default
+            self._fixit_leg_budget = FIXIT_LEG_BUDGET_DEFAULT
         self._board = build_board()
         self._claimed: dict[str, int] = {}
 
@@ -1870,6 +1879,7 @@ class InvestigateCapacityGate:
             repo_name,
             self._board,
             claimed=self._claimed.get(repo_name, 0),
+            budget=self._fixit_leg_budget,
         )
 
     def confirm_dispatch(self, row: StuckRow) -> None:
@@ -1949,7 +1959,7 @@ def _stuck_since_text(queue: str, key: str) -> str:
     matching = [e for e in entries if e.get("queue") == queue and e.get("key") == key]
     if not matching:
         return "since this sweep"
-    timestamps = [state._board_doctor_decision_ts(e) for e in matching]  # noqa: SLF001
+    timestamps = [state.board_doctor_decision_ts(e) for e in matching]
     timestamps = [t for t in timestamps if t is not None]
     if not timestamps:
         return "since this sweep"

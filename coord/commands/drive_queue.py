@@ -608,6 +608,16 @@ def drive_queue_add(
         no_acceptance=no_acceptance,
         plan_destructive=plan_destructive,
     )
+    # #2235 Phase 0 / #3889 review: re-queuing a `blocked`/`parked` row IS
+    # the same operator intervention `remove` already logs — the #2972
+    # "bump --max-fix-rounds and re-add" remedy, and the `remove && add`
+    # requeue both land here. `previous` is the PRE-mutation entry (read
+    # above, before `enqueue_drive_queue` overwrote its row), the same
+    # "read first or the state is gone" posture `remove` takes. Logs
+    # nothing for a fresh insert (`previous is None`) or a routine metadata
+    # edit on a `waiting`/`running` entry — see
+    # `_record_operator_release_entry`'s own guard.
+    _record_operator_release_entry(previous, resolution="operator_requeued")
     # #3395: apply the REVERSED edges rule 2 selected — writing to the
     # INCUMBENT entry's own row, now that this add's row exists to name as
     # its `--after`. Must run after the write above: it names `entry_key
@@ -2136,6 +2146,31 @@ def _record_block_log(events: list[dict[str, Any]]) -> int:
     return block_log.record(events)
 
 
+def _record_operator_release_entry(entry: QueueEntry | None, *, resolution: str) -> None:
+    """Log a stall a HUMAN just cleared, given the PRE-mutation entry.
+
+    Shared tail of :func:`_record_operator_release` (``remove``, which only
+    has a raw row) and ``coord drive-queue add`` (#3889 review — which
+    already has a parsed :class:`~coord.drive_queue.QueueEntry` via
+    ``entries_from_rows(list_drive_queue())``, so converting it to a row and
+    back would be pure overhead). An entry that was not ``blocked``/
+    ``parked`` logs nothing: re-adding a ``waiting``/``running`` entry is a
+    routine metadata edit, and counting it as an intervention would inflate
+    the one number #2235 wants to watch fall.
+    """
+    if entry is None or entry.state not in STALL_STATES:
+        return
+    from coord.block_log import operator_resolution_event  # noqa: PLC0415
+
+    _record_block_log(
+        [
+            operator_resolution_event(
+                entry, resolution=resolution, host=_local_host_id()
+            )
+        ]
+    )
+
+
 def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) -> None:
     """Log a stall a HUMAN just cleared, if the row was actually stalled.
 
@@ -2150,17 +2185,7 @@ def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) 
         entry = entries_from_rows([row])[0]
     except (IndexError, KeyError, TypeError, ValueError):  # pragma: no cover
         return
-    if entry.state not in STALL_STATES:
-        return
-    from coord.block_log import operator_resolution_event  # noqa: PLC0415
-
-    _record_block_log(
-        [
-            operator_resolution_event(
-                entry, resolution=resolution, host=_local_host_id()
-            )
-        ]
-    )
+    _record_operator_release_entry(entry, resolution=resolution)
 
 
 # ── log-intervention (#2540) ─────────────────────────────────────────────────
@@ -3529,18 +3554,25 @@ def _doctor_log_summary(
     against the same window's block-log episodes, so an operator can read
     "what has the doctor fixed" next to "what did a human still have to do."
 
-    ``rows_unstuck``/``rows_still_stuck`` count distinct ROWS (by ``key``),
-    not decision entries: a row stuck for the whole window logs one
-    ``unchanged`` decision per sweep, so counting entries would make
-    ``rows_still_stuck`` grow with the sweep cadence instead of the stuck
-    population. A row can carry mixed outcomes across the window (e.g.
-    `progressed` on one sweep, `unchanged` on a later one) — the LAST
-    outcome recorded for that key wins, since `board_doctor_decisions`
-    returns entries most-recent-last and "still stuck" should answer "is it
-    stuck now," not "was it ever." A key with neither `progressed` nor an
-    `unchanged`/`regressed` outcome in its last entry (e.g. still
-    `outcome: None`, awaiting a later sweep to fill it in) counts toward
-    neither bucket.
+    ``rows_unstuck``/``rows_still_stuck``/``rows_pending`` count distinct
+    ROWS (by ``key``), not decision entries: a row stuck for the whole
+    window logs one ``unchanged`` decision per sweep, so counting entries
+    would make ``rows_still_stuck`` grow with the sweep cadence instead of
+    the stuck population. Each key's MOST RECENT action-tracked entry
+    (``board_doctor_decisions`` returns oldest first) is the one that
+    decides its bucket — a row can carry mixed outcomes across the window
+    (e.g. `progressed` on one sweep, `unchanged` on a later one), and only
+    the latest one answers "is it stuck NOW," not "was it ever."
+
+    ``rows_unstuck`` counts only outcome ``"progressed"`` — the doctor's
+    OWN confirmed action is what moved the row (#3889:
+    `coord.state.evaluate_board_doctor_outcome`'s attribution rule).
+    ``"progressed_by_other"`` (an operator action, or the ordinary drive
+    loop, got there first) is counted separately in
+    ``rows_unstuck_by_other`` so this number never credits the doctor for
+    a human's fix. ``rows_pending`` (#3889) is the key's latest
+    action-tracked entry still carrying ``outcome: None`` — logged, but no
+    later sweep has re-observed the row yet to say whether it worked.
     """
     from coord import state  # noqa: PLC0415
     from coord.block_log import episodes, read_events  # noqa: PLC0415
@@ -3548,15 +3580,20 @@ def _doctor_log_summary(
     actions_taken = sum(
         1 for e in entries if e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
     )
-    last_outcome_by_key: dict[Any, str | None] = {}
+    last_entry_by_key: dict[Any, dict] = {}
     for e in entries:
-        outcome = e.get("outcome")
-        if outcome is not None:
-            last_outcome_by_key[e.get("key")] = outcome
+        if e.get("action") not in state.BOARD_DOCTOR_OUTCOME_ACTIONS:
+            continue
+        last_entry_by_key[e.get("key")] = e
+    last_outcome_by_key = {k: v.get("outcome") for k, v in last_entry_by_key.items()}
     rows_unstuck = sum(1 for outcome in last_outcome_by_key.values() if outcome == "progressed")
+    rows_unstuck_by_other = sum(
+        1 for outcome in last_outcome_by_key.values() if outcome == "progressed_by_other"
+    )
     rows_still_stuck = sum(
         1 for outcome in last_outcome_by_key.values() if outcome in ("unchanged", "regressed")
     )
+    rows_pending = sum(1 for outcome in last_outcome_by_key.values() if outcome is None)
     acted_keys = {
         e.get("key") for e in entries if e.get("action") in state.BOARD_DOCTOR_OUTCOME_ACTIONS
     }
@@ -3584,7 +3621,9 @@ def _doctor_log_summary(
     return {
         "actions_taken": actions_taken,
         "rows_unstuck": rows_unstuck,
+        "rows_unstuck_by_other": rows_unstuck_by_other,
         "rows_still_stuck": rows_still_stuck,
+        "rows_pending": rows_pending,
         "human_interventions_missed": len(missed),
         "human_interventions_missed_keys": missed,
     }
@@ -3624,19 +3663,26 @@ def drive_queue_doctor_log(
 ) -> None:
     """Read back `coord drive-queue sweep`'s durable decision/action log.
 
-    Replaces the old 500-entry ring buffer with a log kept for
-    `coord.state.BOARD_DOCTOR_LOG_RETENTION_DAYS` (default 90) and
-    outcome-tracked: every `auto-dispatch`/`alert` decision gets an
-    `outcome` ("progressed"/"unchanged"/"regressed") filled in once a
-    later sweep re-observes the same row, so this answers "did it work",
-    not just "what did the doctor try."
+    The log lives in its own `board_doctor_log` table (#3889 — a single
+    JSON blob before that), kept for `coordinator.yml`'s
+    `board_doctor.log_retention_days` (`coord.state.BOARD_DOCTOR_LOG_RETENTION_DAYS`,
+    default 90, when unset) and outcome-tracked: every `auto-dispatch`/
+    `alert` decision gets an `outcome` filled in once a later sweep
+    re-observes the same row — `"progressed"` (the doctor's own confirmed
+    action moved it), `"progressed_by_other"` (an operator action or the
+    ordinary drive loop got there first), `"unchanged"`, or `"regressed"`
+    — so this answers "did it work, and was it really the doctor", not
+    just "what did the doctor try."
 
-    `--summary` is the fleet-health number this was built to drive down
-    `rows_still_stuck` trending to zero and
+    `--summary` is the fleet-health number this was built to drive down:
+    `rows_still_stuck` trending to zero, `rows_pending` (logged, outcome
+    not yet evaluated) shrinking rather than growing unbounded, and
     `human_interventions_missed` — a block-log episode a human had to act
     on (`coord drive-queue block-log`'s own `human_acted`) that this same
     window's log never shows an `auto-dispatch`/`alert` against — staying
-    at zero both mean the doctor, not an operator, is doing the unsticking.
+    at zero. `rows_unstuck` only counts `"progressed"`;
+    `rows_unstuck_by_other` is reported separately so this number never
+    credits the doctor for a human's fix.
 
     Same `is_remote()` guard as `sweep`/`diagnose` — the decision log
     lives on the daemon host (unlike `block-log`, which reads a local
@@ -3668,7 +3714,9 @@ def drive_queue_doctor_log(
         click.echo(
             f"{summary['actions_taken']} action(s) taken in {_doctor_log_window_label(since)} — "
             f"{summary['rows_unstuck']} row(s) unstuck · "
-            f"{summary['rows_still_stuck']} still stuck"
+            f"{summary['rows_unstuck_by_other']} unstuck by other · "
+            f"{summary['rows_still_stuck']} still stuck · "
+            f"{summary['rows_pending']} pending"
         )
         if summary["human_interventions_missed"]:
             click.echo(
