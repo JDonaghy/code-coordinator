@@ -20,10 +20,13 @@ from coord.ci_fix import (
     MAX_CI_FIX_DISPATCHES,
     MAX_CI_FIX_NOOP_STREAK,
     CI_FIX_TITLE_PREFIX,
+    SEALED_STUCK_MARKER,
     build_ci_fix_briefing,
     dispatch_ci_fix,
     dispatch_was_noop,
     refund_noop_ci_fix,
+    sealed_stuck_from_last_fix,
+    sealed_stuck_paths_in_text,
 )
 from coord.ci_github import _extract_relevant_log_lines
 from coord.ci_store import CheckRun, CIFailureDetail, JobRun, JobStep
@@ -210,6 +213,18 @@ class TestBuildBriefingSealedPathGuard:
         assert "STUCK:" in briefing
         assert "tests/acceptance/" in briefing
         assert "do NOT attempt a fix" in briefing
+
+    def test_sealed_paths_demands_the_exact_parseable_marker(self) -> None:
+        """#3900: the briefing must ask for the SAME marker form
+        `sealed_stuck_paths_in_text` parses back out — a prose "name the
+        sealed file(s)" ask (pre-#3900) left nothing for the coordinator to
+        read back after the leg finishes."""
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+            sealed_paths=["tests/acceptance/"],
+        )
+        assert SEALED_STUCK_MARKER in briefing
+        assert f"{SEALED_STUCK_MARKER}tests/acceptance/test_x.py" in briefing
 
     def test_no_sealed_paths_kwarg_is_byte_identical_to_empty_default(self) -> None:
         without_kw = build_ci_fix_briefing(
@@ -521,6 +536,147 @@ class TestRefundNoopCiFix:
         refund_noop_ci_fix(entry)
 
         assert entry.ci_fix_noop_streak == 2
+
+
+class TestSealedStuckPathsInText:
+    """#3900: parsing the `coord:sealed=<path>[,<path>]` marker out of a
+    finished ci-fix leg's transcript — the exact form `build_ci_fix_briefing`
+    now asks for."""
+
+    def test_none_when_no_marker(self) -> None:
+        assert sealed_stuck_paths_in_text("STATUS: rebased, running tests") is None
+
+    def test_none_for_empty_or_none_text(self) -> None:
+        assert sealed_stuck_paths_in_text("") is None
+        assert sealed_stuck_paths_in_text(None) is None
+
+    def test_single_path(self) -> None:
+        text = (
+            "STATUS: reproduced the failure\n"
+            f"STUCK: {SEALED_STUCK_MARKER}tests/acceptance/test_x.py — "
+            "confined to a sealed path"
+        )
+        assert sealed_stuck_paths_in_text(text) == ("tests/acceptance/test_x.py",)
+
+    def test_multiple_comma_separated_paths(self) -> None:
+        text = (
+            f"STUCK: {SEALED_STUCK_MARKER}tests/acceptance/a.py,"
+            "tests/acceptance/b.py — both confined"
+        )
+        assert sealed_stuck_paths_in_text(text) == (
+            "tests/acceptance/a.py", "tests/acceptance/b.py",
+        )
+
+    def test_non_sealed_stuck_line_is_not_matched(self) -> None:
+        """Regression guard: an ordinary `STUCK:` with no sealed marker
+        must not be mistaken for a sealed-confined verdict."""
+        text = "STUCK: hit a flaky network timeout fetching dependencies"
+        assert sealed_stuck_paths_in_text(text) is None
+
+    def test_decodes_stream_json_log(self) -> None:
+        import json
+
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"STUCK: {SEALED_STUCK_MARKER}"
+                            "tests/acceptance/test_x.py — confined"
+                        ),
+                    },
+                ],
+            },
+        }
+        raw = json.dumps(event) + "\n"
+        assert sealed_stuck_paths_in_text(raw) == ("tests/acceptance/test_x.py",)
+
+
+class TestSealedStuckFromLastFix:
+    """#3900: `sealed_stuck_from_last_fix` finds the chain's latest
+    ci-fix leg and reads its transcript for the sealed verdict."""
+
+    def test_none_when_no_ci_fix_leg_in_chain(
+        self, two_machine_config: Config,
+    ) -> None:
+        board = Board()
+        board.completed.append(_work_assignment())
+        entry = _entry()
+        assert sealed_stuck_from_last_fix(entry, board, two_machine_config) is None
+
+    def test_finds_latest_ci_fix_leg_and_reads_its_verdict(
+        self, two_machine_config: Config,
+    ) -> None:
+        board = Board()
+        board.completed.append(_work_assignment())
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[ci-fix] Fix the thing",
+            assignment_id="ci-fix-1", status="done",
+            type="work", review_of_assignment_id="w1", branch="issue-1-fix",
+            dispatched_at=20.0,
+        ))
+        entry = _entry()
+
+        with patch(
+            "coord.ci_fix.detect_sealed_stuck",
+            return_value=("tests/acceptance/test_x.py",),
+        ) as detect:
+            result = sealed_stuck_from_last_fix(entry, board, two_machine_config)
+
+        assert result == ("tests/acceptance/test_x.py",)
+        detect.assert_called_once()
+        assert detect.call_args.kwargs["assignment_id"] == "ci-fix-1"
+        assert detect.call_args.kwargs["host"] == "server.tail"
+
+    def test_picks_the_most_recent_of_several_ci_fix_legs(
+        self, two_machine_config: Config,
+    ) -> None:
+        board = Board()
+        board.completed.append(_work_assignment())
+        board.completed.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[ci-fix] Fix the thing",
+            assignment_id="ci-fix-1", status="done",
+            type="work", review_of_assignment_id="w1", branch="issue-1-fix",
+            dispatched_at=10.0,
+        ))
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[ci-fix] Fix the thing",
+            assignment_id="ci-fix-2", status="done",
+            type="work", review_of_assignment_id="w1", branch="issue-1-fix",
+            dispatched_at=30.0,
+        ))
+        entry = _entry()
+
+        with patch(
+            "coord.ci_fix.detect_sealed_stuck", return_value=None,
+        ) as detect:
+            sealed_stuck_from_last_fix(entry, board, two_machine_config)
+
+        assert detect.call_args.kwargs["assignment_id"] == "ci-fix-2"
+
+    def test_none_when_detect_sealed_stuck_finds_no_marker(
+        self, two_machine_config: Config,
+    ) -> None:
+        board = Board()
+        board.completed.append(_work_assignment())
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[ci-fix] Fix the thing",
+            assignment_id="ci-fix-1", status="done",
+            type="work", review_of_assignment_id="w1", branch="issue-1-fix",
+            dispatched_at=20.0,
+        ))
+        entry = _entry()
+
+        with patch("coord.ci_fix.detect_sealed_stuck", return_value=None):
+            result = sealed_stuck_from_last_fix(entry, board, two_machine_config)
+
+        assert result is None
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
@@ -991,6 +1147,166 @@ class TestNoopCiFixRefund:
         out = capsys.readouterr().out
         assert "already in flight" in out
         assert f"#{entry.issue_number}" in out
+
+
+class TestSealedConfinedCiFixEscalation:
+    """#3900: a ci-fix leg that finished with no new commits AND a
+    `coord:sealed=...` verdict on its own `STUCK:` line must be latched
+    for a human with a design-decision reason — never refunded/retried
+    like an ordinary no-op — and a later `_dispatch_ci_fixes` pass over the
+    same (still-failing) entry must dispatch nothing."""
+
+    def _checks_failed_event(self, entry: QueuedMerge) -> MergeEvent:
+        return MergeEvent(entry, "checks_failed", entry.error or "")
+
+    def test_sealed_confined_noop_latches_human_required(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"  # unchanged — no commit pushed
+        events = [self._checks_failed_event(entry)]
+
+        with (
+            patch("coord.ci_fix.dispatch_ci_fix") as dispatch,
+            patch(
+                "coord.ci_fix.sealed_stuck_from_last_fix",
+                return_value=("tests/acceptance/test_x.py",),
+            ),
+        ):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        dispatch.assert_not_called()
+        assert entry.state == HUMAN_REQUIRED
+        assert "tests/acceptance/test_x.py" in (entry.error or "")
+        assert "design decision" in (entry.error or "")
+        # Never refunded/counted toward the noop streak — a sealed verdict
+        # is a terminal classification, not a bounded retry signal.
+        assert entry.ci_fix_noop_streak == 0
+
+    def test_sealed_confined_noop_is_echoed_with_the_file(
+        self, two_machine_config: Config, coord_db, capsys,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"
+        events = [self._checks_failed_event(entry)]
+
+        with (
+            patch("coord.ci_fix.dispatch_ci_fix"),
+            patch(
+                "coord.ci_fix.sealed_stuck_from_last_fix",
+                return_value=("tests/acceptance/test_x.py",),
+            ),
+        ):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        out = capsys.readouterr().out
+        assert "tests/acceptance/test_x.py" in out
+        assert "design decision" in out
+
+    def test_second_pass_dispatches_nothing_once_latched(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"
+        events = [self._checks_failed_event(entry)]
+
+        with (
+            patch("coord.ci_fix.dispatch_ci_fix") as dispatch,
+            patch(
+                "coord.ci_fix.sealed_stuck_from_last_fix",
+                return_value=("tests/acceptance/test_x.py",),
+            ),
+        ):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        dispatch.assert_not_called()
+        assert entry.state == HUMAN_REQUIRED
+
+    def test_non_sealed_noop_keeps_existing_refund_behaviour(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Regression guard: a plain no-op (no sealed marker found on the
+        finished leg's transcript) must still be refunded and retried, not
+        latched for a human — today's #3011 behaviour is unchanged."""
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"
+        events = [self._checks_failed_event(entry)]
+
+        with (
+            patch("coord.ci_fix.dispatch_ci_fix") as dispatch,
+            patch(
+                "coord.ci_fix.sealed_stuck_from_last_fix",
+                return_value=None,
+            ),
+        ):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        dispatch.assert_not_called()
+        assert entry.state == PENDING
+        assert entry.ci_fix_noop_streak == 1
+        assert entry.ci_fix_dispatches == 0
+
+    def test_sealed_confined_records_drive_escalation(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.state import get_drive_escalation, save_board
+
+        board = Board()
+        save_board(board)
+
+        entry = _entry()
+        entry.ci_fix_dispatches = 1
+        entry.ci_fix_head_sha = "abc123"
+        entry.branch_head_sha = "abc123"
+        events = [self._checks_failed_event(entry)]
+
+        with (
+            patch("coord.ci_fix.dispatch_ci_fix"),
+            patch(
+                "coord.ci_fix.sealed_stuck_from_last_fix",
+                return_value=("tests/acceptance/test_x.py",),
+            ),
+        ):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        escalation = get_drive_escalation(entry.repo_name, entry.issue_number)
+        assert escalation is not None
+        assert "tests/acceptance/test_x.py" in escalation["reason"]
+        assert "design decision" in escalation["reason"]
 
 
 # ── #3114: structured CI failure detail threaded into the ci-fix briefing ───
