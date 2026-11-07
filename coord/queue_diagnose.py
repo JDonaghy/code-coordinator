@@ -102,17 +102,19 @@ CAUSE_DEAD_LEG = "dead-leg"
 CAUSE_NO_PR = "no-pr"
 CAUSE_CI_RED = "ci-red"
 #: A `ci-red` row whose live checks are failing while the LATEST branch
-#: Test-gate verdict (`coord.gates`'s own "test" decision, keyed off the
-#: SAME assignment row — never re-derived here, #2096) already read
-#: `passed`/`skipped` on this branch alone. CI builds the PR's merge ref
-#: (branch + current base); the Test stage builds the branch. When the two
-#: disagree the failure is a property of the COMBINATION, not of this
-#: branch's own diff — quadraui#2028's shape, where a sibling PR that
-#: landed on the base while #2028 was in flight is what actually broke it,
-#: and three fix legs stayed green on the branch because none of them ever
-#: built the merged tree. Never confused with plain `ci-red`: that cause
+#: Test-gate DECISION (`coord.gates`'s own "test" `GateDecision` — its
+#: required/ok answer, not the raw `test_state` column, which can disagree
+#: with it on a #1479-stale verdict) already reads green (`passed`) on this
+#: branch alone. CI builds the PR's merge ref (branch + current base); the
+#: Test stage builds the branch. When the two disagree the failure is a
+#: property of the COMBINATION, not of this branch's own diff — a sibling
+#: PR landing on the base while this one is in flight is the shape that
+#: produces it, and a fix leg that never builds the merged tree stays green
+#: on the branch forever. Never confused with plain `ci-red`: that cause
 #: covers everything else, including a branch whose own Test verdict is
-#: ALSO red (the regression is real and local, not an integration gap).
+#: ALSO red (the regression is real and local, not an integration gap), or
+#: merely `skipped` (a structural claim about the diff's shape, never a
+#: claim the code behaved correctly at this SHA — see `_rule_integration_red`).
 CAUSE_INTEGRATION_RED = "integration-red"
 CAUSE_CI_PENDING = "ci-pending"
 CAUSE_GATE_BLOCKED = "gate-blocked"
@@ -236,15 +238,21 @@ class LiveState:
     #: Probes that raised.  Non-empty means the picture is partial, and every
     #: verdict below high confidence is downgraded accordingly.
     probe_errors: tuple[str, ...] = ()
-    #: #3882: the LATEST terminal Test-gate verdict for this issue's own
-    #: branch — read off ``coord gates``'s own "test" decision
-    #: (:func:`coord.gates.build_gate_report`), never re-derived from a
-    #: second board read (#2096, one question one answer). ``"passed"`` |
-    #: ``"failed"`` | ``"skipped"`` | ``None``. ``None`` covers every case
-    #: that is NOT a confirmed green/red reading: the read failed, no Test
-    #: gate applies to this issue at all, or no smoke verdict has been
-    #: recorded yet — never collapsed into either verdict, same posture as
-    #: every other optional field on this class.
+    #: The LATEST Test-gate DECISION for this issue's own branch — read off
+    #: ``coord gates``'s own "test" :class:`~coord.gates.GateDecision`
+    #: (:func:`coord.gates.build_gate_report`), never off the raw
+    #: ``test_state`` column directly. ``"passed"`` | ``"skipped"`` only
+    #: when the decision itself reads ``ok`` (genuinely satisfied, or not
+    #: required at all); ``"failed"`` whenever the decision is ``required``
+    #: and NOT ``ok`` — including a #1479-STALE refusal, where the raw
+    #: ``test_state`` column can still read ``"passed"`` even though
+    #: ``coord merge`` is actively refusing this exact branch right now.
+    #: Trusting the raw column there would misreport a refusing gate as
+    #: green. ``None`` covers every case that is NOT a confirmed decision
+    #: either way: the read failed, no Test gate applies to this issue at
+    #: all, or no smoke verdict has ever been recorded — never collapsed
+    #: into either verdict, same posture as every other optional field on
+    #: this class.
     branch_test_state: str | None = None
     #: ``True`` only when ``coord gates``'s own board read
     #: (:func:`coord.gates.build_gate_report`) completed WITHOUT raising and
@@ -319,6 +327,16 @@ def _gate_line(live: LiveState) -> str:
     return f"coord gates: blocked — {blockers}"
 
 
+def _branch_test_line(live: LiveState) -> str:
+    """Rendered unconditionally (never only inside `_rule_integration_red`'s
+    own decisive string) so an operator reading a `ci-red` diagnosis can see
+    what the branch's own Test-gate decision read — the one piece of
+    evidence that answers "why didn't this fire as `integration-red`"."""
+    if live.branch_test_state is None:
+        return "coord gates (test decision): not read, or no Test gate on this issue"
+    return f"coord gates (test decision): branch Test verdict reads {live.branch_test_state!r}"
+
+
 def _health_line(entry: QueueEntry, live: LiveState) -> str:
     machine = entry.machine or entry.launch_host or "unassigned"
     if live.agent_reachable is None:
@@ -344,7 +362,13 @@ def _evidence(entry: QueueEntry, live: LiveState) -> list[str]:
     probes that came back empty makes "we did not look" indistinguishable
     from "we looked and there was nothing".
     """
-    lines = [_pr_line(live), _checks_line(live), _gate_line(live), _health_line(entry, live)]
+    lines = [
+        _pr_line(live),
+        _checks_line(live),
+        _gate_line(live),
+        _branch_test_line(live),
+        _health_line(entry, live),
+    ]
     lines.extend(f"probe failed: {err}" for err in live.probe_errors)
     return lines
 
@@ -503,15 +527,26 @@ def _rule_no_pr(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | No
 
 
 def _rule_integration_red(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
-    """#3882: a live-failing check whose branch Test verdict is already
-    green is a property of the MERGE, not the branch — see
+    """A live-failing check whose branch Test verdict is already green is a
+    property of the MERGE, not the branch — see
     :data:`CAUSE_INTEGRATION_RED`'s docstring. Checked strictly BEFORE
     :func:`_rule_ci_red` in :data:`_RULES` so the more specific cause wins
     whenever both would otherwise match; a branch whose own Test verdict
     also read red falls through to plain ``ci-red`` unchanged.
+
+    Restricted to ``"passed"`` alone — deliberately excludes ``"skipped"``.
+    A skipped Test is a structural claim about the SHAPE of the diff
+    ("contract/fixture-only, nothing to smoke-test"), never a claim that
+    code behaved correctly at this SHA (see
+    ``coord.merge_queue.evaluate_smoke_verdict``'s own docstring), so there
+    is no confirmed green half to split the CI failure away from. Worse, a
+    ``baseline_red``-confirmed skip means the BASE is what's broken —
+    relabeling that ``integration-red`` would steer it away from
+    ``coord.board_doctor.CAUSE_BASELINE_RED``, the cause that actually
+    names it.
     """
     failing = live.failing_checks()
-    if not failing or live.branch_test_state not in ("passed", "skipped"):
+    if not failing or live.branch_test_state != "passed":
         return None
     names = ", ".join(sorted(c.name for c in failing)[:3])
     return (
@@ -845,27 +880,44 @@ class GhLiveProbe:
         # code path that is a genuine, successful "nothing was ever
         # dispatched" reading.
         no_assignment_ever = not report.rows
-        # #3882: the branch's own Test-gate verdict, read off `coord
-        # gates`'s UNFILTERED decisions (not the `required`-only list just
-        # below) — a repo with no Test gate configured at all leaves this
-        # `None` rather than reading as either "passed" or "failed", and
-        # `_rule_integration_red` only ever fires on an explicit
-        # passed/skipped reading, never on the absence of one. Keyed off
+        # The branch's own Test-gate DECISION — read off `coord gates`'s
+        # UNFILTERED decisions (not the `required`-only list just below) so
+        # a repo with no Test gate configured at all leaves this `None`
+        # rather than reading as either "passed" or "failed". Keyed off
         # `GateDecision.assignment_id` -> the matching `AssignmentGateRow`
-        # (coord/gates.py: `test_decision.assignment_id` is set whenever a
-        # smoke verdict was actually evaluated), never re-derived from a
-        # second board read — one question, one answer (#2096).
+        # (coord/gates.py: `test_decision.assignment_id` is set on BOTH the
+        # pass and the refusal path), never re-derived from a second board
+        # read — one question, one answer (#2096).
+        #
+        # The decision's own `required`/`ok` is read FIRST and is
+        # authoritative: `coord/gates.py` can refuse a verdict as
+        # #1479-STALE (the recorded SHA moved) while the raw `test_state`
+        # column still reads "passed" — exactly the shape a branch lands in
+        # right after its own push. Trusting the raw column in that case
+        # would read a refusing gate as green. The raw column is consulted
+        # only once the decision itself already says "ok", to tell
+        # "passed" apart from "skipped".
         branch_test_state: str | None = None
         test_decision = next(
-            (d for d in report.decisions if getattr(d, "gate", None) == "test"), None
+            (d for d in report.decisions if d.gate == "test"), None
         )
         if test_decision is not None and test_decision.assignment_id:
-            row = next(
-                (r for r in report.rows if r.assignment_id == test_decision.assignment_id),
-                None,
-            )
-            if row is not None:
-                branch_test_state = row.test_state
+            if test_decision.required and not test_decision.ok:
+                # Actively refusing right now (stale, missing, or a
+                # genuinely failing verdict) — never read as green no
+                # matter what the raw column says.
+                branch_test_state = "failed"
+            else:
+                row = next(
+                    (
+                        r
+                        for r in report.rows
+                        if r.assignment_id == test_decision.assignment_id
+                    ),
+                    None,
+                )
+                if row is not None:
+                    branch_test_state = row.test_state
         decisions = [d for d in report.decisions if getattr(d, "required", False)]
         if not decisions:
             return str(report.branch or ""), None, [], no_assignment_ever, branch_test_state

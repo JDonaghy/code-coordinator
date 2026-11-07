@@ -481,6 +481,80 @@ class TestInvestigate:
         # A started leg is not an alert-worthy outcome.
         assert state.list_drive_escalations() == []
 
+    @pytest.mark.parametrize(
+        "cause", [queue_diagnose.CAUSE_CI_RED, queue_diagnose.CAUSE_INTEGRATION_RED],
+    )
+    def test_ci_shaped_causes_carry_the_merge_ref_instruction(
+        self, monkeypatch, cause,
+    ) -> None:
+        """`_fixit_leg_briefing` (`coord.board_doctor_permissions`) has no
+        merge-ref/CI-excerpt section of its own the way
+        `coord.ci_fix.build_ci_fix_briefing` does — it only ever renders
+        *evidence* verbatim. So a dispatched `ci-red`/`integration-red`
+        fix-it leg must get the merge-the-base instruction THERE, or the
+        leg reproduces nothing but the branch, exactly the blind spot
+        this cause exists to close."""
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[],
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: config)
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
+        monkeypatch.setattr(
+            "coord.branch_model.resolve_base_branch_for_issue_number",
+            lambda *a, **k: "develop",
+        )
+
+        captured: dict = {}
+
+        def fake_dispatch(action, repo_name, issue_number, board, config, **kwargs):
+            captured["evidence"] = kwargs["evidence"]
+            return {
+                "dispatched": True, "assignment_id": "asn-1", "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        row = _row("acme/widgets#40", cause, evidence=("gh pr checks: failing — build",))
+
+        assert _investigate(row) is True
+        briefing_evidence = "\n".join(captured["evidence"])
+        assert "git fetch origin && git rebase origin/develop" in briefing_evidence
+        assert "merge ref" in briefing_evidence
+        # The diagnosis's own decisive line (the closest thing to a CI
+        # excerpt this tier has) is preserved, not replaced.
+        assert "gh pr checks: failing — build" in captured["evidence"]
+
+    def test_non_ci_shaped_cause_gets_no_merge_ref_instruction(
+        self, monkeypatch,
+    ) -> None:
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[],
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: config)
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
+
+        captured: dict = {}
+
+        def fake_dispatch(action, repo_name, issue_number, board, config, **kwargs):
+            captured["evidence"] = kwargs["evidence"]
+            return {
+                "dispatched": True, "assignment_id": "asn-1", "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        row = _row(
+            "acme/widgets#40", queue_diagnose.CAUSE_MERGE_CONFLICT,
+            evidence=("gh pr view: mergeable=NO",),
+        )
+
+        assert _investigate(row) is True
+        assert captured["evidence"] == ("gh pr view: mergeable=NO",)
+
     def test_leaves_an_in_flight_row_alone(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
         monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)

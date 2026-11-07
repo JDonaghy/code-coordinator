@@ -166,18 +166,19 @@ class TestBuildBriefing:
 
 
 class TestBuildBriefingMergesBaseFirst:
-    """#3882: GitHub Actions CI builds the PR's merge ref (this branch plus
-    the current base), never the branch alone — the briefing must instruct
-    the worker to reproduce exactly that tree before doing anything else,
-    or a fix leg can stay green on its own branch while CI stays red
-    (quadraui#2028)."""
+    """GitHub Actions CI builds the PR's merge ref (this branch plus the
+    current base), never the branch alone — the briefing must instruct the
+    worker to reproduce exactly that tree before doing anything else, via a
+    REBASE rather than a merge so the branch never picks up a merge commit
+    that would knock it off GitHub's rebase-merge path."""
 
-    def test_instructs_merging_the_target_branch_first(self) -> None:
+    def test_instructs_rebasing_onto_the_target_branch_first(self) -> None:
         briefing = build_ci_fix_briefing(
             entry=_entry(), checks_summary="x", attempt=1,
         )
-        assert "git fetch origin && git merge --no-edit origin/main" in briefing
+        assert "git fetch origin && git rebase origin/main" in briefing
         assert "merge ref" in briefing
+        assert "git merge" not in briefing
 
     def test_uses_this_entrys_own_target_branch(self) -> None:
         entry = _entry()

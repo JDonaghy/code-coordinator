@@ -1034,6 +1034,102 @@ def test_a_clean_board_read_with_zero_assignments_sets_no_assignment_ever(
     assert got.confidence == qd.CONFIDENCE_HIGH
 
 
+def _gate_row(**overrides):
+    from coord.gates import AssignmentGateRow
+
+    base = dict(
+        assignment_id="asn-1", type="work", status="done", branch="fix-branch",
+        machine_name="mac1", provider_name="claude", dispatched_at=0.0,
+        is_interactive=None, issue_number=99, for_issue_number=None,
+        test_state="passed", smoke_test=None, test_reason=None,
+        test_toolchain=None, test_confirmation=None, review_state=None,
+        review_verdict=None, review_of_assignment_id=None, verdict_source=None,
+        verdict_source_reason=None, mode="single",
+    )
+    base.update(overrides)
+    return AssignmentGateRow(**base)
+
+
+class TestBranchTestStateReadsTheGateDecisionNotTheRawColumn:
+    """#3882 review (blocking finding #1): `GhLiveProbe._gates` must read
+    `branch_test_state` off the Test gate's own DECISION
+    (`GateDecision.required`/`.ok`), never off the raw `test_state` column
+    directly — the two can disagree on a #1479-STALE verdict, where
+    `coord gates` is actively refusing (`anchor="branch"`, exactly the
+    shape a branch reads right after its own fix push) while the raw
+    column still says `"passed"`. These drive the REAL `GhLiveProbe._gates`
+    / `probe()` code via a monkeypatched `build_gate_report`, not a
+    hand-built `LiveState` — the shape `tests/test_block_log.py` already
+    uses for `no_assignment_ever` just above."""
+
+    @staticmethod
+    def _probe(monkeypatch, report) -> qd.GhLiveProbe:
+        monkeypatch.setattr("coord.gates.build_gate_report", lambda *a, **k: report)
+
+        class _RepoCfg:
+            github = "acme/widgets"
+
+        class _Config:
+            def repo(self, name):
+                return _RepoCfg()
+
+        return qd.GhLiveProbe(board=object(), config=_Config())
+
+    def test_a_stale_refusal_reads_failed_even_though_the_raw_column_says_passed(
+        self, monkeypatch,
+    ) -> None:
+        from coord.gates import GateDecision, GateReport
+
+        row = _gate_row(test_state="passed")
+        decision = GateDecision(
+            gate="test", required=True, ok=False, reason="stale",
+            anchor="branch", assignment_id="asn-1",
+        )
+        report = GateReport(
+            repo_name="acme/widgets", issue_number=99, branch="fix-branch",
+            rows=[row], decisions=[decision],
+        )
+        probe = self._probe(monkeypatch, report)
+        entry = stalled(20, "blocked: whatever", attempts=0)
+
+        errors: list[str] = []
+        _, _, _, _, branch_test_state = probe._gates(entry, errors)  # noqa: SLF001
+        assert branch_test_state == "failed"
+
+        state = probe.probe(entry)
+        assert state.branch_test_state == "failed"
+
+    def test_a_genuinely_green_decision_reads_the_raw_column(
+        self, monkeypatch,
+    ) -> None:
+        from coord.gates import GateDecision, GateReport
+
+        row = _gate_row(test_state="passed")
+        decision = GateDecision(gate="test", required=True, ok=True, assignment_id="asn-1")
+        report = GateReport(
+            repo_name="acme/widgets", issue_number=99, branch="fix-branch",
+            rows=[row], decisions=[decision],
+        )
+        probe = self._probe(monkeypatch, report)
+        entry = stalled(21, "blocked: whatever", attempts=0)
+
+        state = probe.probe(entry)
+        assert state.branch_test_state == "passed"
+
+    def test_no_test_gate_at_all_reads_none(self, monkeypatch) -> None:
+        from coord.gates import GateReport
+
+        report = GateReport(
+            repo_name="acme/widgets", issue_number=99, branch="fix-branch",
+            rows=[_gate_row()], decisions=[],
+        )
+        probe = self._probe(monkeypatch, report)
+        entry = stalled(22, "blocked: whatever", attempts=0)
+
+        state = probe.probe(entry)
+        assert state.branch_test_state is None
+
+
 def test_a_partial_picture_downgrades_a_medium_verdict_but_not_a_high_one():
     partial = {"probe_errors": ("coord gates: TimeoutError: 30s",)}
     medium = qd.diagnose(

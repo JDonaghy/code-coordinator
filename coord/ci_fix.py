@@ -34,7 +34,7 @@ naturally cannot merge again until it clears Test + Review + CI fresh.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -43,6 +43,9 @@ from coord.ci_store import CIFailureDetail
 from coord.config import Config
 from coord.merge_queue import QueuedMerge, _chain_work_ids
 from coord.models import Assignment, Board
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from collections.abc import Sequence
 
 _log = logging.getLogger(__name__)
 
@@ -277,23 +280,30 @@ def build_ci_fix_briefing(
         "",
     ]
 
-    # #3882: GitHub Actions CI builds the PR's MERGE REF (this branch plus
-    # the CURRENT target branch) — never this branch in isolation. A fix
-    # leg that skips merging the base in can stay green on its own branch
+    # GitHub Actions CI builds the PR's MERGE REF (this branch plus the
+    # CURRENT target branch) — never this branch in isolation. A fix leg
+    # that skips bringing the base in can stay green on its own branch
     # while CI stays red for a reason that only exists once the two are
-    # combined (quadraui#2028: a sibling PR that landed on the base while
-    # this one was in flight). So reproducing that exact tree is step 2,
-    # right after confirming the branch — not an optional/later step.
+    # combined (a sibling PR landing on the base while this one was in
+    # flight is the shape that produces it). So reproducing that exact
+    # tree is step 2, right after confirming the branch — not an
+    # optional/later step. A REBASE, not a merge: a merge commit on this
+    # branch would make it ineligible for a rebase-merge on GitHub
+    # (`coord.github_ops.branch_has_merge_commit`) and silently fall every
+    # ci-fix PR back to the squash-merge path; a rebase reproduces the
+    # identical merged tree without leaving one behind.
     steps: list[str] = [
         "You are already on this issue's existing branch — continue on "
         "it, do NOT start a fresh branch.",
-        "Before anything else, run `git fetch origin && git merge "
-        f"--no-edit origin/{entry.target_branch}` — even if it reports "
-        '"Already up to date". GitHub Actions CI built the PR\'s merge '
-        f"ref (this branch plus the current `{entry.target_branch}`), not "
-        "this branch alone, so skipping this step can leave a local "
-        "`cargo`/`pytest` run green while CI stays red for the exact same "
-        "commit.",
+        "Before anything else, run `git fetch origin && git rebase "
+        f"origin/{entry.target_branch}` — even if it reports "
+        '"Current branch is up to date". GitHub Actions CI built the '
+        f"PR's merge ref (this branch plus the current "
+        f"`{entry.target_branch}`), not this branch alone, so skipping "
+        "this step can leave a local `cargo`/`pytest` run green while CI "
+        "stays red for the exact same commit. Rebase (not merge) so this "
+        "branch stays free of merge commits and eligible for GitHub's "
+        "rebase-merge.",
         "Reproduce the failure locally if the project's test command "
         "covers it (`coord`'s Test stage already runs the same diff-scoped "
         "suite CI reruns in full, now against the SAME merged tree the "
@@ -306,7 +316,7 @@ def build_ci_fix_briefing(
     ]
     if sealed_paths:
         steps.append(
-            "If, after merging, the failure reproduces ONLY inside a "
+            "If, after rebasing, the failure reproduces ONLY inside a "
             "sealed acceptance-oracle path you are not authorized to "
             "modify (" + ", ".join(sealed_paths) + "), do NOT attempt a "
             "fix. End your session with a line starting `STUCK:` naming "
