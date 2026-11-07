@@ -3151,16 +3151,16 @@ def drive_queue_sweep(
     comments.
 
     #3887 (#3875 ask A): the allowlist's mechanical actions include four
-    queue repairs the sweep applies itself through the SAME closed #3881
-    investigator wrapper (`coord.board_doctor_permissions.
+    queue repairs the sweep applies itself. Three go through the SAME
+    closed #3881 investigator wrapper (`coord.board_doctor_permissions.
     dispatch_investigator_action`) a daemon-host investigator session
     would use via `coord drive-queue doctor-act` — `mark_done` (a PR
     merged out-of-band while the row sat running/blocked/waiting),
-    `clear_latch` (a stale CONFLICT/HUMAN_REQUIRED latch whose approval is
-    already bound to the current branch content), `merge` (a PENDING row
+    `clear_latch` (a stale HUMAN_REQUIRED latch whose approval is already
+    bound to the current branch content), and `merge` (a PENDING row
     that already reads green/approved/mergeable but the ordinary merge
-    tick keeps missing), and a fifth, sweep-only primitive —
-    `conflict_fix_redispatch`, pairing with #3871's own completion-time
+    tick keeps missing). The fourth, `conflict_fix_redispatch`, is a
+    sweep-only primitive pairing with #3871's own completion-time
     redispatch for a conflict-fix that completed clean but never moved the
     branch. Every one of these re-reads live state immediately before
     acting and audits with `actor="sweep"`, never `"board_doctor_
