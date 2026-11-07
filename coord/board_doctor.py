@@ -213,6 +213,26 @@ CAUSE_CONFLICT_FIX_HEAD_UNMOVED = "conflict-fix-head-unmoved"
 #: does not wait indefinitely for a human to notice.
 MERGE_PENDING_STALE_AFTER_SECONDS = 1800.0
 
+#: #3901 (#3887 case 4, the remainder #3887 itself claimed but never
+#: wired): a `blocked`/`parked` drive-queue row that was DISPATCHED at
+#: least once (it has a board assignment behind it — a branch or a PR,
+#: not the #3874 never-dispatched shape) whose stored `last_reason` is
+#: still `coord.drive_queue._resolve_prereqs`'s own unsatisfiable-`after=`
+#: verdict, even though every named pre-req now reads terminal.
+#:
+#: `coord.drive_queue._reconcile_blocked_after` already resumes a LIVE
+#: `blocked` row matching this exact shape on every ordinary drive-queue
+#: tick (#2362/#2756) — but only while the periodic tick is still walking
+#: that row at all. A row #3888's `no_progress_rows` surfaces here reached
+#: this sweep precisely because the episode/no-progress walk, not the
+#: ordinary tick, is the thing still looking at it (a budget-exhausted
+#: `CAUSE_UNKNOWN` episode `_episode_stuck_row` would otherwise silently
+#: drop — see that function's own docstring), so this is the belt the
+#: ordinary tick's suspenders do not reach, never a second, competing
+#: implementation of the same resume: see
+#: :func:`_reclassify_after_prereqs_landed`.
+CAUSE_AFTER_PREREQS_LANDED = "after-prereqs-landed"
+
 
 def default_tier_of(cause: str) -> str:
     """Default `tier_of`: delegates to the real C2 policy.
@@ -929,6 +949,151 @@ def _reclassify_stale_latch(
     return reclassified
 
 
+def after_prereqs_landed_for_entry(
+    entry: Any,
+    entries_by_key: Mapping[str, Any],
+    board: Board,
+    board_view: Any = None,
+) -> bool:
+    """Does *entry* match #3901's "frozen block cause no longer holds"
+    shape — the ONE predicate both :func:`_reclassify_after_prereqs_landed`
+    (classification) and `coord.board_doctor_policy`'s pre-dispatch live
+    re-check call, rather than two independently-maintained copies of the
+    same question (#2096).
+
+    *board* is the `coord.models.Board` `collect_rows` already built this
+    sweep (`coord.state.build_board`) — the one thing `coord.gates.
+    assignments_for_issue` reads. *board_view* is `coord.drive_queue.
+    BoardView` — the SAME typed wrapper `_resolve_prereqs`/`diagnose_
+    blocked_after` call `.facts(key)` on — kept a SEPARATE, optional
+    parameter rather than derived from *board* here: building one is its
+    own `GET /board` round trip this predicate must not silently repeat
+    per row, so a caller that could not build one (an advisory failure,
+    same posture :func:`collect_rows`'s own no-progress pass already takes)
+    passes ``None`` and this predicate degrades to trusting only
+    *entries_by_key*'s `coord.drive_queue.STATE_DONE_LIKE` reading for a
+    dep still queued — never a dep that left the queue after landing,
+    exactly the gap the next bullet's second check exists to close when a
+    `board_view` IS on hand.
+
+    True only when ALL of:
+
+    * *entry*'s state is `blocked`/`parked` (`coord.drive_queue.
+      STATE_BLOCKED`/`STATE_PARKED`) — a row an operator already resumed
+      (back to `waiting`) no longer matches, which is exactly what makes
+      this callable safely as the live re-check too;
+    * *entry* declares a non-empty `after=` and is NOT a permanent block
+      (`coord.drive_queue.is_permanent_block_reason`);
+    * `entry.last_reason` is still exactly `coord.drive_queue._resolve_
+      prereqs`'s own unsatisfiable-`after=` verdict text
+      (`coord.drive_queue.is_unsatisfiable_prereq_reason`) — the recorded
+      block cause names ONLY its `after=` graph, never an unrelated reason
+      this predicate has no business overriding;
+    * every named pre-req now reads terminal — its OWN drive-queue row (if
+      still queued, per *entries_by_key*) is in `coord.drive_queue.
+      STATE_DONE_LIKE`, or (when *board_view* is given) `board_view.
+      facts(dep).landed` is `True` — the SAME two positive-evidence checks
+      `_resolve_prereqs` itself treats as "satisfied; continue" (#2096
+      again: not a second derivation of what "landed" means);
+    * the issue was actually DISPATCHED at least once
+      (`coord.gates.assignments_for_issue` — the same existing primitive
+      :func:`coord.board_doctor_policy._never_dispatched_still_true`
+      already answers this question with) — the #3874
+      `CAUSE_NEVER_DISPATCHED` -> `drive_queue_requeue` wiring already
+      covers the NEVER-dispatched shape (`coord.drive_queue.
+      is_unreachable_wait_shape`, which unconditionally excludes this
+      entry's own `after=` reason); this predicate is deliberately the
+      complement of that one, not a second path to the same place.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        STATE_BLOCKED,
+        STATE_DONE_LIKE,
+        STATE_PARKED,
+        is_permanent_block_reason,
+        is_unsatisfiable_prereq_reason,
+        parse_key as _parse_row_key,
+    )
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
+
+    if entry.state not in (STATE_BLOCKED, STATE_PARKED):
+        return False
+    if not entry.after or is_permanent_block_reason(entry.last_reason):
+        return False
+    if not is_unsatisfiable_prereq_reason(entry.last_reason):
+        return False
+
+    def _dep_landed(dep: str) -> bool:
+        dep_entry = entries_by_key.get(dep)
+        if dep_entry is not None and dep_entry.state in STATE_DONE_LIKE:
+            return True
+        if board_view is None:
+            return False
+        return board_view.facts(dep).landed
+
+    if not all(_dep_landed(dep) for dep in entry.after):
+        return False
+
+    parsed = _parse_row_key(entry.key)
+    return parsed is not None and bool(assignments_for_issue(board, *parsed))
+
+
+def _reclassify_after_prereqs_landed(
+    rows: list[StuckRow],
+    entries_by_key: Mapping[str, Any],
+    *,
+    board: Board,
+    board_view: Any = None,
+) -> list[StuckRow]:
+    """Relabel a frozen `blocked`/`parked` drive-queue row whose `after=`
+    block cause no longer holds (#3901, #3887 case 4).
+
+    Runs strictly AFTER :func:`queue_diagnose.diagnose`/:func:`no_progress_
+    rows` have already picked a cause from live evidence alone, same
+    "classify first, reclassify a narrow confirmed subset second" shape
+    every other reclassifier in this module uses. Promotes a row to
+    :data:`CAUSE_AFTER_PREREQS_LANDED` only for a row this sweep classified
+    fresh (:attr:`StuckRow.fresh`) — never a stale episode reconstruction
+    (:func:`_episode_stuck_row`), whose `entry.last_reason` could be
+    arbitrarily old — whose live drive-queue entry (*entries_by_key*,
+    loaded fresh by :func:`collect_rows` this same sweep) satisfies
+    :func:`after_prereqs_landed_for_entry`.
+
+    `coord.drive_queue._reconcile_blocked_after` resumes a LIVE `blocked`
+    row matching this exact shape to `waiting` in place on every ordinary
+    tick, no board-doctor involvement at all — this reclassifier (and the
+    `drive_queue_requeue` dispatch it feeds, same mechanical action
+    :data:`CAUSE_NEVER_DISPATCHED`/:data:`CAUSE_CEILING_BLOCKED_MERGEABLE`
+    already use) only ever matters for a row the ordinary tick's own walk
+    is not still reaching — e.g. one #3888's `no_progress_rows` had to
+    rescue from a budget-exhausted, silently-dropped episode. Never a
+    competing second implementation of `_reconcile_blocked_after`'s own
+    resume — this reclassifies, the SAME mechanical `drive_queue_requeue`
+    action every other row on this allowlist dispatches, re-confirmed live
+    immediately before it fires (see `coord.board_doctor_policy.
+    _requeue_after_prereqs_landed`).
+    """
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        if row.queue == "drive-queue" and row.fresh:
+            entry = entries_by_key.get(row.key)
+            if entry is not None and after_prereqs_landed_for_entry(
+                entry, entries_by_key, board, board_view
+            ):
+                row = replace(
+                    row,
+                    cause=CAUSE_AFTER_PREREQS_LANDED,
+                    evidence=row.evidence
+                    + (
+                        f"drive_queue: every --after prereq "
+                        f"({', '.join(entry.after)}) now reads terminal while "
+                        "the stored block reason still names only them "
+                        "(#3901)",
+                    ),
+                )
+        reclassified.append(row)
+    return reclassified
+
+
 #: #3888: the three drive-queue shapes that can sit making no progress while
 #: carrying neither a `block_log` episode (only `blocked`/`parked`
 #: transitions ever open one — :data:`coord.block_log.STALL_STATES`) nor a
@@ -1391,6 +1556,14 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     # of the sweep down with it. Run BEFORE the reclassifiers below (review
     # fix) so a no-progress row gets the same second look any other fresh
     # row does.
+    #
+    # #3901: also the ONE `BoardView` :func:`_reclassify_after_prereqs_
+    # landed` reuses for its own `.facts(dep).landed` reads below — never a
+    # second `GET /board` round trip for the same sweep. ``None`` on the
+    # same advisory failure this comment already documents; that
+    # reclassifier degrades to trusting only still-queued deps in that case
+    # (see its own docstring), never raises.
+    board_view: Any = None
     try:
         board_view = _fetch_board_view_with_retry()
     except Exception:  # noqa: BLE001 — see comment above
@@ -1418,6 +1591,9 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows = _reclassify_ceiling_blocked(rows)
     rows = _reclassify_checks_stale_race(rows, config=config)
     rows = _reclassify_stale_latch(rows, merge_entries, board=board, config=config)
+    rows = _reclassify_after_prereqs_landed(
+        rows, entries_by_key, board=board, board_view=board_view,
+    )
     rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
     rows.extend(smoke_no_verdict_rows(board))
 

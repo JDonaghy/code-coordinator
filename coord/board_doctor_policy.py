@@ -73,6 +73,25 @@ way, each wired below via :func:`_register_auto_action`:
   #3871's own synchronous completion-time redispatch already enforces —
   this is the periodic net for when that one-shot attempt had no capable
   machine right then, never a second or larger budget.
+* ``CAUSE_AFTER_PREREQS_LANDED`` (`coord.board_doctor.
+  _reclassify_after_prereqs_landed`, #3901 — #3887 case 4's remainder: the
+  PR that shipped #3887 claimed this shape was already covered by
+  #3874's `queue_diagnose.CAUSE_NEVER_DISPATCHED`, which is wrong — that
+  cause requires `coord.drive_queue.is_unreachable_wait_shape` (no
+  branch, no PR, no merge-queue row ever), and unconditionally EXCLUDES a
+  row blocked on an `after=` verdict, which is exactly this shape's whole
+  premise) — a `blocked`/`parked` row that WAS dispatched at least once
+  whose stored block reason is still `coord.drive_queue._resolve_
+  prereqs`'s own unsatisfiable-`after=` verdict even though every named
+  pre-req now reads terminal. Reuses the SAME ``drive_queue_requeue``
+  action the other two mechanical-requeue causes above dispatch, since
+  the safety argument is identical: nothing here mutates the PR, only the
+  queue row's own `waiting`/`blocked` bookkeeping. `coord.drive_queue.
+  _reconcile_blocked_after` already resumes a LIVE `blocked` row matching
+  this shape on every ordinary tick with no board-doctor involvement at
+  all; this cause only ever matters for a row that tick's own walk is no
+  longer reaching (e.g. one #3888's `no_progress_rows` had to rescue from
+  a budget-exhausted, silently-dropped episode).
 
 Every other mechanical cause stays off this allow-list until it has the
 same kind of reviewed, narrowly-scoped evidence behind it — a wrong
@@ -179,6 +198,7 @@ _log = logging.getLogger(__name__)
 from coord import queue_diagnose
 from coord.board_doctor import (
     ALERT_SKIPPED,
+    CAUSE_AFTER_PREREQS_LANDED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CONFLICT_FIX_HEAD_UNMOVED,
@@ -188,6 +208,7 @@ from coord.board_doctor import (
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
+    after_prereqs_landed_for_entry,
 )
 from coord.board_doctor_permissions import (
     SAFE_TIER_ACTIONS,
@@ -851,10 +872,97 @@ def _requeue_never_dispatched(row: StuckRow) -> bool:
     return True
 
 
+def _requeue_after_prereqs_landed(row: StuckRow) -> bool:
+    """#3901 (#3887 case 4): requeue a frozen `blocked`/`parked` row whose
+    `--after` block cause no longer holds.
+
+    Unlike :func:`_requeue_ceiling_blocked_mergeable`/:func:`_requeue_never_
+    dispatched` (the two existing `drive_queue_requeue` callers, neither of
+    which is wrapped), this one IS run through :func:`_run_mechanical_action`
+    — its own live re-check reads the board (`coord.state.build_board`),
+    the drive queue (`coord.state.list_drive_queue`) AND a fresh
+    `coord.drive_queue.BoardView` (`coord.commands.drive_queue.
+    _fetch_board_view_with_retry` — the SAME typed board
+    :func:`coord.board_doctor.collect_rows` builds for its own no-progress
+    pass, just a fresh fetch rather than a reused one: this call runs long
+    after that sweep concluded, often on a different process entirely), any
+    of which can raise the same live-GitHub/network-bound way the four
+    #3887 dispatchers this module already shields do, so an uncaught
+    exception here must not abort the whole sweep either.
+
+    Re-derives the FULL eligibility — not just "did a dispatch happen since
+    diagnosis" the way :func:`_never_dispatched_still_true` narrowly
+    re-checks for its own cause — via :func:`coord.board_doctor.
+    after_prereqs_landed_for_entry`, the SAME predicate
+    :func:`coord.board_doctor._reclassify_after_prereqs_landed` used to mint
+    this cause in the first place (#2096: one question, one answer). A
+    stored diagnosis can be arbitrarily old, and unlike a merge-gate
+    reading, an operator may have already resumed this exact row by hand
+    (`coord drive-queue remove`+`add`, or simply waiting for the ordinary
+    tick's own `_reconcile_blocked_after` to get there first) — either
+    leaves the row no longer `blocked`/`parked`, which the predicate reads
+    as "no longer this shape" and refuses rather than requeuing a row that
+    does not need it.
+
+    Returns ``True`` only when `sweep_drive_queue_requeue` (via
+    ``drive_queue_requeue``) confirms ``requeued=True`` — preserving
+    ``--machine``, ``--after``, position and fix-round state exactly like
+    the other two callers of the same primitive. An unparseable key, a row
+    that no longer matches the live predicate, or a reported no-op all
+    report ``False`` so :func:`coord.board_doctor.sweep` records
+    ``"auto-dispatch-noop"`` rather than a false success.
+    """
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
+
+        import click  # noqa: PLC0415
+        from coord.commands.drive_queue import _fetch_board_view_with_retry  # noqa: PLC0415
+        from coord.drive_queue import entries_from_rows  # noqa: PLC0415
+        from coord.state import build_board, list_drive_queue  # noqa: PLC0415
+
+        board = build_board()
+        entries_by_key = {e.key: e for e in entries_from_rows(list_drive_queue())}
+        entry = entries_by_key.get(row.key)
+        try:
+            board_view = _fetch_board_view_with_retry()
+        except Exception:  # noqa: BLE001 — advisory, see this function's own docstring
+            board_view = None
+        if entry is None or not after_prereqs_landed_for_entry(
+            entry, entries_by_key, board, board_view
+        ):
+            click.echo(
+                f"warning: board-doctor NOT requeuing {repo_name}#"
+                f"{issue_number} — it no longer matches the frozen "
+                "--after-prereqs-landed shape this cause was diagnosed "
+                "from (an operator may have already resumed it, or a "
+                "prereq's reading changed) — leaving it for the alert "
+                "tier rather than requeuing a row that no longer needs it",
+                err=True,
+            )
+            return False
+
+        result = dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
+        if not result.get("requeued"):
+            return _warn_noop(
+                "drive_queue_requeue", repo_name, issue_number, result.get("detail"),
+            )
+        return True
+
+    return _run_mechanical_action("drive_queue_requeue", row, _body)
+
+
 _register_auto_action(
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     "drive_queue_requeue",
     _requeue_ceiling_blocked_mergeable,
+)
+_register_auto_action(
+    CAUSE_AFTER_PREREQS_LANDED,
+    "drive_queue_requeue",
+    _requeue_after_prereqs_landed,
 )
 _register_auto_action(
     queue_diagnose.CAUSE_PR_MERGED,
