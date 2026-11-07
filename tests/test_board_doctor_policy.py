@@ -575,6 +575,50 @@ class TestEscalationAlertDispatcher:
         assert "redesign" in reason
 
 
+class TestClassifyEnvProbeOutput:
+    """The text classifier behind the baseline-red env diagnosis."""
+
+    def test_names_the_provider_whose_credential_failed(self) -> None:
+        category, name = queue_diagnose.classify_env_probe_output(
+            "opencode: 401 Unauthorized — invalid api key",
+        )
+        assert category == queue_diagnose.ENV_DIAGNOSIS_CREDENTIAL
+        assert name == "opencode"
+
+    def test_names_the_forge_by_its_full_name(self) -> None:
+        category, name = queue_diagnose.classify_env_probe_output(
+            "github: HTTP 403 Forbidden",
+        )
+        assert category == queue_diagnose.ENV_DIAGNOSIS_CREDENTIAL
+        assert name == "github"
+
+    def test_an_unrecognised_provider_is_still_a_credential_failure(self) -> None:
+        """A provider nobody listed must not be mis-named just because an
+        English word in the output happens to contain a short abbreviation
+        of some other provider — the category is what drives the option,
+        and ``None`` is a legitimate name.
+        """
+        category, name = queue_diagnose.classify_env_probe_output(
+            "forgeproxy: authentication failed halfway through the highlighted run",
+        )
+        assert category == queue_diagnose.ENV_DIAGNOSIS_CREDENTIAL
+        assert name is None
+
+    def test_a_missing_tool_is_named_from_the_shells_own_wording(self) -> None:
+        category, name = queue_diagnose.classify_env_probe_output(
+            "/bin/sh: line 1: pytest: command not found",
+        )
+        assert category == queue_diagnose.ENV_DIAGNOSIS_MISSING_TOOL
+        assert name == "pytest"
+
+    def test_an_ordinary_test_failure_is_a_red_base(self) -> None:
+        category, name = queue_diagnose.classify_env_probe_output(
+            "FAILED tests/test_widget.py::test_spin - AssertionError\n1 failed",
+        )
+        assert category == queue_diagnose.ENV_DIAGNOSIS_BASE_RED
+        assert name is None
+
+
 class TestDismissResolvedEscalation:
     def test_dismisses_an_escalation_this_module_filed(self) -> None:
         row = _row("acme/widgets#8", "ci_red")
