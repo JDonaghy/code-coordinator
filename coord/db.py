@@ -60,6 +60,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -347,6 +348,7 @@ def _migrate_if_needed(conn: Any, *, is_production: bool, target_desc: str) -> N
         _maybe_migrate_json(conn)
         _migrate_gate_order(conn)
         _backfill_orphaned_review_verdicts(conn)
+        _migrate_board_doctor_log_table(conn)
 
 
 def _open(path: Path) -> sqlite3.Connection:
@@ -1164,7 +1166,14 @@ def retry_on_locked(
 # push, most commonly) re-arm those budgets for its own fair rerun-once
 # chance instead of inheriting an already-exhausted count from an unrelated
 # prior commit. See `coord.merge_queue.QueuedMerge.ci_rerun_budget_sha`.
-_DB_SCHEMA_VERSION = 25
+#
+# #3889: bumped 25 -> 26 for the new `board_doctor_log` TABLE (not a column —
+# same shape as #3113/#3333/#2468's table-only bumps: `_MIGRATE_ADD_COLUMNS`
+# below is unchanged, `CREATE TABLE IF NOT EXISTS` in `_SCHEMA_SQL` is what
+# actually creates it on an existing database). `_migrate_board_doctor_log_
+# table` then moves every entry out of the old `board_meta` JSON-blob log
+# into it, losslessly, the first time this runs.
+_DB_SCHEMA_VERSION = 26
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1559,6 +1568,42 @@ _SCHEMA_SQL = """
             proposed_command TEXT    NOT NULL DEFAULT '',
             created_at       REAL    NOT NULL,
             UNIQUE(repo_name, issue_number)
+        );
+
+        -- #3889: the board-doctor sweep's append-only decision/action log —
+        -- one row per (queue, key) classified by `coord.board_doctor.sweep`,
+        -- replacing the single JSON blob previously held under the
+        -- `board_meta` key `"board_doctor_log"` (capped at a fixed entry
+        -- count). A real table gets a real retention prune
+        -- (`coord.state.prune_board_doctor_log`, age-based via
+        -- `recorded_at_ts`) instead of a blob rewritten-and-truncated on
+        -- every single write. `coord.db._migrate_board_doctor_log_table`
+        -- moves every entry already in the old blob here, losslessly, the
+        -- first time a database at a pre-#3889 schema version is opened.
+        --
+        -- `recorded_at` is kept as the ISO string every pre-existing caller
+        -- already renders (`coord.commands.drive_queue._doctor_log_line`);
+        -- `recorded_at_ts` is the SAME instant as a POSIX float, computed
+        -- once at insert time, so retention/`--since` queries compare
+        -- numbers in SQL rather than parsing ISO text per row. `key` is a
+        -- `"repo#issue"` string, matching `coord.drive_queue.entry_key` —
+        -- not a SQL keyword conflict in SQLite, which allows plain
+        -- identifiers named `key`.
+        CREATE TABLE IF NOT EXISTS board_doctor_log (
+            id             __AUTOPK_DDL__,
+            sweep_id       TEXT    NOT NULL,
+            queue          TEXT    NOT NULL,
+            key            TEXT    NOT NULL,
+            cause          TEXT    NOT NULL,
+            tier           TEXT    NOT NULL DEFAULT '',
+            action         TEXT    NOT NULL,
+            count          INTEGER NOT NULL DEFAULT 0,
+            escalated      INTEGER NOT NULL DEFAULT 0,
+            confidence     TEXT    NOT NULL DEFAULT '',
+            evidence_json  TEXT    NOT NULL DEFAULT '[]',
+            outcome        TEXT,
+            recorded_at    TEXT    NOT NULL,
+            recorded_at_ts REAL    NOT NULL
         );
 
         -- #1753 (DQ-1): the operator-declared `coord drive` work queue.  One
@@ -2121,6 +2166,16 @@ _SCHEMA_SQL = """
             ON issue_comments(repo_name, issue_number);
         CREATE INDEX IF NOT EXISTS idx_drive_escalations_issue
             ON drive_escalations(repo_name, issue_number);
+        -- #3889: `coord.state.board_doctor_decisions`' hot read is "entries
+        -- at/after a `--since` cutoff" and `coord.state.prune_board_doctor_
+        -- log`'s is "entries before the retention cutoff" — both scan on
+        -- `recorded_at_ts` alone. The `(queue, key)` index backs
+        -- `coord.state.pending_board_doctor_outcomes`'/`evaluate_board_
+        -- doctor_outcome`'s per-row lookups.
+        CREATE INDEX IF NOT EXISTS idx_board_doctor_log_ts
+            ON board_doctor_log(recorded_at_ts);
+        CREATE INDEX IF NOT EXISTS idx_board_doctor_log_key
+            ON board_doctor_log(queue, key);
         CREATE INDEX IF NOT EXISTS idx_drive_queue_state
             ON drive_queue(state, position);
         -- #1982: the push loop's hot read is "pending rows, oldest first,
@@ -3071,6 +3126,100 @@ def _migrate_gate_order(conn: sqlite3.Connection) -> None:
         (_NEW, _OLD),
     )
     conn.commit()
+
+
+# ── #3889: board-doctor log, JSON blob -> dedicated table ──────────────────
+
+_BOARD_DOCTOR_LOG_BLOB_KEY = "board_doctor_log"
+
+
+def _migrate_board_doctor_log_table(conn: sqlite3.Connection) -> int:
+    """One-shot, lossless move of every entry under the ``board_meta`` key
+    ``"board_doctor_log"`` into the dedicated ``board_doctor_log`` table
+    (#3889).
+
+    Idempotent by construction, same shape as :func:`_migrate_gate_order`:
+    the blob row is DELETED once its entries land in the table, so a second
+    call (every later connection open routes through here) finds nothing to
+    migrate and is a cheap no-op. A blob that fails to decode (corrupt JSON,
+    not a list) is dropped without raising — a decision log is diagnostic
+    history, not a merge gate, and a startup migration must never be able to
+    block every other table this function runs alongside.
+
+    Each entry's ``recorded_at`` (an ISO string every pre-#3889 writer
+    already set) is preserved verbatim; ``recorded_at_ts`` is derived from
+    it once here so later retention/``--since`` queries never re-parse ISO
+    text. An entry with a missing/unparseable ``recorded_at`` is still
+    migrated (never dropped — see :func:`_trim_board_doctor_log`'s own
+    fail-open convention this mirrors) with ``recorded_at_ts`` set to this
+    migration's own run time, so it sorts as "as old as this migration"
+    rather than vanishing.
+
+    Returns the number of entries migrated (0 on the steady state, once the
+    blob key is gone).
+    """
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_BOARD_DOCTOR_LOG_BLOB_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return 0
+    try:
+        entries = json.loads(row["value"])
+    except ValueError:
+        entries = None
+    if not isinstance(entries, list):
+        sql.execute(
+            conn, "DELETE FROM board_meta WHERE key = ?",
+            (_BOARD_DOCTOR_LOG_BLOB_KEY,),
+        )
+        conn.commit()
+        return 0
+
+    now = time.time()
+    migrated = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        recorded_at = entry.get("recorded_at")
+        recorded_at_ts = now
+        if isinstance(recorded_at, str) and recorded_at:
+            try:
+                recorded_at_ts = datetime.fromisoformat(recorded_at).timestamp()
+            except ValueError:
+                pass
+        else:
+            recorded_at = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+        evidence = entry.get("evidence")
+        sql.execute(
+            conn,
+            """INSERT INTO board_doctor_log (
+                sweep_id, queue, key, cause, tier, action, count, escalated,
+                confidence, evidence_json, outcome, recorded_at, recorded_at_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(entry.get("sweep_id") or ""),
+                str(entry.get("queue") or ""),
+                str(entry.get("key") or ""),
+                str(entry.get("cause") or ""),
+                str(entry.get("tier") or ""),
+                str(entry.get("action") or ""),
+                int(entry.get("count") or 0),
+                1 if entry.get("escalated") else 0,
+                str(entry.get("confidence") or ""),
+                json.dumps(evidence if isinstance(evidence, list) else []),
+                entry.get("outcome"),
+                recorded_at,
+                recorded_at_ts,
+            ),
+        )
+        migrated += 1
+    sql.execute(
+        conn, "DELETE FROM board_meta WHERE key = ?",
+        (_BOARD_DOCTOR_LOG_BLOB_KEY,),
+    )
+    conn.commit()
+    return migrated
 
 
 def _backfill_orphaned_review_verdicts(conn: sqlite3.Connection) -> int:

@@ -8773,6 +8773,59 @@ def test_doctor_log_summary_dedupes_rows_and_catches_a_missed_human_intervention
     assert summary["human_interventions_missed_keys"] == [f"{REPO}#2"]
 
 
+def test_doctor_log_summary_reports_pending_and_unstuck_by_other_buckets(
+    cli, block_log
+):
+    """#3889: a row whose latest action-tracked decision still carries
+    ``outcome: None`` (no later sweep has re-observed it yet) counts
+    toward ``rows_pending`` — never ``rows_still_stuck``, which would
+    claim knowledge nobody has yet. A row whose outcome is
+    ``"progressed_by_other"`` (an operator action, or the ordinary drive
+    loop, moved it first) counts toward ``rows_unstuck_by_other`` — never
+    the doctor-credited ``rows_unstuck``.
+    """
+    from datetime import datetime, timezone
+
+    now = time.time()
+
+    # Pending: dispatched, no later sweep has filled in a verdict yet.
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-1", "queue": "drive-queue", "key": f"{REPO}#10",
+            "cause": "ci_red", "tier": "auto", "action": "auto-dispatch",
+            "count": 1, "escalated": False, "confidence": "high",
+            "evidence": [],
+            "recorded_at": datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat(),
+        }
+    )
+
+    # Unstuck by other: an operator action resolved it, not the doctor's
+    # own confirmed action.
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-2", "queue": "drive-queue", "key": f"{REPO}#11",
+            "cause": "merge-conflict", "tier": "alert", "action": "alert",
+            "count": 3, "escalated": True, "confidence": "medium",
+            "evidence": [],
+            "recorded_at": datetime.fromtimestamp(now - 7200, tz=timezone.utc).isoformat(),
+            "outcome": "progressed_by_other",
+        }
+    )
+
+    result = cli("doctor-log", "--summary", "--json")
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["rows_pending"] == 1
+    assert summary["rows_unstuck_by_other"] == 1
+    assert summary["rows_unstuck"] == 0
+    assert summary["rows_still_stuck"] == 0
+
+    text_result = cli("doctor-log", "--summary")
+    assert text_result.exit_code == 0, text_result.output
+    assert "1 pending" in text_result.output
+    assert "1 unstuck by other" in text_result.output
+
+
 def test_doctor_log_on_an_empty_log_says_so_rather_than_printing_nothing(cli):
     result = cli("doctor-log")
     assert result.exit_code == 0, result.output
