@@ -1137,6 +1137,14 @@ for _investigate_cause in (
     queue_diagnose.CAUSE_DEAD_LEG,
     queue_diagnose.CAUSE_NO_PR,
     queue_diagnose.CAUSE_CI_RED,
+    # #3882: a `ci-red` row whose branch Test verdict already read green —
+    # the merged-tree-only failure `queue_diagnose._rule_integration_red`
+    # exists to name. Routed through the SAME `sweep_dispatch_fixit_leg`
+    # primitive as plain `ci-red` rather than a bespoke dispatcher: the
+    # fix still needs a worker that can change code, bounded by the same
+    # per-repo investigate-tier budget (`FIXIT_LEG_BUDGET_DEFAULT`) and
+    # convergence limit as every other investigate-eligible cause.
+    queue_diagnose.CAUSE_INTEGRATION_RED,
     queue_diagnose.CAUSE_CI_PENDING,
     queue_diagnose.CAUSE_GATE_BLOCKED,
     queue_diagnose.CAUSE_AGENT_UNREACHABLE,

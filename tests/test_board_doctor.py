@@ -1335,6 +1335,101 @@ class TestNeverDispatchedRowReachesTheSweep:
         assert alert.count == 0
 
 
+class TestIntegrationRedClassification:
+    """#3882: a `ci-red` row whose own branch Test verdict already read
+    green must classify as `integration-red` — the merged-tree-only
+    failure shape (quadraui#2028) a fix leg built from the branch alone
+    can never reproduce. A row whose branch Test verdict is ALSO red (or
+    simply unread) must stay plain `ci-red`: collapsing an unread verdict
+    into "integration" would manufacture a confidently-wrong cause out of
+    a probe gap."""
+
+    @staticmethod
+    def _entry() -> QueueEntry:
+        from coord.drive_queue import STATE_BLOCKED
+
+        return QueueEntry(
+            repo="acme/widgets", issue=2028, state=STATE_BLOCKED, attempts=1,
+            last_reason="checks failed: build (failure)",
+        )
+
+    def test_ci_red_with_green_branch_test_is_integration_red(self) -> None:
+        from coord.queue_diagnose import CheckReading
+
+        live = LiveState(
+            checks=(CheckReading(name="build", conclusion="failure"),),
+            branch_test_state="passed",
+        )
+        diagnosis = queue_diagnose.diagnose(self._entry(), live)
+        assert diagnosis.cause == queue_diagnose.CAUSE_INTEGRATION_RED
+
+    def test_ci_red_with_red_branch_test_stays_plain_ci_red(self) -> None:
+        from coord.queue_diagnose import CheckReading
+
+        live = LiveState(
+            checks=(CheckReading(name="build", conclusion="failure"),),
+            branch_test_state="failed",
+        )
+        diagnosis = queue_diagnose.diagnose(self._entry(), live)
+        assert diagnosis.cause == queue_diagnose.CAUSE_CI_RED
+
+    def test_ci_red_with_unread_branch_test_stays_plain_ci_red(self) -> None:
+        from coord.queue_diagnose import CheckReading
+
+        live = LiveState(
+            checks=(CheckReading(name="build", conclusion="failure"),),
+            branch_test_state=None,
+        )
+        diagnosis = queue_diagnose.diagnose(self._entry(), live)
+        assert diagnosis.cause == queue_diagnose.CAUSE_CI_RED
+
+
+class TestIntegrationRedRowReachesTheInvestigateTier:
+    """End-to-end through the real adapters, the same shape as
+    `TestNeverDispatchedRowReachesTheSweep` — load-bearing evidence the
+    cause is actually wired to the `drive_queue_requeue`-style fixit-leg
+    auto-dispatcher via the real `policy_tier_of`, not a tautology."""
+
+    def test_an_integration_red_row_is_classified_and_investigated(self) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+        from coord.drive_queue import STATE_BLOCKED
+        from coord.queue_diagnose import CheckReading
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=2028, state=STATE_BLOCKED, attempts=1,
+            last_reason="checks failed: build (failure)",
+        )
+        episode = {
+            "key": entry.key, "state": STATE_BLOCKED, "diagnoses": 0,
+            "diagnosed_cause": "",
+        }
+
+        class _Probe:
+            def probe(self, entry_):
+                return LiveState(
+                    checks=(CheckReading(name="build", conclusion="failure"),),
+                    branch_test_state="passed",
+                )
+
+        diagnoses = queue_diagnose.run_pass([entry], [episode], probe=_Probe())
+        rows = drive_queue_rows(diagnoses)
+
+        [row] = rows
+        assert row.key == entry.key
+        assert row.cause == queue_diagnose.CAUSE_INTEGRATION_RED
+
+        auto = _Recorder()
+        alert = _Recorder()
+        sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers={queue_diagnose.CAUSE_INTEGRATION_RED: auto},
+            alert_dispatcher=alert,
+        )
+        assert auto.count == 1
+        assert alert.count == 0
+
+
 class TestSuppressedRowsStayPresentForClearAbsentRows:
     """#3761 review (blocking finding #1).
 

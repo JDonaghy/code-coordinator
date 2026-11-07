@@ -165,6 +165,61 @@ class TestBuildBriefing:
         assert without_kw == with_explicit_none
 
 
+class TestBuildBriefingMergesBaseFirst:
+    """#3882: GitHub Actions CI builds the PR's merge ref (this branch plus
+    the current base), never the branch alone — the briefing must instruct
+    the worker to reproduce exactly that tree before doing anything else,
+    or a fix leg can stay green on its own branch while CI stays red
+    (quadraui#2028)."""
+
+    def test_instructs_merging_the_target_branch_first(self) -> None:
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+        )
+        assert "git fetch origin && git merge --no-edit origin/main" in briefing
+        assert "merge ref" in briefing
+
+    def test_uses_this_entrys_own_target_branch(self) -> None:
+        entry = _entry()
+        entry.target_branch = "develop"
+        briefing = build_ci_fix_briefing(
+            entry=entry, checks_summary="x", attempt=1,
+        )
+        assert "origin/develop" in briefing
+        assert "origin/main" not in briefing
+
+
+class TestBuildBriefingSealedPathGuard:
+    """#3882: a merged-tree failure confined to a sealed acceptance-oracle
+    path must not be attempted by a plain ci-fix worker — the briefing
+    tells it to stop with `STUCK:` instead, which the escalation path
+    turns into a needs-a-design-decision page."""
+
+    def test_no_sealed_paths_adds_no_stuck_guard(self) -> None:
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+        )
+        assert "STUCK:" not in briefing
+
+    def test_sealed_paths_adds_explicit_stuck_instruction(self) -> None:
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+            sealed_paths=["tests/acceptance/"],
+        )
+        assert "STUCK:" in briefing
+        assert "tests/acceptance/" in briefing
+        assert "do NOT attempt a fix" in briefing
+
+    def test_no_sealed_paths_kwarg_is_byte_identical_to_empty_default(self) -> None:
+        without_kw = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+        )
+        with_empty = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, sealed_paths=(),
+        )
+        assert without_kw == with_empty
+
+
 class TestBuildBriefingWithDetail:
     """#3114: a fixture failed-run's `CIFailureDetail` — job name, failing
     step, and a bounded log excerpt — must show up in the built briefing,
@@ -354,6 +409,52 @@ class TestDispatchCiFixFetchesIssueBody:
         assert result is not None
         _, payload = client.calls[0]
         assert "## Issue body" not in payload["briefing"]
+
+
+class TestDispatchCiFixThreadsSealedPaths:
+    """#3882: `dispatch_ci_fix` must thread *entry*'s own repo's sealed
+    acceptance-oracle paths (`config.acceptance.sealed_paths`) into the
+    briefing, so a worker whose merged-tree reproduction fails only there
+    knows to stop rather than attempt a fix `coord/review.py`'s mandatory
+    tamper rule would reject anyway."""
+
+    def test_sealed_paths_from_config_reach_the_briefing(
+        self, repo: Repo, coord_db,
+    ) -> None:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        config = Config(
+            repos=[repo],
+            machines=[Machine(
+                name="laptop", host="laptop.tail",
+                repos=["api"], repo_paths={"api": "/work/api"},
+            )],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest")},
+            ),
+        )
+        board = Board()
+        board.completed.append(_work_assignment())
+        client = _FakeHTTPClient({"id": "ci-fix-sealed"})
+
+        result = dispatch_ci_fix(_entry(), board, config, http_client=client)
+
+        assert result is not None
+        _, payload = client.calls[0]
+        assert "STUCK:" in payload["briefing"]
+        assert "tests/acceptance/" in payload["briefing"]
+
+    def test_no_acceptance_driver_adds_no_stuck_guard(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        board = Board()
+        board.completed.append(_work_assignment())
+        client = _FakeHTTPClient({"id": "ci-fix-no-sealed"})
+
+        dispatch_ci_fix(_entry(), board, two_machine_config, http_client=client)
+
+        _, payload = client.calls[0]
+        assert "STUCK:" not in payload["briefing"]
 
 
 # ── #3011: no-op leg detection/refund ────────────────────────────────────────

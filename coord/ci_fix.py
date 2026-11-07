@@ -34,6 +34,7 @@ naturally cannot merge again until it clears Test + Review + CI fresh.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 import httpx
 
@@ -226,6 +227,7 @@ def build_ci_fix_briefing(
     attempt: int,
     detail: CIFailureDetail | None = None,
     issue_body: str | None = None,
+    sealed_paths: Sequence[str] = (),
 ) -> str:
     """Assemble the CI-fix worker's briefing. Pure function — testable.
 
@@ -240,6 +242,15 @@ def build_ci_fix_briefing(
     :func:`_fetch_issue_body` at dispatch time — optional and additive,
     same shape as *detail*: ``None`` or blank leaves the briefing
     byte-identical to before #3456.
+
+    *sealed_paths* (#3882) is this repo's sealed acceptance-oracle path set
+    (:meth:`coord.config.AcceptanceConfig.sealed_paths`). When non-empty,
+    one extra numbered step tells the worker to stop with a ``STUCK:``
+    line instead of attempting a fix if the merged-tree failure lives only
+    inside one of those paths — see the "## What to do" steps below for
+    the merge-ref step every ci-fix briefing now carries unconditionally,
+    the reason this module is no longer blind to a green-branch/red-CI
+    split (quadraui#2028).
     """
     lines: list[str] = [
         f"# CI failure fix: {entry.repo_github} branch `{entry.branch}`",
@@ -264,19 +275,51 @@ def build_ci_fix_briefing(
         "",
         "## What to do",
         "",
-        "1. You are already on this issue's existing branch — continue on "
+    ]
+
+    # #3882: GitHub Actions CI builds the PR's MERGE REF (this branch plus
+    # the CURRENT target branch) — never this branch in isolation. A fix
+    # leg that skips merging the base in can stay green on its own branch
+    # while CI stays red for a reason that only exists once the two are
+    # combined (quadraui#2028: a sibling PR that landed on the base while
+    # this one was in flight). So reproducing that exact tree is step 2,
+    # right after confirming the branch — not an optional/later step.
+    steps: list[str] = [
+        "You are already on this issue's existing branch — continue on "
         "it, do NOT start a fresh branch.",
-        "2. Reproduce the failure locally if the project's test command "
+        "Before anything else, run `git fetch origin && git merge "
+        f"--no-edit origin/{entry.target_branch}` — even if it reports "
+        '"Already up to date". GitHub Actions CI built the PR\'s merge '
+        f"ref (this branch plus the current `{entry.target_branch}`), not "
+        "this branch alone, so skipping this step can leave a local "
+        "`cargo`/`pytest` run green while CI stays red for the exact same "
+        "commit.",
+        "Reproduce the failure locally if the project's test command "
         "covers it (`coord`'s Test stage already runs the same diff-scoped "
-        "suite CI reruns in full — a failure CI alone caught may live in a "
-        "suite that only runs in CI, e.g. a sealed acceptance suite).",
-        "3. Fix the actual regression. Do not edit the failing check's "
+        "suite CI reruns in full, now against the SAME merged tree the "
+        "previous step just built — a failure CI alone caught may live in "
+        "a suite that only runs in CI, e.g. a sealed acceptance suite).",
+        "Fix the actual regression. Do not edit the failing check's "
         "workflow config to make it pass without fixing the underlying "
         "issue, and do not skip/xfail the failing test unless the test "
         "itself is proven wrong.",
-        "4. Commit and push to the SAME branch. The coordinator re-runs "
-        "Test, Review, and CI from scratch on the new commit — this is not "
-        "a force-merge shortcut.",
+    ]
+    if sealed_paths:
+        steps.append(
+            "If, after merging, the failure reproduces ONLY inside a "
+            "sealed acceptance-oracle path you are not authorized to "
+            "modify (" + ", ".join(sealed_paths) + "), do NOT attempt a "
+            "fix. End your session with a line starting `STUCK:` naming "
+            "the sealed file(s) and stop — the coordinator escalates that "
+            "for a design decision instead of spending another fix round."
+        )
+    steps.append(
+        "Commit and push to the SAME branch. The coordinator re-runs "
+        "Test, Review, and CI from scratch on the new commit — this is "
+        "not a force-merge shortcut."
+    )
+    lines += [f"{i}. {step}" for i, step in enumerate(steps, start=1)]
+    lines += [
         "",
         "You will NOT use `gh` — the coordinator owns PR/issue interaction "
         "and CI status reads.",
@@ -437,9 +480,17 @@ def dispatch_ci_fix(
 
     summary = checks_summary or entry.error or "CI checks failed"
     issue_body = _fetch_issue_body(entry)
+    # #3882: thread this repo's sealed acceptance-oracle paths into the
+    # briefing so a worker whose merged-tree failure lives only there
+    # knows to stop (`STUCK:`) rather than trip the mandatory
+    # `tests/acceptance/**` tamper rule in `coord/review.py` attempting a
+    # fix it isn't authorized to make. `[]` for a repo with no acceptance
+    # driver at all — same "leaves the briefing unaffected" posture as
+    # every other optional section above.
+    sealed_paths = config.acceptance.sealed_paths(entry.repo_name)
     briefing = build_ci_fix_briefing(
         entry=entry, checks_summary=summary, attempt=entry.ci_fix_dispatches + 1,
-        detail=detail, issue_body=issue_body,
+        detail=detail, issue_body=issue_body, sealed_paths=sealed_paths,
     )
 
     from coord.auto_loop import _dispatch_fix  # noqa: PLC0415
