@@ -3435,8 +3435,8 @@ def test_no_review_row_yet_waits_for_coords_auto_dispatch():
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# #3891: a SCOPED re-review's review_of_assignment_id can anchor to an OLDER
-# round of the same chain (see coord.auto_loop.newest_work_round_on_chain's
+# A SCOPED re-review's review_of_assignment_id can anchor to an OLDER round
+# of the same chain (see coord.auto_loop.propagate_review_verdict's
 # docstring) — `drive_state.project`'s review match, keyed on the exact
 # current work id, finds nothing even though an approval genuinely landed.
 # The merge queue's OWN gate (`merge_queue.has_approved_review`, tolerant of
@@ -3447,23 +3447,24 @@ def test_no_review_row_yet_waits_for_coords_auto_dispatch():
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_stale_review_chain_falls_through_to_merge_when_gate_is_ready():
+def test_missing_review_with_ready_gate_falls_through_to_merge():
     action = step(work_tested(merge_status="READY", merge_aid="w1"))
     assert action.command == ("merge", "--only", "w1", "--method", "rebase")
 
 
 def test_missing_review_waits_when_gate_is_only_pending():
     """The override is narrow: a merge_status of PENDING (not READY yet)
-    must still wait on the review, exactly as before #3891."""
+    must still wait on the review, exactly as before."""
     action = step(work_tested(merge_status="PENDING"))
     assert action.kind == WAIT
     assert action.command == ()
 
 
 def test_request_changes_verdict_is_not_overridden_by_a_ready_gate():
-    """The override only ever short-circuits a bare WAIT — a genuine
-    request-changes verdict (a RUN fix dispatch) must never be swallowed
-    just because some OTHER queue entry happens to read READY."""
+    """The override only ever short-circuits a bare WAIT with no review row
+    at all — a genuine request-changes verdict (a RUN fix dispatch) must
+    never be swallowed just because some OTHER queue entry happens to read
+    READY."""
     action = step(
         work_tested(
             review_aid="r1", review_verdict="request-changes",
@@ -3472,6 +3473,24 @@ def test_request_changes_verdict_is_not_overridden_by_a_ready_gate():
     )
     assert action.kind == RUN
     assert action.command == ("fix", "r1")
+
+
+def test_fix_already_dispatched_latch_is_not_overridden_by_a_ready_gate():
+    """A WAIT that already has a review row to explain itself — the "fix
+    already dispatched, waiting for the fix row" latch — must keep waiting
+    even when some OTHER queue entry happens to read READY; the override is
+    for the "no verdict AND no review row at all" shape only."""
+    counters = DriveCounters()
+    counters.review_fix_dispatched_for = "r1"
+    action = step(
+        work_tested(
+            review_aid="r1", review_verdict="request-changes",
+            merge_status="READY",
+        ),
+        counters=counters,
+    )
+    assert action.kind == WAIT
+    assert action.command == ()
 
 
 def test_a_review_that_finished_with_no_verdict_is_terminal():
@@ -3997,6 +4016,22 @@ def test_no_merge_stops_after_the_review_approves():
     assert action.is_exit
     assert action.exit_code == EXIT_OK
     assert "coord merge --only w1" in action.message
+    assert "review approved" in action.message
+
+
+def test_no_merge_stops_on_a_ready_gate_with_no_review_row():
+    """No review was actually observed here — the message must say the
+    merge queue reports READY, not claim a review approval this driver
+    never read."""
+    action = step(
+        work_tested(merge_status="READY", merge_aid="w1"),
+        DriveOptions(machine="precision", do_merge=False),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_OK
+    assert "coord merge --only w1" in action.message
+    assert "merge queue reports READY" in action.message
+    assert "review approved" not in action.message
 
 
 def test_an_approved_review_merges_through_the_cli_under_the_merge_lock():
@@ -8102,19 +8137,21 @@ def test_smaller_stall_never_produces_fewer_nudges(driver_factory):
     assert small >= large > 0, (small, large)
 
 
-def test_stale_dispatched_review_with_no_live_assignment_is_reset_after_stall(
+def test_stale_dispatched_review_relies_on_notify_not_a_separate_repair(
     driver_factory,
 ):
-    """#3891: ``review_state="dispatched"`` with NOTHING active and no
-    review assignment on the board at all is a STALE claim — the exact
-    shape a scoped re-review's review_of_assignment_id anchoring to a
-    superseded round can leave behind — not a review genuinely in flight.
-    ``dispatch_pending_reviews``'s own eligibility filter
-    (``review_state in (None, "pending")``) treats "dispatched" as already
-    handled, so a bare ``coord notify`` nudge alone would never re-offer
-    this row. The stall path must reset it to "pending" via ``coord
-    diagnose --stage review --reset``, on the SAME cadence as the existing
-    nudge — not never."""
+    """``review_state="dispatched"`` with NOTHING active and no review
+    assignment on the board at all (a scoped re-review's verdict landed on
+    a superseded round, leaving this one wedged) is repaired by
+    ``coord.review.heal_unreviewed_newest_work_legs`` — which
+    ``dispatch_pending_reviews`` calls before its eligibility filter runs,
+    and which ``coord notify`` routes through. The stall path must keep
+    relying on the existing ``coord notify`` nudge for this shape rather
+    than firing a second, separate repair command: ``coord diagnose
+    --stage review --reset`` answers a different question (an existing
+    review ASSIGNMENT's own stale state) and does nothing for a plain
+    ``type="work"`` row with no review assignment at all — see
+    ``coord.diagnose.STAGE_ASSIGNMENT_TYPES``."""
     driver = driver_factory(
         [board(status="done", test_state="passed", review_state="dispatched")],
         opts=DriveOptions(
@@ -8131,44 +8168,8 @@ def test_stale_dispatched_review_with_no_live_assignment_is_reset_after_stall(
     driver.run_coord = lambda args, **kw: seen.append(args) or 0  # type: ignore[assignment]
 
     assert driver.run() == EXIT_DEADLINE
-    assert ("diagnose", REPO, str(ISSUE), "--stage", "review", "--reset") in seen
-    # The repair re-fires on every stall window, same as the nudge — not a
-    # single one-shot latch that goes silent after the first attempt.
-    assert seen.count(
-        ("diagnose", REPO, str(ISSUE), "--stage", "review", "--reset")
-    ) > 1, seen
-
-
-def test_live_review_assignment_is_not_treated_as_stale(driver_factory):
-    """A review genuinely in flight (status not yet terminal) must never be
-    reset — only the "dispatched but nothing is actually running" shape
-    qualifies."""
-    payload = board(status="done", test_state="passed", review_state="dispatched")
-    payload["assignments"].append({
-        "repo_name": REPO,
-        "issue_number": ISSUE,
-        "type": "review",
-        "assignment_id": "r1",
-        "dispatched_at": 2.0,
-        "status": "running",
-        "review_of_assignment_id": "w1",
-    })
-    driver = driver_factory(
-        [payload],
-        opts=DriveOptions(
-            machine="precision",
-            poll=1.0,
-            stall_mins=1.0 / 60.0,
-            deadline_mins=5.0 / 60.0,
-            notify=True,
-        ),
-        config=make_config_no_stall_overrides(),
-    )
-    seen: list[tuple] = []
-    driver.run_coord = lambda args, **kw: seen.append(args) or 0  # type: ignore[assignment]
-
-    driver.run()
     assert not any(a and a[0] == "diagnose" for a in seen), seen
+    assert seen.count(("notify",)) > 1, seen
 
 
 def test_fingerprint_change_clears_the_published_stall_nudge(driver_factory, monkeypatch):

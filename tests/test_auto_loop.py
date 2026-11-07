@@ -21,6 +21,7 @@ from coord.auto_loop import (
     next_fix_iteration,
     next_fix_iteration_for_branch,
     process_review_completion,
+    propagate_review_verdict,
     run_for_fix_transition,
     run_for_review_transition,
 )
@@ -2281,6 +2282,10 @@ class TestFullCycle:
         fix1_on_board = board3.find_by_id("fix-1")
         assert fix1_on_board is not None
         fix1_on_board.status = "done"
+        # The scoped re-review below must be able to prove it was actually
+        # dispatched AFTER this round became ready — give it a real
+        # `finished_at` rather than leaving the field unset.
+        fix1_on_board.finished_at = (fix1_on_board.dispatched_at or 0.0) + 50.0
         board3.completed.append(
             board3.active.pop(board3.active.index(fix1_on_board))
         )
@@ -2288,7 +2293,9 @@ class TestFullCycle:
         # #3891: the scoped re-review is dispatched with the STALE anchor
         # ("w-1", the original round) as its review_of_assignment_id —
         # exactly the shape `dispatch_scoped_review` produces today — not
-        # "fix-1", the round it actually reviewed.
+        # "fix-1", the round it actually reviewed. Its own dispatch happens
+        # well AFTER fix-1 became ready, so it genuinely could have read
+        # that head — the evidence the re-parent gate requires.
         review2_log = tmp_path / "review2.log"
         review2_log.write_text(
             "REVIEW_VERDICT: approve\n"
@@ -2298,6 +2305,8 @@ class TestFullCycle:
         )
         review2 = _review_assignment(assignment_id="r-2", review_of="w-1")
         review2.status = "done"
+        review2.dispatched_at = fix1_on_board.finished_at + 10.0
+        review2.finished_at = review2.dispatched_at + 5.0
         board3.completed.append(review2)
         save_board(board3)
 
@@ -2323,6 +2332,45 @@ class TestFullCycle:
         review2_reloaded = board4.find_by_id("r-2")
         assert review2_reloaded is not None
         assert review2_reloaded.review_of_assignment_id == "fix-1"
+
+    def test_rereview_not_reparented_when_it_predates_the_newer_round(
+        self, config: Config, coord_db,
+    ) -> None:
+        """A review that finished long BEFORE a newer round on the same
+        chain was even dispatched has no way to have read that round's
+        head. Crediting it anyway would invert #3668's guarantee that a
+        review of an older leg never satisfies the review gate for a newer
+        one — so the verdict must stay on the round it was actually
+        dispatched to review, and the newer round must be left untouched.
+        """
+        from coord.state import save_board
+
+        old_work = _work_assignment(assignment_id="w-1", review_iteration=0)
+        new_work = _work_assignment(
+            assignment_id="fix-1", review_iteration=1,
+        )
+        new_work.dispatched_at = 1000.0
+        new_work.finished_at = 1050.0
+        new_work.review_state = "dispatched"
+        board = Board(completed=[old_work, new_work])
+        save_board(board)
+
+        # r-2 finished long before fix-1 was even dispatched — it could
+        # only have reviewed w-1, regardless of which id it is parented to.
+        review = _review_assignment(assignment_id="r-2", review_of="w-1")
+        review.dispatched_at = 1.0
+        review.finished_at = 2.0
+        review.review_verdict = "approve"
+
+        work = propagate_review_verdict(review, board, config)
+
+        assert work is not None
+        assert work.assignment_id == "w-1"
+        assert review.review_of_assignment_id == "w-1"
+        fix1 = board.find_by_id("fix-1")
+        assert fix1 is not None
+        assert fix1.review_state == "dispatched"
+        assert fix1.review_verdict is None
 
     def test_max_iterations_stops_at_configured_limit(
         self, config: Config, tmp_path

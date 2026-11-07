@@ -3210,35 +3210,47 @@ def decide(
         return replace(test, warnings=warnings + test.warnings)
 
     review = _decide_review(state, opts, counters, machine)
-    if review is not None and not (
-        # #3891: `_decide_review` found nothing to report — no verdict, no
-        # live review assignment, nothing active — and would otherwise wait
-        # forever. But the merge queue's OWN gate
-        # (`merge_queue.has_approved_review`, matched by branch / the
-        # `review_of_assignment_id` CHAIN rather than this driver's own
-        # exact-work-id match — see that function's #292 docstring) already
-        # reports READY: an approved re-review landed, just linked to a
-        # different round of the same chain than the one `drive_state.
-        # project` matched. Trust the gate that can actually see it and
-        # fall through to the merge arm instead of waiting on a review this
-        # driver's own narrower match will never find.
-        review.kind == WAIT
+    # The merge queue's OWN gate (`merge_queue.has_approved_review`, matched
+    # by branch / the `review_of_assignment_id` chain rather than this
+    # driver's own exact-work-id match — see that function's #292 docstring)
+    # can report READY even when `drive_state.project`'s narrower match finds
+    # no review row for the CURRENT round at all: a scoped re-review's
+    # verdict can land on an older round of the same chain. Narrowed to
+    # exactly that shape — a bare WAIT with no verdict and no review
+    # assignment on this round — so it can never swallow a genuine WAIT that
+    # already has a review row to explain itself, such as the #1584
+    # usage-limit wait or the request-changes fix-dispatched latch; both of
+    # those must still wait even if some other queue entry happens to read
+    # READY.
+    review_gate_overridden_by_queue = (
+        review is not None
+        and review.kind == WAIT
+        and state.review_verdict == ""
+        and not state.review_aid
         and state.active_count == 0
         and (state.merge_status or "").upper() == "READY"
-    ):
+    )
+    if review is not None and not review_gate_overridden_by_queue:
         return replace(review, warnings=warnings + review.warnings)
-    if review is not None:
+    if review_gate_overridden_by_queue:
         warnings = warnings + review.warnings + (
-            f"review gate would have waited ({review.label or 'no verdict'}) "
-            "but the merge queue already reports READY — proceeding to the "
-            "merge arm instead of waiting indefinitely (#3891)",
+            "review gate found no review on this round, but the merge queue "
+            "already reports READY — proceeding to the merge arm instead of "
+            "waiting indefinitely (#3891)",
         )
 
     if not opts.do_merge:
         return replace(
             _succeed(
-                "✓ review approved — stopping here (--no-merge)\n"
-                f"  merge with: coord merge --only {state.work_aid}"
+                (
+                    "✓ merge queue reports READY — stopping here (--no-merge)\n"
+                    f"  merge with: coord merge --only {state.work_aid}"
+                )
+                if review_gate_overridden_by_queue
+                else (
+                    "✓ review approved — stopping here (--no-merge)\n"
+                    f"  merge with: coord merge --only {state.work_aid}"
+                )
             ),
             warnings=warnings,
         )
@@ -6475,34 +6487,19 @@ class Driver:
                     f"no state change in {(now - last_change) / 60.0:g}m "
                     f"({','.join(state.active_types) or 'nothing'} active)"
                 )
-                # #3891: `work_review_state == "dispatched"` with nothing
-                # active and no review assignment on the board at all is a
-                # STALE claim, not a review genuinely in flight — a scoped
-                # re-review's verdict can land on a SUPERSEDED round (see
-                # `coord.auto_loop.newest_work_round_on_chain`), leaving this
-                # round's own row wedged at "dispatched" forever.
-                # `dispatch_pending_reviews`'s eligibility filter treats
-                # "dispatched" as already-handled, so the plain `coord
-                # notify` nudge below would do nothing for this shape on its
-                # own. Reset it to "pending" FIRST, on this same stall
-                # cadence (not every poll — a dispatch that is genuinely in
-                # flight just hasn't shown up on this board read yet), so
-                # the `coord notify` this branch is about to run re-offers
-                # it in the SAME pass.
-                if (
-                    state.active_count == 0
-                    and state.work_review_state == "dispatched"
-                    and not state.review_aid
-                ):
-                    self.warn(
-                        f"review_state='dispatched' for {state.work_aid} but "
-                        "no live review assignment is on the board — "
-                        "resetting to 'pending' (#3891)"
-                    )
-                    self.run_coord((
-                        "diagnose", self.repo, str(self.issue),
-                        "--stage", "review", "--reset",
-                    ))
+                # A `review_state="dispatched"` row with no live review
+                # assignment on the board (a scoped re-review's verdict
+                # landed on an older round, leaving this one wedged) is
+                # exactly the shape `coord.review.heal_unreviewed_newest_
+                # work_legs` resets to "pending" before the eligibility
+                # filter runs — `dispatch_pending_reviews` calls it, and
+                # `coord notify` (just below) routes through
+                # `dispatch_pending_reviews`. No separate repair belongs
+                # here: `coord diagnose --stage review --reset` answers a
+                # different question (an existing review ASSIGNMENT's own
+                # stale state) and, for a plain `type="work"` row with no
+                # review assignment at all, neither resets nor re-dispatches
+                # anything.
                 self.run_notify()
                 last_nudge = now
                 # #1632: publish the nudge so the phone notifier can ask

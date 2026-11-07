@@ -57,6 +57,7 @@ from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
     Board,
+    effective_issue_number,
 )
 from coord.review import (
     ReviewFindings,
@@ -67,9 +68,11 @@ from coord.review import (
     maybe_scoped_review_for_completed_fix,
     mechanical_gate_kind,
     needs_redesign_escalation,
+    newest_done_work_leg,
     parse_review_from_agent,
     parse_review_from_log,
     record_unparseable_treated_as_blocking,
+    review_could_have_seen_head,
 )
 from coord.board_service import read_board, write_board
 from coord.state import record_dispatched_assignment
@@ -645,29 +648,42 @@ def propagate_review_verdict(
     creating a PENDING queue entry would only add a row that
     ``has_approved_review`` is guaranteed to reject.
 
-    #3891: ``review.review_of_assignment_id`` is not always the round this
-    review actually reviewed — a SCOPED re-review (see
-    :func:`newest_work_round_on_chain`'s docstring) keeps it anchored to an
-    OLDER round on the same chain. Resolve it with
-    :func:`newest_work_round_on_chain` and, when that finds a newer round,
-    re-parent *review* onto it (both in memory and durably via
-    :func:`coord.state.repoint_review_of_assignment_id`) before writing the
-    verdict — so the verdict, and every reader keyed on
-    ``review_of_assignment_id`` (``drive_state.project``'s review match
-    chief among them), land on the round whose head was actually read.
+    ``review.review_of_assignment_id`` is not always the round this review
+    actually reviewed — a SCOPED re-review (see
+    :func:`coord.review.dispatch_scoped_review`'s docstring) keeps it
+    anchored to an OLDER round on the same issue. Resolve the issue's
+    newest done work leg via :func:`coord.review.newest_done_work_leg` —
+    the same answer the Review gate itself uses, rather than a second
+    lookup that could disagree with it — and, only when *review* was
+    actually dispatched late enough to have read that leg's head
+    (:func:`coord.review.review_could_have_seen_head`, the exact
+    discriminator :func:`coord.review.superseded_review_gap` uses, so the
+    two can never disagree), re-parent *review* onto it: both in memory and
+    durably via :func:`coord.state.repoint_review_of_assignment_id`, before
+    writing the verdict. Every reader keyed on ``review_of_assignment_id``
+    (``drive_state.project``'s review match chief among them) then agrees
+    on which round was actually reviewed.
     """
     if not review.review_of_assignment_id:
         return None
     anchor = board.find_by_id(review.review_of_assignment_id)
     if anchor is None:
         return None
-    work = newest_work_round_on_chain(board, anchor)
+    work = anchor
+    newest = newest_done_work_leg(
+        board, anchor.repo_name, effective_issue_number(anchor)
+    )
+    if (
+        newest is not None
+        and newest.assignment_id != anchor.assignment_id
+        and review_could_have_seen_head(review, newest)
+    ):
+        work = newest
 
     if work.assignment_id != anchor.assignment_id:
         log.info(
             "auto_loop: re-parenting review %s from stale round %s to "
-            "newest round %s on the same (repo, issue, branch) chain "
-            "(#3891)",
+            "newest round %s on the same issue (#3891)",
             review.assignment_id, anchor.assignment_id, work.assignment_id,
         )
         review.review_of_assignment_id = work.assignment_id
@@ -946,48 +962,6 @@ def next_fix_iteration_for_branch(
             continue
         highest = max(highest, a.review_iteration or 0)
     return highest + 1
-
-
-def newest_work_round_on_chain(board: Board, work: Assignment) -> Assignment:
-    """The newest :data:`~coord.models.WORK_LIKE_TYPES` row on *work*'s own
-    (repo, issue, branch) chain — *work* itself when nothing newer exists.
-
-    #3891: a SCOPED re-review's ``review_of_assignment_id`` deliberately
-    stays anchored to an OLDER round rather than the fix round it actually
-    reviewed — see :func:`coord.review.maybe_scoped_review_for_completed_fix`
-    and :func:`coord.review.dispatch_scoped_review`'s docstrings for why
-    (the #3310 claim/release key). Resolving ``review.review_of_assignment_id``
-    with a plain :func:`Board.find_by_id` therefore risks landing a terminal
-    verdict on a SUPERSEDED round — the exact incident this closes: a fix
-    round's re-review approved, but the approval landed on the original
-    (already-bounced) work row, so the fix round sat at
-    ``review_state="dispatched"``/``review_verdict=None`` forever while the
-    merge gate, reading the stale row, reported READY.
-
-    This is the ONE place that answers "given a row this chain's claim
-    bookkeeping points at, which round should actually receive the verdict?"
-    — :func:`propagate_review_verdict` is the only caller today, but any
-    future one should route through this rather than re-deriving the scan.
-
-    Same scan shape as :func:`next_fix_iteration_for_branch` (exact repo/
-    issue/branch match, ``active`` and ``completed`` both), tie-broken on
-    ``dispatched_at`` so a same-iteration race resolves to whichever row
-    actually dispatched most recently, deterministically.
-    """
-    best = work
-    best_key = (work.review_iteration or 0, float(work.dispatched_at or 0.0))
-    for a in (*board.active, *board.completed):
-        if a.type not in WORK_LIKE_TYPES:
-            continue
-        if a.repo_name != work.repo_name or a.issue_number != work.issue_number:
-            continue
-        if a.branch != work.branch:
-            continue
-        key = (a.review_iteration or 0, float(a.dispatched_at or 0.0))
-        if key > best_key:
-            best_key = key
-            best = a
-    return best
 
 
 def last_fix_model_for_branch(
@@ -1284,28 +1258,20 @@ def _dispatch_fix_for_review(
     *override_machine* (#3208, from ``coord fix --machine``) is forwarded
     straight to :func:`_dispatch_fix` — see its docstring.
     """
-    # #1663 (second gap): write the verdict onto the parent work row on the
-    # request-changes path too. `_advance_pipeline` has always done this for
-    # approve (#1565) but there was no request-changes twin — the only place
-    # this function ever touched the parent was the `_work_is_terminal` early
-    # return below, and even that set `review_state` without `review_verdict`.
-    # The fix worker is dispatched off the *transition* and doesn't need the
-    # row, so nothing broke loudly; what it cost was legibility — a row that
-    # still reads `dispatched`/NULL after a real rejection is invisible to
-    # `coord drive`, to the TUI's Review stage, and to any state-derived
-    # recovery sweep. Done BEFORE the terminal/iteration-cap branches so every
-    # outcome of this function leaves an honest parent row, not just the happy
-    # one. No merge-queue refresh: request-changes can never satisfy
+    # Writes `review_state`/`review_verdict` onto the parent work row for the
+    # request-changes path, same as the approve path does — a row that still
+    # reads `dispatched`/NULL after a real rejection is invisible to `coord
+    # drive`, the TUI's Review stage, and any state-derived recovery sweep.
+    # Done BEFORE the terminal/iteration-cap branches so every outcome of
+    # this function leaves an honest parent row, not just the happy one. No
+    # merge-queue refresh: request-changes can never satisfy
     # `has_approved_review`.
     #
-    # #3891: this ALSO resolves *review*'s reviewed work assignment — reading
-    # it back off `propagate_review_verdict`'s return (rather than a separate
-    # ``board.find_by_id(review.review_of_assignment_id)`` here) rather than
-    # re-deriving the same answer twice, which is also what the "any future
-    # caller routes through `newest_work_round_on_chain`" promise in that
-    # helper's docstring means in practice. A SCOPED re-review's
-    # ``review_of_assignment_id`` can anchor to an OLDER, superseded round;
-    # resolving it BEFORE this function reads `work` means the fix this
+    # Also resolves *review*'s reviewed work assignment — reading it back
+    # off the return value rather than a separate
+    # ``board.find_by_id(review.review_of_assignment_id)`` here, so a SCOPED
+    # re-review's ``review_of_assignment_id`` (which can anchor to an OLDER,
+    # superseded round) is resolved exactly once, and the fix this
     # request-changes verdict dispatches lands on the round that was
     # actually reviewed, not the stale anchor.
     work = propagate_review_verdict(review, board, config, refresh_merge_queue=False)

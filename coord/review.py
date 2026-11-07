@@ -5277,6 +5277,22 @@ def newest_done_work_leg(
     return max(legs, key=lambda a: (a.dispatched_at or 0.0, a.assignment_id or ""))
 
 
+def review_could_have_seen_head(review: Assignment, work: Assignment) -> bool:
+    """Whether *review* was dispatched late enough to have actually read
+    *work*'s head — the one-line discriminator a scoped re-review relies on
+    (it deliberately carries an OLDER round's ``review_of_assignment_id``,
+    see ``dispatch_scoped_review``'s docstring) to tell a round it already
+    covers from one it has never seen.
+
+    Factored out of :func:`superseded_review_gap` so every caller that
+    needs to answer "did this review cover this round's head" — including
+    :func:`coord.auto_loop.propagate_review_verdict`'s re-parent — uses the
+    exact same predicate and can never disagree with it.
+    """
+    head_ready_at = work.finished_at or work.dispatched_at or 0.0
+    return (review.dispatched_at or 0.0) >= head_ready_at
+
+
 def superseded_review_gap(
     board: Board, repo_name: str, issue_number: int
 ) -> tuple[Assignment, Assignment] | None:
@@ -5306,10 +5322,9 @@ def superseded_review_gap(
         return None
     latest = max(reviews, key=lambda a: (a.dispatched_at or 0.0, a.assignment_id or ""))
     # A review dispatched after the newest leg finished already saw its head
-    # (the #3161 scoped re-review deliberately carries the OLDER leg's id),
-    # so it is not a gap.
-    head_ready_at = newest.finished_at or newest.dispatched_at or 0.0
-    if (latest.dispatched_at or 0.0) >= head_ready_at:
+    # (a scoped re-review deliberately carries the OLDER leg's id), so it is
+    # not a gap.
+    if review_could_have_seen_head(latest, newest):
         return None
     return newest, latest
 
