@@ -1617,6 +1617,58 @@ class TestBranchCommitsAhead:
         gh.assert_called_once()
 
 
+class TestGetBaseDivergence:
+    """#3899: one three-dot compare answering "where did this tree fork from
+    the base, and how far has the base moved since". Every failure shape
+    returns ``None`` — "couldn't ask", never "no divergence"."""
+
+    _PAYLOAD = json.dumps(
+        {"merge_base_commit": {"sha": "a1a1a1a1a1a1"}, "ahead_by": 4}
+    )
+
+    def test_returns_merge_base_and_distance(self) -> None:
+        with patch("coord.github_ops._gh", return_value=self._PAYLOAD) as gh:
+            assert github_ops.get_base_divergence(
+                "acme/api", "branchsha", "main",
+            ) == ("a1a1a1a1a1a1", 4)
+        # head is the compare's BASE and the base branch its HEAD, so
+        # `ahead_by` counts what the base gained past the branch point.
+        assert "repos/acme/api/compare/branchsha...main" in gh.call_args.args
+
+    def test_zero_distance_is_a_real_answer(self) -> None:
+        payload = json.dumps(
+            {"merge_base_commit": {"sha": "b2b2b2b2b2b2"}, "ahead_by": 0}
+        )
+        with patch("coord.github_ops._gh", return_value=payload):
+            assert github_ops.get_base_divergence(
+                "acme/api", "branchsha", "main",
+            ) == ("b2b2b2b2b2b2", 0)
+
+    def test_gh_failure_is_none(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("boom")):
+            assert github_ops.get_base_divergence("acme/api", "b", "main") is None
+
+    def test_unparseable_payload_is_none(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not json"):
+            assert github_ops.get_base_divergence("acme/api", "b", "main") is None
+
+    def test_missing_merge_base_is_none(self) -> None:
+        with patch("coord.github_ops._gh", return_value=json.dumps({"ahead_by": 2})):
+            assert github_ops.get_base_divergence("acme/api", "b", "main") is None
+
+    def test_missing_ahead_by_is_none(self) -> None:
+        payload = json.dumps({"merge_base_commit": {"sha": "a1a1a1a1a1a1"}})
+        with patch("coord.github_ops._gh", return_value=payload):
+            assert github_ops.get_base_divergence("acme/api", "b", "main") is None
+
+    def test_blank_refs_never_spend_a_call(self) -> None:
+        with patch("coord.github_ops._gh") as gh:
+            assert github_ops.get_base_divergence("acme/api", "", "main") is None
+            assert github_ops.get_base_divergence("acme/api", "b", "") is None
+            assert github_ops.get_base_divergence("", "b", "main") is None
+        gh.assert_not_called()
+
+
 class TestBranchCommitsAheadForAssignment:
     """#1606: the one shared implementation of "branch empty -> 0, repo
     missing -> None, else ask GitHub" — `coord retry`'s advisory gate

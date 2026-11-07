@@ -132,14 +132,18 @@ class FakeGh:
     def __init__(
         self, *, branch_sha="branchsha", base_sha="basesha", patch_id="patchid",
         compare_files: list[str] | None = None,
+        merge_base: str | None = None, base_ahead: int = 0,
     ):
         self.branch_sha = branch_sha
         self.base_sha = base_sha
         self.patch_id = patch_id
         self.compare_files = compare_files
+        self.merge_base = merge_base
+        self.base_ahead = base_ahead
         self.sha_calls: list[tuple[str, str]] = []
         self.patch_calls: list[tuple[str, str, str]] = []
         self.compare_calls: list[tuple[str, str, str]] = []
+        self.divergence_calls: list[tuple[str, str, str]] = []
 
     def get_branch_sha(self, repo: str, branch: str) -> str | None:
         self.sha_calls.append((repo, branch))
@@ -152,6 +156,18 @@ class FakeGh:
     def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
         self.compare_calls.append((repo, base, head))
         return self.compare_files
+
+    def get_base_divergence(
+        self, repo: str, head: str, base: str,
+    ) -> tuple[str, int] | None:
+        """#3899's merge-base probe. ``merge_base=None`` (the default, and so
+        every pre-#3899 test in this file) answers "couldn't ask", which the
+        base-moved note treats as silence — the same opt-in convention the
+        other optional ``gh_ops`` reads use."""
+        self.divergence_calls.append((repo, head, base))
+        if self.merge_base is None:
+            return None
+        return self.merge_base, self.base_ahead
 
     def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
         """Synthesize unified-diff text for ``self.compare_files``, one block
@@ -471,6 +487,148 @@ class TestDecision:
         # gh_ops was actually consulted for both the branch and the base.
         assert ("acme/api", "issue-42-foo") in gh.sha_calls
         assert ("acme/api", "main") in gh.sha_calls
+
+    def test_base_moved_note_names_both_shas_and_the_distance(
+        self, config: Config,
+    ) -> None:
+        """#3899: the verdict was recorded against base `A` and `main` is now
+        at `B` — the Test decision carries a base-moved note naming both,
+        plus how far the base moved past the branch point."""
+        work = _work(
+            test_state="passed", test_reason="headless smoke",
+            test_head_sha="branchsha", test_base_sha="a1a1a1a1a1a1",
+        )
+        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(
+            branch_sha="branchsha", base_sha="b2b2b2b2b2b2", patch_id="samepatch",
+            merge_base="a1a1a1a1a1a1", base_ahead=3,
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        test_decision = {d.gate: d for d in report.decisions}["test"]
+        # The note is informational — it does not flip the gate.
+        assert test_decision.required is True
+        assert test_decision.ok is True
+        note = test_decision.base_moved_note
+        assert note is not None
+        assert "a1a1a1a" in note   # the base the Test stage built against
+        assert "b2b2b2b" in note   # where `main` is now
+        assert "3 commits" in note
+        # Anchored on the RECORDED test-time branch tip, not the live head.
+        assert ("acme/api", "branchsha", "main") in gh.divergence_calls
+        # Flows through the machine-readable surface too.
+        assert report_to_dict(report)["decisions"][1]["base_moved_note"] == note
+
+    def test_single_commit_base_move_reads_singular(self, config: Config) -> None:
+        work = _work(
+            test_state="passed", test_head_sha="branchsha",
+            test_base_sha="a1a1a1a1a1a1",
+        )
+        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(
+            branch_sha="branchsha", base_sha="b2b2b2b2b2b2", patch_id="samepatch",
+            merge_base="a1a1a1a1a1a1", base_ahead=1,
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        note = {d.gate: d for d in report.decisions}["test"].base_moved_note
+        assert note is not None
+        assert "1 commit " in note
+
+    def test_no_note_when_the_base_has_not_moved(self, config: Config) -> None:
+        """#3899: the branch point IS the base's current tip — the Test stage
+        and GitHub CI build the same tree, so there is nothing to say."""
+        work = _work(
+            test_state="passed", test_head_sha="branchsha",
+            test_base_sha="b2b2b2b2b2b2",
+        )
+        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(
+            branch_sha="branchsha", base_sha="b2b2b2b2b2b2", patch_id="samepatch",
+            merge_base="b2b2b2b2b2b2", base_ahead=0,
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        test_decision = {d.gate: d for d in report.decisions}["test"]
+        assert test_decision.ok is True
+        assert test_decision.base_moved_note is None
+
+    def test_no_note_when_the_divergence_read_cannot_answer(
+        self, config: Config,
+    ) -> None:
+        """A probe that came back empty is "couldn't ask", never "the base is
+        where the test left it" — so no note, same fail-open posture as every
+        other optional ``gh_ops`` read in this module."""
+        work = _work(
+            test_state="passed", test_head_sha="branchsha",
+            test_base_sha="a1a1a1a1a1a1",
+        )
+        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(
+            branch_sha="branchsha", base_sha="b2b2b2b2b2b2", patch_id="samepatch",
+            merge_base=None,
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        assert {d.gate: d for d in report.decisions}["test"].base_moved_note is None
+
+    def test_no_note_without_a_recorded_test_time_branch_anchor(
+        self, config: Config,
+    ) -> None:
+        """No ``test_head_sha`` means there is no record of WHICH tree was
+        tested, so the merge-base of "the tested tree" is unanswerable — the
+        divergence probe is never even spent."""
+        work = _work(test_state="passed", test_head_sha=None, test_base_sha=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(merge_base="a1a1a1a1a1a1", base_ahead=5)
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        test_decision = {d.gate: d for d in report.decisions}["test"]
+        assert test_decision.ok is True
+        assert test_decision.base_moved_note is None
+        assert gh.divergence_calls == []
+
+    def test_base_moved_note_renders_under_the_passing_test_line(
+        self, config: Config,
+    ) -> None:
+        work = _work(
+            test_state="passed", test_head_sha="branchsha",
+            test_base_sha="a1a1a1a1a1a1",
+        )
+        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(
+            branch_sha="branchsha", base_sha="b2b2b2b2b2b2", patch_id="samepatch",
+            merge_base="a1a1a1a1a1a1", base_ahead=2,
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+        out = format_gate_report(report)
+
+        lines = out.splitlines()
+        passed_idx = next(i for i, ln in enumerate(lines) if "test   : passed" in ln)
+        assert "BASE MOVED" in lines[passed_idx + 1]
+        assert "b2b2b2b" in lines[passed_idx + 1]
+
+    def test_no_note_when_the_test_gate_is_already_blocked(
+        self, config: Config,
+    ) -> None:
+        """A refusing Test gate already says what it is refusing on (#1479's
+        STALE line is frequently this very base move, seen through a gate
+        that DOES act on it). The note exists for the silent case."""
+        work = _work(test_state=None)  # never tested
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(merge_base="a1a1a1a1a1a1", base_ahead=4)
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        test_decision = {d.gate: d for d in report.decisions}["test"]
+        assert test_decision.ok is False
+        assert test_decision.base_moved_note is None
 
     def test_stale_branch_content_change(self, config: Config) -> None:
         # Branch content changed (patch-id differs) since the test ran —

@@ -3501,6 +3501,48 @@ def branch_commits_ahead_for_assignment(assignment: Any, config: Any) -> int | N
     return branch_commits_ahead(repo_cfg.github, base, branch)
 
 
+def get_base_divergence(repo: str, head: str, base: str) -> tuple[str, int] | None:
+    """The merge-base of *head* and *base*, plus how far *base* has moved past it.
+
+    #3899: the Test stage builds the branch **as-is**; GitHub CI builds the
+    PR's merge ref (the branch combined with the base's current tip). Those
+    are the same tree only while the base has gained nothing since the
+    branch forked from it. This answers that question in one three-dot
+    compare (``repos/{repo}/compare/{head}...{base}``, the same API
+    :func:`get_compare_files` and :func:`branch_commits_ahead` use): the
+    returned ``merge_base_commit.sha`` is the commit the branch actually
+    forked from, and ``ahead_by`` — with *head* as the compare's base and
+    *base* as its head — counts the commits the base branch holds that the
+    branch does not.
+
+    *head* may be a branch name or a raw SHA, so a caller holding a
+    recorded test-time branch tip can ask about the tree that was actually
+    tested rather than about whatever the branch points at now.
+
+    Returns ``None`` on any ``gh`` failure, an unparseable payload, or a
+    payload missing either field — callers treat that as "could not ask"
+    and stay silent, never as "the base has not moved".
+    """
+    if not repo or not head or not base:
+        return None
+    try:
+        raw = _gh("api", f"repos/{repo}/compare/{head}...{base}",
+            caller="github_ops.get_base_divergence")
+        cmp = json.loads(raw)
+    except Exception:  # noqa: BLE001 — unknown, never "no divergence"
+        return None
+    if not isinstance(cmp, dict):
+        return None
+    merge_base = (cmp.get("merge_base_commit") or {})
+    merge_base_sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
+    ahead = cmp.get("ahead_by")
+    if not isinstance(merge_base_sha, str) or not merge_base_sha:
+        return None
+    if not isinstance(ahead, int) or isinstance(ahead, bool):
+        return None
+    return merge_base_sha, ahead
+
+
 def get_branch_patch_id(repo: str, base: str, branch: str) -> str | None:
     """Return the content-addressed patch-id for *branch*'s diff against *base*.
 

@@ -17,6 +17,13 @@ Two things were missing before this module existed:
    has since moved), which is otherwise unexplainable from any surface the
    operator has: a verdict can read ``passed`` while ``coord merge`` still
    refuses with ``smoke_required``.
+3. #3899: whether the tree the Test stage built is the tree GitHub CI
+   builds. The Test stage runs the branch as-is; CI runs the PR's merge ref
+   (branch + the base's current tip), so a base that moved past the branch
+   point makes ``test: passed`` and an all-red PR both correct at once. A
+   passing Test decision carries a ``base_moved_note`` naming both SHAs when
+   that split exists — informational, never a refusal
+   (:func:`_base_moved_note`).
 
 :func:`build_gate_report` is the read-only core (board + config + an
 optional ``gh_ops`` duck-typed seam in, a :class:`GateReport` out); it
@@ -171,6 +178,15 @@ class GateDecision:
     # for the fix row reads as two components disagreeing about one fact
     # instead of two components correctly answering two different questions.
     assignment_id: str | None = None
+    # #3899: populated ONLY for gate="test", and only when the Test stage
+    # provably built a different tree than GitHub CI does — the base branch
+    # has gained commits since the tested branch forked from it, so the
+    # branch-only tree the Test stage ran is not the merge ref CI builds.
+    # Purely INFORMATIONAL: it never touches `required`/`ok` (whether the
+    # combined tree is actually broken is CI's question, and #2091's
+    # live-CI check is what answers it). `None` means either no divergence
+    # or no way to ask — never "the base is where the test left it".
+    base_moved_note: str | None = None
 
 
 @dataclass
@@ -818,6 +834,22 @@ def build_gate_report(
         test_decision.anchor = smoke_status.anchor
         test_decision.recorded_sha = smoke_status.recorded_sha
         test_decision.current_sha = smoke_status.current_sha
+    if test_ok and smoke_required:
+        # #3899: only on the GREEN path — a Test gate that is already
+        # refusing says plenty on its own, and a #1479 STALE refusal is
+        # frequently this very base move seen through a gate that DOES act
+        # on it. The silent case is the one worth a note: `test: passed`
+        # for a tree GitHub CI never built.
+        verdict_row = next(
+            (
+                a for a in matching
+                if a.assignment_id == (test_decision.assignment_id or winner.assignment_id)
+            ),
+            None,
+        )
+        test_decision.base_moved_note = _base_moved_note(
+            repo_cfg, target_branch, verdict_row, gh_ops,
+        )
     report.decisions.append(test_decision)
 
     # #2024: the two readings, reconciled by SAYING WHICH ROW EACH IS ABOUT.
@@ -963,6 +995,72 @@ def _short_sha(sha: str | None) -> str:
     return sha[:7] if sha else "unknown"
 
 
+def _base_moved_note(
+    repo_cfg,
+    target_branch: str | None,
+    verdict_row: "Assignment | None",
+    gh_ops: "GhOps | None",
+) -> str | None:
+    """(#3899) The note for a Test verdict whose tree GitHub CI never built.
+
+    The Test stage checks the branch out as-is and runs the suite on it; it
+    does not merge or rebase the base in first (the invariant
+    ``coord.merge_queue.has_smoke_verdict``'s #3443 block already relies
+    on). GitHub, meanwhile, runs every PR check against the **merge ref** —
+    the branch combined with the base's current tip. The two trees are the
+    same only while the base has gained nothing since the branch forked
+    from it, so a base that moved past the branch point is exactly the
+    shape that shows ``test: passed`` next to an all-red PR
+    (quadraui#2028's whole fix budget went green on the branch while CI
+    stayed red for a failure that only existed once a sibling PR's change
+    to the base combined with this branch's diff).
+
+    Anchored on the verdict row's recorded ``test_head_sha`` (#1479's
+    Test-gate anchor — the branch tip as it was when the suite ran), not on
+    the branch's current head, so the note describes the tree that was
+    actually **tested** even after a later rebase. Asking GitHub for the
+    merge-base of that recorded tip is equivalent to having recorded the
+    merge-base at test time: the target branch only ever grows forward, so
+    it can never rewrite the history the tested tip forked from.
+
+    ``None`` — say nothing — whenever the question cannot be answered
+    rather than when it is answered "no": no verdict row, no recorded
+    branch anchor, no live GitHub access, a *gh_ops* that doesn't implement
+    the reads (every pre-#3899 test double, so this is a true no-op against
+    them), or any error. The one case that returns a note is a positively
+    confirmed divergence.
+    """
+    if verdict_row is None or gh_ops is None or repo_cfg is None or not target_branch:
+        return None
+    get_base_divergence = getattr(gh_ops, "get_base_divergence", None)
+    get_branch_sha = getattr(gh_ops, "get_branch_sha", None)
+    if get_base_divergence is None or get_branch_sha is None:
+        return None
+    tested_head = getattr(verdict_row, "test_head_sha", None)
+    if not tested_head:
+        return None
+    try:
+        divergence = get_base_divergence(repo_cfg.github, tested_head, target_branch)
+        if not divergence:
+            return None
+        tested_base_sha, moved_by = divergence
+        current_base_sha = get_branch_sha(repo_cfg.github, target_branch)
+    except Exception:  # noqa: BLE001 — informational only, never break `coord gates`
+        return None
+    if not current_base_sha or not tested_base_sha or tested_base_sha == current_base_sha:
+        return None
+    commits = "1 commit" if moved_by == 1 else f"{moved_by} commits"
+    return (
+        f"base moved: the Test stage built this branch on top of {target_branch} at "
+        f"{_short_sha(tested_base_sha)}, but {target_branch} is now at "
+        f"{_short_sha(current_base_sha)} ({commits} ahead of the branch point). "
+        f"GitHub CI builds the PR's merge ref — branch + {target_branch}@"
+        f"{_short_sha(current_base_sha)} — so a green Test verdict here can sit "
+        "next to red checks without either being wrong (#3899). Informational: "
+        "the live CI state is the gate on that combined tree, not this verdict."
+    )
+
+
 def _row_test_confirmation(report: "GateReport", assignment_id: str | None) -> str | None:
     """The ``test_confirmation`` provenance carried by the row *assignment_id*
     names, or ``None`` when unknown/unset (#3357).
@@ -1098,6 +1196,11 @@ def format_gate_report(report: GateReport) -> str:
                     + (f" (recorded on {test.assignment_id})" if test.assignment_id else "")
                     + suffix
                 )
+                if test.base_moved_note:
+                    # #3899: printed under the passing line, not as a
+                    # refusal — the verdict stands, it just does not
+                    # describe the tree GitHub CI is building.
+                    lines.append(f"           BASE MOVED — {test.base_moved_note}")
             elif test.anchor:
                 noun = "base" if test.anchor == "base" else "branch"
                 lines.append(
