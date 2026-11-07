@@ -3455,10 +3455,54 @@ def _doctor_log_window_label(since_days: float) -> str:
 def _doctor_log_line(entry: Mapping[str, Any]) -> str:
     outcome = entry.get("outcome")
     outcome_suffix = f" outcome={outcome}" if outcome else ""
-    return (
+    line = (
         f"{entry.get('recorded_at', '?')}  {entry.get('queue', '?')}:{entry.get('key', '?')} "
         f"cause={entry.get('cause', '?')} action={entry.get('action', '?')}{outcome_suffix}"
     )
+    if entry.get("action") == "alert":
+        reason = _doctor_log_escalation_reason(entry)
+        if reason:
+            line += f" — {reason}"
+    return line
+
+
+def _doctor_log_escalation_reason(entry: Mapping[str, Any]) -> str | None:
+    """The live `coord.state.drive_escalations` reason text for *entry*'s
+    alert-tier row, when one is still on file for the same stage this
+    entry's own queue maps to
+    (`coord.board_doctor_policy._board_doctor_stage`).
+
+    `coord.board_doctor_policy.escalation_alert_dispatcher`'s full
+    diagnosis — cause with its confidence, evidence, what the doctor
+    already tried, and 2-3 options each with a command — is filed into
+    `drive_escalations`, not into the `board_doctor_decisions` row this
+    function's caller otherwise renders unchanged; this is the one place
+    `doctor-log` also reads that table, so the diagnosis reaches this
+    surface instead of only the phone alert and the digest.
+
+    Best-effort, read-only: an unparseable key, no escalation on file, a
+    `coord.state` read failure, or a stage mismatch (a more specific
+    escalation has since superseded this one) all return ``None`` — the
+    plain ``cause=.../action=...`` line is still printed either way, this
+    is enrichment, never a requirement.
+    """
+    parsed = parse_key(str(entry.get("key") or ""))
+    if parsed is None:
+        return None
+    repo_name, issue_number = parsed
+    try:
+        from coord.board_doctor_policy import _board_doctor_stage  # noqa: PLC0415, SLF001
+        from coord.state import get_drive_escalation  # noqa: PLC0415
+
+        escalation = get_drive_escalation(repo_name, issue_number)
+    except Exception:  # noqa: BLE001 — enrichment only, never blocks the log line
+        return None
+    if not escalation:
+        return None
+    if escalation.get("stage") != _board_doctor_stage(str(entry.get("queue") or "")):
+        return None
+    reason = str(escalation.get("reason") or "").strip()
+    return reason or None
 
 
 def _doctor_log_summary(

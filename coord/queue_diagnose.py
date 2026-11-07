@@ -99,7 +99,6 @@ __all__ = [
     "extract_failing_file_paths",
     "find_lost_work_touching",
     "is_sealed_confined_failure",
-    "parse_failing_check_names",
 ]
 
 
@@ -1232,62 +1231,51 @@ class DiagnosisOption:
     recommended: bool = False
 
 
-def parse_failing_check_names(evidence: Sequence[str]) -> tuple[str, ...]:
-    """Pull the failing check names back out of a :class:`~coord.
-    board_doctor.StuckRow`'s own evidence tuple.
-
-    `coord.board_doctor_policy` only ever sees `StuckRow.evidence`, never
-    the `LiveState` :func:`_checks_line` rendered it from, so recovering the
-    names means parsing the one line that already carries them —
-    ``"gh pr checks: N check(s) — K failure (name1, name2, name3)"`` — rather
-    than re-deriving a second copy of that rendering (#2096). Returns ``()``
-    when no line matches (no `gh pr checks` evidence line at all, or no
-    failures bucket in it, e.g. a row that is pending rather than failing).
-
-    Lossy on purpose, in the same direction `_checks_line` already is: that
-    renderer caps each bucket at 3 names, so a row with more than 3 failing
-    checks is under-reported here too — a known, pre-existing limit, not a
-    new one introduced by this parser.
-    """
-    pattern = re.compile(r"\bfailure \(([^)]*)\)")
-    for line in evidence:
-        match = pattern.search(line)
-        if match:
-            names = [n.strip() for n in match.group(1).split(",") if n.strip()]
-            return tuple(names)
-    return ()
-
-
 def is_sealed_confined_failure(
-    check_names: Sequence[str], sealed_paths: Sequence[str]
+    failing_paths: Sequence[str], sealed_paths: Sequence[str]
 ) -> bool:
-    """True only when *check_names* is non-empty, *sealed_paths* is
-    non-empty, and EVERY name in *check_names* names a path falling under
-    one of *sealed_paths* (#3883 point 4).
+    """True only when *failing_paths* is non-empty, *sealed_paths* is
+    non-empty, and EVERY entry in *failing_paths* names a path falling
+    under one of *sealed_paths*.
 
-    A CI job name that never mentions a path (the common case — "Test
-    (ubuntu-latest)") can never match, which is the conservative direction:
-    this must never manufacture a design-decision page out of an ordinary
-    CI failure just because the repo happens to have a sealed suite. It
-    fires only for the shape quadraui#2028 actually hit — a merge-ref-only
-    failure whose job name (or, for a directory-discovered driver, the test
-    file path within it) is itself inside the sealed tree.
+    *failing_paths* is the set of file paths a failing CI job's own log
+    excerpt named as failing (`extract_failing_file_paths`), never a bare
+    CI check/job NAME — a job name is an operator-chosen label ("Test
+    (ubuntu-latest)") that essentially never mentions a path, so matching
+    on it alone could never fire. An empty *failing_paths* (no log excerpt
+    available, or none of its lines named a file) is the conservative
+    direction: this must never manufacture a design-decision page out of
+    an ordinary CI failure just because the repo happens to have a sealed
+    suite. It fires only for the shape quadraui#2028 actually hit — a
+    merge-ref-only failure whose only failing file(s) are themselves
+    inside the sealed tree.
     """
-    if not check_names or not sealed_paths:
+    if not failing_paths or not sealed_paths:
         return False
-    for name in check_names:
-        if not any(_path_under_sealed(name, prefix) for prefix in sealed_paths):
+    for path in failing_paths:
+        if not any(_path_under_sealed(path, prefix) for prefix in sealed_paths):
             return False
     return True
 
 
 def _path_under_sealed(name: str, sealed_path: str) -> bool:
+    """True when *name* (a failing check name, or a failing file path
+    pulled from a CI log excerpt) falls under *sealed_path*.
+
+    A trailing ``/`` means *sealed_path* is a directory: any name
+    containing that prefix anywhere counts. No trailing slash means
+    *sealed_path* is itself one exact file (an `entrypoint:` route like
+    ``tui/tests/acceptance.rs``) — that must match *name* exactly, or as
+    a path suffix (*name* ending in ``/<sealed_path>``), never a bare
+    substring check, which would also match an unrelated file that
+    merely shares a substring with the sealed file's own name.
+    """
     sealed_path = sealed_path.strip()
     if not sealed_path:
         return False
     if sealed_path.endswith("/"):
         return sealed_path in name
-    return sealed_path in name
+    return name == sealed_path or name.endswith("/" + sealed_path)
 
 
 #: :func:`diagnose_baseline_red_env`'s verdict vocabulary — mirrors the
@@ -1304,17 +1292,30 @@ ENV_DIAGNOSIS_INCONCLUSIVE = "inconclusive"
 
 #: Substrings of a failing re-run's combined stdout/stderr that mean "the
 #: credential this ran with is no good", lowercase. Deliberately broad
-#: (`"401"`/`"403"` alone, not anchored to a provider's exact wording) since
-#: the whole point (coord#3870) is catching a NEW provider's auth failure
-#: without having seen its exact error text before — a false positive here
-#: only produces an extra, harmless "renew credential" option; a false
-#: negative silently drops back to the generic "base is red" wording, which
-#: is the pre-#3883 status quo, never a worse outcome than today.
+#: (not anchored to a provider's exact wording) since the whole point
+#: (coord#3870) is catching a NEW provider's auth failure without having
+#: seen its exact error text before — a false positive here only produces
+#: an extra, harmless "renew credential" option; a false negative silently
+#: drops back to the generic "base is red" wording, which is the pre-#3883
+#: status quo, never a worse outcome than today.
+#:
+#: A bare ``"401"``/``"403"`` is deliberately NOT one of these: pytest's own
+#: failure output routinely contains both as line numbers
+#: (``tests/test_foo.py:403: AssertionError``) and as pass/fail counts
+#: (``5 failed, 1401 passed``), so an ordinary red base would misclassify
+#: as a credential failure far more often than not. The status-code
+#: entries below require the code to appear WITH its usual HTTP wording —
+#: enough context that a line number or a count can never match, while
+#: still catching a provider's error text this list has never seen before.
 _CREDENTIAL_ERROR_PATTERNS: tuple[str, ...] = (
-    "401", "403", "unauthorized", "forbidden", "invalid api key",
+    "unauthorized", "forbidden", "invalid api key",
     "invalid_api_key", "authentication failed", "authentication error",
     "api key expired", "token expired", "invalid_request_error: incorrect api key",
     "permission denied: invalid credential",
+    "http 401", "401 unauthorized", "unauthorized (401", "status 401",
+    "status: 401", "error 401",
+    "http 403", "403 forbidden", "forbidden (403", "status 403",
+    "status: 403", "error 403",
 )
 
 #: Provider/credential names worth naming in the option text when they turn

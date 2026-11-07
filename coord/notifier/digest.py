@@ -35,7 +35,7 @@ from coord.notifier.models import CONDITION_LABELS, Message, NotifyEvent
 #: line always reports the true total, so nothing is silently dropped.
 DIGEST_DETAIL_LIMIT = 12
 
-#: #3883: `coord.notifier.predicate._halted_event` appends exactly this
+#: `coord.notifier.predicate._halted_event` appends exactly this
 #: " Fix: <command>" suffix to a drive-halted event's own *body* whenever
 #: `HaltedDrive.proposed_command` is set — a board-doctor escalation's own
 #: recommended next step (`coord.board_doctor_policy.
@@ -43,7 +43,14 @@ DIGEST_DETAIL_LIMIT = 12
 #: this module already treats as user-facing prose) rather than reached
 #: for out of `NotifyEvent.detail`, which stays "never rendered verbatim"
 #: — see that field's own docstring.
-_FIX_COMMAND_RE = re.compile(r"\bFix: (.+)$")
+#:
+#: The leading ``.*`` is greedy and DOTALL, so it consumes the WHOLE body
+#: before backtracking to find the LAST ``Fix: `` rather than the first —
+#: `_halted_event` only ever appends one, as the final suffix, but any
+#: reason text that happens to contain its own "Fix: " substring earlier
+#: in the body must not have that occurrence (and everything after it)
+#: swallowed into the captured command instead of the real one.
+_FIX_COMMAND_RE = re.compile(r".*\bFix: (.+)$", re.DOTALL)
 
 
 def _as_datetime(now: float | datetime) -> datetime:
