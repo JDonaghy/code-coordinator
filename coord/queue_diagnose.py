@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -85,6 +85,21 @@ __all__ = [
     "stalled_keys",
     "stated_family",
     "trigger_conditions",
+    # #3883: escalation-diagnosis enrichment.
+    "ENV_DIAGNOSIS_BASE_RED",
+    "ENV_DIAGNOSIS_CREDENTIAL",
+    "ENV_DIAGNOSIS_INCONCLUSIVE",
+    "ENV_DIAGNOSIS_MISSING_TOOL",
+    "DiagnosisOption",
+    "EnvDiagnosis",
+    "EnvProbeResult",
+    "LostWorkCandidate",
+    "classify_env_probe_output",
+    "diagnose_baseline_red_env",
+    "extract_failing_file_paths",
+    "find_lost_work_touching",
+    "is_sealed_confined_failure",
+    "parse_failing_check_names",
 ]
 
 
@@ -1181,3 +1196,324 @@ def run_pass(
             live = LiveState(probe_errors=(f"probe raised {type(exc).__name__}: {exc}",))
         out.append(diagnose(entry, live, trigger=triggers.get(key, "")))
     return out
+
+
+# ── #3883: escalation-diagnosis enrichment ──────────────────────────────────
+#
+# `coord.board_doctor_policy.escalation_alert_dispatcher` is the one place a
+# `StuckRow` turns into a human-facing page — these three pieces each answer
+# one of #3883's three re-investigation questions that cost an operator a
+# whole session apiece on 2026-11-05/06 (coord#3870, quadraui#2028,
+# coord#3793): is the live failure confined to a sealed oracle path (never
+# fixable by a retry), is the repo's red base an environment problem rather
+# than a real regression, and does a branch already sitting unmerged on the
+# board happen to be the fix. Every function here is pure or takes its I/O
+# as an injected callable — `coord.board_doctor_policy` supplies the live
+# board/config/subprocess the production path needs; the tests below drive
+# the same functions with fakes, exactly like `LiveProbe` does for
+# :func:`diagnose` above.
+
+
+@dataclass(frozen=True)
+class DiagnosisOption:
+    """One concrete, ready-to-run next step offered to the operator.
+
+    *command* is a literal, copy-pasteable shell command whenever the fleet
+    has one (a `coord` verb, a `git`/`gh` invocation) — the whole point of
+    #3883 is that the operator should not have to re-derive it. A handful of
+    causes (renewing an out-of-band credential, choosing a design direction)
+    have no such command; for those *command* is the concrete instruction
+    itself, worded as an imperative action rather than left blank, since
+    "there is no command" must never collapse into "there is no option".
+    """
+
+    label: str
+    command: str
+    recommended: bool = False
+
+
+def parse_failing_check_names(evidence: Sequence[str]) -> tuple[str, ...]:
+    """Pull the failing check names back out of a :class:`~coord.
+    board_doctor.StuckRow`'s own evidence tuple.
+
+    `coord.board_doctor_policy` only ever sees `StuckRow.evidence`, never
+    the `LiveState` :func:`_checks_line` rendered it from, so recovering the
+    names means parsing the one line that already carries them —
+    ``"gh pr checks: N check(s) — K failure (name1, name2, name3)"`` — rather
+    than re-deriving a second copy of that rendering (#2096). Returns ``()``
+    when no line matches (no `gh pr checks` evidence line at all, or no
+    failures bucket in it, e.g. a row that is pending rather than failing).
+
+    Lossy on purpose, in the same direction `_checks_line` already is: that
+    renderer caps each bucket at 3 names, so a row with more than 3 failing
+    checks is under-reported here too — a known, pre-existing limit, not a
+    new one introduced by this parser.
+    """
+    pattern = re.compile(r"\bfailure \(([^)]*)\)")
+    for line in evidence:
+        match = pattern.search(line)
+        if match:
+            names = [n.strip() for n in match.group(1).split(",") if n.strip()]
+            return tuple(names)
+    return ()
+
+
+def is_sealed_confined_failure(
+    check_names: Sequence[str], sealed_paths: Sequence[str]
+) -> bool:
+    """True only when *check_names* is non-empty, *sealed_paths* is
+    non-empty, and EVERY name in *check_names* names a path falling under
+    one of *sealed_paths* (#3883 point 4).
+
+    A CI job name that never mentions a path (the common case — "Test
+    (ubuntu-latest)") can never match, which is the conservative direction:
+    this must never manufacture a design-decision page out of an ordinary
+    CI failure just because the repo happens to have a sealed suite. It
+    fires only for the shape quadraui#2028 actually hit — a merge-ref-only
+    failure whose job name (or, for a directory-discovered driver, the test
+    file path within it) is itself inside the sealed tree.
+    """
+    if not check_names or not sealed_paths:
+        return False
+    for name in check_names:
+        if not any(_path_under_sealed(name, prefix) for prefix in sealed_paths):
+            return False
+    return True
+
+
+def _path_under_sealed(name: str, sealed_path: str) -> bool:
+    sealed_path = sealed_path.strip()
+    if not sealed_path:
+        return False
+    if sealed_path.endswith("/"):
+        return sealed_path in name
+    return sealed_path in name
+
+
+#: :func:`diagnose_baseline_red_env`'s verdict vocabulary — mirrors the
+#: `CAUSE_*`/`CONFIDENCE_*` convention above: short, stable slugs a report
+#: can bucket on, not prose.
+ENV_DIAGNOSIS_CREDENTIAL = "credential"
+ENV_DIAGNOSIS_MISSING_TOOL = "missing_tool"
+ENV_DIAGNOSIS_BASE_RED = "base_red"
+#: The probe could not be run at all, or ran and passed — neither answers
+#: "why is the base red", so neither may claim one of the three categories
+#: above. Never rendered as a finding; callers fall back to the pre-#3883
+#: generic wording when they see this.
+ENV_DIAGNOSIS_INCONCLUSIVE = "inconclusive"
+
+#: Substrings of a failing re-run's combined stdout/stderr that mean "the
+#: credential this ran with is no good", lowercase. Deliberately broad
+#: (`"401"`/`"403"` alone, not anchored to a provider's exact wording) since
+#: the whole point (coord#3870) is catching a NEW provider's auth failure
+#: without having seen its exact error text before — a false positive here
+#: only produces an extra, harmless "renew credential" option; a false
+#: negative silently drops back to the generic "base is red" wording, which
+#: is the pre-#3883 status quo, never a worse outcome than today.
+_CREDENTIAL_ERROR_PATTERNS: tuple[str, ...] = (
+    "401", "403", "unauthorized", "forbidden", "invalid api key",
+    "invalid_api_key", "authentication failed", "authentication error",
+    "api key expired", "token expired", "invalid_request_error: incorrect api key",
+    "permission denied: invalid credential",
+)
+
+#: Provider/credential names worth naming in the option text when they turn
+#: up near a credential-shaped error — cosmetic only (`EnvDiagnosis.
+#: credential_name` is never required to be non-``None``), so this list may
+#: safely miss a provider without breaking the classification itself.
+_KNOWN_CREDENTIAL_NAMES: tuple[str, ...] = (
+    "opencode", "anthropic", "claude", "openai", "github", "gh",
+)
+
+#: Matches the shell's own "command not found" / "no such file" wording —
+#: covers bash, zsh and PowerShell's `CommandNotFoundException` message
+#: closely enough to extract the missing tool's name as the capture group.
+_MISSING_TOOL_RE = re.compile(
+    r"(?:^|[:\s])([\w.\-]+): (?:command not found|not found)"
+    r"|no such file or directory: ['\"]?([\w.\-/]+)",
+    re.IGNORECASE,
+)
+
+
+def classify_env_probe_output(output: str) -> tuple[str, str | None]:
+    """``(category, name)`` for one failing re-run's combined output.
+
+    *category* is one of :data:`ENV_DIAGNOSIS_CREDENTIAL`,
+    :data:`ENV_DIAGNOSIS_MISSING_TOOL` or :data:`ENV_DIAGNOSIS_BASE_RED` —
+    never :data:`ENV_DIAGNOSIS_INCONCLUSIVE`, which is
+    :func:`diagnose_baseline_red_env`'s own verdict for "never got output to
+    classify at all", not something this text classifier can conclude.
+    Credential is checked before missing-tool: an expired-token message
+    sometimes also echoes a "command not found" from the *wrapper* script
+    the credential failure aborted, and the credential reading is the more
+    actionable one of the two.
+    """
+    lowered = output.lower()
+    for pattern in _CREDENTIAL_ERROR_PATTERNS:
+        if pattern in lowered:
+            name = next((n for n in _KNOWN_CREDENTIAL_NAMES if n in lowered), None)
+            return ENV_DIAGNOSIS_CREDENTIAL, name
+    match = _MISSING_TOOL_RE.search(output)
+    if match:
+        tool = match.group(1) or match.group(2)
+        return ENV_DIAGNOSIS_MISSING_TOOL, tool
+    return ENV_DIAGNOSIS_BASE_RED, None
+
+
+#: pytest's own short-summary line ("FAILED tests/test_foo.py::test_bar -
+#: AssertionError ..."), which `diagnose_baseline_red_env`'s re-run output
+#: carries whenever the failure is a genuine local test and not a
+#: credential/missing-tool error aborting before any test ran at all.
+_FAILING_FILE_RE = re.compile(r"^FAILED\s+([^\s:]+)", re.MULTILINE)
+
+
+def extract_failing_file_paths(output: str) -> tuple[str, ...]:
+    """The source file(s) named by a failing re-run's own output (#3883
+    point 3) — read off the SAME output :func:`diagnose_baseline_red_env`
+    already classified, never a second probe, so the lost-work cross-check
+    costs no extra re-run. Dedupes, preserving first-seen order; ``()``
+    when the output names no file at all (a credential/missing-tool error
+    aborted before any test ran, or the output is empty).
+    """
+    return tuple(dict.fromkeys(_FAILING_FILE_RE.findall(output)))
+
+
+@dataclass(frozen=True)
+class EnvProbeResult:
+    """One re-run of a repo's test command, on one host.
+
+    *error* is set only when the probe itself could not be carried out at
+    all (no remote-exec path to *host* from here, the checkout is missing,
+    the runner raised) — a case :func:`diagnose_baseline_red_env` must read
+    as "cannot tell", never as "the tests failed", since *exit_code*/*output*
+    are meaningless when *error* is set.
+    """
+
+    exit_code: int = 0
+    output: str = ""
+    error: str | None = None
+
+
+#: Re-runs *command* on *host*, returning what actually happened. The
+#: production default (`coord.board_doctor_policy._default_env_probe_runner`)
+#: is a real subprocess re-run under this process's own environment when
+#: *host* is the machine this process is itself running on — the fleet has
+#: no agent-HTTP exec primitive yet to reach a DIFFERENT host's env from
+#: here (tracked as a gap, not silently pretended away: see that function's
+#: own docstring). Tests inject a fake.
+EnvProbeRunner = Callable[[str, str], EnvProbeResult]
+
+
+@dataclass(frozen=True)
+class EnvDiagnosis:
+    """#3883 point 2: what re-running the base under *host*'s own
+    environment actually showed.
+
+    *raw_output* is the probe's own combined stdout/stderr, carried through
+    verbatim (never re-derived) so a caller doing the point-3 lost-work
+    cross-check (:func:`extract_failing_file_paths`) reads the SAME output
+    this already classified, rather than re-running the probe a second
+    time. Empty whenever the probe itself could not run at all.
+    """
+
+    category: str
+    detail: str
+    host: str
+    credential_name: str | None = None
+    tool_name: str | None = None
+    raw_output: str = ""
+
+
+def diagnose_baseline_red_env(
+    repo_name: str,
+    command: str,
+    *,
+    host: str,
+    run: EnvProbeRunner,
+) -> EnvDiagnosis:
+    """Re-run *command* for *repo_name* on *host* and classify the result
+    (#3883 point 2).
+
+    Never raises: *run* itself raising is caught and reported the same as
+    an explicit :attr:`EnvProbeResult.error` — a diagnosis probe failing is
+    evidence of nothing and must degrade to
+    :data:`ENV_DIAGNOSIS_INCONCLUSIVE`, not take the sweep down. A re-run
+    that PASSES is just as inconclusive as one that could not be run at
+    all: it means the failure did not reproduce right now, which is real
+    information (the board-doctor's own alert text says so) but answers a
+    different question than "why is it red", so it is never reported as one
+    of the three positive categories.
+    """
+    try:
+        result = run(host, command)
+    except Exception as exc:  # noqa: BLE001 — a probe failing is not a verdict
+        return EnvDiagnosis(
+            ENV_DIAGNOSIS_INCONCLUSIVE,
+            f"could not re-run on {host}: {type(exc).__name__}: {exc}",
+            host,
+        )
+    if result.error:
+        return EnvDiagnosis(
+            ENV_DIAGNOSIS_INCONCLUSIVE, f"could not re-run on {host}: {result.error}", host,
+        )
+    if result.exit_code == 0:
+        return EnvDiagnosis(
+            ENV_DIAGNOSIS_INCONCLUSIVE,
+            f"re-ran clean on {host} just now — the failure did not reproduce",
+            host,
+        )
+    category, name = classify_env_probe_output(result.output)
+    if category == ENV_DIAGNOSIS_CREDENTIAL:
+        named = f" ({name})" if name else ""
+        return EnvDiagnosis(
+            category, f"renew credential{named} on {host}", host,
+            credential_name=name, raw_output=result.output,
+        )
+    if category == ENV_DIAGNOSIS_MISSING_TOOL:
+        return EnvDiagnosis(
+            category, f"install {name or 'the missing tool'} on {host}", host,
+            tool_name=name, raw_output=result.output,
+        )
+    return EnvDiagnosis(
+        category, f"base is red on {host}: {command}", host, raw_output=result.output,
+    )
+
+
+@dataclass(frozen=True)
+class LostWorkCandidate:
+    """One unmerged branch the board still knows about — a merged-status
+    row GitHub never actually shows a matching merged PR for, or a
+    closed-issue branch with commits that never reached the base — together
+    with what it actually changed (#3883 point 3).
+
+    *changed_files* is the branch's diff against the base, already resolved
+    by the caller (`coord.github_ops.get_compare_files`, the same primitive
+    `coord.reconcile`'s own false-merge audit uses) — this dataclass and
+    :func:`find_lost_work_touching` do not fetch anything themselves, so the
+    search stays unit-testable without a live repo.
+    """
+
+    assignment_id: str
+    repo_name: str
+    issue_number: int
+    branch: str
+    changed_files: tuple[str, ...] = ()
+
+
+def find_lost_work_touching(
+    failing_files: Sequence[str],
+    candidates: Sequence[LostWorkCandidate],
+) -> list[LostWorkCandidate]:
+    """Which *candidates* touched any of *failing_files* (#3883 point 3).
+
+    Pure set-intersection — the I/O (which branches exist, what they
+    changed) is entirely the caller's job
+    (`coord.board_doctor_policy._lost_work_candidates`), so this is the one
+    piece that can be driven with plain fixtures. Returns ``[]`` when
+    *failing_files* is empty: an unknown failing-file set must never match
+    every candidate by vacuous intersection.
+    """
+    wanted = set(failing_files)
+    if not wanted:
+        return []
+    return [c for c in candidates if wanted.intersection(c.changed_files)]

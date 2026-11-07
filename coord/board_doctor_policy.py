@@ -143,7 +143,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Sequence
 
 _log = logging.getLogger(__name__)
 
@@ -165,6 +165,7 @@ from coord.board_doctor_permissions import (
     dispatch_sweep_action,
 )
 from coord.drive_queue import parse_key as _parse_row_key
+from coord.queue_diagnose import DiagnosisOption, EnvProbeResult
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
@@ -1017,6 +1018,69 @@ def _merge_ref_instruction(
     )
 
 
+#: #3883 point 4: `quadraui#2028`'s shape — an integration-red row whose
+#: live failing checks are ALL confined to the repo's own sealed acceptance
+#: paths. `coord.ci_fix`'s briefing (#3882) already tells a dispatched
+#: fix-it leg to stop with a `STUCK:` line rather than attempt a fix
+#: confined to a sealed path; this is the doctor-side half — recognizing
+#: the same shape BEFORE a leg is even dispatched (from `_investigate`,
+#: never from a leg's own report, which this module has no access to) and
+#: paging "needs a design decision" instead of burning a fix-it leg on
+#: something that briefing already refuses to touch.
+def _sealed_confined_lines(
+    row: StuckRow, repo_name: str, config: "Config",
+) -> tuple[str, ...] | None:
+    """The failing check lines, when *row* is a `CAUSE_INTEGRATION_RED` row
+    whose failure is entirely inside *repo_name*'s sealed acceptance paths —
+    ``None`` otherwise (no sealed driver configured, the cause isn't
+    `integration-red`, or at least one failing check falls outside the
+    sealed tree, which keeps this from misfiring on an ordinary mixed
+    failure that happens to touch a sealed file alongside others).
+    """
+    if row.cause != queue_diagnose.CAUSE_INTEGRATION_RED:
+        return None
+    sealed_paths = config.acceptance.sealed_paths(repo_name)
+    if not sealed_paths:
+        return None
+    check_names = queue_diagnose.parse_failing_check_names(row.evidence)
+    if not queue_diagnose.is_sealed_confined_failure(check_names, sealed_paths):
+        return None
+    return check_names
+
+
+def _design_decision_options(sealed_lines: tuple[str, ...]) -> tuple[DiagnosisOption, ...]:
+    """#3883 point 4's two choices — never a mechanical fix, since a sealed
+    oracle only EVER changes for a human-approved reason (#944). Neither is
+    marked recommended over the other: unlike every other option set this
+    module builds, there genuinely is no safe default here — see the
+    module-level "Why the allowlist... is NOT empty" rationale for the same
+    reasoning applied to C2's allowlist. :func:`_investigate` must never
+    dispatch a fix-it leg against this shape (see its own docstring),
+    so this exists purely to describe the decision, never to let the sweep
+    make it.
+    """
+    lines = ", ".join(sealed_lines) if sealed_lines else "the sealed check(s)"
+    return (
+        DiagnosisOption(
+            label="edit the sealed suite itself and bump its minor version",
+            command=(
+                f"edit the sealed descriptor/test lines that now fail ({lines}) "
+                "to accept the new field, then bump the acceptance suite's "
+                "own minor version so the change is reviewed as a deliberate "
+                "oracle update, not a quiet weakening"
+            ),
+        ),
+        DiagnosisOption(
+            label="redesign the change to stay non-breaking",
+            command=(
+                "make the new field/behavior additive (optional with a "
+                "backward-compatible default) so the existing sealed "
+                f"descriptor/test ({lines}) keeps validating unchanged"
+            ),
+        ),
+    )
+
+
 def _investigate(row: StuckRow) -> bool:
     """#3769's C1 wiring: dispatch a fix-it leg for an alert-eligible
     cause instead of paging a human outright.
@@ -1136,6 +1200,20 @@ def _investigate(row: StuckRow) -> bool:
             "--no-investigate sweep flag, or this repo has not opted in via "
             "repos[].board_doctor.investigate); falling back to the alert "
             "tier instead of dispatching a fix-it leg (#3771)",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    sealed_lines = _sealed_confined_lines(row, repo_name, config)
+    if sealed_lines is not None:
+        click.echo(
+            f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
+            "— its live failing check(s) are confined to this repo's sealed "
+            "acceptance paths (#3883 point 4); a fix-it leg would only "
+            "re-confirm the same `STUCK:` a worker's own ci-fix briefing "
+            "(#3882) already refuses to touch, so this pages a design "
+            "decision instead of dispatching one",
             err=True,
         )
         _alert_fallback(row)
@@ -1488,6 +1566,337 @@ def _attempted_actions_suffix(queue: str, key: str) -> str:
     return " — already tried: " + ", ".join(parts)
 
 
+def _stuck_since_text(queue: str, key: str) -> str:
+    """"since <timestamp>" / "since this sweep" for *queue*/*key* (#3883
+    point 1's "what is stuck and since when").
+
+    Reuses the SAME durable decision log :func:`_attempted_actions_suffix`
+    already reads (`coord.state.board_doctor_decisions`) rather than a
+    second timestamp source: the earliest recorded decision for this exact
+    row IS the earliest moment the doctor itself can prove this row was
+    already stuck. A row with no prior decision — the first sweep to ever
+    flag it — reads "since this sweep" rather than inventing a timestamp
+    nothing observed; a read failure degrades the same way, fail-open,
+    never blocking the alert itself on this being answerable.
+    """
+    import datetime as _dt  # noqa: PLC0415
+
+    from coord import state  # noqa: PLC0415
+
+    try:
+        entries = state.board_doctor_decisions()
+    except Exception:  # noqa: BLE001 — see docstring
+        return "since this sweep"
+    matching = [e for e in entries if e.get("queue") == queue and e.get("key") == key]
+    if not matching:
+        return "since this sweep"
+    timestamps = [state._board_doctor_decision_ts(e) for e in matching]  # noqa: SLF001
+    timestamps = [t for t in timestamps if t is not None]
+    if not timestamps:
+        return "since this sweep"
+    earliest = min(timestamps)
+    stamp = _dt.datetime.fromtimestamp(earliest, tz=_dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%MZ"
+    )
+    return f"since {stamp}"
+
+
+def _candidate_hosts_for_repo(repo_name: str, config: "Config") -> tuple[str, ...]:
+    """Every machine's ``host`` declared to carry *repo_name*
+    (``Machine.repos``) — the baseline-red env probe runs against each in
+    turn (#3883 point 2), since coord#3870's own incident spanned TWO hosts
+    (dellserver + precision) with independently expired credentials; a
+    probe confined to a single host would only ever have named half the
+    fix.
+    """
+    return tuple(
+        m.host
+        for m in (getattr(config, "machines", None) or ())
+        if repo_name in (getattr(m, "repos", None) or ())
+    )
+
+
+def _default_env_probe_runner(host: str, command: str) -> EnvProbeResult:
+    """#3883 point 2's production re-run of *command* under THIS process's
+    own environment (PATH, HOME) — real, never simulated, but only when
+    *host* names the machine this process is itself running on.
+
+    The fleet has no agent-HTTP exec primitive yet to reach a DIFFERENT
+    host's environment from here (tracked as a gap, not quietly assumed
+    away) — a probe aimed at any other host degrades to an honest
+    :attr:`EnvProbeResult.error` rather than guessing at that host's
+    environment from this one's, which `diagnose_baseline_red_env` then
+    reports as :data:`queue_diagnose.ENV_DIAGNOSIS_INCONCLUSIVE` exactly
+    like any other probe that could not run.
+    """
+    import socket  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    this_host = socket.gethostname()
+    if host != this_host and host.split(".")[0] != this_host.split(".")[0]:
+        return EnvProbeResult(
+            error=(
+                f"no remote-exec primitive to reach {host} from {this_host} "
+                "yet (#3883)"
+            ),
+        )
+    try:
+        completed = subprocess.run(  # noqa: S602 — operator-configured test command
+            command, shell=True, capture_output=True, text=True, timeout=600,
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe failing is not a verdict
+        return EnvProbeResult(error=f"{type(exc).__name__}: {exc}")
+    return EnvProbeResult(
+        exit_code=completed.returncode,
+        output=(completed.stdout or "") + (completed.stderr or ""),
+    )
+
+
+def _baseline_red_env_and_lost_work_options(
+    row: StuckRow, repo_name: str, config: "Config",
+) -> tuple[DiagnosisOption, ...]:
+    """#3883 points 2 and 3, folded into zero or more options for a
+    :data:`CAUSE_BASELINE_RED` row.
+
+    Re-runs the repo's own Test-stage command (`coord.smoke.
+    resolve_smoke_command` — the SAME resolution `coord drive-queue
+    sweep`'s own Test-stage dispatch uses, never a second guess at what
+    "the failing tests" means) on every machine :func:`_candidate_hosts_
+    for_repo` names, classifies each re-run
+    (`queue_diagnose.diagnose_baseline_red_env`), and — only for a host
+    that genuinely reproduced a red base rather than a credential/missing-
+    tool error — cross-checks the files that re-run named against the
+    board's own :class:`~coord.queue_diagnose.LostWorkCandidate` branches
+    (:func:`_lost_work_candidates`) for a likely ready-made fix.
+
+    Returns ``()`` whenever nothing came of any of this (no acceptance
+    driver/test command configured, no machine declares the repo, every
+    probe was inconclusive) — callers must then fall back to the #3761
+    generic ``coord status`` wording exactly as before #3883, never
+    invent a finding out of an inconclusive probe.
+    """
+    from coord.smoke import resolve_smoke_command  # noqa: PLC0415
+
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None:
+        return ()
+    smoke_cfg = getattr(config, "smoke_tests", None)
+    command = resolve_smoke_command(repo_cfg, smoke_cfg).command if smoke_cfg else None
+    if not command:
+        return ()
+    hosts = _candidate_hosts_for_repo(repo_name, config)
+    if not hosts:
+        return ()
+
+    credential_hosts: list[str] = []
+    credential_name: str | None = None
+    tool_hosts: list[str] = []
+    tool_name: str | None = None
+    failing_files: tuple[str, ...] = ()
+    for host in hosts:
+        diagnosis = queue_diagnose.diagnose_baseline_red_env(
+            repo_name, command, host=host, run=_default_env_probe_runner,
+        )
+        if diagnosis.category == queue_diagnose.ENV_DIAGNOSIS_CREDENTIAL:
+            credential_hosts.append(host)
+            credential_name = credential_name or diagnosis.credential_name
+        elif diagnosis.category == queue_diagnose.ENV_DIAGNOSIS_MISSING_TOOL:
+            tool_hosts.append(host)
+            tool_name = tool_name or diagnosis.tool_name
+        elif diagnosis.category == queue_diagnose.ENV_DIAGNOSIS_BASE_RED and not failing_files:
+            failing_files = queue_diagnose.extract_failing_file_paths(
+                diagnosis.raw_output
+            )
+
+    options: list[DiagnosisOption] = []
+    if credential_hosts:
+        named = f" ({credential_name})" if credential_name else ""
+        options.append(
+            DiagnosisOption(
+                label=f"renew credential{named}",
+                command=f"renew credential{named} on {' + '.join(credential_hosts)}",
+                recommended=True,
+            )
+        )
+    elif tool_hosts:
+        options.append(
+            DiagnosisOption(
+                label=f"install {tool_name or 'the missing tool'}",
+                command=(
+                    f"install {tool_name or 'the missing tool'} on "
+                    f"{' + '.join(tool_hosts)}"
+                ),
+                recommended=True,
+            )
+        )
+
+    if failing_files:
+        for candidate in _lost_work_candidates(repo_name, config, failing_files):
+            options.append(
+                DiagnosisOption(
+                    label=(
+                        f"a likely ready-made fix already exists on "
+                        f"{candidate.branch} ({candidate.assignment_id})"
+                    ),
+                    command=(
+                        f"git fetch origin {candidate.branch} && git log "
+                        f"--oneline origin/{candidate.branch} -- "
+                        f"{' '.join(candidate.changed_files)}"
+                    ),
+                    recommended=not options,
+                )
+            )
+            break  # one named branch is enough for a page, not a list
+
+    return tuple(options)
+
+
+def _lost_work_candidates(
+    repo_name: str, config: "Config", failing_files: Sequence[str],
+) -> list[queue_diagnose.LostWorkCandidate]:
+    """#3883 point 3: which of the board's merged-status rows for
+    *repo_name* touched any of *failing_files* — a best-effort,
+    bounded scan, never a re-derivation of `coord.reconcile`'s own
+    false-merge AUDIT (that still owns actually confirming a row is lost
+    and clearing the ones that are not, #2096). This only answers a
+    narrower question: "could one of these already be the fix a baseline-
+    red streak is waiting on" — read-only, and every failure fails open to
+    "no candidate found" rather than raising into the escalation path.
+    """
+    import click  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None or not getattr(repo_cfg, "github", None):
+        return []
+
+    try:
+        board = build_board()
+    except Exception as exc:  # noqa: BLE001 — best-effort; see docstring
+        click.echo(
+            f"warning: board-doctor could not read the board for the "
+            f"{repo_name} lost-work cross-check: {exc}",
+            err=True,
+        )
+        return []
+
+    out: list[queue_diagnose.LostWorkCandidate] = []
+    seen_branches: set[str] = set()
+    candidates = list(getattr(board, "completed", None) or ()) + list(
+        getattr(board, "active", None) or ()
+    )
+    for assignment in candidates:
+        if str(getattr(assignment, "repo_name", "")) != repo_name:
+            continue
+        if str(getattr(assignment, "status", "")) != "merged":
+            continue
+        branch = str(getattr(assignment, "branch", "") or "")
+        if not branch or branch in seen_branches:
+            continue
+        seen_branches.add(branch)
+        if len(seen_branches) > 20:
+            break  # bounded scan — mirrors reconcile's own per-pass cap
+        try:
+            issue_number = int(getattr(assignment, "for_issue_number", None)
+                                or getattr(assignment, "issue_number", 0) or 0)
+            base_branch = resolve_base_branch_for_issue_number(
+                repo_cfg, repo_cfg.github, issue_number,
+            )
+            if github_ops.pr_is_merged(repo_cfg.github, branch):
+                continue
+            ahead = github_ops.branch_commits_ahead(repo_cfg.github, base_branch, branch)
+            if not ahead:
+                continue
+            changed = github_ops.get_compare_files(repo_cfg.github, base_branch, branch)
+            if not changed:
+                continue
+        except Exception as exc:  # noqa: BLE001 — one bad row must not sink the scan
+            click.echo(
+                f"warning: board-doctor lost-work probe failed for "
+                f"{repo_name} branch {branch!r}: {exc}",
+                err=True,
+            )
+            continue
+        matches = queue_diagnose.find_lost_work_touching(
+            failing_files,
+            (
+                queue_diagnose.LostWorkCandidate(
+                    assignment_id=str(getattr(assignment, "assignment_id", "")),
+                    repo_name=repo_name,
+                    issue_number=issue_number,
+                    branch=branch,
+                    changed_files=tuple(changed),
+                ),
+            ),
+        )
+        out.extend(matches)
+    return out
+
+
+def _diagnosis_options(
+    row: StuckRow,
+    repo_name: str,
+    issue_number: int,
+    config: "Config | None",
+    *,
+    sealed_lines: tuple[str, ...] | None,
+) -> tuple[DiagnosisOption, ...]:
+    """2-3 concrete, ready-to-run operator options for *row* — exactly one
+    marked recommended whenever this can tell which (#3883 point 1).
+
+    *sealed_lines* is the caller's own, already-computed
+    :func:`_sealed_confined_lines` result (#2096: one question, one
+    answer — `escalation_alert_dispatcher` needs that same verdict for its
+    own ``resolution_suffix``, so it is passed in here rather than asked a
+    second time). Non-``None`` routes to :func:`_design_decision_options`
+    instead of a "recommended" pick — see that function's own docstring
+    for why neither choice is marked there. A :data:`CAUSE_BASELINE_RED`
+    row with an environment/lost-work finding
+    (:func:`_baseline_red_env_and_lost_work_options`) gets that finding as
+    its recommended option, with the #3761 ``coord status`` default kept
+    on as a second, non-recommended option. Every other row falls back to
+    the #3761 :func:`_alert_resolution` command as its one recommended
+    option, plus a second, generic option so the operator always has
+    somewhere else to look.
+
+    *config* may be ``None`` when the caller could not load one (the same
+    best-effort posture `escalation_alert_dispatcher` already has for
+    everything else) — causes that need it (baseline-red) are simply
+    skipped, never crashed on.
+    """
+    if sealed_lines is not None:
+        return _design_decision_options(sealed_lines)
+    if config is not None and row.cause == CAUSE_BASELINE_RED:
+        found = _baseline_red_env_and_lost_work_options(row, repo_name, config)
+        if found:
+            return (*found[:2], DiagnosisOption(
+                label="wait — the streak clears on its own once the base is green",
+                command="coord status",
+            ))
+
+    _suffix, command = _alert_resolution(row, repo_name, issue_number)
+    options = [
+        DiagnosisOption(
+            label="act on the doctor's proposed next step", command=command, recommended=True,
+        )
+    ]
+    if command == "coord status":
+        options.append(
+            DiagnosisOption(
+                label="re-derive the live blocker first",
+                command="coord drive-queue diagnose --json",
+            )
+        )
+    else:
+        options.append(
+            DiagnosisOption(label="check overall fleet/pipeline status first", command="coord status")
+        )
+    return tuple(options)
+
+
 def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:
     """``(reason_suffix, proposed_command)`` for *row*'s cause (#3761's C4).
 
@@ -1596,6 +2005,18 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
 
     stage = _board_doctor_stage(row.queue)
 
+    # #3883: a best-effort config load for the enrichment below
+    # (sealed-path design-decision detection, baseline-red env/lost-work
+    # diagnosis) — never required for the alert itself, which is exactly
+    # as deliverable without it as it was before #3883 existed.
+    config = None
+    try:
+        from coord.commands._common import resolve_and_load_config  # noqa: PLC0415
+
+        config = resolve_and_load_config(None)
+    except Exception:  # noqa: BLE001 — enrichment only, never blocks the alert
+        config = None
+
     try:
         existing = get_drive_escalation(repo_name, issue_number)
         if existing is not None and existing.get("stage") != stage:
@@ -1604,13 +2025,39 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
             # generic "coord status" pointer.
             return ALERT_SKIPPED
 
-        resolution_suffix, proposed_command = _alert_resolution(row, repo_name, issue_number)
+        sealed_lines = (
+            _sealed_confined_lines(row, repo_name, config) if config is not None else None
+        )
+        if sealed_lines is not None:
+            lines_text = ", ".join(sealed_lines) if sealed_lines else "the sealed check(s)"
+            resolution_suffix = (
+                " — needs a design decision: the live failure is confined "
+                f"to this repo's own sealed acceptance paths ({lines_text}); "
+                "never fixable by retrying — choose: edit the sealed suite "
+                "and bump its minor version, or redesign the change to "
+                "stay non-breaking"
+            )
+            proposed_command = "coord status"
+        else:
+            resolution_suffix, proposed_command = _alert_resolution(row, repo_name, issue_number)
         attempted_suffix = _attempted_actions_suffix(row.queue, row.key)
+        since_text = _stuck_since_text(row.queue, row.key)
+        options = _diagnosis_options(
+            row, repo_name, issue_number, config, sealed_lines=sealed_lines,
+        )
+        options_suffix = (
+            " — options: " + "; ".join(
+                f"{'[recommended] ' if o.recommended else ''}{o.label}: `{o.command}`"
+                for o in options
+            )
+            if options
+            else ""
+        )
         reason = (
-            f"board-doctor: {row.queue} row {row.key} stuck on cause="
-            f"{row.cause} (confidence={row.confidence}) — see `coord "
+            f"board-doctor: {row.queue} row {row.key} stuck ({since_text}) on "
+            f"cause={row.cause} (confidence={row.confidence}) — see `coord "
             "drive-queue doctor-log` for the full decision log"
-            f"{attempted_suffix}{resolution_suffix}"
+            f"{attempted_suffix}{resolution_suffix}{options_suffix}"
         )
         gate_readings = f"queue={row.queue} | cause={row.cause} | evidence={' | '.join(row.evidence)}"
         record_drive_escalation(
