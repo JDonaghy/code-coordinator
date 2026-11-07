@@ -176,6 +176,16 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: :func:`authorize_investigator_action`'s alias table, not a second grant,
 #: so the sweep and the investigator can never disagree about whether one
 #: of those three is allowed (#2096, one question one answer).
+#: #3887 adds ``"conflict_fix_redispatch"``: re-dispatch the ordinary
+#: mechanical conflict-fix for a `HUMAN_REQUIRED` row whose last attempt
+#: completed clean but never actually moved the branch (`coord.merge_queue.
+#: CONFLICT_FIX_HEAD_UNMOVED_SIGNAL`, #3871's own detection). It calls the
+#: SAME `coord.conflict_fix.dispatch_conflict_fix` primitive #3871's own
+#: completion-time redispatch does, with the SAME `after_head_unmoved_
+#: fix_assignment_id` retry-cap carve-out, so it never spends a budget
+#: #3871 did not already intend this row to have — this is the periodic
+#: retry for when that one-shot, synchronous redispatch had no capable
+#: machine right then, never a second or larger budget.
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
         "merge_approved_green",
@@ -185,6 +195,7 @@ SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
         "ci_rerun",
         "dispatch_fixit_leg",
         "dispatch_finisher_leg",
+        "conflict_fix_redispatch",
         "smoke_requeue",
         "raise_budget",
         "bounce",
@@ -360,6 +371,7 @@ def _investigator_result(
     acted: bool,
     detail: str,
     reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Build an :class:`InvestigatorActionResult` and audit it — every
     #3881 investigator handler's only way to return, so neither a refusal
@@ -367,6 +379,16 @@ def _investigator_result(
     audit row (actor, row, action, reason) for #3875's outcome tracking to
     read. Never raises — audit writes are best-effort
     (:func:`coord.audit.record_audit`'s own contract).
+
+    *actor* (#3887) defaults to the human-attended ``coord drive-queue
+    doctor-act`` CLI's own attribution — every pre-#3887 call site. The
+    deterministic sweep (`coord.board_doctor_policy`) calling the SAME
+    handler through :func:`dispatch_investigator_action` passes
+    ``actor="sweep"`` instead, so #3875's outcome tracking can tell "a
+    human-attended investigator session decided this" apart from "the
+    unattended periodic sweep applied an unambiguous mechanical repair" —
+    one audit trail, one real answer to "who did this", never a second
+    record for the same mutation under a different name (#2096).
     """
     from coord.audit import record_audit  # noqa: PLC0415
 
@@ -374,7 +396,7 @@ def _investigator_result(
         tier="business",
         category="board_doctor_investigator",
         event_type=f"investigator_{action}" if acted else f"investigator_{action}_refused",
-        actor="board_doctor_investigator",
+        actor=actor,
         summary=detail,
         repo=repo_name,
         issue=issue_number,
@@ -2130,6 +2152,166 @@ def sweep_clear_latch(
     return ClearLatchResult(cleared=True, detail=mine[0].message)
 
 
+class ConflictFixRedispatchResult(TypedDict):
+    """:func:`sweep_redispatch_head_unmoved_conflict_fix`'s return shape."""
+
+    redispatched: bool
+    detail: str
+
+
+def _redispatch_result(
+    repo_name: str, issue_number: int, *, redispatched: bool, detail: str,
+) -> ConflictFixRedispatchResult:
+    """Build a :class:`ConflictFixRedispatchResult` and audit it (#3887) —
+    this action has no human-attended CLI call site (unlike the #3881
+    investigator verbs' :func:`_investigator_result`), so ``actor="sweep"``
+    is the only answer this audit trail will ever carry: there is no
+    session to attribute it to instead. Never raises —
+    :func:`coord.audit.record_audit`'s own best-effort contract.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="board_doctor",
+        event_type="conflict_fix_redispatched" if redispatched else "conflict_fix_redispatch_refused",
+        actor="sweep",
+        summary=detail,
+        repo=repo_name,
+        issue=issue_number,
+        details={"redispatched": redispatched},
+    )
+    return ConflictFixRedispatchResult(redispatched=redispatched, detail=detail)
+
+
+def _latest_done_conflict_fix_assignment_id(
+    board: "Board", merge_entry_id: str | None,
+) -> str | None:
+    """The most recently FINISHED ``type="conflict-fix"`` assignment linked
+    to *merge_entry_id*, or ``None`` (#3887).
+
+    Mirrors how `coord.conflict_fix.has_prior_conflict_fix` finds the SAME
+    conflict-fix assignments for this entry (``a.review_of_assignment_id
+    == merge_entry_id``), picking the one with the latest `finished_at` —
+    the just-completed head-unmoved leg, by construction, since nothing
+    else on this entry can have finished more recently. Passed through to
+    :func:`coord.conflict_fix.dispatch_conflict_fix`'s own
+    ``after_head_unmoved_fix_assignment_id`` carve-out, which excludes
+    exactly this one row from the retry-cap's identical-error walk — the
+    same exclusion #3871's own synchronous completion-time redispatch
+    applies, never a looser one.
+    """
+    if merge_entry_id is None:
+        return None
+    candidates = [
+        a
+        for a in list(board.active) + list(board.completed)
+        if a.type == "conflict-fix"
+        and a.review_of_assignment_id == merge_entry_id
+        and a.status == "done"
+    ]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda a: a.finished_at or 0.0)
+    return latest.assignment_id
+
+
+def sweep_redispatch_head_unmoved_conflict_fix(
+    repo_name: str, issue_number: int, board: "Board", config: "Config",
+) -> ConflictFixRedispatchResult:
+    """Re-dispatch the ordinary conflict-fix for a `HUMAN_REQUIRED` row
+    whose last attempt completed clean but never moved the branch (#3887,
+    pairs with #3871).
+
+    Two gates before anything is dispatched:
+
+    1. The row must actually BE the head-unmoved shape — ``HUMAN_REQUIRED``
+       AND `coord.merge_queue.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL` present in
+       the entry's own ``error`` — never a generic latch (that is
+       :func:`sweep_clear_latch`'s job, not this one's).
+    2. :func:`coord.conflict_fix.dispatch_conflict_fix` itself, called with
+       :func:`_latest_done_conflict_fix_assignment_id` as ``after_head_
+       unmoved_fix_assignment_id`` — the SAME retry-cap carve-out #3871's
+       own synchronous completion-time redispatch uses, so this never
+       spends a budget that carve-out did not already intend this row to
+       have. A ``None`` return (no capable machine, already active, or the
+       cap genuinely spent by a DIFFERENT prior attempt) is reported
+       ``redispatched=False``, never raised.
+
+    On a confirmed dispatch, moves the entry back to ``CONFLICT`` (the
+    redispatched worker is now in flight) with an appended, honest error
+    trailer — the same shape #3871's own redispatch leaves behind — and
+    persists only this entry back over the current on-disk queue (never
+    the whole pre-dispatch snapshot), then writes the board so the new
+    assignment is visible.
+    """
+    authorize_sweep_action("conflict_fix_redispatch")
+
+    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+    from coord.merge_queue import (  # noqa: PLC0415
+        CONFLICT,
+        CONFLICT_FIX_HEAD_UNMOVED_SIGNAL,
+        HUMAN_REQUIRED,
+        load_queue,
+        save_queue,
+    )
+
+    queue = load_queue()
+    entry = next(
+        (e for e in queue if e.repo_name == repo_name and e.issue_number == issue_number),
+        None,
+    )
+    if entry is None:
+        return _redispatch_result(
+            repo_name, issue_number, redispatched=False,
+            detail=f"{repo_name}#{issue_number} has no merge-queue entry",
+        )
+    if entry.state != HUMAN_REQUIRED or CONFLICT_FIX_HEAD_UNMOVED_SIGNAL not in (entry.error or ""):
+        return _redispatch_result(
+            repo_name, issue_number, redispatched=False,
+            detail=(
+                f"{repo_name}#{issue_number} merge-queue entry is not a "
+                "head-unmoved HUMAN_REQUIRED latch"
+            ),
+        )
+
+    ignore_assignment_id = _latest_done_conflict_fix_assignment_id(board, entry.assignment_id)
+    fix = dispatch_conflict_fix(
+        entry, board, config, after_head_unmoved_fix_assignment_id=ignore_assignment_id,
+    )
+    if fix is None:
+        return _redispatch_result(
+            repo_name, issue_number, redispatched=False,
+            detail=(
+                f"{repo_name}#{issue_number}: a fresh conflict-fix could not "
+                "be dispatched (no capable machine, one already active, or "
+                "the retry cap was already spent by a different prior "
+                "attempt)"
+            ),
+        )
+
+    entry.state = CONFLICT
+    entry.error = (
+        f"{entry.error}; board-doctor redispatched an ordinary conflict-fix "
+        f"(assignment {fix.assignment_id}) on {fix.machine_name}."
+    )
+    fresh_queue = load_queue()
+    by_id = {entry.assignment_id: entry}
+    save_queue([by_id.get(x.assignment_id, x) for x in fresh_queue])
+
+    from coord.board_service import write_board  # noqa: PLC0415
+
+    write_board(board)
+
+    return _redispatch_result(
+        repo_name, issue_number, redispatched=True,
+        detail=(
+            f"{repo_name}#{issue_number}: redispatched conflict-fix "
+            f"{fix.assignment_id} on {fix.machine_name}"
+        ),
+    )
+
+
 class MarkDoneResult(TypedDict):
     """:func:`sweep_mark_done`'s return shape."""
 
@@ -2289,6 +2471,7 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "restage": sweep_restage,
     "clear_latch": sweep_clear_latch,
     "mark_done": sweep_mark_done,
+    "conflict_fix_redispatch": sweep_redispatch_head_unmoved_conflict_fix,
 }
 
 
@@ -2331,7 +2514,12 @@ def dispatch_sweep_action(action: str, *args: Any, **kwargs: Any) -> Any:
 
 
 def investigator_requeue(
-    repo_name: str, issue_number: int, board: "Board", *, reason: str,
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    *,
+    reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Take a stuck-but-approved row down and put it back exactly as
     declared (#3881) — the investigator's ``requeue`` verb.
@@ -2340,13 +2528,21 @@ def investigator_requeue(
     assignment or a live `coord drive` session already against this row:
     a requeue mid-flight would yank the row out from under a leg that is
     actively using it.
+
+    *actor* (#3887): see :func:`_investigator_result`.
     """
     authorize_investigator_action("requeue")
 
     in_flight = _in_flight_work_detail(repo_name, issue_number, board)
     if in_flight is not None:
         return _investigator_result(
-            "requeue", repo_name, issue_number, acted=False, reason=reason, detail=in_flight,
+            "requeue",
+            repo_name,
+            issue_number,
+            acted=False,
+            reason=reason,
+            detail=in_flight,
+            actor=actor,
         )
 
     result = sweep_drive_queue_requeue(repo_name, issue_number)
@@ -2357,6 +2553,7 @@ def investigator_requeue(
         acted=result["requeued"],
         reason=reason,
         detail=result["detail"],
+        actor=actor,
     )
 
 
@@ -2457,6 +2654,7 @@ def investigator_raise_budget(
     review_assignment_id: str | None = None,
     reason: str,
     increment: int = 2,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Spend this row's ONE lifetime fix-round-ceiling bump (#3881) — the
     investigator's ``raise_budget`` verb.
@@ -2493,6 +2691,7 @@ def investigator_raise_budget(
                 f"{repo_name}#{issue_number} already spent its one "
                 "lifetime raise-budget"
             ),
+            actor=actor,
         )
 
     eligible = _live_review_red_with_findings(
@@ -2511,6 +2710,7 @@ def investigator_raise_budget(
                 "CI-red-on-the-merge-ref-only — not eligible for a "
                 "raise-budget"
             ),
+            actor=actor,
         )
 
     result = sweep_raise_fixit_budget(repo_name, issue_number, config, increment=increment)
@@ -2523,6 +2723,7 @@ def investigator_raise_budget(
         acted=result["raised"],
         reason=reason,
         detail=result["detail"],
+        actor=actor,
     )
 
 
@@ -2534,6 +2735,7 @@ def investigator_bounce(
     config: "Config",
     *,
     reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Re-run the auto-loop's review-bounce fix dispatch (#3881) — the
     investigator's ``bounce`` verb.
@@ -2563,6 +2765,7 @@ def investigator_bounce(
                 "yet — bounce is only for a row already given a fresh "
                 "fix-round ceiling"
             ),
+            actor=actor,
         )
 
     result = sweep_bounce(repo_name, issue_number, review_assignment_id, board, config)
@@ -2573,6 +2776,7 @@ def investigator_bounce(
         acted=result["bounced"],
         reason=reason,
         detail=result["detail"],
+        actor=actor,
     )
 
 
@@ -2587,6 +2791,7 @@ def investigator_integration_fix(
     cause: str,
     reason: str,
     evidence: tuple[str, ...] = (),
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Dispatch the base-merged fix leg against *sibling_repo*#
     *sibling_issue* — the issue tracking the broken base/integration this
@@ -2626,6 +2831,7 @@ def investigator_integration_fix(
                 f"fix-it leg against it (integration fix for {repo_name}#"
                 f"{issue_number})"
             ),
+            actor=actor,
         )
 
     result = dispatch_sweep_action(
@@ -2643,7 +2849,13 @@ def investigator_integration_fix(
         f"via {sibling_repo}#{sibling_issue})"
     )
     return _investigator_result(
-        "integration_fix", repo_name, issue_number, acted=acted, reason=reason, detail=detail,
+        "integration_fix",
+        repo_name,
+        issue_number,
+        acted=acted,
+        reason=reason,
+        detail=detail,
+        actor=actor,
     )
 
 
@@ -2655,6 +2867,7 @@ def investigator_restage(
     *,
     stage: str,
     reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Re-dispatch a missing/unreadable Test or Review stage (#3881) —
     the investigator's ``restage`` verb. *stage* is ``"test"`` or
@@ -2669,11 +2882,19 @@ def investigator_restage(
         acted=result["restaged"],
         reason=reason,
         detail=result["detail"],
+        actor=actor,
     )
 
 
 def investigator_clear_latch(
-    repo_name: str, issue_number: int, board: "Board", config: "Config", gh_ops: Any, *, reason: str,
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    gh_ops: Any,
+    *,
+    reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Re-test a stale CONFLICT/HUMAN_REQUIRED merge-queue latch (#3881)
     — the investigator's ``clear_latch`` verb. See :func:`sweep_clear_latch`
@@ -2689,11 +2910,19 @@ def investigator_clear_latch(
         acted=result["cleared"],
         reason=reason,
         detail=result["detail"],
+        actor=actor,
     )
 
 
 def investigator_merge(
-    repo_name: str, issue_number: int, board: "Board", config: "Config", gh_ops: Any, *, reason: str,
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    gh_ops: Any,
+    *,
+    reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Plain ``coord merge --only`` of an already-approved, CI-green row
     (#3881) — the investigator's ``merge`` verb, reached through
@@ -2765,6 +2994,7 @@ def investigator_merge(
             acted=False,
             reason=reason,
             detail=f"{repo_name}#{issue_number} has no merge-queue entry",
+            actor=actor,
         )
     if entry.state != PENDING:
         return _investigator_result(
@@ -2777,6 +3007,7 @@ def investigator_merge(
                 f"{repo_name}#{issue_number} merge-queue entry is "
                 f"{entry.state!r}, not pending"
             ),
+            actor=actor,
         )
     if not has_approved_review(entry, board, gh_ops, config=config):
         return _investigator_result(
@@ -2789,6 +3020,7 @@ def investigator_merge(
                 f"{repo_name}#{issue_number} has no approval bound to the "
                 "current branch content — refusing to merge"
             ),
+            actor=actor,
         )
 
     ci_store = build_ci_store(
@@ -2825,12 +3057,24 @@ def investigator_merge(
         )
     )
     return _investigator_result(
-        "merge", repo_name, issue_number, acted=acted, reason=reason, detail=detail,
+        "merge",
+        repo_name,
+        issue_number,
+        acted=acted,
+        reason=reason,
+        detail=detail,
+        actor=actor,
     )
 
 
 def investigator_mark_done(
-    repo_name: str, issue_number: int, board: "Board", config: "Config", *, reason: str,
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    reason: str,
+    actor: str = "board_doctor_investigator",
 ) -> InvestigatorActionResult:
     """Reconcile a row whose PR merged out-of-band and free its slot
     (#3881) — the investigator's ``mark_done`` verb. See
@@ -2845,6 +3089,7 @@ def investigator_mark_done(
         acted=result["marked"],
         reason=reason,
         detail=result["detail"],
+        actor=actor,
     )
 
 

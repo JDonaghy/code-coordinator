@@ -3150,6 +3150,23 @@ def drive_queue_sweep(
     (`coord.state.board_doctor_decisions`), in the spirit of #1478's board
     comments.
 
+    #3887 (#3875 ask A): the allowlist's mechanical actions include four
+    queue repairs the sweep applies itself through the SAME closed #3881
+    investigator wrapper (`coord.board_doctor_permissions.
+    dispatch_investigator_action`) a daemon-host investigator session
+    would use via `coord drive-queue doctor-act` — `mark_done` (a PR
+    merged out-of-band while the row sat running/blocked/waiting),
+    `clear_latch` (a stale CONFLICT/HUMAN_REQUIRED latch whose approval is
+    already bound to the current branch content), `merge` (a PENDING row
+    that already reads green/approved/mergeable but the ordinary merge
+    tick keeps missing), and a fifth, sweep-only primitive —
+    `conflict_fix_redispatch`, pairing with #3871's own completion-time
+    redispatch for a conflict-fix that completed clean but never moved the
+    branch. Every one of these re-reads live state immediately before
+    acting and audits with `actor="sweep"`, never `"board_doctor_
+    investigator"` — the same precondition a human-attended `doctor-act`
+    invocation gets, just applied without spending an investigator slot.
+
     A row stuck on the SAME cause for `coord.board_doctor.CONVERGENCE_LIMIT`
     (default 3) consecutive sweeps stops being re-acted on and falls back
     to the alert tier instead of auto-action looping forever. Escalating

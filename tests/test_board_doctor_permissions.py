@@ -42,6 +42,7 @@ from coord.board_doctor_policy import (
     _register_auto_action,
     policy_tier_of,
 )
+import coord.commands._common as common
 from coord.commands.drive_queue import drive_queue_add, drive_queue_remove
 from coord.config import Config
 from coord.models import Assignment, Board, Machine, Repo
@@ -641,13 +642,49 @@ class TestThe3760AutoActionsEndToEnd:
         assert _policy_of(dict(twice)) == _policy_of(dict(once))
         assert twice["state"] == "waiting"
 
-    def test_pr_merged_row_is_cleared(self, monkeypatch) -> None:
+    @staticmethod
+    def _pr_merged_config() -> Config:
+        # `reconcile_board_merges` resolves the row's assignment through
+        # `config.repo(a.repo_name)` — this class's existing rows all use
+        # "acme/widgets" as the bare `repo_name`, so the fixture config's
+        # one repo is named (and keyed to GitHub as) exactly that string.
+        repo = Repo(
+            name="acme/widgets", github="acme/widgets",
+            default_branch="main", test_command="pytest",
+        )
+        return Config(
+            repos=[repo],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tail",
+                    repos=["acme/widgets"], repo_paths={"acme/widgets": "/work"},
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _seed_done_work_assignment(coord_db, *, issue: int, aid: str) -> None:
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch, type, status) "
+            "VALUES (?, 'laptop', 'acme/widgets', ?, 't', ?, 'work', 'done')",
+            (aid, issue, f"issue-{issue}-x"),
+        )
+        coord_db.commit()
+
+    def test_pr_merged_row_is_marked_done(self, monkeypatch, coord_db) -> None:
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: self._pr_merged_config())
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
 
-        # No hold_after gate on this row: there is nothing a removal could
-        # prematurely satisfy, so the clear goes through cleanly.
+        # quadraui#2038: the row sits `running`/`blocked`/`waiting` in the
+        # drive queue while its PR already merged by hand — `mark_done`
+        # reconciles the STALE assignment to `status="merged"`, freeing its
+        # machine slot, without touching the drive-queue row's own
+        # declaration (unlike the pre-#3887 `drive_queue_remove` action).
         state.enqueue_drive_queue("acme/widgets", 3763)
+        self._seed_done_work_assignment(coord_db, issue=3763, aid="w3763")
         row = StuckRow(
             queue="drive-queue",
             key="acme/widgets#3763",
@@ -668,22 +705,23 @@ class TestThe3760AutoActionsEndToEnd:
         decision = report.decisions[0]
         assert decision.tier == TIER_AUTO
         assert decision.action == "auto-dispatch"
-        assert state.get_drive_queue_entry("acme/widgets", 3763) is None
+        # The drive-queue row's own declaration survives — `mark_done`
+        # reconciles the assignment, it never removes the queue row.
+        assert state.get_drive_queue_entry("acme/widgets", 3763) is not None
+        reconciled = state.build_board().find_by_id("w3763")
+        assert reconciled is not None
+        assert reconciled.status == "merged"
 
-    def test_pr_merged_row_with_an_unresolved_deploy_gate_is_not_cleared(
+    def test_pr_merged_row_with_no_candidate_assignment_is_a_noop(
         self, monkeypatch
     ) -> None:
-        # #1757: `_after_satisfied` treats an absent row as satisfied, so
-        # clearing a merged row whose deploy gate is still armed/fired would
-        # silently release every `after=`-dependent row as if a human had
-        # already deployed. The sweep must refuse to remove it — and #3805:
-        # that refusal must be absorbed as a no-op for THIS row rather than
-        # propagate out of `sweep()` and abort every row ordered after it.
+        # No work assignment at all for this row — `mark_done` has nothing
+        # to reconcile and must refuse cleanly, not raise.
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: self._pr_merged_config())
 
         before = _seed_declared_row("acme/widgets", 3765)
-        assert before["hold_state"] == "armed"
         row = StuckRow(
             queue="drive-queue",
             key="acme/widgets#3765",
@@ -698,7 +736,7 @@ class TestThe3760AutoActionsEndToEnd:
             tier_of=policy_tier_of,
             auto_dispatchers=AUTO_DISPATCHERS,
             alert_dispatcher=_must_not_alert,
-            sweep_id="sweep-3765-merged-gated",
+            sweep_id="sweep-3765-merged-no-candidate",
         )
 
         decision = report.decisions[0]
@@ -710,20 +748,23 @@ class TestThe3760AutoActionsEndToEnd:
         assert after == before
 
     def test_refused_merged_row_does_not_abort_the_rest_of_the_sweep(
-        self, monkeypatch
+        self, monkeypatch, coord_db
     ) -> None:
-        # #3805: a gated row ordered first must not starve every row ordered
-        # after it — the sweep has no `try` around its dispatch call site,
-        # so the refusal has to be caught (and recorded as a decision)
-        # inside the C3 handler itself, not left to propagate.
+        # A row `mark_done` cannot reconcile (no candidate assignment),
+        # ordered first, must not starve every row ordered after it — the
+        # sweep has no `try` around its dispatch call site, so the refusal
+        # has to be absorbed (and recorded as a decision) inside the C3
+        # handler itself.
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: self._pr_merged_config())
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
 
-        gated_before = _seed_declared_row("acme/widgets", 3767)
-        assert gated_before["hold_state"] == "armed"
+        state.enqueue_drive_queue("acme/widgets", 3767)
         state.enqueue_drive_queue("acme/widgets", 3768)
+        self._seed_done_work_assignment(coord_db, issue=3768, aid="w3768")
 
-        gated_row = StuckRow(
+        no_candidate_row = StuckRow(
             queue="drive-queue",
             key="acme/widgets#3767",
             state="stuck",
@@ -741,67 +782,38 @@ class TestThe3760AutoActionsEndToEnd:
         )
 
         report = sweep(
-            [gated_row, clean_row],
+            [no_candidate_row, clean_row],
             tier_of=policy_tier_of,
             auto_dispatchers=AUTO_DISPATCHERS,
             alert_dispatcher=_must_not_alert,
-            sweep_id="sweep-3805-gated-then-clean",
+            sweep_id="sweep-3805-noop-then-clean",
         )
 
         assert len(report.decisions) == 2
-        gated_decision, clean_decision = report.decisions
-        assert gated_decision.key == "acme/widgets#3767"
-        assert gated_decision.action == "auto-dispatch-noop"
+        noop_decision, clean_decision = report.decisions
+        assert noop_decision.key == "acme/widgets#3767"
+        assert noop_decision.action == "auto-dispatch-noop"
         assert clean_decision.key == "acme/widgets#3768"
         assert clean_decision.action == "auto-dispatch"
 
-        # The gated row survives untouched; the clean one ordered after it
-        # still got processed and removed.
+        # The no-candidate row's own queue entry survives untouched; the
+        # clean one ordered after it still got processed and reconciled.
         assert state.get_drive_queue_entry("acme/widgets", 3767) is not None
-        assert state.get_drive_queue_entry("acme/widgets", 3768) is None
+        reconciled = state.build_board().find_by_id("w3768")
+        assert reconciled is not None
+        assert reconciled.status == "merged"
 
-    def test_pr_merged_row_with_a_released_deploy_gate_is_cleared(
-        self, monkeypatch
-    ) -> None:
-        # `hold_state == "released"` is the one gated state removal is safe
-        # in: a human already resolved the gate by hand.
+    def test_pr_merged_row_mark_done_is_idempotent(self, monkeypatch, coord_db) -> None:
+        # A row already reconciled (by an earlier sweep) must not make a
+        # second sweep pass over the same cause raise or re-mutate an
+        # assignment that is no longer `status="done"`.
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
-
-        _seed_declared_row("acme/widgets", 3766)
-        assert state.update_drive_queue_entry(
-            "acme/widgets", 3766, hold_state="released"
-        )
-        row = StuckRow(
-            queue="drive-queue",
-            key="acme/widgets#3766",
-            state="stuck",
-            cause=queue_diagnose.CAUSE_PR_MERGED,
-            confidence="high",
-            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
-        )
-
-        report = sweep(
-            [row],
-            tier_of=policy_tier_of,
-            auto_dispatchers=AUTO_DISPATCHERS,
-            alert_dispatcher=_must_not_alert,
-            sweep_id="sweep-3766-merged-released",
-        )
-
-        decision = report.decisions[0]
-        assert decision.tier == TIER_AUTO
-        assert decision.action == "auto-dispatch"
-        assert state.get_drive_queue_entry("acme/widgets", 3766) is None
-
-    def test_pr_merged_row_clear_is_idempotent(self, monkeypatch) -> None:
-        # A row already removed (by an earlier sweep, or by hand) must not
-        # make a second sweep pass over the same cause raise or re-mutate
-        # anything that no longer exists.
-        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
-        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: self._pr_merged_config())
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
 
         state.enqueue_drive_queue("acme/widgets", 3764)
+        self._seed_done_work_assignment(coord_db, issue=3764, aid="w3764")
         row = StuckRow(
             queue="drive-queue",
             key="acme/widgets#3764",
@@ -811,23 +823,29 @@ class TestThe3760AutoActionsEndToEnd:
             evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
         )
 
-        sweep(
+        first = sweep(
             [row],
             tier_of=policy_tier_of,
             auto_dispatchers=AUTO_DISPATCHERS,
             alert_dispatcher=_must_not_alert,
             sweep_id="sweep-3764-merged-first",
         )
-        assert state.get_drive_queue_entry("acme/widgets", 3764) is None
+        assert first.decisions[0].action == "auto-dispatch"
+        once = state.build_board().find_by_id("w3764")
+        assert once is not None
+        assert once.status == "merged"
 
-        sweep(
+        second = sweep(
             [row],
             tier_of=policy_tier_of,
             auto_dispatchers=AUTO_DISPATCHERS,
             alert_dispatcher=_must_not_alert,
             sweep_id="sweep-3764-merged-second",
         )
-        assert state.get_drive_queue_entry("acme/widgets", 3764) is None
+        assert second.decisions[0].action == "auto-dispatch-noop"
+        twice = state.build_board().find_by_id("w3764")
+        assert twice is not None
+        assert twice.status == "merged"
 
 
 class TestSmokeNoVerdictRequeue:

@@ -150,6 +150,61 @@ CAUSE_BASELINE_RED = "baseline-red"
 #: reason` for the exact marker this reclassifier keys on.
 CAUSE_CHECKS_STALE_RACE = "checks-stale-race"
 
+#: #3887 (#3875 ask A): a narrow cause minted by :func:`_reclassify_stale_latch`,
+#: never by `queue_diagnose` itself — the same "promote only an
+#: independently-confirmed subset of a broader cause" shape as
+#: :data:`CAUSE_CEILING_BLOCKED_MERGEABLE`. A merge-queue row latched
+#: ``CONFLICT``/``HUMAN_REQUIRED`` (:data:`_MERGE_QUEUE_STUCK_CAUSE`'s
+#: ``CAUSE_MERGE_CONFLICT``/``CAUSE_GATE_BLOCKED``) whose approval is ALSO
+#: confirmed, live, bound to the branch's current content
+#: (`coord.merge_queue.has_approved_review`) — quadraui#2034's shape: the
+#: latch is stale archaeology, not a live blocker, but nothing re-tests it
+#: until a human runs `coord merge --only --override-human-required` or
+#: `--drop` + re-enqueue. Registered in `coord.board_doctor_policy.ALLOWLIST`
+#: against the `clear_latch` action (`coord.board_doctor_permissions.
+#: sweep_clear_latch`, via #3881's investigator wrapper), whose own three
+#: gates (latched, approval bound to current content, live mergeability)
+#: are the real precondition — this cause only decides which rows are worth
+#: the attempt, same division of labor as every other allowlisted cause.
+CAUSE_LATCH_STALE_MERGEABLE = "latch-stale-mergeable"
+
+#: #3887: a `PENDING` merge-queue row `_MERGE_QUEUE_STUCK_CAUSE` otherwise
+#: never names (a row merely waiting its turn is not this doctor's
+#: problem) — but ``entry.last_attempt`` being set AND
+#: :data:`MERGE_PENDING_STALE_AFTER_SECONDS` old means `process()` already
+#: tried this entry at least once and it sat back down at `PENDING`
+#: without landing or latching, which only happens when every gate reads
+#: approved + green + mergeable yet the ordinary merge tick is not
+#: reaching it again (quadraui's "green, approved PR just not merging"
+#: shape). Registered against the `merge` action (`coord.merge_queue.
+#: process()` via #3881's investigator wrapper, `coord.board_doctor_
+#: permissions.investigator_merge`), which re-confirms every gate live
+#: before merging anything — this cause only decides which rows are worth
+#: the attempt.
+CAUSE_MERGE_PENDING_STUCK = "merge-pending-not-progressing"
+
+#: #3887, pairs with #3871: a `HUMAN_REQUIRED` merge-queue row whose
+#: `entry.error` carries `coord.merge_queue.CONFLICT_FIX_HEAD_UNMOVED_
+#: SIGNAL` — a conflict-fix worker completed cleanly but never actually
+#: pushed, and #3871's own completion-time redispatch
+#: (`coord.reconcile._try_ordinary_escalation_after_head_unmoved`) could
+#: not find a capable machine right then. That redispatch is a one-shot
+#: synchronous attempt; this cause is the periodic net that retries it on
+#: a later sweep, still within the SAME retry cap #3871 already enforces
+#: (`coord.conflict_fix.dispatch_conflict_fix`'s own `after_head_unmoved_
+#: fix_assignment_id` carve-out) — never a fresh budget, never the
+#: ordinary give-up escalation a real conflict would trigger. Registered
+#: against the `conflict_fix_redispatch` action (`coord.board_doctor_
+#: permissions.sweep_redispatch_head_unmoved_conflict_fix`).
+CAUSE_CONFLICT_FIX_HEAD_UNMOVED = "conflict-fix-head-unmoved"
+
+#: #3887: how long a `PENDING` merge-queue entry must sit past its last
+#: merge attempt before :data:`CAUSE_MERGE_PENDING_STUCK` fires — long
+#: enough that a row merely waiting a few ordinary ticks for its turn
+#: never matches, short enough that a genuinely stuck green/approved PR
+#: does not wait indefinitely for a human to notice.
+MERGE_PENDING_STALE_AFTER_SECONDS = 1800.0
+
 
 def default_tier_of(cause: str) -> str:
     """Default `tier_of`: delegates to the real C2 policy.
@@ -268,7 +323,7 @@ class SweepReport:
     rows_observed: int = 0
 
 
-def merge_queue_rows(entries: Sequence[Any]) -> list[StuckRow]:
+def merge_queue_rows(entries: Sequence[Any], *, now: float | None = None) -> list[StuckRow]:
     """Local cause mapping for merge-queue rows (#3758).
 
     :func:`coord.queue_diagnose.run_pass` only understands drive-queue
@@ -279,12 +334,50 @@ def merge_queue_rows(entries: Sequence[Any]) -> list[StuckRow]:
     second one, and needs no `gh` call — the already-refreshed
     ``QueuedMerge.state``/``.error`` is evidence enough for a cause this
     coarse.
+
+    Two #3887 refinements on top of the plain state->cause table
+    (:data:`_MERGE_QUEUE_STUCK_CAUSE`):
+
+    * A ``human_required`` entry whose ``error`` carries
+      `coord.merge_queue.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL` is relabelled
+      :data:`CAUSE_CONFLICT_FIX_HEAD_UNMOVED` instead of the generic
+      :data:`coord.queue_diagnose.CAUSE_GATE_BLOCKED` — this is a sharper
+      reading of the SAME live evidence `_MERGE_QUEUE_STUCK_CAUSE` already
+      has in hand, not a reclassification of a settled verdict, so it
+      belongs here rather than in a post-hoc ``_reclassify_*`` pass.
+    * A ``pending`` entry (otherwise invisible to this function entirely —
+      waiting its turn is not stuck) whose ``last_attempt`` is set and at
+      least :data:`MERGE_PENDING_STALE_AFTER_SECONDS` old is labelled
+      :data:`CAUSE_MERGE_PENDING_STUCK`: `process()` already tried it once
+      and it sat back down at ``PENDING`` with no latch, which only
+      recurs when the ordinary merge tick keeps missing it rather than
+      anything being wrong with the row.
+
+    *now* defaults to :func:`time.time` — overridable so a replay test can
+    assert on a fixed, reproducible staleness window.
     """
+    import time as _time  # noqa: PLC0415
+
+    from coord.merge_queue import CONFLICT_FIX_HEAD_UNMOVED_SIGNAL, PENDING  # noqa: PLC0415
+
+    moment = _time.time() if now is None else now
     rows: list[StuckRow] = []
     for entry in entries:
         cause = _MERGE_QUEUE_STUCK_CAUSE.get(entry.state)
+        if (
+            cause == queue_diagnose.CAUSE_GATE_BLOCKED
+            and CONFLICT_FIX_HEAD_UNMOVED_SIGNAL in (entry.error or "")
+        ):
+            cause = CAUSE_CONFLICT_FIX_HEAD_UNMOVED
         if cause is None:
-            continue
+            if (
+                entry.state == PENDING
+                and entry.last_attempt is not None
+                and moment - entry.last_attempt >= MERGE_PENDING_STALE_AFTER_SECONDS
+            ):
+                cause = CAUSE_MERGE_PENDING_STUCK
+            else:
+                continue
         evidence = (f"merge_queue.state={entry.state}",)
         if entry.error:
             evidence += (f"error={entry.error}",)
@@ -690,6 +783,58 @@ def _reclassify_checks_stale_race(rows: list[StuckRow], *, config) -> list[Stuck
     return reclassified
 
 
+def _reclassify_stale_latch(
+    rows: list[StuckRow], merge_entries: Sequence[Any], *, board: Board, config
+) -> list[StuckRow]:
+    """Relabel a merge-queue latch whose approval is already confirmed bound
+    to the branch's current content (#3887).
+
+    Runs strictly AFTER :func:`merge_queue_rows` has already picked
+    ``CAUSE_MERGE_CONFLICT``/``CAUSE_GATE_BLOCKED`` from the entry's own
+    live ``state``/``error`` alone, the same "classify first, reclassify a
+    narrow confirmed subset second" shape :func:`_reclassify_ceiling_blocked`
+    uses. The extra, independent confirmation here is
+    `coord.merge_queue.has_approved_review` — quadraui#2034's shape: a
+    latch is only WORTH an auto-``clear_latch`` attempt once the approval
+    on file is already known to cover the live branch content; a latch
+    whose approval is stale for an unrelated reason gets no promotion and
+    stays at the alert tier, same as it always has.
+
+    This promotion is deliberately NOT "the latch will clear" — the third,
+    live-mergeability gate inside `coord.board_doctor_permissions.
+    sweep_clear_latch` (via `coord.merge_queue.reconcile_conflict_entries`)
+    is what actually decides that, and no-ops harmlessly when it still
+    refuses. Promoting on the approval check alone, rather than
+    pre-computing full eligibility here too, keeps the live-mergeability
+    re-test as the ONE place that question is answered (#2096).
+    """
+    from coord.merge_queue import has_approved_review  # noqa: PLC0415
+
+    entries_by_key = {
+        f"{entry.repo_name}#{entry.issue_number}": entry for entry in merge_entries
+    }
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        if (
+            row.queue == "merge-queue"
+            and row.fresh
+            and row.cause in (queue_diagnose.CAUSE_MERGE_CONFLICT, queue_diagnose.CAUSE_GATE_BLOCKED)
+        ):
+            entry = entries_by_key.get(row.key)
+            if entry is not None and has_approved_review(entry, board, config=config):
+                row = replace(
+                    row,
+                    cause=CAUSE_LATCH_STALE_MERGEABLE,
+                    evidence=row.evidence
+                    + (
+                        "merge_queue: approval is bound to the current branch "
+                        "content — worth re-testing live mergeability (#3887)",
+                    ),
+                )
+        reclassified.append(row)
+    return reclassified
+
+
 def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRow]:
     """The impure production walk over both queues (#3758).
 
@@ -764,7 +909,9 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows = _reclassify_ceiling_blocked(rows)
     rows = _reclassify_checks_stale_race(rows, config=config)
-    rows.extend(merge_queue_rows(load_merge_queue()))
+    merge_entries = load_merge_queue()
+    rows.extend(merge_queue_rows(merge_entries))
+    rows = _reclassify_stale_latch(rows, merge_entries, board=board, config=config)
     rows.extend(smoke_no_verdict_rows(board))
 
     blocked_streaks = {
