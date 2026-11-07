@@ -215,7 +215,8 @@ MERGE_PENDING_STALE_AFTER_SECONDS = 1800.0
 
 #: #3901 (#3887 case 4, the remainder #3887 itself claimed but never
 #: wired): a `blocked`/`parked` drive-queue row that was DISPATCHED at
-#: least once (it has a board assignment behind it — a branch or a PR,
+#: least once (it has at least one `coord.gates.assignments_for_issue`
+#: board assignment behind it, which is NOT necessarily a branch or a PR —
 #: not the #3874 never-dispatched shape) whose stored `last_reason` is
 #: still `coord.drive_queue._resolve_prereqs`'s own unsatisfiable-`after=`
 #: verdict, even though every named pre-req now reads terminal.
@@ -232,6 +233,28 @@ MERGE_PENDING_STALE_AFTER_SECONDS = 1800.0
 #: implementation of the same resume: see
 #: :func:`_reclassify_after_prereqs_landed`.
 CAUSE_AFTER_PREREQS_LANDED = "after-prereqs-landed"
+
+#: The ONLY incoming `queue_diagnose` causes :func:`_reclassify_after_
+#: prereqs_landed` may promote away from (#3901 review) — both mean the
+#: live diagnosis found nothing actionable about THIS entry's own
+#: PR/branch lifecycle (`CAUSE_UNKNOWN`: no rule matched, or the probe
+#: read nothing at all; `CAUSE_NO_PR`: the PR probe ran and confirmed no
+#: PR exists). Every other named cause (`CAUSE_PR_MERGED`,
+#: `CAUSE_MERGE_CONFLICT`, `CAUSE_CI_RED`, `CAUSE_CI_PENDING`, ...) is live
+#: evidence about a DIFFERENT, already-actionable blocker on the entry's
+#: own PR — `ALLOWLIST`/`INVESTIGATE_CAUSES` already route some of those
+#: to their own real fix (e.g. `CAUSE_PR_MERGED` -> `mark_done`, freeing
+#: the stale assignment slot) and this reclassifier must never relabel one
+#: of those into a blunt `drive_queue_requeue` remove+re-add instead,
+#: losing the dispatch that cause exists to trigger — the same reasoning
+#: :func:`_reclassify_stale_latch` spells out for why it excludes
+#: `CAUSE_MERGE_CONFLICT`. Same shape as the other three reclassifiers in
+#: this module (:data:`_LIVE_CLEAR_CAUSES`, `_reclassify_stale_latch`'s own
+#: `CAUSE_GATE_BLOCKED` check): require a specific incoming cause, never
+#: "any cause at all".
+_AFTER_PREREQS_LANDED_SAFE_CAUSES = frozenset(
+    {queue_diagnose.CAUSE_UNKNOWN, queue_diagnose.CAUSE_NO_PR}
+)
 
 
 def default_tier_of(cause: str) -> str:
@@ -1054,8 +1077,16 @@ def _reclassify_after_prereqs_landed(
     :data:`CAUSE_AFTER_PREREQS_LANDED` only for a row this sweep classified
     fresh (:attr:`StuckRow.fresh`) — never a stale episode reconstruction
     (:func:`_episode_stuck_row`), whose `entry.last_reason` could be
-    arbitrarily old — whose live drive-queue entry (*entries_by_key*,
-    loaded fresh by :func:`collect_rows` this same sweep) satisfies
+    arbitrarily old — whose incoming cause is one of
+    :data:`_AFTER_PREREQS_LANDED_SAFE_CAUSES` (#3901 review: the three
+    sibling reclassifiers in this module all require a specific incoming
+    cause — `_reclassify_ceiling_blocked`/`_reclassify_checks_stale_race`
+    require `_LIVE_CLEAR_CAUSES` plus confidence above
+    :data:`queue_diagnose.CONFIDENCE_LOW`, `_reclassify_stale_latch`
+    requires exactly `queue_diagnose.CAUSE_GATE_BLOCKED` — this is the same
+    shape, never "promote regardless of what the live diagnosis already
+    found"), and whose live drive-queue entry (*entries_by_key*, loaded
+    fresh by :func:`collect_rows` this same sweep) satisfies
     :func:`after_prereqs_landed_for_entry`.
 
     `coord.drive_queue._reconcile_blocked_after` resumes a LIVE `blocked`
@@ -1074,7 +1105,11 @@ def _reclassify_after_prereqs_landed(
     """
     reclassified: list[StuckRow] = []
     for row in rows:
-        if row.queue == "drive-queue" and row.fresh:
+        if (
+            row.queue == "drive-queue"
+            and row.fresh
+            and row.cause in _AFTER_PREREQS_LANDED_SAFE_CAUSES
+        ):
             entry = entries_by_key.get(row.key)
             if entry is not None and after_prereqs_landed_for_entry(
                 entry, entries_by_key, board, board_view
