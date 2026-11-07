@@ -3187,10 +3187,14 @@ def drive_queue_sweep(
     tick keeps missing). The fourth, `conflict_fix_redispatch`, is a
     sweep-only primitive pairing with #3871's own completion-time
     redispatch for a conflict-fix that completed clean but never moved the
-    branch. Every one of these re-reads live state immediately before
-    acting and audits with `actor="sweep"`, never `"board_doctor_
-    investigator"` — the same precondition a human-attended `doctor-act`
-    invocation gets, just applied without spending an investigator slot.
+    branch. #3901 (#3887 case 4's remainder) adds a fifth: `drive_queue_
+    requeue` of a frozen `blocked`/`parked` row whose `--after` block cause
+    no longer holds (`coord.board_doctor_policy._requeue_after_prereqs_
+    landed`) — through the same investigator wrapper as the first three.
+    Every one of these re-reads live state immediately before acting and
+    audits with `actor="sweep"`, never `"board_doctor_investigator"` — the
+    same precondition a human-attended `doctor-act` invocation gets, just
+    applied without spending an investigator slot.
 
     A row stuck on the SAME cause for `coord.board_doctor.CONVERGENCE_LIMIT`
     (default 3) consecutive sweeps stops being re-acted on and falls back

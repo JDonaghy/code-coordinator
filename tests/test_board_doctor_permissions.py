@@ -156,17 +156,21 @@ class TestOutOfAllowlistActionsAreRejected:
         with pytest.raises(SweepPermissionError, match="bogus_action"):
             authorize_sweep_action("bogus_action")
 
-    def test_merge_approved_green_is_allowlisted_but_has_no_handler_yet(self) -> None:
+    def test_merge_is_allowlisted_but_has_no_dispatch_sweep_action_handler_yet(
+        self,
+    ) -> None:
         # Fixed in shape by the issue's hard constraints ahead of any cause
         # being wired to it (#3745's C3) — authorize_sweep_action clears it,
-        # but dispatch_sweep_action still refuses because no handler exists.
-        # The more specific exception type distinguishes this from "not
-        # allowed at all".
-        authorize_sweep_action("merge_approved_green")  # does not raise
-        assert "merge_approved_green" in SAFE_TIER_ACTIONS
+        # but dispatch_sweep_action still refuses because `_HANDLERS` has no
+        # entry for it (CAUSE_MERGE_PENDING_STUCK reaches a working handler
+        # a different way — through the #3881 investigator path, not this
+        # one). The more specific exception type distinguishes this from
+        # "not allowed at all".
+        authorize_sweep_action("merge")  # does not raise
+        assert "merge" in SAFE_TIER_ACTIONS
 
-        with pytest.raises(SweepHandlerNotRegisteredError, match="merge_approved_green"):
-            dispatch_sweep_action("merge_approved_green", "acme/widgets", 1)
+        with pytest.raises(SweepHandlerNotRegisteredError, match="merge"):
+            dispatch_sweep_action("merge", "acme/widgets", 1)
 
         assert state.list_drive_queue("acme/widgets") == []
 
@@ -1846,15 +1850,17 @@ class TestAuthorizeInvestigatorAction:
             authorize_investigator_action("bogus_verb")
 
     def test_aliases_reach_the_same_gate_as_the_sweep(self) -> None:
-        # requeue/merge/integration_fix are a rename, not a second grant —
+        # requeue/integration_fix are a rename, not a second grant —
         # disabling the underlying safe-tier name must disable the alias.
+        # merge (#3902) needs no alias at all: the investigator verb and
+        # the safe-tier name are the identical string.
         from coord.board_doctor_permissions import (
             SAFE_TIER_ACTIONS,
             authorize_investigator_action,
         )
 
         assert "drive_queue_requeue" in SAFE_TIER_ACTIONS
-        assert "merge_approved_green" in SAFE_TIER_ACTIONS
+        assert "merge" in SAFE_TIER_ACTIONS
         assert "dispatch_fixit_leg" in SAFE_TIER_ACTIONS
         authorize_investigator_action("requeue")
         authorize_investigator_action("merge")
@@ -2378,7 +2384,7 @@ class TestInvestigatorClearLatchAndMerge:
         monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
         monkeypatch.setattr(
             mq, "reconcile_conflict_entries",
-            lambda gh_ops: [mq.MergeEvent(entry, "reopened", "cleared for real")],
+            lambda gh_ops, **kwargs: [mq.MergeEvent(entry, "reopened", "cleared for real")],
         )
 
         result = investigator_clear_latch(
@@ -2465,6 +2471,165 @@ class TestInvestigatorClearLatchAndMerge:
         assert captured.get("ci_store") is not None
         queue_after = mq.load_queue()
         assert {e.assignment_id for e in queue_after} == {"w1", "w9"}
+
+
+class TestLatestDoneConflictFixAssignmentId:
+    """#3902 item 1: the head-unmoved redispatch's retry-cap exclusion must
+    name the EXACT leg that produced the park, never a guess a later,
+    unrelated `done` conflict-fix for the same entry can outrank."""
+
+    def test_prefers_the_recorded_marker_over_a_newer_unrelated_done(self) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import (
+            _latest_done_conflict_fix_assignment_id,
+        )
+
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef) — push the fix by hand, or re-run `coord "
+                "merge` once a machine is free. "
+                f"[{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}old-leg]"
+            ),
+        )
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=1,
+                issue_title="t", assignment_id="old-leg", type="conflict-fix",
+                status="done", review_of_assignment_id="w1", finished_at=100.0,
+            ),
+            # Finished for this SAME entry AFTER the park (a manual retry,
+            # or a different sweep tick) — must not outrank the recorded
+            # marker just because it is newer.
+            Assignment(
+                machine_name="server", repo_name="api", issue_number=1,
+                issue_title="t", assignment_id="new-leg", type="conflict-fix",
+                status="done", review_of_assignment_id="w1", finished_at=200.0,
+            ),
+        ])
+
+        assert _latest_done_conflict_fix_assignment_id(board, entry) == "old-leg"
+
+    def test_fallback_without_a_marker_skips_stale_rebase_titled_rows(self) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import (
+            _latest_done_conflict_fix_assignment_id,
+        )
+        from coord.conflict_fix import STALE_REBASE_FIX_TITLE_PREFIX
+
+        entry = mq.QueuedMerge(
+            assignment_id="w2", repo_name="api", repo_github="acme/api",
+            branch="issue-2-fix", target_branch="main", issue_number=2,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+            # No #3902 marker — a latch parked before this fix existed.
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef)"
+            ),
+        )
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=2,
+                issue_title="t", assignment_id="ordinary-leg", type="conflict-fix",
+                status="done", review_of_assignment_id="w2", finished_at=100.0,
+            ),
+            Assignment(
+                machine_name="server", repo_name="api",
+                issue_title=f"{STALE_REBASE_FIX_TITLE_PREFIX} Fix the thing",
+                issue_number=2, assignment_id="stale-rebase-leg", type="conflict-fix",
+                status="done", review_of_assignment_id="w2", finished_at=200.0,
+            ),
+        ])
+
+        assert _latest_done_conflict_fix_assignment_id(board, entry) == "ordinary-leg"
+
+
+class TestSweepRedispatchHeadUnmovedConflictFixMachineChoice:
+    """#3902 item 2: the periodic redispatch must get the SAME machine-
+    selection inputs #3871's own synchronous redispatch
+    (`coord.reconcile._try_ordinary_escalation_after_head_unmoved`) does —
+    never the busy-only fallback that can pick an offline machine."""
+
+    def test_passes_status_fetcher_and_prefer_machine_through(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import (
+            sweep_redispatch_head_unmoved_conflict_fix,
+        )
+        from coord.network import fetch_status
+
+        entry = mq.QueuedMerge(
+            assignment_id="w3", repo_name="api", repo_github="acme/api",
+            branch="issue-3-fix", target_branch="main", issue_number=3,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef) — push the fix by hand. "
+                f"[{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}old-leg]"
+            ),
+        )
+        mq.save_queue([entry])
+        board = Board(completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=3,
+                issue_title="t", assignment_id="old-leg", type="conflict-fix",
+                status="done", review_of_assignment_id="w3", finished_at=100.0,
+            ),
+        ])
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+
+        captured: dict = {}
+
+        def _fake_dispatch(entry_, board_, config_, **kwargs):
+            captured.update(kwargs)
+            return None
+
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _fake_dispatch)
+
+        sweep_redispatch_head_unmoved_conflict_fix("api", 3, board, config)
+
+        assert captured.get("status_fetcher") is fetch_status
+        assert captured.get("prefer_machine") == "laptop"
+        assert captured.get("after_head_unmoved_fix_assignment_id") == "old-leg"
+
+
+class TestSweepRedispatchHeadUnmovedConflictFixRefused:
+    """#3902 item 5: the ``conflict_fix_redispatch_refused`` path, driven
+    end to end (no mocked `dispatch_conflict_fix`) through a genuinely
+    uncapable config — the audit event the code already writes, but no
+    test previously drove."""
+
+    def test_refused_with_no_capable_machine_audits_the_refusal(self) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import (
+            sweep_redispatch_head_unmoved_conflict_fix,
+        )
+
+        entry = mq.QueuedMerge(
+            assignment_id="w4", repo_name="api", repo_github="acme/api",
+            branch="issue-4-fix", target_branch="main", issue_number=4,
+            issue_title="Fix the thing", state=mq.HUMAN_REQUIRED,
+            error=(
+                f"conflict-fix failed; the {mq.CONFLICT_FIX_HEAD_UNMOVED_SIGNAL} "
+                "(still deadbeef) — push the fix by hand."
+            ),
+        )
+        mq.save_queue([entry])
+        board = Board()
+        config = Config(repos=[_fixit_repo()], machines=[])  # no capable machine
+
+        result = sweep_redispatch_head_unmoved_conflict_fix("api", 4, board, config)
+
+        assert result["redispatched"] is False
+
+        log = query_audit_log(
+            event_type="conflict_fix_redispatch_refused", repo="api", issue=4,
+        )
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
 
 
 class TestDispatchInvestigatorActionThinClientGuard:

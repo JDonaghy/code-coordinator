@@ -668,9 +668,16 @@ def _merge_pending_stuck_row(row: StuckRow) -> bool:
 
         from coord import github_ops as gh_ops  # noqa: PLC0415
 
+        # #3902: `allow_fix_dispatch=False` — this mechanical-tier cause is
+        # never routed through `InvestigateCapacityGate` or the per-repo
+        # `fixit_leg_budget` (it is on the C2 allowlist, not an investigate
+        # cause), so it must not let `investigator_merge`'s own post-merge
+        # fan-out (conflict-fix/ci-fix/sibling-conflict dispatch) start a
+        # worker leg of its own on this call's behalf — see
+        # `investigator_merge`'s docstring.
         result = dispatch_investigator_action(
             "merge", repo_name, issue_number, board, config, gh_ops,
-            reason=_SWEEP_REASON, actor="sweep",
+            reason=_SWEEP_REASON, actor="sweep", allow_fix_dispatch=False,
         )
         if not result["acted"]:
             return _warn_noop("merge", repo_name, issue_number, result["detail"])
@@ -1021,7 +1028,13 @@ _register_auto_action(
 )
 _register_auto_action(
     CAUSE_MERGE_PENDING_STUCK,
-    "merge_approved_green",
+    # #3902: named "merge", not the historical "merge_approved_green" —
+    # the SAME verb name `_merge_pending_stuck_row` → `dispatch_
+    # investigator_action` → `investigator_merge` already audits this
+    # action under (`investigator_merge`/`investigator_merge_refused`),
+    # so `ALLOWLIST` and the audit trail never disagree about this
+    # cause's action name.
+    "merge",
     _merge_pending_stuck_row,
 )
 _register_auto_action(

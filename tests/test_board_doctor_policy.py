@@ -128,7 +128,7 @@ class TestPolicyTierOf:
             CAUSE_SMOKE_NO_VERDICT: "smoke_requeue",
             queue_diagnose.CAUSE_NEVER_DISPATCHED: "drive_queue_requeue",
             CAUSE_LATCH_STALE_MERGEABLE: "clear_latch",
-            CAUSE_MERGE_PENDING_STUCK: "merge_approved_green",
+            CAUSE_MERGE_PENDING_STUCK: "merge",
             CAUSE_CONFLICT_FIX_HEAD_UNMOVED: "conflict_fix_redispatch",
             CAUSE_AFTER_PREREQS_LANDED: "drive_queue_requeue",
         }
@@ -2063,6 +2063,93 @@ class TestInvestigateCapacityCheck:
         assert make_investigate_capacity_check(config)(row) is True
 
 
+class TestFixitLegBudgetConfigKnob:
+    """#3889 review / #3902 item 5: `config.board_doctor.fixit_leg_budget`
+    must actually reach `_at_fixit_leg_capacity` through `InvestigateCapacityGate`
+    — not just exist as an unread knob — in BOTH directions, plus the
+    constructor's own fail-closed `except` branch for a value that cannot
+    be read as a positive int."""
+
+    @staticmethod
+    def _busy_board() -> Board:
+        return Board(active=[
+            Assignment(
+                machine_name="mac1", repo_name="acme/widgets", issue_number=40,
+                issue_title="t", status="running", type="work", assignment_id="asn-40",
+            )
+        ])
+
+    @staticmethod
+    def _record_one_fixit_leg_dispatched() -> None:
+        from coord.audit import record_audit
+
+        record_audit(
+            tier="operational", category="board_doctor",
+            event_type="fixit_leg_dispatched", actor="daemon",
+            summary="board-doctor dispatched a fix-it leg",
+            repo="acme/widgets", issue=40, assignment_id="asn-40", machine="mac1",
+        )
+
+    def test_budget_of_one_blocks_a_second_leg(self, monkeypatch) -> None:
+        from coord.config import BoardDoctorConfig
+
+        self._record_one_fixit_leg_dispatched()
+        monkeypatch.setattr(state, "build_board", self._busy_board)
+
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets", max_parallel=5)],
+            machines=[], board_doctor=BoardDoctorConfig(fixit_leg_budget=1),
+        )
+        capacity_check = make_investigate_capacity_check(config)
+        row = _row("acme/widgets#41", queue_diagnose.CAUSE_CI_RED)
+
+        # One leg already in flight, budget=1 — at capacity, defer.
+        assert capacity_check(row) is True
+
+    def test_budget_of_three_does_not_block_a_second_leg(self, monkeypatch) -> None:
+        from coord.config import BoardDoctorConfig
+
+        self._record_one_fixit_leg_dispatched()
+        monkeypatch.setattr(state, "build_board", self._busy_board)
+
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets", max_parallel=5)],
+            machines=[], board_doctor=BoardDoctorConfig(fixit_leg_budget=3),
+        )
+        capacity_check = make_investigate_capacity_check(config)
+        row = _row("acme/widgets#41", queue_diagnose.CAUSE_CI_RED)
+
+        # Same one-in-flight board, but budget=3 — still room; the SAME
+        # board state that blocks at budget=1 above must not block here,
+        # which is only true if the configured value actually reaches the
+        # comparison rather than the hardcoded default being used instead.
+        assert capacity_check(row) is False
+
+    def test_an_unreadable_budget_fails_closed_to_the_default(self, monkeypatch) -> None:
+        from coord.config import BoardDoctorConfig
+
+        self._record_one_fixit_leg_dispatched()
+        monkeypatch.setattr(state, "build_board", self._busy_board)
+
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets", max_parallel=5)],
+            machines=[], board_doctor=BoardDoctorConfig(),
+        )
+        # `_parse_board_doctor` already refuses this at config-load time —
+        # this bypasses it to pin `InvestigateCapacityGate.__init__`'s own
+        # defensive `except` branch directly, for a bad value that somehow
+        # reached the dataclass anyway (e.g. a future caller that builds
+        # `Config`/`BoardDoctorConfig` by hand, never through the parser).
+        config.board_doctor.fixit_leg_budget = "not-an-int"  # type: ignore[assignment]
+
+        capacity_check = make_investigate_capacity_check(config)
+        row = _row("acme/widgets#41", queue_diagnose.CAUSE_CI_RED)
+
+        # Fails closed to FIXIT_LEG_BUDGET_DEFAULT (1) — one leg already in
+        # flight is therefore at capacity, same as an explicit budget=1.
+        assert capacity_check(row) is True
+
+
 class TestInvestigateConvergence:
     def test_same_row_escalates_once_after_the_convergence_limit(
         self, monkeypatch
@@ -2797,7 +2884,7 @@ class TestClearStaleLatchEndToEnd:
         monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
         monkeypatch.setattr(
             mq, "reconcile_conflict_entries",
-            lambda gh_ops: [mq.MergeEvent(entry, "reopened", "cleared for real")],
+            lambda gh_ops, **kwargs: [mq.MergeEvent(entry, "reopened", "cleared for real")],
         )
 
         row = StuckRow(
@@ -2838,7 +2925,7 @@ class TestClearStaleLatchEndToEnd:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
         monkeypatch.setattr(mq, "has_approved_review", lambda *a, **k: True)
 
-        def _reconcile(gh_ops):
+        def _reconcile(gh_ops, **kwargs):
             queue = mq.load_queue()
             live = next(e for e in queue if e.assignment_id == "w2034b")
             if live.state != mq.HUMAN_REQUIRED:
@@ -3076,6 +3163,37 @@ class TestMechanicalRepairsAuditAsSweep:
         assert _reconcile_merged_row(row) is True
         assert captured["action"] == "mark_done"
         assert captured["actor"] == "sweep"
+
+    def test_reconcile_merged_row_real_dispatch_audits_mark_done_as_sweep(
+        self, monkeypatch,
+    ) -> None:
+        # #3902 review: the test above only confirms `dispatch_investigator_
+        # action` was CALLED with `actor="sweep"` — it mocks the dispatcher
+        # itself, so it can never catch a bug in `_investigator_result`'s own
+        # audit write. This drives the REAL `dispatch_investigator_action` →
+        # `investigator_mark_done` → `_investigator_result` path and reads
+        # the audit ROW back, mirroring the clear_latch/merge end-to-end
+        # tests below.
+        from coord import github_ops
+        from coord.audit import query_audit_log
+
+        assignment = Assignment(
+            machine_name="laptop", repo_name="acme/widgets", issue_number=82,
+            issue_title="t", status="done", type="work", branch="issue-82-fix",
+            assignment_id="w82",
+        )
+        board = Board(completed=[assignment])
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: True)
+        monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: _widgets_config())
+        monkeypatch.setattr(state, "build_board", lambda: board)
+
+        row = _row("acme/widgets#82", queue_diagnose.CAUSE_PR_MERGED, queue="drive-queue")
+        assert _reconcile_merged_row(row) is True
+
+        log = query_audit_log(event_type="investigator_mark_done", repo="acme/widgets", issue=82)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
 
     def test_clear_stale_latch_dispatches_clear_latch_as_sweep(self, monkeypatch) -> None:
         captured: dict = {}
