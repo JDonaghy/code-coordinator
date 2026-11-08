@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -2432,6 +2433,7 @@ def stash_artifacts_for_branch(
     assignment_id: str | None = None,
     log_path: str | None = None,
     unmatched_out: "list[str] | None" = None,
+    leg_suffix: str | None = None,
 ) -> int:
     """Copy build artifacts from *worktree_path* into the persistent stash.
 
@@ -2466,6 +2468,15 @@ def stash_artifacts_for_branch(
     patterns matched but at least one didn't).  When not provided the
     per-pattern tracking is skipped.
 
+    *leg_suffix* (#3912) is forwarded to
+    :func:`coord.cargo_cache.target_dir_for_repo` for the worktree-glob-miss
+    cargo-cache fallback below — pass the SAME value the build itself used
+    (:func:`_fanout_leg_cargo_suffix`) so a #3182 fan-out leg's artifacts are
+    looked for where they were actually built
+    (``<cache>/<repo>/fanout-leg/<tag>/debug/...``), not the bare per-repo
+    cache an ordinary single-leg assignment uses. ``None`` (the default,
+    and every pre-#3912 caller) is unaffected.
+
     Returns the number of files copied (0 for a no-op).
     """
     if not patterns:
@@ -2491,7 +2502,7 @@ def stash_artifacts_for_branch(
     # any pattern that misses in the worktree, so a Rust repo's
     # ``artifact_paths`` keeps resolving (and #1357's silent stash-miss does
     # not come back through the front door).
-    _cargo_dir = cargo_cache.target_dir_for_repo(repo_name, state_dir)
+    _cargo_dir = cargo_cache.target_dir_for_repo(repo_name, state_dir, leg_suffix)
     if _cargo_dir is not None and not _cargo_dir.is_dir():
         _cargo_dir = None
 
@@ -3497,6 +3508,7 @@ def _git_worktree_add(
     log_path: str | None = None,
     default_branch: str | None = None,
     assignments: "dict[str, AgentAssignment] | None" = None,
+    assignment_id: str | None = None,
 ) -> None:
     """Run ``git worktree add <add_args>``, retrying once on a branch collision.
 
@@ -3507,19 +3519,13 @@ def _git_worktree_add(
     the add is retried exactly once.  Any other git error, or a failure after the
     single retry, is re-raised so the caller sees a clear ``_GitError``.
 
-    #3912: before that force-remove, the conflicting worktree's own liveness
-    is checked via :func:`_worktree_assignment_is_live` — the SAME question
-    :func:`_free_branch_in_worktrees` already asked (and may have answered
-    "still live, leave it") immediately before this call ran. Without this
-    check, two #3182 fan-out legs racing on one machine for the same branch
-    hit exactly this: the proactive eviction correctly refused to touch the
-    sibling's live worktree, `git worktree add` then failed with the
-    resulting collision, and this retry path force-removed it anyway — no
-    liveness check of its own — deleting a sibling leg's worktree out from
-    under its still-running build. A live conflict is now a hard error here
-    too: never force-removed, never retried, so the sibling's build survives
-    and the loser just reports "collision" instead of silently destroying
-    the winner.
+    Before that force-remove, the conflicting worktree's own liveness is
+    checked via :func:`_worktree_assignment_is_live` — the SAME question
+    :func:`_free_branch_in_worktrees` already asked immediately before this
+    call ran. A live conflict (e.g. a #3182 fan-out sibling still mid-build
+    on the same branch) is a hard error here, never force-removed or
+    retried — the loser reports "collision" and the winner's build
+    survives untouched.
 
     *assignments* (optional, mirroring :func:`_free_branch_in_worktrees`) is
     a ``dict(self._assignments)`` snapshot the caller already has to hand;
@@ -3527,6 +3533,15 @@ def _git_worktree_add(
     falls back to the tmux-session check alone inside
     :func:`_worktree_assignment_is_live` — still strictly safer than no
     check at all.
+
+    *assignment_id* (optional) is THIS dispatch's own assignment id — when
+    the conflicting worktree's name matches it, the liveness check is
+    skipped and the collision is force-removed and retried as usual.
+    *assignments* is a snapshot taken while this very assignment is
+    already PENDING/RUNNING, so without this a conflict naming THIS
+    assignment's own leftover worktree would read as "live" against its
+    own snapshot entry — never a sibling's build, and never something
+    worth a hard, permanent error over.
 
     #1693: the conflicting path is *scraped out of git's error text*, so it can
     name anything git happens to mention — including the **base checkout**,
@@ -3688,12 +3703,22 @@ def _git_worktree_add(
         ) from original
 
     # #3912: never force-remove a worktree whose assignment is still live —
-    # the exact same question `_free_branch_in_worktrees` already asked (and
-    # may have just answered "leave it") for this same path moments earlier.
-    # A hard error here, not a third retry: removing it would delete a
-    # sibling leg's live checkout mid-build.
+    # the exact same question `_free_branch_in_worktrees` already asked
+    # for this same path moments earlier. A hard error here, not a third
+    # retry: removing it would delete a sibling leg's live checkout
+    # mid-build.
+    #
+    # The one exception: a conflicting path naming THIS dispatch's own
+    # assignment id is never a sibling's build — only ever this
+    # assignment's own leftover worktree (a retry reusing the same id, a
+    # self-heal re-add) — so the liveness check is skipped for it and the
+    # collision is force-removed and retried like any other self-owned
+    # stale worktree.
     conflicting_assignment_id = Path(conflicting_path).name
-    if _worktree_assignment_is_live(conflicting_assignment_id, assignments):
+    if (
+        conflicting_assignment_id != assignment_id
+        and _worktree_assignment_is_live(conflicting_assignment_id, assignments)
+    ):
         if log_path:
             _append_log_line(
                 log_path,
@@ -3751,22 +3776,36 @@ def _branch_from_add_args(add_args: list[str]) -> str:
 
 
 def _fanout_leg_cargo_suffix(issue_title: str) -> str | None:
-    """The ``leg_suffix`` to pass to :func:`coord.cargo_cache.cargo_env` for
-    an assignment whose ``issue_title`` is *issue_title*, or ``None`` (#3912).
+    """The ``leg_suffix`` to pass to :func:`coord.cargo_cache.cargo_env`/
+    :func:`coord.cargo_cache.target_dir_for_repo` for an assignment whose
+    ``issue_title`` is *issue_title*, or ``None``.
 
     ``None`` for every ordinary assignment — a plain work/review/single-leg
     smoke row never carries a ``[smoke:<caps>]`` tag
-    (:func:`coord.smoke_tags.smoke_leg_capabilities`), so `cargo_env` returns
-    the bare per-repo shared cache exactly as before #3912. Only a #3182
-    fan-out leg (ONE OF SEVERAL sibling partitions that can land on the same
-    machine at the same time) gets its own capability-tagged subdirectory —
-    see that function's docstring for why two siblings sharing the bare
-    cache corrupted each other's build mid-compile.
+    (:func:`coord.smoke_tags.smoke_leg_capabilities`), so the caller falls
+    back to the bare per-repo shared cache. Only a #3182 fan-out leg gets
+    its own capability-tagged subdirectory, so concurrent sibling
+    partitions on the same machine never race on the same cargo target
+    dir — see :func:`coord.cargo_cache.target_dir_for_repo`'s docstring.
+
+    The returned tag is a human-readable ``+``-joined capability list, a
+    dash, and a short hash of the capability tuple. The hash — not the
+    readable part — is what guarantees two different sibling partitions
+    never nest under the same directory: capability names may themselves
+    contain ``+``/``-``/``_`` (:data:`coord.smoke_tags._LEG_TAG_RE`'s
+    charset), so a single capability literally named e.g.
+    ``"gtk-windows"`` and the two-capability partition ``("gtk",
+    "windows")`` would otherwise produce the identical readable string
+    once :func:`coord.cargo_cache.target_dir_for_repo` remaps ``+`` to
+    ``-`` for the filesystem. Hashed over a NUL-joined encoding (a byte no
+    capability name can contain), so the hash alone is unambiguous
+    regardless of what the readable prefix collapses to.
     """
     caps = smoke_leg_capabilities(issue_title)
     if not caps:
         return None
-    return "+".join(caps)
+    digest = hashlib.sha256("\x00".join(caps).encode("utf-8")).hexdigest()[:8]
+    return f"{'+'.join(caps)}-{digest}"
 
 
 def _set_worktree_pull_rebase(repo_path: Path, worktree_path: Path) -> None:
@@ -8370,6 +8409,7 @@ class AgentServer:
             assignment_id=assignment.id,
             log_path=assignment.log_path,
             unmatched_out=unmatched,
+            leg_suffix=_fanout_leg_cargo_suffix(assignment.spec.issue_title),
         )
 
         # Invalidate the artifact_bytes cache so health() picks up the new files.
@@ -10056,6 +10096,7 @@ class AgentServer:
                 log_path=assignment.log_path,
                 default_branch=default_branch,
                 assignments=_live_assignments,
+                assignment_id=assignment.id,
             )
         elif local_has_branch and not has_origin:
             # Local-only repo (no remote) — reuse the local branch as before.
@@ -10065,6 +10106,7 @@ class AgentServer:
                 log_path=assignment.log_path,
                 default_branch=default_branch,
                 assignments=_live_assignments,
+                assignment_id=assignment.id,
             )
         else:
             # Fresh branch, OR an untrusted local-only leftover in a repo that
@@ -10090,6 +10132,7 @@ class AgentServer:
                 log_path=assignment.log_path,
                 default_branch=default_branch,
                 assignments=_live_assignments,
+                assignment_id=assignment.id,
             )
 
         # #1468: default this worktree's `pull.rebase` to true — see

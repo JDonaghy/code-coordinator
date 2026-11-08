@@ -1079,114 +1079,6 @@ def _find_leg_for_partition(
     return best
 
 
-def _reclassify_infra_fanout_leg(
-    work_parent_id: str, leg_id: str, capabilities: tuple[str, ...], leg_reason: str | None,
-) -> str | None:
-    """#3912: if *leg_id*'s own ``failed`` verdict is a build/worktree
-    infrastructure outage — not a genuine test result — clear it back to
-    retryable and return ``None``; otherwise return ``"failed"`` unchanged.
-
-    Reuses :func:`coord.failure_class.classify_failure`'s :data:`coord.
-    failure_class.KIND_INFRA` — the SAME classifier
-    :func:`coord.reconcile.propagate_smoke_terminal_failure` already uses for
-    a fan-out leg that dies without ever reporting a verdict at all (#3315) —
-    rather than inventing a second one: two concurrent #3182 fan-out legs
-    racing on one machine (a worktree collision, a shared cargo target dir
-    race) produce a leg that DID run and DID exit non-zero, with real output
-    describing the outage, so it reaches here as an ordinary ``"failed"``
-    verdict rather than #3315's "never reported anything" shape.
-
-    Folding an infra-flavoured failure in as plain ``failed`` would be wrong
-    twice over: :func:`finalize_smoke_fanout`'s AND-across-legs severity
-    order would flip a sibling's genuine ``passed`` to the aggregate's
-    ``failed`` (#3912's own bug report), and the leg would then carry a
-    terminal verdict forever — :func:`_find_leg_for_partition` treats ANY
-    terminal state as "already handled", so the partition would never
-    retry. Clearing *leg_id* back to ``test_state=None`` fixes both: this
-    leg reads as "not reported yet" (the aggregate stays at ``running``,
-    never folding it in) and as "retryable" (`_find_leg_for_partition`'s own
-    criterion for a terminal row with no real verdict).
-
-    Bounded by the SAME :data:`ENVIRONMENTAL_SMOKE_RETRY_BUDGET` #3315 already
-    tracks for this fan-out, read off the PARENT's own ``test_reason`` (the
-    one row that persists for the fan-out's whole lifetime — a fan-out leg
-    mints a fresh id every retry, so a leg-scoped tally could never reach the
-    budget). Once exhausted, this parks both the parent and the leg at
-    :data:`TEST_STATE_BLOCKED` and returns :data:`TEST_STATE_BLOCKED` instead
-    of ``None`` — the caller must stop folding immediately rather than
-    continue computing an aggregate on top of an already-terminal parent.
-    """
-    from coord.state import (  # noqa: PLC0415
-        load_assignment_test_reason,
-        record_test_verdict,
-    )
-    from coord.failure_class import KIND_INFRA, classify_failure  # noqa: PLC0415
-
-    classification = classify_failure(failure_reason=leg_reason)
-    if classification.kind != KIND_INFRA:
-        return "failed"
-
-    previous_parent_reason = load_assignment_test_reason(work_parent_id)
-    env_legs = environmental_smoke_legs(previous_parent_reason) + 1
-    cause = classification.reason
-    caps_label = "+".join(capabilities)
-
-    if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
-        record_test_verdict(
-            assignment_id=work_parent_id,
-            test_state=TEST_STATE_BLOCKED,
-            test_reason=(
-                f"{environmental_smoke_tally(env_legs)}: the Test-stage "
-                f"environmental retry budget ({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) "
-                f"is exhausted after {env_legs} consecutive environmental "
-                f"fan-out-leg deaths (#3182/#3315/#3912) — capability set "
-                f"[{caps_label}] hit {cause}. Recover with `coord diagnose "
-                "<repo> <issue> --stage test --reset` once the "
-                "infrastructure is healthy again, or record the verdict by "
-                f"hand with `coord test --passed|--fail {work_parent_id}`."
-            ),
-        )
-        record_test_verdict(
-            assignment_id=leg_id,
-            test_state=TEST_STATE_BLOCKED,
-            test_reason=(
-                f"Test-stage fan-out leg [{caps_label}] failed from a build/"
-                f"worktree infrastructure outage ({cause}), not a test "
-                "result — the fan-out's shared #3315 retry budget (tracked "
-                f"on parent {work_parent_id}) is now exhausted; see the "
-                "parent row for the full reason."
-            ),
-        )
-        return TEST_STATE_BLOCKED
-
-    record_test_verdict(
-        assignment_id=work_parent_id,
-        test_state="running",
-        test_reason=(
-            f"{environmental_smoke_tally_reset(previous_parent_reason)}"
-            f"\n{environmental_smoke_tally(env_legs)}: {env_legs} of "
-            f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive environmental "
-            f"fan-out-leg death(s) so far (#3315/#3912) — capability set "
-            f"[{caps_label}] hit {cause}."
-        ).strip(),
-    )
-    record_test_verdict(
-        assignment_id=leg_id,
-        test_state=None,
-        test_reason=(
-            f"Test-stage fan-out leg [{caps_label}] failed from a build/"
-            f"worktree infrastructure outage ({cause}), not a test result "
-            "— cleared for a fresh re-dispatch of this partition rather "
-            f"than folded into the aggregate as a failure (#3912); "
-            f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET - env_legs} of the "
-            f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET}-leg retry budget left "
-            "before the fan-out parks instead. Originally reported: "
-            f"{leg_reason or '<no reason recorded>'}"
-        ),
-    )
-    return None
-
-
 def finalize_smoke_fanout(work_parent_id: str) -> None:
     """#3182: fold every fan-out leg's own terminal verdict into ONE
     aggregate verdict on the parent work row, once enough of them are in.
@@ -1207,13 +1099,36 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
     ``running``/unset holds the aggregate at ``running`` — not everyone has
     reported in yet.
 
-    #3912: a ``failed`` leg is first checked for an infrastructure signature
-    via :func:`_reclassify_infra_fanout_leg` — see that function for why a
-    build/worktree outage must never fold in as a genuine failure. A leg it
-    clears reads as ``None`` below, which the existing "not everyone has
-    reported in yet" guard already treats correctly: the aggregate holds at
-    ``running`` (never flips a passing sibling to ``failed``) and the
-    cleared partition alone is left for a fresh dispatch.
+    #3912: a leg whose own failure is a build/worktree infrastructure
+    outage (two #3182 fan-out legs racing on one machine) never reaches this
+    function as ``"failed"`` at all — every ``test_state="failed"`` write,
+    including this leg's own, funnels through
+    :func:`coord.state.record_test_verdict`'s
+    :func:`coord.state._reclassify_infra_test_failure` choke point first,
+    which already clears a :data:`coord.failure_class.KIND_INFRA` reason
+    back to ``test_state=None`` (or parks it at
+    :data:`TEST_STATE_BLOCKED` once its own retry budget is exhausted)
+    before it ever lands. So by the time this loop reads the leg's state,
+    an infra-flavoured failure already reads as ``None``/``TEST_STATE_
+    BLOCKED`` — the existing "not everyone has reported in yet" guard below
+    holds the aggregate at ``running`` for the former (never flips a
+    passing sibling to ``failed``, and leaves the cleared partition for a
+    fresh dispatch) and the existing terminal-state handling folds the
+    latter like any other park. Nothing fan-out-specific is needed here:
+    reusing the ONE choke point every other caller already goes through
+    (:func:`coord.state.record_test_verdict`) rather than a second,
+    independently-tuned copy of the same classify-and-clear logic.
+
+    One trade-off of leaning on that per-row choke point rather than a
+    fan-out-specific one: its retry budget is tracked on each write's own
+    row, and a fan-out leg mints a fresh assignment id every retry (unlike
+    an ordinary single-leg smoke row, which reuses the same id) — so a
+    SUSTAINED infrastructure outage on one partition never reaches that
+    budget and this fan-out keeps re-dispatching the broken partition
+    indefinitely rather than parking. Acceptable for now: the alternative
+    is a second, parent-scoped tally that only this function would ever
+    exercise, which is exactly the "two independent implementations of one
+    question" split #2085 warns against.
     """
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
@@ -1242,10 +1157,6 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
         for leg_id, caps, command in legs:
             state = load_assignment_test_state(leg_id)
             reason = load_assignment_test_reason(leg_id)
-            if state == "failed":
-                state = _reclassify_infra_fanout_leg(work_parent_id, leg_id, caps, reason)
-                if state == TEST_STATE_BLOCKED:
-                    return  # parked — parent and leg already written above
             leg_states.append((caps, state, reason, command))
         if any(state in (None, "running") for _, state, _, _ in leg_states):
             return  # not everyone has reported in yet

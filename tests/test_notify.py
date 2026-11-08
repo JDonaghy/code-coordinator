@@ -3079,6 +3079,128 @@ class TestSmokeCompletionVerdict:
             f"expected the #3315 environmental tally — got {row['test_reason']!r}"
         )
 
+    def test_worktree_collision_losers_own_error_text_does_not_clobber_sibling_pass(
+        self, coord_db,
+    ) -> None:
+        """#3912 review (non-blocking): the collision-loser's own
+        `_GitError` text (`coord.agent._git_worktree_add`'s new #3912
+        liveness refusal — "...is still live (RUNNING/PENDING or an active
+        tmux session)") matches no environmental/infra signature of its
+        own. It only survives as a bounded silent-death retry today because
+        `entry["error"]` never feeds `coord.notify`'s `_failure_reason` —
+        the SAME mechanism `test_silent_fanout_leg_death_clears_the_leg_
+        for_a_bounded_retry` pins generically, pinned here specifically
+        against the actual #3912 collision message so a future change that
+        starts forwarding `entry["error"]` into `_failure_reason` is caught
+        by this test before it reintroduces #3912 end-to-end (a fan-out
+        leg that merely loses a worktree race would then clobber its
+        sibling's genuine pass)."""
+        from coord.notify import (  # noqa: PLC0415
+            EVENT_COMPLETION,
+            EVENT_FAILURE,
+            Transition,
+            post_transition,
+        )
+        from coord.state import (  # noqa: PLC0415
+            get_connection,
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        self._record_work("work-collision")
+        self._record_fanout_leg(
+            "leg-gtk-collision", parent_id="work-collision", capabilities=("gtk",),
+        )
+        self._record_fanout_leg(
+            "leg-win-collision", parent_id="work-collision",
+            capabilities=("windows",),
+        )
+        record_test_verdict(
+            assignment_id="work-collision", test_state="running",
+            test_reason=(
+                "[[smoke-fanout:leg-gtk-collision=gtk,"
+                "leg-win-collision=windows]]\n"
+                "Test stage running across 2 capability-partition leg(s) "
+                "(#3182): [gtk]; [windows]."
+            ),
+        )
+
+        patches = (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.post_failure"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        )
+
+        completion = Transition(
+            assignment_id="leg-gtk-collision", machine_name="dell64",
+            repo_name="api", issue_number=42, event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+        completion_record = {
+            "repo_github": "acme/api", "type": "smoke",
+            "review_of_assignment_id": "work-collision",
+            "issue_title": "[smoke:gtk] Fix thing",
+        }
+        completion_entry = {
+            "started_at": 1000.0, "finished_at": 1010.0,
+            "branch": "issue-42-fix-thing", "log_path": None,
+        }
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            post_transition(completion, completion_record, completion_entry)
+            # Simulate the worker printing a real `SMOKE: pass` — the
+            # shared `_record_smoke_verdict` path reads it from the log in
+            # production; here, record it directly for the same effect.
+        record_test_verdict(assignment_id="leg-gtk-collision", test_state="passed")
+
+        # The windows leg LOST the worktree race: `_git_worktree_add`
+        # refused the collision with the #3912 liveness error and the
+        # agent reports EVENT_FAILURE carrying that error text verbatim.
+        failure = Transition(
+            assignment_id="leg-win-collision", machine_name="dell64",
+            repo_name="api", issue_number=42, event=EVENT_FAILURE,
+            exit_code=None,
+        )
+        failure_record = {
+            "repo_github": "acme/api", "type": "smoke",
+            "review_of_assignment_id": "work-collision",
+            "issue_title": "[smoke:windows] Fix thing",
+        }
+        failure_entry = {
+            "started_at": 1000.0, "finished_at": 1010.0,
+            "branch": "issue-42-fix-thing", "log_path": None,
+            "error": (
+                "cannot create a worktree for branch 'issue-42-fix-thing': "
+                "the conflicting worktree '/state/worktrees/leg-gtk-"
+                "collision' belongs to assignment 'leg-gtk-collision', "
+                "which is still live (RUNNING/PENDING or an active tmux "
+                "session). Refusing to remove it (#3912) — re-dispatch "
+                "once that assignment finishes."
+            ),
+        }
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            post_transition(failure, failure_record, failure_entry)
+
+        assert load_assignment_test_state("leg-win-collision") is None, (
+            "the collision loser must clear for a bounded automatic retry "
+            "of its own partition, never record a genuine `failed` verdict "
+            f"— got {load_assignment_test_state('leg-win-collision')!r}"
+        )
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+            ("work-collision",),
+        ).fetchone()
+        assert row["test_state"] == "running", (
+            "the sibling's genuine pass must survive the collision loser "
+            f"— got {row['test_state']!r}"
+        )
+        assert load_assignment_test_state("leg-gtk-collision") == "passed"
+
     def test_operator_cancelled_leg_does_not_fail_the_parent_while_sibling_runs(
         self, coord_db,
     ) -> None:

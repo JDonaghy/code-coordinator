@@ -273,6 +273,21 @@ _NETWORK_RE = re.compile(
 # in the field; the other phrasings below are kept for a human operator
 # typing a `coord test --fail`/`coord diagnose` reason in the same register,
 # but none of them is (yet) machine-emitted.
+#
+# #3912: two more machine-emitted shapes, both cargo/rustc toolchain-
+# invocation failures rather than a test result — a #3182 fan-out leg racing
+# a sibling for the same shared build dir deletes a ``.d`` file mid-compile,
+# or a concurrent worktree collision removes the toolchain binary's own
+# directory out from under the invoking process:
+#   * ``error: could not parse/generate dep info at: <path> ... No such
+#     file or directory`` — cargo's own dependency-info file vanished
+#     between it being listed and read.
+#   * ``could not execute process `.../rustc ...`: No such file or
+#     directory (os error 2)`` — the OS could not even start the rustc
+#     binary. Anchored on the ``(os error 2)`` suffix together with the
+#     "could not execute process" phrase so a genuine test asserting
+#     subprocess-spawn behaviour (which could print either phrase alone)
+#     is not misread as a toolchain outage.
 _INFRA_RE = re.compile(
     r"("
     r"worktree\s+\S+\s+was\s+deleted\s+out\s+from\s+under"
@@ -281,6 +296,8 @@ _INFRA_RE = re.compile(
     r"|never\s+returned\s+an\s+exit\s+status"
     r"|runner\s+(?:was\s+)?killed\s+before\s+it\s+could\s+report"
     r"|infra\s+issue,?\s+not\s+a\s+test\s+result"
+    r"|could\s+not\s+(?:parse|generate)(?:/\w+)?\s+dep\s+info\b"
+    r"|could\s+not\s+execute\s+process\b[^\n]*\(os\s+error\s+2\)"
     r")",
     re.IGNORECASE,
 )
