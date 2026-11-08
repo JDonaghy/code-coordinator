@@ -6277,6 +6277,107 @@ def test_finalize_smoke_fanout_passes_when_every_leg_passes(coord_db) -> None:
     assert load_assignment_test_state("w-fanout") == "passed"
 
 
+def test_finalize_smoke_fanout_infra_failed_leg_does_not_clobber_sibling_pass(
+    coord_db,
+) -> None:
+    """#3912: a leg whose own failure is a build/worktree infrastructure
+    outage (two concurrent fan-out legs racing on one machine) must not fold
+    in as a genuine `failed` — the aggregate must stay `running` (never flip
+    the sibling's real `passed` to `failed`), and the infra leg's own row
+    must clear back to retryable so only ITS partition gets a fresh leg."""
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="passed", reason="ok")
+    _seed_leg(
+        leg_id="leg-b", state="failed",
+        reason=(
+            "headless smoke: worktree /home/x/.coord/worktrees/leg-b was "
+            "deleted out from under the running cargo build"
+        ),
+    )
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_state,
+    )
+
+    # The aggregate never flips to `failed` — the genuine pass survives.
+    assert load_assignment_test_state("w-fanout") == "running"
+    # The passing sibling's own row is untouched.
+    assert load_assignment_test_state("leg-a") == "passed"
+    # The infra-flavoured leg is cleared back to retryable, not left `failed`
+    # — `_find_leg_for_partition` would otherwise treat it as "already
+    # handled" and strand this partition forever.
+    assert load_assignment_test_state("leg-b") is None
+
+
+def test_finalize_smoke_fanout_infra_leg_parks_after_retry_budget_exhausted(
+    coord_db,
+) -> None:
+    """#3912: a SUSTAINED infrastructure outage (every retry of the same
+    partition dies the same way) must still park the fan-out instead of
+    clearing it for retry forever — the same #3315 budget #3182 fan-out legs
+    already share for a leg that dies without reporting at all."""
+    from coord.smoke import (  # noqa: PLC0415
+        ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
+        TEST_STATE_BLOCKED,
+    )
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="passed", reason="ok")
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    infra_reason = (
+        "headless smoke: worktree /home/x/.coord/worktrees/leg-b was "
+        "deleted out from under the running cargo build"
+    )
+    for i in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET):
+        _seed_leg(leg_id="leg-b", state="failed", reason=infra_reason)
+        finalize_smoke_fanout("w-fanout")
+        parent_state = load_assignment_test_state("w-fanout")
+        if i + 1 < ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
+            assert parent_state == "running", (
+                f"parked too early, after only {i + 1} death(s)"
+            )
+            assert load_assignment_test_state("leg-b") is None
+            # Re-seed the SAME partition under a fresh leg id — exactly the
+            # #3182 fan-out shape: every retry mints a new transient row.
+            record_test_verdict(
+                assignment_id="w-fanout", test_state="running",
+                test_reason=(
+                    "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+                    "Test stage running across 2 capability-partition leg(s) "
+                    "(#3182): [gtk]; [windows]."
+                ),
+            )
+
+    assert load_assignment_test_state("w-fanout") == TEST_STATE_BLOCKED
+    assert load_assignment_test_state("leg-b") == TEST_STATE_BLOCKED
+    # The still-passing sibling is never touched by the park either.
+    assert load_assignment_test_state("leg-a") == "passed"
+
+
 def test_finalize_smoke_fanout_is_a_noop_for_a_non_fanout_row(coord_db) -> None:
     """No manifest in `test_reason` — an ordinary single-leg row — must never
     be touched by the fan-out aggregator."""

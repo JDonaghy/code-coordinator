@@ -185,27 +185,72 @@ def cache_root(state_dir: Path) -> Path:
     return Path(state_dir) / CACHE_DIRNAME
 
 
-def target_dir_for_repo(repo_name: str, state_dir: Path) -> Path | None:
+#: #3912: the subdirectory a #3182 fan-out leg's OWN cargo target dir nests
+#: under, when it gets one — see :func:`target_dir_for_repo`'s *leg_suffix*
+#: parameter for why this is scoped to fan-out legs only, never an ordinary
+#: single-leg assignment.
+FANOUT_LEG_DIRNAME = "fanout-leg"
+
+
+def target_dir_for_repo(
+    repo_name: str, state_dir: Path, leg_suffix: str | None = None,
+) -> Path | None:
     """The shared target dir for *repo_name*, or ``None`` if the name is not a
     safe single path component (never guessed, never sanitized into a
-    collision — an unusable name simply opts that repo out)."""
+    collision — an unusable name simply opts that repo out).
+
+    *leg_suffix* (#3912, optional) nests the result under
+    ``<repo>/fanout-leg/<leg_suffix>/`` instead of returning the bare
+    per-repo root — pass the #3182 fan-out leg's own capability-partition tag
+    (e.g. ``"gtk+windows"``) when dispatching a leg that is ONE OF SEVERAL
+    sibling partitions, never for an ordinary single-leg assignment. Two
+    sibling legs of one fan-out routed to the same machine at the same time
+    used to share the bare per-repo target dir and race on cargo's
+    ``deps/*.d`` files mid-build (the #3912 incident) — nesting under the
+    leg's own tag keeps that race from ever happening while still sharing
+    ONE cache across repeated retries of the SAME partition on the same
+    machine (unlike keying on the transient assignment id, which would cold-
+    build every single retry). Nested under the repo's own cache dir — not a
+    sibling top-level entry — so :func:`sweep`'s existing repo-name-keyed
+    ``protect_repos``/:func:`build_active` live-build protection still
+    covers it with no changes of its own.
+
+    A *leg_suffix* that is not a single safe path component (anything
+    outside ``+`` — which is remapped to ``-`` first, since every
+    capability-partition tag is ``+``-joined — plus
+    ``[A-Za-z0-9._-]``) falls back to the bare per-repo root rather than
+    disabling the cache for the whole repo: an unusable suffix should never
+    be worse than not having one.
+    """
     if not repo_name or not _SAFE_COMPONENT.match(repo_name):
         return None
     if repo_name in (".", ".."):
         return None
-    return cache_root(state_dir) / repo_name
+    base = cache_root(state_dir) / repo_name
+    if not leg_suffix:
+        return base
+    safe_suffix = leg_suffix.replace("+", "-")
+    if not _SAFE_COMPONENT.match(safe_suffix) or safe_suffix in (".", ".."):
+        return base
+    return base / FANOUT_LEG_DIRNAME / safe_suffix
 
 
 def cargo_env(
     repo_name: str,
     state_dir: Path,
     base_env: dict[str, str] | None = None,
+    leg_suffix: str | None = None,
 ) -> dict[str, str]:
     """Environment overlay pointing cargo at the shared cache.
 
     Returns ``{}`` (a no-op overlay) when the feature is disabled, the repo
     name is unusable, or *base_env* already carries a ``CARGO_TARGET_DIR`` —
     an operator's explicit choice always wins.
+
+    *leg_suffix* (#3912) is forwarded to :func:`target_dir_for_repo` — see
+    its docstring. ``None`` (the default, and every pre-#3912 caller) is the
+    common single-leg case and is completely unaffected: it returns the bare
+    per-repo shared cache exactly as before.
 
     The directory is **not** created here: cargo does its own ``mkdir -p``, so
     a repo that never invokes cargo never leaves an empty dir behind.
@@ -215,7 +260,7 @@ def cargo_env(
         return {}
     if env.get(CARGO_ENV):
         return {}
-    target = target_dir_for_repo(repo_name, state_dir)
+    target = target_dir_for_repo(repo_name, state_dir, leg_suffix)
     if target is None:
         return {}
     return {CARGO_ENV: str(target)}

@@ -183,6 +183,71 @@ def test_cargo_env_disabled_by_env_var(tmp_path: Path) -> None:
     assert cargo_cache.cargo_env("api", tmp_path, {cargo_cache.ENABLE_ENV: "1"})
 
 
+# ── #3912: per-#3182-fan-out-leg target dir isolation ───────────────────────
+
+
+def test_leg_suffix_none_is_unaffected(tmp_path: Path) -> None:
+    """The common case — no `leg_suffix` — is byte-for-byte the pre-#3912
+    bare per-repo target dir."""
+    assert (
+        cargo_cache.target_dir_for_repo("api", tmp_path, None)
+        == tmp_path / "cargo-target" / "api"
+    )
+    assert cargo_cache.cargo_env("api", tmp_path, {}, leg_suffix=None) == {
+        "CARGO_TARGET_DIR": str(tmp_path / "cargo-target" / "api"),
+    }
+
+
+def test_leg_suffix_nests_under_a_distinct_subdirectory(tmp_path: Path) -> None:
+    """Two sibling #3182 fan-out legs get DISTINCT target dirs, nested under
+    the same repo's cache root (so the existing repo-keyed GC protection
+    still covers both)."""
+    gtk = cargo_cache.target_dir_for_repo("api", tmp_path, "gtk")
+    windows = cargo_cache.target_dir_for_repo("api", tmp_path, "windows")
+    assert gtk != windows
+    assert gtk == tmp_path / "cargo-target" / "api" / "fanout-leg" / "gtk"
+    assert windows == tmp_path / "cargo-target" / "api" / "fanout-leg" / "windows"
+    repo_root = tmp_path / "cargo-target" / "api"
+    assert gtk.is_relative_to(repo_root)
+    assert windows.is_relative_to(repo_root)
+
+
+def test_leg_suffix_is_stable_across_retries_of_the_same_partition(
+    tmp_path: Path,
+) -> None:
+    """A RETRY of the same capability partition on the same machine still
+    warms the SAME leg-scoped cache — only concurrent DIFFERENT partitions
+    must never share a directory."""
+    first = cargo_cache.target_dir_for_repo("api", tmp_path, "gtk+windows")
+    second = cargo_cache.target_dir_for_repo("api", tmp_path, "gtk+windows")
+    assert first == second
+
+
+def test_leg_suffix_plus_joined_capabilities_sanitized_to_a_safe_path(
+    tmp_path: Path,
+) -> None:
+    """A multi-capability tag (`+`-joined, per `smoke_leg_issue_title`) is
+    remapped to a single safe path component rather than rejected."""
+    d = cargo_cache.target_dir_for_repo("api", tmp_path, "gtk+windows")
+    assert d == tmp_path / "cargo-target" / "api" / "fanout-leg" / "gtk-windows"
+
+
+def test_leg_suffix_unusable_falls_back_to_the_bare_repo_root(tmp_path: Path) -> None:
+    """An unusable suffix must never be WORSE than having none — it falls
+    back to the shared per-repo cache rather than opting the repo out."""
+    d = cargo_cache.target_dir_for_repo("api", tmp_path, "../escape")
+    assert d == tmp_path / "cargo-target" / "api"
+
+
+def test_cargo_env_forwards_leg_suffix(tmp_path: Path) -> None:
+    env = cargo_cache.cargo_env("api", tmp_path, {}, leg_suffix="gtk")
+    assert env == {
+        "CARGO_TARGET_DIR": str(
+            tmp_path / "cargo-target" / "api" / "fanout-leg" / "gtk"
+        ),
+    }
+
+
 # ── the cap ─────────────────────────────────────────────────────────────────
 
 
