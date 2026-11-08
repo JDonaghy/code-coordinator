@@ -1608,6 +1608,13 @@ class BoardDoctorConfig:
     fallback used on the same read failure. Read fresh every sweep
     (:func:`coord.board_doctor_policy.make_investigate_capacity_check`), so
     a change here needs no daemon restart to take effect.
+
+    ``outcome_grace_hours`` (#3907) is how long an open outcome-log decision
+    is left ungraded after it is logged, so a leg (or the row's drive) that
+    is still running does not get graded `regressed` against work in
+    flight. Default 3h — matches
+    :data:`coord.state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS`, the fallback used
+    on the same read failure as every other knob in this section.
     """
 
     investigate: bool = True
@@ -1620,6 +1627,7 @@ class BoardDoctorConfig:
     backoff_initial_hours: float = 1.0
     backoff_cap_hours: float = 24.0
     fixit_leg_budget: int = 1
+    outcome_grace_hours: float = 3.0
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3680,6 +3688,15 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         ):
             raise ConfigError("board_doctor.fixit_leg_budget must be a positive integer")
         cfg.fixit_leg_budget = fixit_leg_budget
+    if "outcome_grace_hours" in raw:
+        outcome_grace_hours = raw["outcome_grace_hours"]
+        if (
+            isinstance(outcome_grace_hours, bool)
+            or not isinstance(outcome_grace_hours, (int, float))
+            or outcome_grace_hours <= 0
+        ):
+            raise ConfigError("board_doctor.outcome_grace_hours must be a positive number")
+        cfg.outcome_grace_hours = float(outcome_grace_hours)
     return cfg
 
 
