@@ -2414,18 +2414,16 @@ class TestNoProgressRows:
         assert reclassified.cause == CAUSE_CEILING_BLOCKED_MERGEABLE
 
     def test_repo_ceiling_honours_systemd_max_parallel_per_repo_override(self) -> None:
-        # #3906: a `--max-parallel-per-repo` baked into the daemon host's
+        # A `--max-parallel-per-repo` baked into the daemon host's
         # installed systemd unit outranks `coordinator.yml` for the REAL
-        # tick (`resolve_max_parallel_per_repo`'s own contract). Before
-        # this fix, `_repo_parallel_ceiling` read ONLY `coordinator.yml`,
-        # so a fleet running a lower systemd override had the doctor
-        # compute a HIGHER ceiling than the tick ever enforces.
+        # tick (`resolve_max_parallel_per_repo`'s own contract) —
+        # `_repo_parallel_ceiling` must read the same override, not only
+        # `coordinator.yml`, so a fleet running a lower systemd override
+        # never has the doctor compute a HIGHER ceiling than the tick ever
+        # enforces.
         from coord.board_doctor import _repo_parallel_ceiling
 
-        config = Config(
-            repos=[Repo(name="acme/widgets", github="acme/widgets")],
-            machines=[],
-        )
+        config = self._config()
         config.pipeline.max_parallel_per_repo = 5
 
         # No systemd override known (default posture, e.g. a non-daemon
@@ -2442,21 +2440,64 @@ class TestNoProgressRows:
             systemd_flags={"max_parallel_per_repo": 2},
         ) == 2
 
-    def test_waiting_row_deferred_by_systemd_override_is_not_classified(self) -> None:
-        # #3906 regression: N (=ceiling) `running` rows for one repo — one
-        # launched on a FOREIGN host — plus an aged-out `waiting` row whose
-        # `after=` deps have all landed. The repo's effective ceiling is
-        # the daemon host's systemd-unit override (2), lower than
-        # `coordinator.yml`'s `pipeline.max_parallel_per_repo` (5) — the
-        # exact 2026-11-07T18:26Z quadraui#2137-et-al. shape: the tick's
-        # own capacity read (2/2, deferring) must be the SAME number the
-        # doctor reads, so this produces ZERO no-progress rows and ZERO
-        # escalations for the repo, never `waiting-ready-not-launched`.
-        config = Config(
-            repos=[Repo(name="acme/widgets", github="acme/widgets")],
-            machines=[],
+    def test_systemd_flags_read_sees_a_dropin_override(self, tmp_path) -> None:
+        # The packaged `coord-drive-queue.service` deliberately omits
+        # `--max-parallel-per-repo` from its own `ExecStart=` line — a host
+        # that carries that flag at all does so via a
+        # `coord-drive-queue.service.d/*.conf` drop-in, systemd's own
+        # mechanism for overriding one unit without copying its whole
+        # `ExecStart=`. A reader that only opens the main unit file can
+        # never see that value.
+        from coord.drive_queue import read_systemd_max_parallel_flags
+
+        unit_path = tmp_path / "coord-drive-queue.service"
+        unit_path.write_text(
+            "[Service]\n"
+            "ExecStart=/h/.coord-venv/bin/coord drive-queue tick --config x\n"
         )
+        dropin_dir = tmp_path / "coord-drive-queue.service.d"
+        dropin_dir.mkdir()
+        (dropin_dir / "override.conf").write_text(
+            "[Service]\n"
+            "ExecStart=\n"
+            "ExecStart=/h/.coord-venv/bin/coord drive-queue tick --config x "
+            "--max-parallel-per-repo 2\n"
+        )
+
+        assert read_systemd_max_parallel_flags(unit_path) == {
+            "max_parallel_per_repo": 2
+        }
+
+    def test_systemd_flags_read_ignores_dropin_without_main_unit(self, tmp_path) -> None:
+        # A drop-in with no unit to override means nothing to systemd
+        # either — this must read as "no override known" (`{}`), the same
+        # as an absent unit today, never crash or invent a flag.
+        from coord.drive_queue import read_systemd_max_parallel_flags
+
+        unit_path = tmp_path / "coord-drive-queue.service"
+        dropin_dir = tmp_path / "coord-drive-queue.service.d"
+        dropin_dir.mkdir()
+        (dropin_dir / "override.conf").write_text(
+            "[Service]\nExecStart=/x --max-parallel-per-repo 2\n"
+        )
+
+        assert read_systemd_max_parallel_flags(unit_path) == {}
+
+    def _systemd_override_fixture(self):
+        """The shared N(=ceiling) `running` + aged-out `waiting` fixture
+        both systemd-override tests below replay — one `running` row
+        launched on a FOREIGN host, plus a `waiting` row whose `after=`
+        deps have all landed. Returns ``(config, entries, board_view,
+        live_sessions, probe)`` so each test only has to vary the
+        ``systemd_flags`` it passes into :func:`no_progress_rows`.
+        """
+        config = self._config()
         config.pipeline.max_parallel_per_repo = 5
+        # `ConcurrencyConfig.max_workers` defaults to 2 — raised here so
+        # the FLEET-wide gate this fixture is not exercising never binds
+        # first and masks the repo-ceiling behaviour both tests below are
+        # actually checking.
+        config.concurrency.max_workers = 10
 
         running_local = QueueEntry(
             repo="acme/widgets",
@@ -2479,26 +2520,122 @@ class TestNoProgressRows:
             after=("acme/widgets#2000",),
             reason_at=0.0,
         )
-        probe = _FakeProbe({})
+        board_view = BoardView(
+            issues={"acme/widgets#2000": IssueFacts(issue_state="closed")},
+            # `BoardView.live_sessions` keys on `repo#issue`, the SAME
+            # occupancy verdict `_reconcile_running` reads — distinct from
+            # the top-level `live_sessions` collection below (local tmux
+            # session NAMES, used only by the `running` no-progress
+            # shape's own liveness check).
+            live_sessions=frozenset({running_local.key}),
+        )
+        return (
+            config,
+            [running_local, running_foreign, waiting],
+            board_view,
+            frozenset({"drive-acme-widgets-2137"}),
+            _FakeProbe({}),
+        )
+
+    def test_waiting_row_deferred_by_systemd_override_is_not_classified(self) -> None:
+        # Regression: the repo's effective ceiling is the daemon host's
+        # systemd-unit override (2), lower than `coordinator.yml`'s
+        # `pipeline.max_parallel_per_repo` (5) — the exact
+        # 2026-11-07T18:26Z quadraui#2137-et-al. shape: the tick's own
+        # capacity read (2/2, deferring) must be the SAME number the
+        # doctor reads, so this produces ZERO no-progress rows and ZERO
+        # escalations for the repo, never `waiting-ready-not-launched`.
+        config, entries, board_view, live_sessions, probe = self._systemd_override_fixture()
 
         rows = no_progress_rows(
-            [running_local, running_foreign, waiting],
+            entries,
             covered_keys=frozenset(),
-            live_sessions=frozenset({"drive-acme-widgets-2137"}),
-            board_view=BoardView(
-                issues={"acme/widgets#2000": IssueFacts(issue_state="closed")},
-                # `BoardView.live_sessions` keys on `repo#issue`, the SAME
-                # occupancy verdict `_reconcile_running` reads — distinct
-                # from the top-level `live_sessions` collection above
-                # (local tmux session NAMES, used only by the `running`
-                # no-progress shape's own liveness check).
-                live_sessions=frozenset({running_local.key}),
-            ),
+            live_sessions=live_sessions,
+            board_view=board_view,
             probe=probe,
             config=config,
             now=100_000.0,
             local_host="thishost",
             systemd_flags={"max_parallel_per_repo": 2},
+        )
+
+        assert rows == []
+        assert probe.calls == []
+
+    def test_waiting_row_without_override_still_classifies_at_ceiling_five(self) -> None:
+        # Companion to the regression above: the IDENTICAL fixture (2
+        # `running` rows, ceiling-eligible `waiting` row) with NO systemd
+        # override known. `coordinator.yml`'s own ceiling (5) then has
+        # room for the repo's 2 occupied slots, so the row IS classified —
+        # proving the override test above passes BECAUSE of the override,
+        # not because this fixture was never classifiable at all.
+        config, entries, board_view, live_sessions, probe = self._systemd_override_fixture()
+
+        rows = no_progress_rows(
+            entries,
+            covered_keys=frozenset(),
+            live_sessions=live_sessions,
+            board_view=board_view,
+            probe=probe,
+            config=config,
+            now=100_000.0,
+            local_host="thishost",
+            systemd_flags={},
+        )
+
+        [row] = rows
+        assert row.key == "acme/widgets#2139"
+        assert "waiting-ready-not-launched" in row.evidence[-1]
+
+    def test_waiting_row_deferred_by_fleet_capacity_is_not_classified(self) -> None:
+        # A `waiting` row with room under its OWN repo's ceiling must
+        # still not be classified no-progress while the FLEET-wide
+        # `--max-parallel` ceiling is full — the identical "queue working
+        # as intended" shape as the repo-ceiling case above, one level up.
+        # `plan_tick`'s own global early return only refreshes a `waiting`
+        # row's prereq text (`counted=False`) and never writes a capacity
+        # reason, so a row deferred only at this level reads a
+        # `last_reason` that names no capacity at all.
+        config = Config(
+            repos=[
+                Repo(name="acme/widgets", github="acme/widgets", max_parallel=3),
+                Repo(name="acme/other", github="acme/other", max_parallel=3),
+            ],
+            machines=[],
+        )
+        config.pipeline.max_parallel = 2
+
+        running_a = QueueEntry(
+            repo="acme/other", issue=3001, state="running",
+            session_name="drive-acme-other-3001", launched_at=0.0,
+        )
+        running_b = QueueEntry(
+            repo="acme/other", issue=3002, state="running",
+            session_name="drive-acme-other-3002", launched_at=0.0,
+        )
+        waiting = QueueEntry(
+            repo="acme/widgets",
+            issue=3003,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [running_a, running_b, waiting],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(
+                {"drive-acme-other-3001", "drive-acme-other-3002"}
+            ),
+            board_view=BoardView(
+                issues={"acme/widgets#2000": IssueFacts(issue_state="closed")},
+                live_sessions=frozenset({running_a.key, running_b.key}),
+            ),
+            probe=probe,
+            config=config,
+            now=100_000.0,
+            local_host="thishost",
         )
 
         assert rows == []

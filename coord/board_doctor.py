@@ -1146,78 +1146,85 @@ _NO_PROGRESS_BLOCKED = "blocked"
 _NO_PROGRESS_WAITING_READY = "waiting-ready-not-launched"
 
 
-def _repo_running_counts(
-    entries: Sequence[Any], board_view: Any, *, now: float, local_host: str | None
-) -> dict[str, int]:
-    """Per-repo slot occupancy among *entries*' ``running`` rows (#3888).
+def _resolve_no_progress_concurrency(
+    entries: Sequence[Any],
+    board_view: Any,
+    *,
+    config,
+    systemd_flags: Mapping[str, int] | None,
+    now: float | None,
+    local_host: str | None,
+):
+    """The one capacity verdict the no-progress ``waiting`` shape reads —
+    repo-level AND fleet-level ceilings, each with its own current
+    occupancy — resolved through :func:`coord.drive_queue.
+    resolve_concurrency_report`, the SAME entry point `coord config
+    --effective` and the real tick's own ``ConcurrencyReport`` both already
+    go through (#3428, #2096 "one question, one answer"), rather than this
+    module hand-deriving the resolution order a second time. Replaces the
+    former `_repo_running_counts`/`_repo_parallel_ceiling` pair, which only
+    ever answered the repo-level half of this question.
 
-    Delegates to :func:`coord.drive_queue.compute_running_occupancy` — the
-    SAME "does this `running` row still occupy a slot?" verdict a real
-    launch tick asks (via ``_reconcile_running``) — rather than a second,
-    board-doctor-local count of raw ``state == running`` rows (#2096 "one
-    question, one answer").
-
-    That distinction is exactly the quadraui#2038 incident shape: a
-    `running` row whose PR was merged by hand reads ``state == running``
-    (the raw count's answer: occupied) but ``_reconcile_running`` sees
-    ``facts.landed`` and returns ``occupies=False`` — the slot is actually
-    free. A raw count would have kept a same-repo `waiting` row's "is there
-    room" check pinned at the ceiling forever, the #3888 review finding
-    that reproduced the 2026-11-05 incident. Using the scheduler's own
-    verdict here means a phantom `running` row no longer blocks the
-    `waiting`-ready classification for its own repo.
+    *systemd_flags* is ``{}`` (no override known) when the caller gives
+    ``None`` — never this function reading the filesystem itself, so a test
+    can call this without touching a real ``~/.config/systemd/user/``.
+    :func:`collect_rows` reads :func:`coord.drive_queue.
+    read_systemd_max_parallel_flags` (which now also sees any drop-in under
+    that unit's own ``.d/`` directory) once per sweep and threads the
+    result down, the same posture it already has for *local_host*.
     """
-    from coord.drive_queue import DEFAULT_MAX_ATTEMPTS, compute_running_occupancy  # noqa: PLC0415
+    from coord.drive_queue import resolve_concurrency_report  # noqa: PLC0415
 
-    _occupied, repo_occupied = compute_running_occupancy(
-        entries, board_view, DEFAULT_MAX_ATTEMPTS, now=now, local_host=local_host
+    return resolve_concurrency_report(
+        repo_overrides={repo.name: repo.max_parallel for repo in config.repos},
+        pipeline_max_parallel=config.pipeline.max_parallel,
+        pipeline_max_parallel_per_repo=config.pipeline.max_parallel_per_repo,
+        max_workers_cap=config.concurrency.max_workers,
+        systemd_flags=systemd_flags or {},
+        entries=entries,
+        board=board_view,
+        now=now,
+        local_host=local_host,
     )
-    return repo_occupied
 
 
 def _repo_parallel_ceiling(
-    repo_name: str, *, config, systemd_flags: Mapping[str, int] | None = None
+    repo_name: str, *, config, systemd_flags: Mapping[str, int]
 ) -> int:
-    """*repo_name*'s effective ``max_parallel_per_repo`` ceiling (#3888, #3906).
-
-    Delegates to the SAME resolution :func:`coord.drive_queue.
-    resolve_repo_max_parallel` / :func:`coord.drive_queue.
-    resolve_max_parallel_per_repo` the real tick uses to decide capacity
-    (#2096: one question, one answer) — never a second, doctor-local guess
-    at the ceiling. ``0`` means uncapped, mirroring that function's own
-    meaning.
-
-    #3906: a ``--max-parallel-per-repo`` baked into the daemon host's
-    installed ``coord-drive-queue`` systemd unit's ``ExecStart=`` line
-    outranks `coordinator.yml` for the REAL tick
-    (:func:`coord.drive_queue.resolve_max_parallel_per_repo`'s own
-    contract) — the exact number :func:`coord.drive_queue.
-    resolve_concurrency_report` reads for ``coord config --effective``.
-    Ignoring it here, as this sweep used to, let the doctor compute a
-    HIGHER ceiling than the tick ever enforces whenever that override is
-    set, reading room open where the tick itself read none (quadraui#2137
-    et al., 2026-11-07T18:26Z). *systemd_flags* is ``{}`` (no override
-    known — today's behaviour) unless the caller supplies the real read —
-    :func:`collect_rows` reads :func:`coord.drive_queue.
-    read_systemd_max_parallel_flags` once per sweep and threads it down,
-    the same posture it already has for *local_host*; this function never
-    touches the filesystem itself, so neither a test nor any other caller
-    is exposed to another machine's installed unit by surprise.
+    """*repo_name*'s effective ``max_parallel_per_repo`` ceiling, with no
+    occupancy question attached — a thin single-repo convenience over
+    :func:`coord.drive_queue.resolve_concurrency_report` (the same shared
+    entry point :func:`_resolve_no_progress_concurrency` uses) for a caller
+    that only wants to check one repo's ceiling, e.g. a unit test asserting
+    a systemd override wins over `coordinator.yml`. ``0`` means uncapped,
+    mirroring that resolution's own meaning. *systemd_flags* is required —
+    a caller must say explicitly whether it is asking "with the daemon
+    host's real override" or "with none known" rather than the answer
+    silently depending on an unstated default.
     """
-    from coord.drive_queue import (  # noqa: PLC0415
-        resolve_max_parallel_per_repo,
-        resolve_repo_max_parallel,
-    )
+    from coord.drive_queue import resolve_concurrency_report  # noqa: PLC0415
 
-    flags = systemd_flags or {}
-    fleet = resolve_max_parallel_per_repo(
-        override_value=flags.get("max_parallel_per_repo"),
-        override_source="systemd ExecStart --max-parallel-per-repo",
-        config_value=config.pipeline.max_parallel_per_repo,
+    report = resolve_concurrency_report(
+        repo_overrides={repo.name: repo.max_parallel for repo in config.repos},
+        pipeline_max_parallel=config.pipeline.max_parallel,
+        pipeline_max_parallel_per_repo=config.pipeline.max_parallel_per_repo,
+        max_workers_cap=config.concurrency.max_workers,
+        systemd_flags=systemd_flags,
     )
-    repo = config.repo(repo_name)
-    override = repo.max_parallel if repo is not None else None
-    return resolve_repo_max_parallel(repo_name, repo_override=override, fleet=fleet).value
+    resolution = report.repo_resolutions.get(repo_name, report.max_parallel_per_repo)
+    return resolution.value
+
+
+def _render_ceiling(resolution: Any) -> str:
+    """Render one :class:`coord.drive_queue.CeilingResolution` for a
+    no-progress evidence line — the bare number, or ``uncapped`` for the
+    ``0`` value both `max_parallel_per_repo` and `max_parallel` document as
+    "no limit" (:mod:`coord.config`'s own validation permits ``0`` there).
+    Without this, an uncapped repo's evidence read as e.g. "1/0 occupied",
+    which looks like a repo already over its limit rather than one with no
+    limit at all.
+    """
+    return "uncapped" if resolution.value == 0 else str(resolution.value)
 
 
 def _no_progress_shape(
@@ -1227,6 +1234,8 @@ def _no_progress_shape(
     facts_of: Callable[[str], Any],
     repo_ceiling: Callable[[str], int],
     running_counts: Mapping[str, int],
+    fleet_ceiling: int,
+    fleet_occupied: int,
     dep_states: Mapping[str, str],
     local_host: str | None,
 ) -> str | None:
@@ -1260,9 +1269,19 @@ def _no_progress_shape(
     ``issues`` cache backing ``landed`` can run minutes behind a merge the
     queue performed itself — AND the repo has room under its own ceiling
     right now, per *running_counts* (the scheduler's own occupancy
-    verdict — see :func:`_repo_running_counts`). A ``waiting`` row failing
-    either check is correctly explained already (still waiting on a dep,
-    or waiting its turn for capacity) — this only flags the quadraui#2047
+    verdict) — AND the FLEET has room too, per *fleet_occupied* against
+    *fleet_ceiling*. Both capacity answers come from the same
+    ``ConcurrencyReport`` :func:`_resolve_no_progress_concurrency` resolves,
+    the one the real tick's own ``plan_tick`` enforces at both levels: a
+    `waiting` row at `repo` capacity and one at the FLEET's own
+    ``--max-parallel`` ceiling are the identical "queue working as
+    intended" shape, just at different ceilings — ``plan_tick``'s own
+    global-capacity early return only refreshes a `waiting` row's prereq
+    text (never writes a capacity reason into it), so a row deferred there
+    is just as easy to misread as `cause=unknown` without this check as the
+    repo-level one was. A ``waiting`` row failing any of the three checks
+    is correctly explained already (still waiting on a dep, or waiting its
+    turn for capacity at either level) — this only flags the quadraui#2047
     shape, a row the scheduler should have launched by now and, for
     whatever reason, did not.
     """
@@ -1292,6 +1311,8 @@ def _no_progress_shape(
             return None
         ceiling = repo_ceiling(entry.repo)
         if ceiling > 0 and running_counts.get(entry.repo, 0) >= ceiling:
+            return None
+        if fleet_ceiling > 0 and fleet_occupied >= fleet_ceiling:
             return None
         return _NO_PROGRESS_WAITING_READY
     return None
@@ -1375,14 +1396,13 @@ def no_progress_rows(
     *board_view* is the same :class:`coord.drive_queue.BoardView`
     :func:`collect_rows` already builds for its own probe — its
     ``.facts(key)`` is this pass's ONLY "is this issue landed / is there
-    live work" reading, and (#3888 review) it is also handed to
-    :func:`coord.drive_queue.compute_running_occupancy` to answer "is
-    there a free repo slot" with the scheduler's own verdict rather than a
-    second count (see :func:`_repo_running_counts`). *local_host* gates the
-    `running` shape the same way :func:`coord.queue_diagnose.
-    is_foreign_launch` gates every other liveness call in this fleet: a
-    row launched on a different host is never judged dead from an absent
-    LOCAL tmux session.
+    live work" reading, and it is also handed to
+    :func:`_resolve_no_progress_concurrency` to answer "is there a free
+    repo slot, and a free fleet slot" with the scheduler's own verdict
+    rather than a second count. *local_host* gates the `running` shape the
+    same way :func:`coord.queue_diagnose.is_foreign_launch` gates every
+    other liveness call in this fleet: a row launched on a different host
+    is never judged dead from an absent LOCAL tmux session.
 
     A matching, aged-out row is diagnosed through the SAME `probe` +
     :func:`queue_diagnose.diagnose` pair every other fresh row in this
@@ -1398,28 +1418,34 @@ def no_progress_rows(
     alert tier, so returning the row here is sufficient to make it alert;
     nothing downstream needs to special-case the cause name.
 
-    *systemd_flags* (#3906) is forwarded to :func:`_repo_parallel_ceiling`
-    unchanged — ``{}`` (no override known) unless the caller supplies the
-    real read; :func:`collect_rows` reads the daemon host's installed unit
-    once per sweep (the same posture it already has for *local_host*) and
-    passes it down here, so every repo's ceiling reads the SAME override
-    the real tick would.
+    *systemd_flags* is ``{}`` (no override known) unless the caller
+    supplies the real read; :func:`collect_rows` reads the daemon host's
+    installed unit (and any drop-in under its own ``.d/`` directory — see
+    :func:`coord.drive_queue.read_systemd_max_parallel_flags`) once per
+    sweep and passes it down here, so both the repo and the FLEET ceiling
+    read the SAME override the real tick would.
     """
     stamp = _utcnow().timestamp() if now is None else now
     threshold_seconds = config.board_doctor.no_progress_minutes * 60
     facts_of = board_view.facts
     dep_states = {entry.key: entry.state for entry in entries}
-    running_counts = _repo_running_counts(
-        entries, board_view, now=stamp, local_host=local_host
+    concurrency = _resolve_no_progress_concurrency(
+        entries,
+        board_view,
+        config=config,
+        systemd_flags=systemd_flags,
+        now=stamp,
+        local_host=local_host,
     )
-    ceilings: dict[str, int] = {}
+    running_counts = concurrency.repo_occupied
+    fleet_ceiling = concurrency.max_parallel.value
+    fleet_occupied = concurrency.occupied
 
     def repo_ceiling(repo_name: str) -> int:
-        if repo_name not in ceilings:
-            ceilings[repo_name] = _repo_parallel_ceiling(
-                repo_name, config=config, systemd_flags=systemd_flags
-            )
-        return ceilings[repo_name]
+        resolution = concurrency.repo_resolutions.get(
+            repo_name, concurrency.max_parallel_per_repo
+        )
+        return resolution.value
 
     rows: list[StuckRow] = []
     probes_spent = 0
@@ -1432,6 +1458,8 @@ def no_progress_rows(
             facts_of=facts_of,
             repo_ceiling=repo_ceiling,
             running_counts=running_counts,
+            fleet_ceiling=fleet_ceiling,
+            fleet_occupied=fleet_occupied,
             dep_states=dep_states,
             local_host=local_host,
         )
@@ -1494,23 +1522,30 @@ def no_progress_rows(
                     (),
                 )
 
-        # #3906: for the `waiting-ready` shape specifically, name the exact
-        # capacity numbers THIS sweep read — the repo's occupied count (the
-        # scheduler's own `compute_running_occupancy` verdict, see
-        # `_repo_running_counts`) and its ceiling (`_repo_parallel_ceiling`,
-        # now including any systemd-unit override) — so a human checking
-        # an alert against the tick's own `repo ... at its limit (N/M)`
-        # deferral text can tell at a glance whether the two numbers
+        # For the `waiting-ready` shape specifically, name the exact
+        # capacity numbers THIS sweep read — at BOTH levels the scheduler
+        # gates on (repo ceiling and fleet-wide ceiling), each paired with
+        # its resolved provenance (coordinator.yml vs. a systemd override)
+        # — so a human checking an alert against the tick's own
+        # `repo ... at its limit (N/M)` deferral text, or its global
+        # early-return, can tell at a glance whether the two numbers
         # actually agree or this sweep read stale/incomplete evidence.
         # Every other shape has no capacity question to answer, so this is
         # never added for them.
-        capacity_note = (
-            f"; repo capacity this sweep read: "
-            f"{running_counts.get(entry.repo, 0)}/{repo_ceiling(entry.repo)} "
-            f"occupied"
-            if shape == _NO_PROGRESS_WAITING_READY
-            else ""
-        )
+        capacity_note = ""
+        if shape == _NO_PROGRESS_WAITING_READY:
+            repo_resolution = concurrency.repo_resolutions.get(
+                entry.repo, concurrency.max_parallel_per_repo
+            )
+            fleet_resolution = concurrency.max_parallel
+            capacity_note = (
+                f"; repo capacity this sweep read: "
+                f"{running_counts.get(entry.repo, 0)}/"
+                f"{_render_ceiling(repo_resolution)} occupied "
+                f"({repo_resolution.source}); fleet capacity this sweep "
+                f"read: {fleet_occupied}/{_render_ceiling(fleet_resolution)} "
+                f"occupied ({fleet_resolution.source})"
+            )
         evidence = extra_evidence + (
             f"{coverage_note}, and it has made no progress for over "
             f"{config.board_doctor.no_progress_minutes}m ({shape}, "
@@ -1610,10 +1645,11 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     )
     board = build_board()
     local_host = _local_host_id()
-    # #3906: read once per sweep, same posture as `local_host` above — the
-    # no-progress pass's repo ceilings must read the SAME systemd-unit
-    # override (if any) the real tick enforces, not a second, independent
-    # read that could land on a different mtime mid-sweep.
+    # Read once per sweep, same posture as `local_host` above — the
+    # no-progress pass's repo and fleet ceilings must read the SAME
+    # systemd-unit override (main unit or drop-in; if any) the real tick
+    # enforces, not a second, independent read that could land on a
+    # different mtime mid-sweep.
     systemd_flags = read_systemd_max_parallel_flags()
     probe = queue_diagnose.GhLiveProbe(
         config=config,
