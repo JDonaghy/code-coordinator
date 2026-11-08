@@ -139,8 +139,9 @@
 #
 # Exit codes: 0 pass (or skip — nothing to test), 1 genuine failure or refusal
 # (cannot determine what to test), 2 usage, 3 INFRASTRUCTURE — the suite could
-# not run at all (a required toolchain is missing); no verdict may be inferred
-# from it in either direction, 4 BASELINE-RED — the suite ran and failed, but
+# not run at all (a required toolchain is missing, or the environment it has to
+# run from could not be built); no verdict may be inferred from it in either
+# direction, 4 BASELINE-RED — the suite ran and failed, but
 # identically on $BASE_REF, so no verdict about the BRANCH may be inferred from
 # it (the machine's baseline needs fixing).
 
@@ -741,6 +742,38 @@ toolchain_missing() {
     INFRA_SUITES+=("$suite")
 }
 
+# The other way a suite can fail to run: every toolchain it needs IS present,
+# but the environment it has to be run FROM could not be built — `python3 -m
+# venv` dying mid-`ensurepip`, a worktree deleted underneath a concurrent run,
+# a full disk.
+#
+# Same verdict class as `toolchain_missing` (INFRA, exit 3, "no verdict may be
+# inferred"), reported separately because the two need different fixes and a
+# message that names the wrong one sends an operator — or a fix worker — to
+# debug the wrong thing. It is deliberately NOT a catch-all for "setup
+# failed": a step whose outcome can depend on the BRANCH's own content (`pip
+# install -e .[dev]` on a branch with a broken pyproject.toml) must stay a
+# plain FAIL, or this helper would launder real red into "could not run".
+# Only steps whose failure is impossible to attribute to branch content may
+# come through here.
+#
+# `evidence_file` is the captured stdout+stderr of the step that failed; its
+# tail is printed, because "environment problem" asserted with no output to
+# back it up is exactly the unverifiable verdict that sent a fix worker to
+# this branch in the first place.
+environment_broken() {
+    local suite="$1" what="$2" evidence_file="${3:-}"
+    say "ENVIRONMENT BROKEN($suite): $what"
+    say "      This is an INFRASTRUCTURE failure, not a test failure: the $suite suite never ran, so nothing about the branch may be inferred from it. This step does not read the branch's content, so no branch can cause it."
+    if [[ -n "$evidence_file" && -s "$evidence_file" ]]; then
+        say "      output of the failing step:"
+        while IFS= read -r line; do say "        $line"; done < <(tail -n 20 "$evidence_file")
+    else
+        say "      (the failing step produced no output)"
+    fi
+    INFRA_SUITES+=("$suite")
+}
+
 # ── python ───────────────────────────────────────────────────────────────────
 
 # #2180 (review fix): run the sealed cli-pytest acceptance route (ms-37)
@@ -945,6 +978,9 @@ run_python_post_arms() {
 
 run_python() {
     local venv="$WT/.venv"
+    # 1 when this run built the venv itself, so a venv that cannot run pytest
+    # can be attributed to the right side of the fence below.
+    local venv_fresh=0
     if [[ ! -x "$venv/bin/python" ]]; then
         # Same class as the cargo case below (#1814): with no interpreter there
         # is no suite, and "no suite" is not a verdict.
@@ -953,11 +989,58 @@ run_python() {
             return 1
         fi
         log "creating venv + installing .[dev] (~12s)"
-        python3 -m venv "$venv" >/dev/null
-        "$venv/bin/pip" install -q -e "$WT[dev]" >/dev/null 2>&1 || {
-            say "FAIL(python): could not install .[dev] — environment problem, not a code failure"
+        # Both setup steps capture their output instead of discarding it: a
+        # setup failure is reported WITH the stderr that explains it, never as
+        # a bare assertion about the environment that the log cannot confirm.
+        local setup_out="$WT/.venv-setup.out"
+        if ! python3 -m venv "$venv" >"$setup_out" 2>&1; then
+            # `python3 -m venv` reads nothing from the branch — it needs an
+            # interpreter and a writable directory — so its failure is never
+            # attributable to the code under test. The shape this takes on the
+            # fleet is `ensurepip` exiting 1 because a concurrent run removed
+            # the worktree underneath it, which must not read as a red branch:
+            # not one test has run at this point.
+            environment_broken python \
+                "could not create the virtualenv at $venv — \`python3 -m venv\` failed" \
+                "$setup_out"
             return 1
-        }
+        fi
+        if ! "$venv/bin/pip" install -q -e "$WT[dev]" >"$setup_out" 2>&1; then
+            # NOT routed through `environment_broken`: this step DOES read the
+            # branch (its pyproject.toml, its dependency pins), so a branch
+            # can genuinely break it and that has to stay a failure. The pip
+            # output below is what distinguishes the two causes.
+            say "FAIL(python): could not install .[dev] into $venv — either this machine's environment or this branch's own packaging (pyproject.toml, a dependency pin); the pip output below says which"
+            while IFS= read -r line; do say "      $line"; done < <(tail -n 20 "$setup_out")
+            return 1
+        fi
+        venv_fresh=1
+    fi
+
+    # Confirm the venv can actually run the suite, rather than inferring it
+    # from a setup step that did not report an error (or, on the reuse path,
+    # from the mere existence of `$venv/bin/python`). A worktree can arrive
+    # here holding a `.venv` left half-built by an earlier interrupted run —
+    # `bin/python` present, nothing installed — and nothing above would have
+    # noticed; pytest would then fail against an uninstalled package and read
+    # as a red branch.
+    #
+    # `import pytest` rather than `pytest --version`: it answers the same
+    # question (is the runner about to invoke a pytest that exists in this
+    # venv?) without starting a pytest session, so it cannot be confused with
+    # — or pay for — the suite run itself.
+    if ! "$venv/bin/python" -c "import pytest" >"$WT/.venv-check.out" 2>&1; then
+        if [[ "$venv_fresh" -eq 1 ]]; then
+            # `.[dev]` reported success moments ago and still cannot run
+            # pytest: that is this branch's dev extra, not the machine.
+            say "FAIL(python): \`.[dev]\` installed into $venv but \`import pytest\` still fails there — this branch's dev extra does not provide a usable pytest"
+            while IFS= read -r line; do say "      $line"; done < <(tail -n 20 "$WT/.venv-check.out")
+            return 1
+        fi
+        environment_broken python \
+            "the \`.venv\` already in this worktree cannot run pytest, and nothing was installed into it this run — it is a leftover from an interrupted setup" \
+            "$WT/.venv-check.out"
+        return 1
     fi
 
     # Use xdist when the BRANCH's pyproject.toml pulls it in (~2.4x faster:
