@@ -23,6 +23,8 @@ coordinator.yml
 .pytest.baseline-confirm.out
 .pytest-acceptance.out
 .pytest-populated-home.out
+.venv-setup.out
+.venv-check.out
 .cargo.out
 .cargo.rerun.out
 .cargo-acceptance.out
