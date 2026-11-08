@@ -31,6 +31,7 @@ from coord.claude_setup_token import inject_setup_token
 from coord.config_reload import reload_config_if_stale
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
+from coord.smoke_tags import smoke_leg_capabilities
 
 if TYPE_CHECKING:
     # Type-only import to give `_spawn_pty` a precise annotation without
@@ -3495,6 +3496,7 @@ def _git_worktree_add(
     *,
     log_path: str | None = None,
     default_branch: str | None = None,
+    assignments: "dict[str, AgentAssignment] | None" = None,
 ) -> None:
     """Run ``git worktree add <add_args>``, retrying once on a branch collision.
 
@@ -3504,6 +3506,27 @@ def _git_worktree_add(
     conflicting worktree is force-removed, git prunes the stale admin entry, and
     the add is retried exactly once.  Any other git error, or a failure after the
     single retry, is re-raised so the caller sees a clear ``_GitError``.
+
+    #3912: before that force-remove, the conflicting worktree's own liveness
+    is checked via :func:`_worktree_assignment_is_live` — the SAME question
+    :func:`_free_branch_in_worktrees` already asked (and may have answered
+    "still live, leave it") immediately before this call ran. Without this
+    check, two #3182 fan-out legs racing on one machine for the same branch
+    hit exactly this: the proactive eviction correctly refused to touch the
+    sibling's live worktree, `git worktree add` then failed with the
+    resulting collision, and this retry path force-removed it anyway — no
+    liveness check of its own — deleting a sibling leg's worktree out from
+    under its still-running build. A live conflict is now a hard error here
+    too: never force-removed, never retried, so the sibling's build survives
+    and the loser just reports "collision" instead of silently destroying
+    the winner.
+
+    *assignments* (optional, mirroring :func:`_free_branch_in_worktrees`) is
+    a ``dict(self._assignments)`` snapshot the caller already has to hand;
+    ``None`` (every interactive-launcher call site, which has no such table)
+    falls back to the tmux-session check alone inside
+    :func:`_worktree_assignment_is_live` — still strictly safer than no
+    check at all.
 
     #1693: the conflicting path is *scraped out of git's error text*, so it can
     name anything git happens to mention — including the **base checkout**,
@@ -3664,6 +3687,30 @@ def _git_worktree_add(
             f"re-dispatch."
         ) from original
 
+    # #3912: never force-remove a worktree whose assignment is still live —
+    # the exact same question `_free_branch_in_worktrees` already asked (and
+    # may have just answered "leave it") for this same path moments earlier.
+    # A hard error here, not a third retry: removing it would delete a
+    # sibling leg's live checkout mid-build.
+    conflicting_assignment_id = Path(conflicting_path).name
+    if _worktree_assignment_is_live(conflicting_assignment_id, assignments):
+        if log_path:
+            _append_log_line(
+                log_path,
+                f"# worktree-add: collision on {conflicting_path!r} — "
+                f"assignment {conflicting_assignment_id!r} is still live "
+                f"(#3912). NOT force-removing; refusing instead of risking "
+                f"a sibling's live build.\n",
+            )
+        raise _GitError(
+            f"cannot create a worktree for branch "
+            f"{_branch_from_add_args(add_args)!r}: the conflicting worktree "
+            f"{conflicting_path!r} belongs to assignment "
+            f"{conflicting_assignment_id!r}, which is still live "
+            f"(RUNNING/PENDING or an active tmux session). Refusing to "
+            f"remove it (#3912) — re-dispatch once that assignment finishes."
+        ) from original
+
     # Retry path: free the conflicting worktree and try again once.
     if log_path:
         _append_log_line(
@@ -3701,6 +3748,25 @@ def _branch_from_add_args(add_args: list[str]) -> str:
     if len(add_args) == 2:
         return add_args[1]
     return " ".join(add_args)
+
+
+def _fanout_leg_cargo_suffix(issue_title: str) -> str | None:
+    """The ``leg_suffix`` to pass to :func:`coord.cargo_cache.cargo_env` for
+    an assignment whose ``issue_title`` is *issue_title*, or ``None`` (#3912).
+
+    ``None`` for every ordinary assignment — a plain work/review/single-leg
+    smoke row never carries a ``[smoke:<caps>]`` tag
+    (:func:`coord.smoke_tags.smoke_leg_capabilities`), so `cargo_env` returns
+    the bare per-repo shared cache exactly as before #3912. Only a #3182
+    fan-out leg (ONE OF SEVERAL sibling partitions that can land on the same
+    machine at the same time) gets its own capability-tagged subdirectory —
+    see that function's docstring for why two siblings sharing the bare
+    cache corrupted each other's build mid-compile.
+    """
+    caps = smoke_leg_capabilities(issue_title)
+    if not caps:
+        return None
+    return "+".join(caps)
 
 
 def _set_worktree_pull_rebase(repo_path: Path, worktree_path: Path) -> None:
@@ -9989,6 +10055,7 @@ class AgentServer:
                 ["-B", branch_name, str(worktree_path), f"origin/{branch_name}"],
                 log_path=assignment.log_path,
                 default_branch=default_branch,
+                assignments=_live_assignments,
             )
         elif local_has_branch and not has_origin:
             # Local-only repo (no remote) — reuse the local branch as before.
@@ -9997,6 +10064,7 @@ class AgentServer:
                 [str(worktree_path), branch_name],
                 log_path=assignment.log_path,
                 default_branch=default_branch,
+                assignments=_live_assignments,
             )
         else:
             # Fresh branch, OR an untrusted local-only leftover in a repo that
@@ -10021,6 +10089,7 @@ class AgentServer:
                 ["-b", branch_name, str(worktree_path), start_point],
                 log_path=assignment.log_path,
                 default_branch=default_branch,
+                assignments=_live_assignments,
             )
 
         # #1468: default this worktree's `pull.rebase` to true — see
@@ -10640,7 +10709,13 @@ class AgentServer:
             if spec.smoke_timeout_s and spec.smoke_timeout_s > 0
             else 600.0
         )
-        smoke_env = {**os.environ, **cargo_cache.cargo_env(spec.repo_name, self.state_dir)}
+        smoke_env = {
+            **os.environ,
+            **cargo_cache.cargo_env(
+                spec.repo_name, self.state_dir,
+                leg_suffix=_fanout_leg_cargo_suffix(spec.issue_title),
+            ),
+        }
         try:
             verdict = execute_plain_runner_smoke(
                 spec, str(repo_path), timeout=timeout, env=smoke_env,
@@ -10898,9 +10973,12 @@ class AgentServer:
         _spawn_env = _worker_subprocess_env(cwd=repo_path, assignment_id=assignment.id)
         # #1402: shared per-repo cargo target dir (see coord.cargo_cache).
         # Must stay in sync with the PTY path in ``_spawn_pty``.
+        # #3912: `leg_suffix` isolates a #3182 fan-out leg's own target dir
+        # from its siblings — see `_fanout_leg_cargo_suffix`.
         _spawn_env.update(
             cargo_cache.cargo_env(
-                assignment.spec.repo_name, self.state_dir, _spawn_env
+                assignment.spec.repo_name, self.state_dir, _spawn_env,
+                leg_suffix=_fanout_leg_cargo_suffix(assignment.spec.issue_title),
             )
         )
         if provider_obj is not None:
@@ -11095,8 +11173,13 @@ class AgentServer:
             # so the build cache survives worktree cleanup and is reused by
             # the next worker.  Applied before ``provider.env()`` so a
             # provider that sets CARGO_TARGET_DIR explicitly still wins.
+            # #3912: `leg_suffix` isolates a #3182 fan-out leg's own target
+            # dir from its siblings — see `_fanout_leg_cargo_suffix`.
             env.update(
-                cargo_cache.cargo_env(assignment.spec.repo_name, self.state_dir, env)
+                cargo_cache.cargo_env(
+                    assignment.spec.repo_name, self.state_dir, env,
+                    leg_suffix=_fanout_leg_cargo_suffix(assignment.spec.issue_title),
+                )
             )
             env.update(provider.env())
             # #2569: see the headless spawn path's identical re-strip for

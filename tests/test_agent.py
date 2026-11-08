@@ -1511,6 +1511,122 @@ def test_free_branch_in_worktrees_still_evicts_a_genuinely_stale_worktree(
     assert not stale_wt.exists()
 
 
+# ── #3912: _git_worktree_add's own collision-retry must never evict a LIVE
+#    sibling either ─────────────────────────────────────────────────────────
+
+
+def test_git_worktree_add_refuses_to_evict_a_live_sibling_on_collision(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """coord#3912: two #3182 fan-out legs racing on one machine for the same
+    branch. The proactive `_free_branch_in_worktrees` call correctly refused
+    to touch the live sibling's worktree — but `_git_worktree_add`'s OWN
+    collision-retry had no liveness check of its own, so `git worktree add`
+    then failed with the resulting collision and this retry path
+    force-removed the live worktree anyway, deleting a sibling leg's
+    checkout out from under its still-running build. A live conflict must
+    now be a hard `_GitError`, never a force-remove-and-retry."""
+    from coord.agent import AgentAssignment, _git_worktree_add, _GitError
+
+    repo = _init_repo(tmp_path / "repo")
+    live_id = "live-sibling-leg"
+    live_wt = tmp_path / "worktrees" / live_id
+    live_wt.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-fix", str(live_wt)],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+
+    monkeypatch.setattr(
+        AgentServer, "_tmux_session_alive", staticmethod(lambda aid: False)
+    )
+    running = AgentAssignment(
+        id=live_id, spec=_spec(repo, branch="issue-1-fix"), status=RUNNING,
+    )
+
+    new_wt = tmp_path / "worktrees" / "new-sibling-leg"
+    with pytest.raises(_GitError, match="still live"):
+        _git_worktree_add(
+            repo, [str(new_wt), "issue-1-fix"],
+            assignments={live_id: running},
+        )
+
+    # The live sibling's worktree must survive, untouched.
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(live_wt) in listing
+    assert live_wt.exists()
+
+
+def test_git_worktree_add_still_evicts_a_genuinely_stale_collision(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The flip side: a collision against a worktree whose assignment is
+    terminal (or unknown) must still be force-removed and retried — #3912's
+    liveness guard must not reintroduce the collision #460/#1693 already
+    fixed for the ordinary stale-worktree case."""
+    from coord.agent import AgentAssignment, _git_worktree_add
+
+    repo = _init_repo(tmp_path / "repo")
+    stale_id = "crashed-sibling-leg"
+    stale_wt = tmp_path / "worktrees" / stale_id
+    stale_wt.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-fix", str(stale_wt)],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+
+    monkeypatch.setattr(
+        AgentServer, "_tmux_session_alive", staticmethod(lambda aid: False)
+    )
+    done = AgentAssignment(
+        id=stale_id, spec=_spec(repo, branch="issue-1-fix"), status=DONE,
+    )
+
+    new_wt = tmp_path / "worktrees" / "new-sibling-leg"
+    _git_worktree_add(
+        repo, [str(new_wt), "issue-1-fix"],
+        assignments={stale_id: done},
+    )
+
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(stale_wt) not in listing
+    assert not stale_wt.exists()
+    assert str(new_wt) in listing
+    assert new_wt.exists()
+
+
+# ── #3912: per-#3182-fan-out-leg cargo target dir suffix ────────────────────
+
+
+def test_fanout_leg_cargo_suffix_none_for_an_ordinary_assignment() -> None:
+    """An ordinary work/review/single-leg-smoke `issue_title` carries no
+    `[smoke:<caps>]` tag, so this must return `None` — the common case keeps
+    the full #1402 shared-cache benefit, completely unaffected by #3912."""
+    from coord.agent import _fanout_leg_cargo_suffix
+
+    assert _fanout_leg_cargo_suffix("fix the frobnicator") is None
+    assert _fanout_leg_cargo_suffix("[smoke] run the suite") is None
+
+
+def test_fanout_leg_cargo_suffix_reads_the_capability_tag() -> None:
+    """A #3182 fan-out leg's own `issue_title` carries its capability-
+    partition tag (`coord.smoke_tags.smoke_leg_issue_title`); the suffix
+    must round-trip it exactly so sibling partitions never collide."""
+    from coord.agent import _fanout_leg_cargo_suffix
+
+    assert _fanout_leg_cargo_suffix("[smoke:gtk] run the suite") == "gtk"
+    assert (
+        _fanout_leg_cargo_suffix("[smoke:gtk+windows] run the suite")
+        == "gtk+windows"
+    )
+
+
 def test_clean_worktrees_stashes_orphaned_worktree_with_no_assignment_record(
     tmp_path: Path,
 ) -> None:
