@@ -2121,6 +2121,30 @@ BOARD_DOCTOR_LOG_RETENTION_DAYS = 90
 BOARD_DOCTOR_BACKOFF_INITIAL_HOURS = 1.0
 BOARD_DOCTOR_BACKOFF_CAP_HOURS = 24.0
 
+#: #3907: a fresh (``outcome`` still ``None``) ``auto-dispatch``/``alert``
+#: decision is held back from its FIRST grading for this many hours past
+#: its own ``recorded_at`` — even once its row reappears in a later sweep
+#: on the exact same cause. The action it took is very often still
+#: running: a Rust work/test/review cycle routinely exceeds an hour, and
+#: grading before it could possibly have landed turns the doctor's own
+#: later ``alert`` escalation into "evidence" that its own dispatch
+#: failed (the #3907 bug). Never gates re-grading a decision that
+#: already carries a verdict — see :data:`BOARD_DOCTOR_OUTCOME_REGRADABLE`,
+#: which has nothing left to protect since it is being corrected, not
+#: graded for the first time. A resolved row (absent from the stuck set
+#: entirely) is also never gated by this — "the leg finished" is itself
+#: the signal, regardless of how little time has passed.
+BOARD_DOCTOR_OUTCOME_GRACE_HOURS = 3.0
+
+#: #3907: outcomes a LATER sweep is still allowed to overwrite. A row
+#: graded ``unchanged``/``regressed`` may still reach a done-like state
+#: (or simply move on to a different cause) before its log entry ages
+#: out of retention, and should get credit for that when it does.
+#: ``progressed``/``progressed_by_other`` are terminal — once something
+#: has been confirmed to have moved the row, nothing it does afterwards
+#: should un-confirm that.
+BOARD_DOCTOR_OUTCOME_REGRADABLE = frozenset({"unchanged", "regressed"})
+
 
 def _board_doctor_row_key(queue: str, key: str) -> str:
     """``"drive-queue:repo#123"`` — one string key per (queue, row)."""
@@ -3051,6 +3075,24 @@ def pending_board_doctor_outcomes() -> list[dict]:
     )
 
 
+def regradable_board_doctor_outcomes() -> list[dict]:
+    """Every logged decision whose outcome is :data:`BOARD_DOCTOR_OUTCOME_REGRADABLE`
+    (``"unchanged"``/``"regressed"``, #3907) — already graded once, but not
+    yet confirmed ``"progressed"``/``"progressed_by_other"``, so a LATER
+    sweep whose row has since reached a done-like state (or simply moved
+    on to a different cause) can still correct the verdict. Oldest first,
+    same ordering contract as :func:`pending_board_doctor_outcomes`, whose
+    ``None``-outcome counterpart this is.
+
+    **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
+    """
+    _thin_client_local_board_guard("regradable_board_doctor_outcomes")
+    return board_doctor_decisions(
+        actions=sorted(BOARD_DOCTOR_OUTCOME_ACTIONS),
+        outcomes=sorted(BOARD_DOCTOR_OUTCOME_REGRADABLE),
+    )
+
+
 def evaluate_board_doctor_outcome(
     decision: dict, current: dict | None, *, attributed_to_other: bool = False,
 ) -> str:
@@ -3101,6 +3143,7 @@ def board_doctor_decisions(
     action: str | None = None,
     actions: Sequence[str] | None = None,
     outcome_is_null: bool = False,
+    outcomes: Sequence[str] | None = None,
 ) -> list[dict]:
     """The persisted decision log, oldest first.
 
@@ -3124,6 +3167,15 @@ def board_doctor_decisions(
     so a sweep with a large durable log never materialises every row just
     to throw most of them away.
 
+    *outcomes* (#3907) is *outcome_is_null*'s "already graded, but with
+    one of these specific verdicts" counterpart — :func:`regradable_board_doctor_outcomes`
+    wants ``outcome IN ('unchanged', 'regressed')``, same SQL-side
+    filtering rationale. Passing both *outcome_is_null* and *outcomes* is
+    redundant (mutually exclusive in SQL — a column cannot be both
+    ``NULL`` and ``IN (...)``) but not a conflict: both are ANDed in,
+    same as every other filter here, so the combination simply returns
+    nothing.
+
     **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
     """
     _thin_client_local_board_guard("board_doctor_decisions")
@@ -3142,6 +3194,10 @@ def board_doctor_decisions(
         params.extend(actions)
     if outcome_is_null:
         sql_text += " AND outcome IS NULL"
+    if outcomes is not None:
+        placeholders = ", ".join("?" for _ in outcomes)
+        sql_text += f" AND outcome IN ({placeholders})"
+        params.extend(outcomes)
     sql_text += " ORDER BY id ASC"
     rows = sql.execute(conn, sql_text, tuple(params)).fetchall()
     out = [_board_doctor_log_row_to_dict(row) for row in rows]

@@ -1853,6 +1853,148 @@ def _board_doctor_attributed_to_other(
     return any(ts >= since_ts for ts in other_resolutions.get(key, ()))
 
 
+def _elapsed_hours_since_decision(decision: Mapping[str, Any], moment: datetime) -> float | None:
+    """Hours between *decision*'s own ``recorded_at`` and *moment* (#3907).
+
+    ``None`` when ``recorded_at`` is missing or unparseable — the caller
+    treats that as "cannot confirm the grace window has elapsed" rather
+    than as zero elapsed time, so a decision with a corrupt timestamp is
+    held back from grading rather than graded against a fabricated
+    instant.
+    """
+    from coord import state  # noqa: PLC0415
+
+    ts = state.board_doctor_decision_ts(decision)
+    if ts is None:
+        return None
+    return (moment.timestamp() - ts) / 3600.0
+
+
+def _grade_open_outcomes(
+    *,
+    open_outcomes: Sequence[dict],
+    current_by_row: Mapping[tuple[str, str], dict],
+    touched: Collection[tuple[str, str]],
+    other_resolutions: Mapping[str, Sequence[float]],
+    moment: datetime,
+    sweep_id: str,
+    grace_hours: float,
+) -> None:
+    """Fill in / correct the outcome for every entry in *open_outcomes* —
+    #3889's still-``None`` pending decisions and #3907's already-graded-
+    but-revisable ``unchanged``/``regressed`` ones — against THIS sweep's
+    view of their row.
+
+    *current_by_row* maps a row :func:`sweep` actually classified this
+    pass to its live ``{"cause", "escalated"}`` snapshot; a row that was
+    itself skipped this pass (``suppressed``/``investigate-deferred``) is
+    in *touched* but not *current_by_row*, and gets no verdict here
+    either — still present, just not freshly classified, so there is
+    nothing new to grade it against yet. A row key absent from *touched*
+    entirely has resolved outright: unambiguous progress regardless of
+    how little time has passed, which is exactly why this branch is
+    never grace-gated below.
+
+    #3907: a decision whose own ``outcome`` is still ``None`` — being
+    graded for the FIRST time — is held back until *grace_hours* have
+    passed since it was recorded, UNLESS its row has already resolved
+    (the ``row_key not in touched`` branch, checked first). A decision
+    that already carries a verdict is never grace-gated: it is being
+    RE-graded, not graded for the first time, so there is nothing left
+    to protect it from — only a chance to correct it.
+    """
+    from coord import state  # noqa: PLC0415
+
+    for pending in open_outcomes:
+        pending_sweep_id = pending.get("sweep_id")
+        if pending_sweep_id is None or pending_sweep_id == sweep_id:
+            continue
+        row_key = (pending.get("queue"), pending.get("key"))
+
+        if row_key not in touched:
+            # Resolved: absent from the whole stuck set this pass — "the
+            # leg finished" is itself the signal here, so this is never
+            # held back by the grace window below.
+            attributed_to_other = _board_doctor_attributed_to_other(
+                other_resolutions, row_key[1], state.board_doctor_decision_ts(pending),
+            )
+            state.record_board_doctor_outcome(
+                pending_sweep_id, row_key[0], row_key[1],
+                "progressed_by_other" if attributed_to_other else "progressed",
+            )
+            continue
+
+        if pending.get("outcome") is None:
+            elapsed = _elapsed_hours_since_decision(pending, moment)
+            if elapsed is None or elapsed < grace_hours:
+                continue
+
+        current = current_by_row.get(row_key)
+        if current is None:
+            continue
+        attributed_to_other = _board_doctor_attributed_to_other(
+            other_resolutions, row_key[1], state.board_doctor_decision_ts(pending),
+        )
+        outcome = state.evaluate_board_doctor_outcome(
+            pending, current, attributed_to_other=attributed_to_other,
+        )
+        state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
+
+
+def backfill_board_doctor_outcomes() -> int:
+    """One-shot re-grade (#3907) of every PAST ``board_doctor_log``
+    decision still open for grading — #3889's ``None``-outcome pending
+    ones and #3907's ``unchanged``/``regressed`` ones — against the
+    doctor's own CURRENT per-row state, without waiting for a fresh
+    sweep to walk past those rows again.
+
+    Reads :func:`coord.state.board_doctor_row_state`/
+    ``board_doctor_tracked_rows`` rather than re-running
+    :func:`collect_rows` — those are exactly the ``{"cause", "escalated"}``
+    (or absence, meaning resolved) snapshot the most recent REAL sweep
+    already maintains for every row, the identical shape
+    :func:`_grade_open_outcomes`'s own ``current_by_row`` builds live.
+    Never grace-gated (unlike a normal sweep's first grading): this is an
+    explicit, operator-invoked correction of entries that are typically
+    already well past any sensible grace window — see `coord
+    drive-queue doctor-log --backfill-outcomes`.
+
+    Returns the number of entries whose outcome this call actually
+    changed.
+    """
+    from coord import state  # noqa: PLC0415
+
+    open_outcomes = state.pending_board_doctor_outcomes() + state.regradable_board_doctor_outcomes()
+    if not open_outcomes:
+        return 0
+    other_resolutions = _board_doctor_other_resolutions()
+    tracked = set(state.board_doctor_tracked_rows())
+    changed = 0
+    for pending in open_outcomes:
+        pending_sweep_id = pending.get("sweep_id")
+        if pending_sweep_id is None:
+            continue
+        row_key = (pending.get("queue"), pending.get("key"))
+        current: dict | None = None
+        if row_key in tracked:
+            row_state = state.board_doctor_row_state(row_key[0], row_key[1]) or None
+            if row_state is not None:
+                current = {
+                    "cause": row_state.get("cause"),
+                    "escalated": bool(row_state.get("escalated")),
+                }
+        attributed_to_other = _board_doctor_attributed_to_other(
+            other_resolutions, row_key[1], state.board_doctor_decision_ts(pending),
+        )
+        outcome = state.evaluate_board_doctor_outcome(
+            pending, current, attributed_to_other=attributed_to_other,
+        )
+        if outcome != pending.get("outcome"):
+            state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
+            changed += 1
+    return changed
+
+
 def sweep(
     rows: Sequence[StuckRow],
     *,
@@ -1869,6 +2011,7 @@ def sweep(
     log_retention_days: float | None = None,
     backoff_initial_hours: float | None = None,
     backoff_cap_hours: float | None = None,
+    outcome_grace_hours: float | None = None,
 ) -> SweepReport:
     """The pure harness core: classify-already-done rows in, decisions out.
 
@@ -1975,6 +2118,23 @@ def sweep(
     sweep (never per-decision); the backoff hours govern
     :func:`coord.state.board_doctor_alert_due`/
     :func:`coord.state.mark_board_doctor_escalated`'s re-alert schedule.
+
+    *outcome_grace_hours* (#3907) defaults to ``None``, resolved below to
+    :data:`coord.state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS`. Outcome
+    backfill (see :func:`_grade_open_outcomes`) grades BOTH #3889's
+    still-``None`` pending decisions and #3907's already-graded-but-
+    revisable ``unchanged``/``regressed`` ones every sweep — but a
+    decision's very FIRST grading is held back until this many hours
+    have passed since it was recorded, unless its row has already
+    resolved outright. Without this, a row that is still stuck on the
+    exact same cause the very next sweep purely because the leg its own
+    ``auto-dispatch`` launched has not had time to land yet — a Rust
+    work/test/review cycle routinely runs well past an hour — gets
+    graded against a doctor-raised escalation that is itself an artifact
+    of being graded too soon, not evidence the action failed. A decision
+    already carrying a verdict is re-graded on every sweep regardless of
+    this window: there is nothing left to protect it from, only a chance
+    to correct it once the row finally reaches a done-like state.
     """
     moment = (now or _utcnow)()
     sweep_id = sweep_id or f"sweep-{moment.strftime('%Y%m%dT%H%M%SZ')}"
@@ -1994,23 +2154,36 @@ def sweep(
         if backoff_cap_hours is not None
         else state.BOARD_DOCTOR_BACKOFF_CAP_HOURS
     )
+    outcome_grace_hours = (
+        outcome_grace_hours
+        if outcome_grace_hours is not None
+        else state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS
+    )
 
     touched: set[tuple[str, str]] = set()
-    # Outcome backfill: decisions from EARLIER sweeps still
-    # waiting on a verdict, read once up front so this sweep's own
-    # decisions below never get evaluated against themselves. Populated
-    # below as rows are classified (`current_by_row`) and consumed after
-    # the main loop and again inside the `clear_absent_rows` pass.
-    pending_outcomes = state.pending_board_doctor_outcomes() if not dry_run else []
+    # Outcome backfill: decisions from EARLIER sweeps still open for a
+    # verdict, read once up front so this sweep's own decisions below
+    # never get evaluated against themselves. #3889's still-``None``
+    # pending ones, plus #3907's already-graded-but-revisable
+    # ``unchanged``/``regressed`` ones — a row that reaches a done-like
+    # state (or moves on to a different cause) after being graded
+    # negatively still deserves credit for that. Populated below as rows
+    # are classified (`current_by_row`) and consumed by
+    # `_grade_open_outcomes` after the main loop.
+    open_outcomes = (
+        state.pending_board_doctor_outcomes() + state.regradable_board_doctor_outcomes()
+        if not dry_run
+        else []
+    )
     # #3889: evidence an operator action, a hand merge/unrelated branch
     # landing (or the ordinary drive loop, which this signal does NOT
     # distinguish from — see `_board_doctor_attributed_to_other`'s
     # docstring) moved a row BEFORE this sweep's own confirmed action could
-    # have — read ONCE here rather than once per pending decision, same
-    # rationale as `pending_outcomes` above. Empty (and never read) when
-    # there is nothing pending.
+    # have — read ONCE here rather than once per open decision, same
+    # rationale as `open_outcomes` above. Empty (and never read) when
+    # there is nothing open.
     other_resolutions = (
-        _board_doctor_other_resolutions() if pending_outcomes else {}
+        _board_doctor_other_resolutions() if open_outcomes else {}
     )
     current_by_row: dict[tuple[str, str], dict] = {}
 
@@ -2204,49 +2377,25 @@ def sweep(
             )
 
     if not dry_run:
-        # Fill in the verdict for every earlier decision whose
-        # row was classified again THIS sweep — the row's current
-        # cause/escalation (`current_by_row`) is exactly the "state at the
-        # next sweep" that answers whether the action worked.
-        for pending in pending_outcomes:
-            pending_sweep_id = pending.get("sweep_id")
-            if pending_sweep_id is None or pending_sweep_id == sweep_id:
-                continue
-            row_key = (pending.get("queue"), pending.get("key"))
-            current = current_by_row.get(row_key)
-            if current is None:
-                continue
-            attributed_to_other = _board_doctor_attributed_to_other(
-                other_resolutions, row_key[1], state.board_doctor_decision_ts(pending),
-            )
-            outcome = state.evaluate_board_doctor_outcome(
-                pending, current, attributed_to_other=attributed_to_other,
-            )
-            state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
+        # Fill in / correct the verdict for every decision still open for
+        # grading (#3889's pending + #3907's regradable, see
+        # `_grade_open_outcomes`) — whether its row was classified again
+        # THIS sweep (`current_by_row`, still stuck) or dropped out of
+        # *rows* entirely (`touched`, resolved).
+        _grade_open_outcomes(
+            open_outcomes=open_outcomes,
+            current_by_row=current_by_row,
+            touched=touched,
+            other_resolutions=other_resolutions,
+            moment=moment,
+            sweep_id=sweep_id,
+            grace_hours=outcome_grace_hours,
+        )
 
     if not dry_run and clear_absent_rows:
         for queue, key in state.board_doctor_tracked_rows():
             if (queue, key) not in touched:
                 state.clear_board_doctor_row(queue, key)
-                # The row dropped out of the stuck set entirely — resolved,
-                # which is unambiguous progress for any decision on it
-                # still waiting on a verdict, UNLESS #3889's attribution
-                # evidence says an operator action, a hand merge/unrelated
-                # branch landing, or the ordinary drive loop got there
-                # first.
-                for pending in pending_outcomes:
-                    if (pending.get("queue"), pending.get("key")) == (
-                        queue,
-                        key,
-                    ) and pending.get("sweep_id") is not None:
-                        attributed_to_other = _board_doctor_attributed_to_other(
-                            other_resolutions, key,
-                            state.board_doctor_decision_ts(pending),
-                        )
-                        state.record_board_doctor_outcome(
-                            pending["sweep_id"], queue, key,
-                            "progressed_by_other" if attributed_to_other else "progressed",
-                        )
                 if escalation_resolver is not None:
                     try:
                         escalation_resolver(queue, key)
@@ -2288,11 +2437,14 @@ def run_sweep(
     ``None`` default could not tell those two cases apart.
 
     #3889: *config*'s ``board_doctor.log_retention_days`` /
-    ``backoff_initial_hours`` / ``backoff_cap_hours`` are read fresh HERE,
-    every call — this is the per-sweep production entry point, so a
-    ``coordinator.yml`` edit takes effect on the very next sweep with no
-    daemon restart, same posture as every other `coord.board_doctor_policy`
-    knob this module already reads live from *config*.
+    ``backoff_initial_hours`` / ``backoff_cap_hours`` (and #3907's
+    ``outcome_grace_hours``, read the same defensive ``getattr`` way so a
+    config version predating that knob still resolves to `sweep`'s own
+    default) are read fresh HERE, every call — this is the per-sweep
+    production entry point, so a ``coordinator.yml`` edit takes effect on
+    the very next sweep with no daemon restart, same posture as every
+    other `coord.board_doctor_policy` knob this module already reads live
+    from *config*.
     """
     rows = collect_rows(config=config)
     resolved_capacity_check = (
@@ -2313,6 +2465,7 @@ def run_sweep(
         log_retention_days=getattr(board_doctor_cfg, "log_retention_days", None),
         backoff_initial_hours=getattr(board_doctor_cfg, "backoff_initial_hours", None),
         backoff_cap_hours=getattr(board_doctor_cfg, "backoff_cap_hours", None),
+        outcome_grace_hours=getattr(board_doctor_cfg, "outcome_grace_hours", None),
     )
 
 

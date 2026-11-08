@@ -8869,6 +8869,43 @@ def test_doctor_log_on_an_empty_log_says_so_rather_than_printing_nothing(cli):
     assert "no board-doctor decisions recorded" in result.output
 
 
+def test_doctor_log_backfill_outcomes_regrades_a_stale_regressed_entry(cli):
+    """#3907: `--backfill-outcomes` re-grades an entry still open for a
+    verdict (`regressed`, here) against the doctor's current per-row
+    state before printing — a resolved row (no live counter tracked for
+    it any more) flips to `progressed` without needing a fresh sweep."""
+    from datetime import datetime, timezone
+
+    key = f"{REPO}#950"
+    state.record_board_doctor_decision(
+        {
+            "sweep_id": "s-1",
+            "queue": "drive-queue",
+            "key": key,
+            "cause": "ci_red",
+            "tier": "auto",
+            "action": "auto-dispatch",
+            "count": 1,
+            "escalated": False,
+            "confidence": "high",
+            "evidence": [],
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    state.record_board_doctor_outcome("s-1", "drive-queue", key, "regressed")
+    # No live counter for this row — it has already resolved (merged, in
+    # the real incident this replays), just never re-graded.
+    assert state.board_doctor_row_state("drive-queue", key) == {}
+
+    result = cli("doctor-log", "--backfill-outcomes", "--json")
+    assert result.exit_code == 0, result.output
+    assert "backfilled 1 outcome(s)" in result.output
+
+    payload = json.loads(result.output.splitlines()[-1])
+    assert payload["entries"][0]["key"] == key
+    assert payload["entries"][0]["outcome"] == "progressed"
+
+
 def _sweep_json(output: str) -> dict:
     """The sweep report from `--json` output, ignoring any `warning:` lines.
 
