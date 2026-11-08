@@ -1170,6 +1170,15 @@ def parse_max_parallel_flags_from_execstart(unit_text: str) -> dict[str, int]:
             break
     if execstart_line is None:
         return {}
+    return _extract_max_parallel_flags(execstart_line)
+
+
+def _extract_max_parallel_flags(execstart_line: str) -> dict[str, int]:
+    """The regex half of :func:`parse_max_parallel_flags_from_execstart`,
+    split out so :func:`_merged_execstart_line` (the drop-in-aware reader)
+    can apply the SAME extraction to the line it resolves across multiple
+    files, instead of a second copy of these two regexes.
+    """
     result: dict[str, int] = {}
     per_repo_match = re.search(r"--max-parallel-per-repo[ =](\d+)", execstart_line)
     if per_repo_match:
@@ -1183,11 +1192,65 @@ def parse_max_parallel_flags_from_execstart(unit_text: str) -> dict[str, int]:
     return result
 
 
+def _dropin_conf_paths(unit_path: Path) -> list[Path]:
+    """Every ``*.conf`` under *unit_path*'s drop-in directory
+    (``<unit_path>.d/``), in the same lexicographic order systemd itself
+    applies them — ``systemctl --user edit`` writes ``override.conf``, but
+    operators can and do add more, and systemd merges all of them in
+    filename order. Returns ``[]`` for "no drop-in directory" exactly like
+    "unit file absent": both mean this host carries no override via this
+    path.
+    """
+    dropin_dir = unit_path.parent / f"{unit_path.name}.d"
+    try:
+        return sorted(dropin_dir.glob("*.conf"))
+    except OSError:
+        return []
+
+
+def _merged_execstart_line(texts: Sequence[str]) -> str | None:
+    """systemd's own ``ExecStart=`` merge rule across a main unit file plus
+    its drop-ins: a bare ``ExecStart=`` line (no value) clears every entry
+    accumulated so far — INCLUDING the main unit's own line — and any other
+    ``ExecStart=`` line appends one. *texts* is the main unit's text
+    followed by each drop-in's text in application order
+    (:func:`_dropin_conf_paths`'s own order); this applies that rule across
+    ALL of them as a single stream, then returns the LAST entry left
+    standing, or ``None`` if nothing ever set one.
+
+    This is what makes a drop-in built "solely to carry
+    ``--max-parallel-per-repo 2``" — `coord/deploy/coord-drive-queue.
+    service`'s own header names this exact pattern as something seen on a
+    real daemon host — visible at all: the packaged unit's own
+    ``ExecStart=`` deliberately omits that flag, so reading the main unit
+    alone can never see an override that lives only in a drop-in.
+    """
+    lines: list[str] = []
+    for text in texts:
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped.startswith("ExecStart="):
+                continue
+            if stripped == "ExecStart=":
+                lines = []
+            else:
+                lines.append(stripped)
+    return lines[-1] if lines else None
+
+
 def read_systemd_max_parallel_flags(unit_path: Path | None = None) -> dict[str, int]:
     """Best-effort read of a locally-INSTALLED systemd user unit's hardcoded
     ``--max-parallel``/``--max-parallel-per-repo`` (#3408) — the one source
     that outranks `coordinator.yml` outright (#3388) and, before this, was
     visible only via an SSH in and `systemctl --user cat`.
+
+    Reads the main unit file AND every drop-in under its ``<unit>.d/``
+    directory (:func:`_dropin_conf_paths`), merged with systemd's own
+    last-wins ``ExecStart=`` rule (:func:`_merged_execstart_line`) — a value
+    set only in a drop-in, never the main unit's own ``ExecStart=`` line, is
+    a form this override can take on a real daemon host (see
+    `coord/deploy/coord-drive-queue.service`'s own header), and a reader
+    that only ever opened the main unit file could never see it.
 
     *unit_path* defaults to :func:`default_systemd_user_unit_path` (this
     machine's own `~/.config/systemd/user/coord-drive-queue.service`);
@@ -1195,14 +1258,26 @@ def read_systemd_max_parallel_flags(unit_path: Path | None = None) -> dict[str, 
     real home directory or a real systemd install. Returns ``{}`` for
     "absent", "unreadable" and "present but carries neither flag" alike —
     every caller already treats an empty result as "no override known",
-    which is correct for a machine that simply is not the daemon host.
+    which is correct for a machine that simply is not the daemon host. A
+    drop-in directory is only consulted when the main unit file itself is
+    readable — a drop-in with no unit to override means nothing to systemd
+    either.
     """
     path = unit_path if unit_path is not None else default_systemd_user_unit_path()
     try:
-        text = path.read_text()
+        main_text = path.read_text()
     except OSError:
         return {}
-    return parse_max_parallel_flags_from_execstart(text)
+    texts = [main_text]
+    for conf_path in _dropin_conf_paths(path):
+        try:
+            texts.append(conf_path.read_text())
+        except OSError:
+            continue
+    execstart_line = _merged_execstart_line(texts)
+    if execstart_line is None:
+        return {}
+    return _extract_max_parallel_flags(execstart_line)
 
 
 def compute_running_occupancy(
