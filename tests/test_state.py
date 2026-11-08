@@ -7022,3 +7022,66 @@ class TestMergeReservation:
         assert get_merge_reservation("acme/repo-0") is not None
         assert get_merge_reservation("acme/repo-1") is None
         assert get_merge_reservation("acme/repo-new") is not None
+
+
+class TestRegradableBoardDoctorOutcomes:
+    """#3907: :func:`coord.state.regradable_board_doctor_outcomes` —
+    `pending_board_doctor_outcomes`'s already-graded counterpart, so a
+    decision that read `unchanged`/`regressed` can still be revisited by a
+    later sweep rather than staying wrong forever."""
+
+    def _decision(self, **overrides) -> dict:
+        base = {
+            "sweep_id": "sweep-1",
+            "queue": "drive-queue",
+            "key": "acme/widgets#900",
+            "cause": "ci_red",
+            "tier": "auto",
+            "action": "auto-dispatch",
+            "count": 1,
+            "escalated": False,
+            "confidence": "high",
+            "evidence": [],
+            "recorded_at": "2030-01-01T00:00:00+00:00",
+        }
+        base.update(overrides)
+        return base
+
+    def test_only_unchanged_and_regressed_entries_are_returned(self, coord_db) -> None:
+        state.record_board_doctor_decision(self._decision(key="acme/widgets#901"))
+        state.record_board_doctor_outcome(
+            "sweep-1", "drive-queue", "acme/widgets#901", "unchanged",
+        )
+        state.record_board_doctor_decision(self._decision(key="acme/widgets#902"))
+        state.record_board_doctor_outcome(
+            "sweep-1", "drive-queue", "acme/widgets#902", "regressed",
+        )
+        state.record_board_doctor_decision(self._decision(key="acme/widgets#903"))
+        state.record_board_doctor_outcome(
+            "sweep-1", "drive-queue", "acme/widgets#903", "progressed",
+        )
+        state.record_board_doctor_decision(self._decision(key="acme/widgets#904"))
+        # Still outcome=None — `pending_board_doctor_outcomes`'s territory,
+        # not this function's.
+
+        keys = {d["key"] for d in state.regradable_board_doctor_outcomes()}
+        assert keys == {"acme/widgets#901", "acme/widgets#902"}
+
+    def test_empty_when_nothing_has_been_graded_yet(self, coord_db) -> None:
+        state.record_board_doctor_decision(self._decision())
+        assert state.regradable_board_doctor_outcomes() == []
+
+    def test_board_doctor_decisions_outcomes_filter_matches_regradable(
+        self, coord_db,
+    ) -> None:
+        state.record_board_doctor_decision(self._decision(key="acme/widgets#905"))
+        state.record_board_doctor_outcome(
+            "sweep-1", "drive-queue", "acme/widgets#905", "unchanged",
+        )
+        state.record_board_doctor_decision(self._decision(key="acme/widgets#906"))
+        state.record_board_doctor_outcome(
+            "sweep-1", "drive-queue", "acme/widgets#906", "progressed",
+        )
+
+        matched = state.board_doctor_decisions(outcomes=["unchanged", "regressed"])
+        assert {d["key"] for d in matched} == {"acme/widgets#905"}

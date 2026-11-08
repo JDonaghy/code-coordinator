@@ -3700,6 +3700,15 @@ def _doctor_log_summary(
     help="Aggregate counts instead of the raw log: actions taken, rows unstuck, rows still "
     "stuck, and human interventions the doctor missed (cross-referenced from the block log).",
 )
+@click.option(
+    "--backfill-outcomes",
+    "backfill_outcomes_flag",
+    is_flag=True,
+    default=False,
+    help="#3907: re-grade every outcome-pending/regradable entry against current state "
+    "first, before printing — a one-shot catch-up for rows that were graded too early "
+    "(or never re-graded) before this fix.",
+)
 @_CONFIG_OPTION
 def drive_queue_doctor_log(
     output_json: bool,
@@ -3709,6 +3718,7 @@ def drive_queue_doctor_log(
     action_filter: str | None,
     limit: int,
     summary_mode: bool,
+    backfill_outcomes_flag: bool,
     config_path: Path,
 ) -> None:
     """Read back `coord drive-queue sweep`'s durable decision/action log.
@@ -3734,11 +3744,20 @@ def drive_queue_doctor_log(
     `rows_unstuck_by_other` is reported separately so this number never
     credits the doctor for a human's fix.
 
+    `--backfill-outcomes` (#3907) re-grades every entry still open for a
+    verdict — `None`, or `unchanged`/`regressed` — against the doctor's
+    CURRENT per-row state before this command does anything else, so a
+    row that merged (or otherwise resolved) since it was last graded
+    reads `progressed`/`progressed_by_other` without needing a fresh
+    sweep to walk past it again. Safe to run repeatedly: it only changes
+    an entry whose re-evaluated outcome actually differs.
+
     Same `is_remote()` guard as `sweep`/`diagnose` — the decision log
     lives on the daemon host (unlike `block-log`, which reads a local
     file and has no such guard).
     """
     from coord import state  # noqa: PLC0415
+    from coord.board_doctor import backfill_board_doctor_outcomes  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
 
     if is_remote():
@@ -3750,6 +3769,10 @@ def drive_queue_doctor_log(
 
     if summary_mode and limit != 200:
         click.echo("warning: --limit is ignored with --summary", err=True)
+
+    if backfill_outcomes_flag:
+        changed = backfill_board_doctor_outcomes()
+        click.echo(f"backfilled {changed} outcome(s)")
 
     since_ts = time.time() - since * 86400.0 if since > 0 else None
     entries = state.board_doctor_decisions(

@@ -1078,9 +1078,16 @@ class TestOutcomeTracking:
         assert logged[0]["outcome"] == "progressed"
 
     def test_still_stuck_on_the_same_cause_is_recorded_as_unchanged(self) -> None:
+        """#3907: grading happens once the grace window has elapsed, not
+        on the very next sweep — so this threads ``now=`` across a gap
+        wider than the default `state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS`.
+        """
+        from datetime import datetime, timezone
+
         dispatch = _Recorder()
         key = "repo#21"
         cause = "ci_red"
+        t0 = 1_900_000_000.0
 
         sweep(
             [_row(key, cause)],
@@ -1089,9 +1096,10 @@ class TestOutcomeTracking:
             alert_dispatcher=_Recorder(),
             convergence_limit=3,
             sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
         )
 
-        # Still stuck on the exact same cause next sweep.
+        # Still stuck on the exact same cause, well past the grace window.
         sweep(
             [_row(key, cause)],
             tier_of=_always(TIER_AUTO),
@@ -1099,6 +1107,9 @@ class TestOutcomeTracking:
             alert_dispatcher=_Recorder(),
             convergence_limit=3,
             sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(
+                t0 + state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS * 3600.0 + 60.0, tz=timezone.utc,
+            ),
         )
 
         logged = [
@@ -1107,11 +1118,19 @@ class TestOutcomeTracking:
         ]
         assert logged[0]["outcome"] == "unchanged"
 
-    def test_freshly_escalating_after_an_action_is_recorded_as_regressed(self) -> None:
+    def test_escalation_moments_after_dispatch_is_deferred_not_regressed(self) -> None:
+        """#3907: the doctor's OWN next-sweep ``alert`` for the exact same
+        cause, minutes after its ``auto-dispatch``, is not graded at all
+        yet — the leg that dispatch launched has barely had time to
+        start, let alone land, so there's no honest verdict to give.
+        """
+        from datetime import datetime, timezone
+
         dispatch = _Recorder()
         alert = _Recorder()
         key = "repo#22"
         cause = "ci_red"
+        t0 = 1_900_000_000.0
 
         # First sweep: under the convergence limit (2), so it
         # auto-dispatches rather than alerting.
@@ -1122,11 +1141,13 @@ class TestOutcomeTracking:
             alert_dispatcher=alert,
             convergence_limit=2,
             sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
         )
         assert report.decisions[0].action == "auto-dispatch"
 
-        # Second sweep: still the same cause, now AT the limit, so it
-        # escalates — the auto action from the first sweep did not help.
+        # Ten minutes later: still the same cause, now AT the limit, so
+        # the doctor escalates — its OWN action, taken while the leg the
+        # first sweep launched is still almost certainly running.
         sweep(
             [_row(key, cause)],
             tier_of=_always(TIER_AUTO),
@@ -1134,6 +1155,57 @@ class TestOutcomeTracking:
             alert_dispatcher=alert,
             convergence_limit=2,
             sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 600.0, tz=timezone.utc),
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] is None
+
+    def test_still_regressed_once_the_grace_window_has_genuinely_elapsed(self) -> None:
+        """The deferral in the test above is not permanent silence: once
+        `BOARD_DOCTOR_OUTCOME_GRACE_HOURS` has genuinely passed with no
+        improvement, the decision DOES grade `regressed`."""
+        from datetime import datetime, timezone
+
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#22b"
+        cause = "ci_red"
+        t0 = 1_900_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+        )
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 600.0, tz=timezone.utc),
+        )
+        # Well past the grace window, and the row is STILL stuck on the
+        # exact same (now escalated) cause — this is genuinely bad news.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-3",
+            now=lambda: datetime.fromtimestamp(
+                t0 + state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS * 3600.0 + 60.0, tz=timezone.utc,
+            ),
         )
 
         logged = [
@@ -1141,6 +1213,77 @@ class TestOutcomeTracking:
             if d["sweep_id"] == "sweep-1" and d["key"] == key
         ]
         assert logged[0]["outcome"] == "regressed"
+
+    def test_regressed_decision_is_later_regraded_progressed_once_the_row_merges(
+        self,
+    ) -> None:
+        """#3907 end to end: auto-dispatch, an alert the doctor raises on
+        itself minutes later (deferred), still stuck once the grace
+        window elapses (graded ``regressed``), and the row finally
+        merges a couple of sweeps after that — the ORIGINAL decision's
+        outcome flips from ``regressed`` to ``progressed`` rather than
+        staying wrong forever."""
+        from datetime import datetime, timezone
+
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#22c"
+        cause = "ci_red"
+        t0 = 1_900_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+        )
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 600.0, tz=timezone.utc),
+        )
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-3",
+            now=lambda: datetime.fromtimestamp(
+                t0 + state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS * 3600.0 + 60.0, tz=timezone.utc,
+            ),
+        )
+        logged_after_sweep_3 = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged_after_sweep_3[0]["outcome"] == "regressed"
+
+        # The fix leg finally lands — the row is gone from the walk.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-4",
+            now=lambda: datetime.fromtimestamp(
+                t0 + state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS * 3600.0 + 7200.0, tz=timezone.utc,
+            ),
+        )
+
+        logged_after_merge = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged_after_merge[0]["outcome"] == "progressed"
 
     def test_only_actionable_decisions_ever_get_an_outcome_key(self) -> None:
         """A `no-dispatcher`/`converged-noop`/deferred row was never
@@ -1539,6 +1682,143 @@ class TestSweepAttributesOutcomesHonestly:
             if d["sweep_id"] == "sweep-1" and d["key"] == key
         ]
         assert logged[0]["outcome"] == "progressed_by_other"
+
+
+class TestQuadraiuAutoDispatchReplayAndBackfill:
+    """#3907: replays the exact shape of the 2026-11-07 quadraui incident —
+    ten ``auto-dispatch`` decisions that all read ``outcome=regressed``
+    despite most of their rows later reaching a done-like drive-queue
+    state (``done``/``merged``/``issue closed``). One parametrized sweep
+    sequence — auto-dispatch, an alert the doctor raises on itself at the
+    very next sweep, then a merge two sweeps later — replayed against each
+    of the six quadraui keys the issue names, asserting every one ends
+    ``progressed`` rather than permanently ``regressed``.
+    """
+
+    @pytest.mark.parametrize(
+        "issue_number",
+        [1960, 1965, 1974, 1975, 2035, 2103],
+    )
+    def test_quadraui_key_ends_progressed_after_the_merge(self, issue_number: int) -> None:
+        from datetime import datetime, timezone
+
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = f"quadraui#{issue_number}"
+        cause = "ci_red"
+        t0 = 1_900_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+        )
+
+        # The doctor's own next-sweep alert — a Rust work/test/review
+        # cycle on quadraui routinely runs past an hour, so the leg the
+        # first sweep dispatched is almost certainly still running here.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 3600.0, tz=timezone.utc),
+        )
+        pending_after_alert = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert pending_after_alert[0]["outcome"] is None
+
+        # Two sweeps after the dispatch, the fix leg's PR merges — the row
+        # is gone from the walk entirely.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-3",
+            now=lambda: datetime.fromtimestamp(t0 + 7200.0, tz=timezone.utc),
+        )
+
+        logged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert logged[0]["outcome"] == "progressed"
+
+    def test_backfill_corrects_an_already_regressed_entry_once_the_row_resolves(
+        self,
+    ) -> None:
+        """#3907 point 5: the one-shot
+        :func:`coord.board_doctor.backfill_board_doctor_outcomes` re-grades
+        an EXISTING ``regressed`` entry against the doctor's current
+        per-row state, without needing another :func:`sweep` call at all.
+        """
+        from datetime import datetime, timezone
+
+        from coord.board_doctor import backfill_board_doctor_outcomes
+
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "quadraui#2035"
+        cause = "ci_red"
+        t0 = 1_900_000_000.0
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-1",
+            now=lambda: datetime.fromtimestamp(t0, tz=timezone.utc),
+            outcome_grace_hours=0.0,
+        )
+        # Force the ORIGINAL bug's exact shape: graded `regressed` on the
+        # very next sweep (grace disabled) while the row is still stuck on
+        # the same cause, now escalated.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=2,
+            sweep_id="sweep-2",
+            now=lambda: datetime.fromtimestamp(t0 + 600.0, tz=timezone.utc),
+            outcome_grace_hours=0.0,
+        )
+        regressed = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert regressed[0]["outcome"] == "regressed"
+
+        # The row resolves with no further sweep ever walking past it
+        # again — `clear_board_doctor_row` has already dropped its
+        # counter, so the key is no longer `tracked` at all.
+        state.clear_board_doctor_row("drive-queue", key)
+
+        changed = backfill_board_doctor_outcomes()
+        assert changed >= 1
+
+        regraded = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert regraded[0]["outcome"] == "progressed"
+
+    def test_backfill_is_a_noop_when_nothing_is_open_for_grading(self) -> None:
+        from coord.board_doctor import backfill_board_doctor_outcomes
+
+        assert backfill_board_doctor_outcomes() == 0
 
 
 class TestDecisionLogRetentionAndFilters:
