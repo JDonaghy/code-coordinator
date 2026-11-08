@@ -727,11 +727,39 @@ class IssueResolution:
 # separator (em/en-dash, hyphen, or colon) stripped so both
 # "ISSUE_RESOLUTION: partial — foo" and "ISSUE_RESOLUTION: partial: foo"
 # read the same remainder.
+#
+# #3915: anchored to the START of a line (`re.MULTILINE`'s `^`), with only
+# leading whitespace and markdown emphasis/blockquote/backtick decoration
+# allowed before the literal marker — so prose that merely *mentions* the
+# marker mid-sentence (e.g. "...whose merge carried ISSUE_RESOLUTION:
+# partial drives the real...", or a quoted "`ISSUE_RESOLUTION: partial`"
+# inside a longer sentence) never counts as a claim. A real marker still
+# starts the line it's on, optionally after `>`/`*`/`_`/backtick decoration.
+# The same decoration is also tolerated between the colon and the value
+# (`**ISSUE_RESOLUTION:** partial`, where the bold closes right after the
+# colon) — same reasoning as `_MD` in `coord/review.py`'s `REVIEW_VERDICT:`
+# parser.
 _ISSUE_RESOLUTION_RE = re.compile(
-    r"ISSUE_RESOLUTION:[ \t]*(resolved|partial|investigation)\b[ \t]*(.*)$",
+    r"^[ \t>*_`]*ISSUE_RESOLUTION:[ \t*_`]*(resolved|partial|investigation)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 _ISSUE_RESOLUTION_REASON_SEP_RE = re.compile(r"^[\s*_`:—–-]+")
+# #3915: a reason left over after stripping the separator may still be
+# nothing but trailing punctuation/decoration (e.g. a quoting sentence's
+# closing "`." or "**"), which should read as "no reason" rather than a
+# dangling fragment.
+_ISSUE_RESOLUTION_REASON_EMPTY_RE = re.compile(r"^[\s*_`.,:;!?—–-]*$")
+
+
+def is_blank_issue_resolution_reason(reason: str | None) -> bool:
+    """True when *reason* carries nothing but whitespace/markdown punctuation
+    (#3915) — the same test :func:`parse_issue_resolution` applies to its own
+    extracted reason, exposed so callers building a "What remains:"-style
+    message from an :class:`IssueResolution` (however it was constructed,
+    not only via :func:`parse_issue_resolution`) can fall back to generic
+    wording instead of printing a dangling fragment.
+    """
+    return not reason or bool(_ISSUE_RESOLUTION_REASON_EMPTY_RE.match(reason))
 
 
 def parse_issue_resolution(text: str | None) -> IssueResolution:
@@ -748,6 +776,8 @@ def parse_issue_resolution(text: str | None) -> IssueResolution:
         return IssueResolution()
     value = matches[-1].group(1).lower()
     reason = _ISSUE_RESOLUTION_REASON_SEP_RE.sub("", matches[-1].group(2).strip()).strip()
+    if is_blank_issue_resolution_reason(reason):
+        reason = ""
     return IssueResolution(value=value, reason=reason)
 
 

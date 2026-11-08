@@ -220,6 +220,76 @@ class TestIssueResolutionMarker:
         )
         assert parse_issue_resolution(text).value == "resolved"
 
+    # ── #3915: the marker must start its own line, not just appear in it ──
+
+    def test_mid_line_mention_is_not_a_claim(self) -> None:
+        """A sentence that happens to contain the marker text mid-line (not
+        at the start) is prose about the marker, not a real claim — reads
+        as the "resolved" default (#3915, the #3901 false positive)."""
+        from coord.models import parse_issue_resolution
+
+        text = (
+            "The merge gate logic whose merge carried ISSUE_RESOLUTION: "
+            "partial drives the real behaviour here."
+        )
+        result = parse_issue_resolution(text)
+        assert result.value == "resolved"
+        assert result.reason == ""
+
+    def test_quoted_marker_inside_a_sentence_is_not_a_claim(self) -> None:
+        """Prose that quotes the marker mid-sentence (the #3889 false
+        positive) must not count, even with backticks around it."""
+        from coord.models import parse_issue_resolution
+
+        text = (
+            "The commit message states `ISSUE_RESOLUTION: partial`. "
+            "This matches exactly what the review expected."
+        )
+        result = parse_issue_resolution(text)
+        assert result.value == "resolved"
+        assert result.reason == ""
+
+    def test_real_marker_still_wins_over_later_mid_line_mention(self) -> None:
+        """A genuine marker at the start of its own line still parses
+        correctly even when followed by prose that later mentions the
+        marker mid-line (#3915) — the mid-line mention is simply never a
+        match, so the real one (the only match) is used."""
+        from coord.models import parse_issue_resolution
+
+        text = (
+            "ISSUE_RESOLUTION: partial — root cause not fixed yet\n\n"
+            "Note: the merge gate logic whose merge carried "
+            "ISSUE_RESOLUTION: partial drives the real behaviour."
+        )
+        result = parse_issue_resolution(text)
+        assert result.value == "partial"
+        assert result.reason == "root cause not fixed yet"
+
+    def test_emphasis_prefixed_marker_at_line_start_still_parses(self) -> None:
+        """Markdown emphasis (`**ISSUE_RESOLUTION:**`) or blockquote/backtick
+        decoration right before the marker at the START of a line is still
+        a real claim, not prose (#3915)."""
+        from coord.models import parse_issue_resolution
+
+        result = parse_issue_resolution("**ISSUE_RESOLUTION:** partial — still broken")
+        assert result.value == "partial"
+        assert result.reason == "still broken"
+
+        result = parse_issue_resolution("> ISSUE_RESOLUTION: investigation — n/a")
+        assert result.value == "investigation"
+
+    def test_punctuation_only_reason_reads_as_empty(self) -> None:
+        """A reason left over after separator-stripping that is nothing but
+        trailing punctuation (e.g. the quoting sentence's own "`.") must
+        read as empty, not a dangling fragment (#3915)."""
+        from coord.models import parse_issue_resolution
+
+        result = parse_issue_resolution(
+            "ISSUE_RESOLUTION: partial.\n\nMore prose after it."
+        )
+        assert result.value == "partial"
+        assert result.reason == ""
+
     def test_reviewer_partial_overrides_worker_resolved(self) -> None:
         from coord.models import IssueResolution, effective_issue_resolution
 
@@ -1034,6 +1104,27 @@ class TestProcess:
         assert call_args[1] == 1
         assert "quadraui#999" in call_args[2]
         assert call_kwargs.get("repo_github") == "acme/api"
+
+    def test_punctuation_only_reason_falls_back_to_generic_remainder_text(
+        self,
+    ) -> None:
+        # #3915: a `ISSUE_RESOLUTION: partial` marker whose reason is
+        # nothing but trailing punctuation (parsed as an empty reason) must
+        # fall back to the generic "What remains:" wording, never print a
+        # dangling "What remains: ." fragment.
+        board = self._board_with_work("ISSUE_RESOLUTION: partial.")
+        items = [_q("a", assignment_type="work")]
+        with patch("coord.merge_queue.comment_on_issue") as fake_comment:
+            events = process(items, FakeGh(), board=board)
+        assert items[0].state == MERGED
+        assert any(e.kind == "merged_partial" for e in events)
+        assert fake_comment.call_count == 1
+        call_args, _call_kwargs = fake_comment.call_args
+        comment_body = call_args[2]
+        assert "What remains:" in comment_body
+        assert "What remains: ." not in comment_body
+        assert "What remains: \n" not in comment_body
+        assert "marked this PR as not fully" in comment_body
 
     def test_comment_failure_does_not_revert_the_merge(self) -> None:
         # Same best-effort posture as `close_issue` failures (#806).

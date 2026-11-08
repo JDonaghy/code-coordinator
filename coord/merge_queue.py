@@ -54,6 +54,7 @@ from coord.models import (
     Assignment,
     IssueResolution,
     effective_issue_resolution,
+    is_blank_issue_resolution_reason,
     parse_issue_resolution,
     trust_issue_closed_for,
 )
@@ -8799,7 +8800,8 @@ def _finalize_merged_entry(
         remainder = (
             (
                 issue_resolution.reason
-                or "the worker/reviewer marked this PR as not fully "
+                if not is_blank_issue_resolution_reason(issue_resolution.reason)
+                else "the worker/reviewer marked this PR as not fully "
                 "resolving the issue — see the PR for details."
             )
             if issue_resolution.value != "resolved"

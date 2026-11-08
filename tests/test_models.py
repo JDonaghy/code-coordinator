@@ -13,6 +13,7 @@ from coord.models import (
     Board,
     Machine,
     Repo,
+    is_blank_issue_resolution_reason,
     trust_issue_closed_for,
 )
 
@@ -374,3 +375,22 @@ def test_trust_issue_closed_for(assignment_type: str | None, expected: bool) -> 
     in SEALED_PATH_AUTHOR_TYPES. Every non-epic-decompose case pins down
     pre-#3132 behaviour is unchanged."""
     assert trust_issue_closed_for(assignment_type) is expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (None, True),
+        ("", True),
+        (".", True),
+        ("  — .  ", True),
+        ("**`.`**", True),
+        ("root cause not fixed yet", False),
+        ("quadraui#999", False),
+    ],
+)
+def test_is_blank_issue_resolution_reason(reason: str | None, expected: bool) -> None:
+    """#3915: a `What remains:`-style builder must treat a reason left
+    over after separator-stripping as blank when it carries nothing but
+    whitespace/markdown punctuation — never a real explanation."""
+    assert is_blank_issue_resolution_reason(reason) is expected
