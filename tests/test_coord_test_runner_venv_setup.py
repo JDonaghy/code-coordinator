@@ -17,13 +17,17 @@ can go wrong there, and they are not the same verdict:
    would be unreportable.
 3. **Setup reports success but the venv still cannot run pytest.** Asserting
    the environment is usable because no step raised is the unverified kind of
-   verdict; the arm confirms it with `python -m pytest --version` and splits
-   the blame by which side built the venv — a leftover `.venv` from an
-   interrupted earlier run is INFRA, a venv this run installed `.[dev]` into
-   is the branch's dev extra.
+   verdict; the arm confirms it with `python -c "import pytest"` — the same
+   question as `pytest --version` without starting a pytest session, so it
+   is never confused with (or billed against) the suite run itself — and
+   splits the blame by which side built the venv — a leftover `.venv` from
+   an interrupted earlier run is INFRA, a venv this run installed `.[dev]`
+   into is the branch's dev extra.
 
-Every case is asserted on the OUTPUT and the report file, not the exit code
-alone: the message is what a fix worker is dispatched against.
+Every case is asserted on the OUTPUT, not the exit code alone: the message is
+what a fix worker is dispatched against. One case
+(`test_venv_creation_failure_classification_reaches_the_report`) additionally
+reads the report file, to confirm the classification lands there too.
 
 The interpreter is a shell shim, so these run in milliseconds and never build
 a real venv. It dispatches on its own basename, so the `python`/`pip`/`coord`

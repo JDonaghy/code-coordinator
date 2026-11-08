@@ -3188,13 +3188,13 @@ def board_doctor_decisions(
     if action is not None:
         sql_text += " AND action = ?"
         params.append(action)
-    if actions is not None:
+    if actions:
         placeholders = ", ".join("?" for _ in actions)
         sql_text += f" AND action IN ({placeholders})"
         params.extend(actions)
     if outcome_is_null:
         sql_text += " AND outcome IS NULL"
-    if outcomes is not None:
+    if outcomes:
         placeholders = ", ".join("?" for _ in outcomes)
         sql_text += f" AND outcome IN ({placeholders})"
         params.extend(outcomes)

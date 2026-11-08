@@ -1040,6 +1040,48 @@ class TestConvergence:
         )
         assert state.board_doctor_row_state("drive-queue", key)["count"] == 1
 
+    def test_clear_absent_rows_false_leaves_the_outcome_log_entry_open(self) -> None:
+        """#3907 review (blocking): a partial walk is a signal the caller
+        has explicitly declared untrustworthy — ``_grade_open_outcomes``
+        must not write a terminal ``progressed`` verdict for a row that
+        is merely absent from a ``clear_absent_rows=False`` pass, the
+        same contract :func:`sweep` itself upholds for the row's
+        counter."""
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#14"
+        cause = "ci_red"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            sweep_id="sweep-1",
+        )
+        pending = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert pending[0]["outcome"] is None
+
+        # A deliberately empty/partial walk with clear_absent_rows=False
+        # must not grade this decision as resolved — the row was never
+        # actually observed this pass.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            clear_absent_rows=False,
+            sweep_id="sweep-2",
+        )
+        still_pending = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "sweep-1" and d["key"] == key
+        ]
+        assert still_pending[0]["outcome"] is None
+
 
 class TestOutcomeTracking:
     """A logged `auto-dispatch`/`alert` decision gets its own ``outcome``
@@ -1684,7 +1726,7 @@ class TestSweepAttributesOutcomesHonestly:
         assert logged[0]["outcome"] == "progressed_by_other"
 
 
-class TestQuadraiuAutoDispatchReplayAndBackfill:
+class TestQuadrauiAutoDispatchReplayAndBackfill:
     """#3907: replays the exact shape of the 2026-11-07 quadraui incident —
     ten ``auto-dispatch`` decisions that all read ``outcome=regressed``
     despite most of their rows later reaching a done-like drive-queue
@@ -1816,9 +1858,30 @@ class TestQuadraiuAutoDispatchReplayAndBackfill:
         assert regraded[0]["outcome"] == "progressed"
 
     def test_backfill_is_a_noop_when_nothing_is_open_for_grading(self) -> None:
+        """A terminal entry (already ``progressed``) is seeded first so a
+        ``0`` result means "correctly found nothing open", not "never
+        looked" — an empty DB cannot distinguish the two."""
+        from datetime import datetime, timezone
+
         from coord.board_doctor import backfill_board_doctor_outcomes
 
+        state.record_board_doctor_decision(
+            {
+                "sweep_id": "s-1", "queue": "drive-queue", "key": "acme/x#1",
+                "cause": "ci_red", "tier": "auto", "action": "auto-dispatch",
+                "count": 1, "escalated": False, "confidence": "high",
+                "evidence": [], "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        state.record_board_doctor_outcome("s-1", "drive-queue", "acme/x#1", "progressed")
+
         assert backfill_board_doctor_outcomes() == 0
+
+        unchanged = [
+            d for d in state.board_doctor_decisions()
+            if d["sweep_id"] == "s-1" and d["key"] == "acme/x#1"
+        ]
+        assert unchanged[0]["outcome"] == "progressed"
 
 
 class TestDecisionLogRetentionAndFilters:
@@ -2068,7 +2131,8 @@ class TestParseNoProgressMinutes:
 class TestParseBoardDoctorLogAndBackoffKnobs:
     """#3889 (#3875 asks B/C): ``board_doctor.log_retention_days`` /
     ``backoff_initial_hours`` / ``backoff_cap_hours`` / ``fixit_leg_budget``
-    parse the same way every other knob in this section does."""
+    — plus #3907's ``outcome_grace_hours`` — parse the same way every other
+    knob in this section does."""
 
     def test_defaults_match_the_hardcoded_fallbacks(self) -> None:
         cfg = _parse_board_doctor(None)
@@ -2076,6 +2140,7 @@ class TestParseBoardDoctorLogAndBackoffKnobs:
         assert cfg.backoff_initial_hours == 1.0
         assert cfg.backoff_cap_hours == 24.0
         assert cfg.fixit_leg_budget == 1
+        assert cfg.outcome_grace_hours == 3.0
 
     def test_custom_values_are_accepted(self) -> None:
         cfg = _parse_board_doctor(
@@ -2084,12 +2149,22 @@ class TestParseBoardDoctorLogAndBackoffKnobs:
                 "backoff_initial_hours": 2.0,
                 "backoff_cap_hours": 48.0,
                 "fixit_leg_budget": 3,
+                "outcome_grace_hours": 6.0,
             }
         )
         assert cfg.log_retention_days == 30
         assert cfg.backoff_initial_hours == 2.0
         assert cfg.backoff_cap_hours == 48.0
         assert cfg.fixit_leg_budget == 3
+        assert cfg.outcome_grace_hours == 6.0
+
+    def test_outcome_grace_hours_rejects_non_positive(self) -> None:
+        with pytest.raises(ConfigError, match="outcome_grace_hours"):
+            _parse_board_doctor({"outcome_grace_hours": 0})
+
+    def test_outcome_grace_hours_rejects_non_number(self) -> None:
+        with pytest.raises(ConfigError, match="outcome_grace_hours"):
+            _parse_board_doctor({"outcome_grace_hours": "6"})
 
     def test_log_retention_days_rejects_non_positive(self) -> None:
         with pytest.raises(ConfigError, match="log_retention_days"):
@@ -2182,10 +2257,10 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
         them off ``config.board_doctor`` and passes them down. Stub
         ``collect_rows``/``sweep`` (both module-level names `run_sweep`
         resolves fresh on every call, so monkeypatching the module wins)
-        and assert the four knobs the production entry point owns —
+        and assert the knobs the production entry point owns —
         ``log_retention_days``/``backoff_initial_hours``/
-        ``backoff_cap_hours`` plus the already-threaded ``capacity_check``
-        — arrive at `sweep` unchanged."""
+        ``backoff_cap_hours``/#3907's ``outcome_grace_hours`` plus the
+        already-threaded ``capacity_check`` — arrive at `sweep` unchanged."""
         import coord.board_doctor as board_doctor_mod
         from coord.config import BoardDoctorConfig, Config
 
@@ -2207,6 +2282,7 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
                 backoff_initial_hours=6.0,
                 backoff_cap_hours=12.0,
                 fixit_leg_budget=2,
+                outcome_grace_hours=9.0,
             ),
         )
 
@@ -2216,6 +2292,7 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
         assert captured["log_retention_days"] == 7
         assert captured["backoff_initial_hours"] == 6.0
         assert captured["backoff_cap_hours"] == 12.0
+        assert captured["outcome_grace_hours"] == 9.0
         assert captured["capacity_check"] is None
 
 

@@ -1879,6 +1879,7 @@ def _grade_open_outcomes(
     moment: datetime,
     sweep_id: str,
     grace_hours: float,
+    clear_absent_rows: bool = True,
 ) -> None:
     """Fill in / correct the outcome for every entry in *open_outcomes* —
     #3889's still-``None`` pending decisions and #3907's already-graded-
@@ -1902,6 +1903,23 @@ def _grade_open_outcomes(
     that already carries a verdict is never grace-gated: it is being
     RE-graded, not graded for the first time, so there is nothing left
     to protect it from — only a chance to correct it.
+
+    *clear_absent_rows* mirrors :func:`sweep`'s own parameter of the same
+    name: "absent from *touched*" only means "resolved" when *rows* was
+    the FULL stuck set. A caller that passed ``clear_absent_rows=False``
+    has already declared *rows* a deliberately partial view — absence
+    there is "not walked this pass", not "progressed" — so with it
+    ``False`` the resolved branch below is skipped entirely and a row
+    absent from *touched* is left untouched, exactly as its counter is
+    left untouched by the matching ``clear_absent_rows`` guard around the
+    tracked-row clear loop.
+
+    The re-grade branch (``pending.get("outcome")`` already set) only
+    writes when the freshly-computed outcome actually differs from the
+    stored one — mirroring :func:`backfill_board_doctor_outcomes`'s own
+    guard — so a sweep that keeps finding the same verdict for an
+    already-graded decision does not re-``UPDATE`` (and re-``commit``)
+    every row, every pass.
     """
     from coord import state  # noqa: PLC0415
 
@@ -1912,6 +1930,12 @@ def _grade_open_outcomes(
         row_key = (pending.get("queue"), pending.get("key"))
 
         if row_key not in touched:
+            if not clear_absent_rows:
+                # Partial walk: absence here says nothing about whether
+                # the row actually resolved, so leave the decision open
+                # rather than mass-crediting (or mass-blaming) rows this
+                # pass never observed.
+                continue
             # Resolved: absent from the whole stuck set this pass — "the
             # leg finished" is itself the signal here, so this is never
             # held back by the grace window below.
@@ -1938,7 +1962,8 @@ def _grade_open_outcomes(
         outcome = state.evaluate_board_doctor_outcome(
             pending, current, attributed_to_other=attributed_to_other,
         )
-        state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
+        if outcome != pending.get("outcome"):
+            state.record_board_doctor_outcome(pending_sweep_id, row_key[0], row_key[1], outcome)
 
 
 def backfill_board_doctor_outcomes() -> int:
@@ -2390,6 +2415,7 @@ def sweep(
             moment=moment,
             sweep_id=sweep_id,
             grace_hours=outcome_grace_hours,
+            clear_absent_rows=clear_absent_rows,
         )
 
     if not dry_run and clear_absent_rows:

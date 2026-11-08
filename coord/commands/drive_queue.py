@@ -3772,7 +3772,7 @@ def drive_queue_doctor_log(
 
     if backfill_outcomes_flag:
         changed = backfill_board_doctor_outcomes()
-        click.echo(f"backfilled {changed} outcome(s)")
+        click.echo(f"backfilled {changed} outcome(s)", err=True)
 
     since_ts = time.time() - since * 86400.0 if since > 0 else None
     entries = state.board_doctor_decisions(
