@@ -5859,6 +5859,91 @@ def test_stale_smoke_redispatch_respects_max_fix_rounds_zero():
     assert action.exit_code == EXIT_ESCALATED
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #3861: the latched stale-smoke `merge_reason` — `merge_queue.process()`
+# only rewrites `entry.error`/`merge_reason` on a REAL merge attempt, never
+# on the #1738 re-test arm above, so the SAME "recorded against branch
+# <old>" text can keep reproducing on every poll even after a fresher Test
+# pass already lands against the live head. quadraui#1975/PR#2008 passed
+# Test on its current head TWICE and still never merged, because each poll
+# re-read that stale text and burned a `fix_rounds` unit re-testing evidence
+# that was not actually stale.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_stale_smoke_refusal_superseded_by_a_fresher_pass_reattempts_merge():
+    """The work row's own `test_head_sha` already matches a LIVE probe of
+    the branch head — confirmed via `verifier.branch_head_sha`, not merely
+    inferred from the refusal's own embedded (possibly equally stale) SHA
+    text — so the refusal is itself outdated. The drive must re-attempt
+    `coord merge` to refresh the gate, never re-test, and must not spend a
+    `fix_rounds` unit on it."""
+    counters = DriveCounters()
+    live_head = "e8c8948" + "0" * 33
+    action = step(
+        approved_work(
+            merge_status="PENDING",
+            merge_reason=(
+                "smoke test verdict is stale: recorded against branch "
+                "3d2a8c8, branch is now e8c8948 — re-verify against the "
+                "current base, then `coord test w1 --passed`"
+            ),
+            work_test_head_sha=live_head,
+        ),
+        verifier=FakeVerifier(head_sha=live_head),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert not action.is_exit
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert counters.fix_rounds == 0
+    assert "re-attempting merge" in action.label.lower()
+
+
+def test_stale_smoke_refusal_still_retests_when_the_verdict_is_genuinely_stale():
+    """Sibling negative case: `test_head_sha` does NOT match the live branch
+    head (nothing has re-tested the current commit yet) — the verdict really
+    is stale, so the existing bounded re-test arm still fires, unchanged."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="PENDING",
+            merge_reason=(
+                "smoke test verdict is stale: recorded against branch "
+                "3d2a8c8, branch is now e8c8948 — re-verify against the "
+                "current base, then `coord test w1 --passed`"
+            ),
+            work_test_head_sha="3d2a8c8" + "0" * 33,
+        ),
+        verifier=FakeVerifier(head_sha="e8c8948" + "0" * 33),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "diagnose", REPO, str(ISSUE), "--stage", "test", "--reset",
+    )
+    assert counters.fix_rounds == 1
+
+
+def test_stale_smoke_anchor_distinguishes_branch_base_and_run():
+    from coord.drive import _stale_smoke_anchor
+
+    assert _stale_smoke_anchor(
+        "smoke test verdict is stale: recorded against branch X, branch is "
+        "now Y"
+    ) == "branch"
+    assert _stale_smoke_anchor(
+        "test verdict stale (recorded against base X, base now Y)"
+    ) == "base"
+    assert _stale_smoke_anchor(
+        "test verdict stale (Test stage stuck at 'running' with no live "
+        "worker)"
+    ) == "run"
+    assert _stale_smoke_anchor("smoke test required but no verdict recorded") is None
+    assert _stale_smoke_anchor("") is None
+    assert _stale_smoke_anchor(None) is None
+
+
 def test_missing_smoke_verdict_divergence_still_escalates_immediately():
     """Restates the #1526 "missing verdict" case side by side with the new
     #1738 "stale verdict" arm above so the two can't silently drift onto the

@@ -14925,6 +14925,29 @@ class TestStaleSmokeConflictProbe:
         assert mq.is_stale_smoke_reason(reason) is True
 
 
+def test_stale_smoke_anchor_reads_which_side_moved_from_the_prose() -> None:
+    """#3861: `coord.drive`'s latched-reason check needs to tell "the BRANCH
+    moved past the recorded SHA" apart from "the BASE moved" over the same
+    rendered prose `is_stale_smoke_reason` already classifies."""
+    assert mq.stale_smoke_anchor(
+        "smoke test verdict is stale: recorded against branch 3d2a8c8, "
+        "branch is now e8c8948 — re-verify against the current base, then "
+        "`coord test w1 --passed`"
+    ) == "branch"
+    assert mq.stale_smoke_anchor(
+        "test verdict stale (recorded against base f6216e4, base now "
+        "c50e30c)"
+    ) == "base"
+    assert mq.stale_smoke_anchor(
+        "test verdict stale (Test stage stuck at 'running' with no live "
+        "worker)"
+    ) == "run"
+    assert mq.stale_smoke_anchor("smoke test required but no verdict recorded") is None
+    assert mq.stale_smoke_anchor("review required but not approved") is None
+    assert mq.stale_smoke_anchor("") is None
+    assert mq.stale_smoke_anchor(None) is None
+
+
 # ── #2246: post-merge sibling conflict sweep ─────────────────────────────────
 
 class _SweepGh:
