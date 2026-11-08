@@ -2190,6 +2190,41 @@ def is_stale_smoke_reason(reason: str | None) -> bool:
     return any(marker in r for marker in STALE_SMOKE_MARKERS)
 
 
+def stale_smoke_anchor(reason: str | None) -> str | None:
+    """Which side a stale-smoke *reason* names as having moved —
+    ``"base"`` | ``"branch"`` | ``"run"`` | ``None`` (not a stale-smoke
+    reason at all).
+
+    Mirrors :class:`SmokeVerdictStatus`'s own ``anchor`` field, but over the
+    rendered PROSE instead of the structured object — the same string-vs-
+    structured split :func:`is_stale_smoke_reason` already draws, for the
+    same reason: a persisted ``merge_reason``/``entry.error`` is all some
+    callers (``coord drive``) ever see once the verdict that produced it is
+    gone.
+
+    #3861: this is what lets a caller distinguish "the BRANCH moved past
+    the SHA this verdict was recorded against" from "the BASE moved" without
+    re-deriving the distinction from scratch. Only the branch case has a
+    direct, already-on-the-board answer — the work row's own
+    ``test_head_sha`` — that can confirm whether the refusal is itself now
+    outdated (a fresher verdict already landed on the current head).
+
+    Both wordings :func:`is_stale_smoke_reason` matches name the moved side
+    as ``"recorded against {base,branch} ..."`` except the ``anchor="run"``
+    case (an abandoned ``test_state="running"`` marker, #1819), which never
+    says "recorded against" at all — so its absence is what identifies
+    ``"run"`` here, rather than a third substring to keep in sync.
+    """
+    r = (reason or "").lower()
+    if not is_stale_smoke_reason(r):
+        return None
+    if "recorded against branch" in r:
+        return "branch"
+    if "recorded against base" in r:
+        return "base"
+    return "run"
+
+
 # #1738: paths whose content cannot affect a pytest/cargo test result — the
 # allowlist a base-SHA move is checked against before staling an otherwise-
 # fresh verdict. Deliberately small and additive (start conservative, widen

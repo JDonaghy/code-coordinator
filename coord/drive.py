@@ -172,6 +172,7 @@ from coord.merge_queue import (
     is_ci_unreadable_reason,
     is_merge_gate_reserved_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
+    stale_smoke_anchor as _mq_stale_smoke_anchor,
 )
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
@@ -4289,6 +4290,7 @@ def _merge_gate_kind(reason: str) -> str | None:
 # not copies: `tests/test_merge_queue.py` asserts identity.
 _STALE_SMOKE_MARKERS = _mq_stale_smoke_markers
 _is_stale_smoke_reason = _mq_is_stale_smoke_reason
+_stale_smoke_anchor = _mq_stale_smoke_anchor
 
 # #2229: `coord merge --only` prints a gate line per REFUSED gate, and the
 # same run prints a "waived by this run" variant of that line for a gate the
@@ -4897,6 +4899,49 @@ def _decide_merge(
             )
         )
     divergence = _merge_gate_divergence(state, reason=gate_reason)
+    if (
+        divergence == "smoke"
+        and _is_stale_smoke_reason(gate_reason)
+        and _stale_smoke_anchor(gate_reason) == "branch"
+        and state.work_test_head_sha
+        and verifier.branch_head_sha(state) == state.work_test_head_sha
+    ):
+        # #3861: the refusal names a BRANCH anchor ("recorded against
+        # branch <old sha>, branch is now <new sha>") — but THIS work row's
+        # own `test_head_sha` already matches a LIVE probe of the branch
+        # head, confirmed here rather than merely trusted from the
+        # refusal's own (possibly equally stale) embedded SHA text. That
+        # can only mean a fresher Test pass already landed against the
+        # current head AFTER this refusal was persisted.
+        #
+        # `merge_queue.process()` only (re)writes `entry.error`/
+        # `merge_reason` on a REAL merge attempt — the #1738 re-test arm
+        # below never touches it — so this exact latched text would
+        # otherwise keep reproducing on every poll even once a fresh,
+        # passing verdict already covers it, discarding that verdict and
+        # spending a `fix_rounds` unit each time (quadraui#1975/PR#2008's
+        # incident: a branch that passed Test on its current head twice
+        # still never merged). A merge RE-ATTEMPT — which re-evaluates the
+        # gate against live state — is what actually refreshes this,
+        # not another re-test of evidence that isn't stale.
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: smoke verdict stale → refusal predates a fresh "
+                "pass already on the live head; re-attempting merge, not "
+                f"re-testing (#3861): {gate_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed "
+                "out) while re-attempting a merge whose stale-smoke "
+                "refusal was already superseded by a fresher Test pass — "
+                "re-checking next poll"
+            ),
+            serialize_merge=True,
+        )
     if (
         gate_reason_from_diagnostic
         and divergence == "smoke"

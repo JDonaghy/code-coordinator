@@ -98,6 +98,25 @@ def test_project_reads_the_work_row_and_repo_config():
     assert state.repo_test_command == "pytest -q"
 
 
+def test_project_reads_work_test_head_sha_from_the_work_row():
+    """#3861: `_decide_merge`'s stale-smoke latched-reason check compares
+    this against a live branch-head probe, so it must come straight off the
+    work row's own column, not be re-derived."""
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", test_state="passed", test_head_sha="e8c8948")
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_test_head_sha == "e8c8948"
+
+
+def test_project_defaults_work_test_head_sha_none_when_absent():
+    payload = {"assignments": [row(assignment_id="w1", test_state="passed")]}
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_test_head_sha is None
+
+
 def test_project_reads_work_completion_summary_from_the_work_row():
     """#3672: `decide()`'s turn-ceiling continuation check reads
     `work_completion_summary` for a `CONTINUATION:` marker — this is the
