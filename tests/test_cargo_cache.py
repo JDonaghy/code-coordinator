@@ -248,6 +248,38 @@ def test_cargo_env_forwards_leg_suffix(tmp_path: Path) -> None:
     }
 
 
+def test_fanout_leg_profile_and_incremental_dirs_reachable(tmp_path: Path) -> None:
+    """#3912 review: a fan-out leg's cache nests two levels deeper than an
+    ordinary repo's (``<repo>/fanout-leg/<tag>/debug`` vs ``<repo>/debug``)
+    — ``_MAX_PROFILE_DEPTH`` must reach it, or ``profile_dirs``/
+    ``incremental_dirs`` silently stop seeing a leg's cache at all, and tier
+    1/2 GC can never reclaim a single byte of it."""
+    root = tmp_path / "cargo-target"
+    repo = root / "api"
+    leg_profile = repo / "fanout-leg" / "gtk-a1b2c3d4" / "debug"
+    (leg_profile / ".fingerprint").mkdir(parents=True, exist_ok=True)
+    _fill(leg_profile / "incremental", 300, name="chunk.bin")
+
+    assert leg_profile in cargo_cache.profile_dirs(repo)
+    assert (leg_profile / "incremental") in cargo_cache.incremental_dirs(repo)
+
+
+def test_fanout_leg_build_lock_detected_at_nested_depth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3912 review: ``_build_lock_held`` (via ``build_active``) — "the most
+    reliable 'is something compiling in here right now' signal" — must see
+    a fan-out leg's own ``.cargo-lock``, not just an ordinary repo's."""
+    monkeypatch.setattr(cargo_cache, "fcntl", _FakeFcntlHeld())
+    root = tmp_path / "cargo-target"
+    repo = root / "api"
+    leg_profile = repo / "fanout-leg" / "gtk-a1b2c3d4" / "debug"
+    leg_profile.mkdir(parents=True, exist_ok=True)
+    (leg_profile / cargo_cache.BUILD_LOCK_NAME).write_text("")
+
+    assert cargo_cache.build_active(repo) is True
+
+
 # ── the cap ─────────────────────────────────────────────────────────────────
 
 
@@ -1139,6 +1171,62 @@ def test_stash_falls_back_to_shared_cargo_target_dir(tmp_path: Path) -> None:
     assert copied == 1
     assert unmatched == []
     assert (state / "artifacts" / "api" / "issue-1-x" / "coord-tui").exists()
+
+
+def test_stash_falls_back_to_the_fanout_leg_cargo_target_dir(tmp_path: Path) -> None:
+    """#3912 review: a #3182 fan-out leg builds into its OWN nested target
+    dir (``<cache>/<repo>/fanout-leg/<tag>/...``), not the bare per-repo
+    cache — the stash fallback must look in the SAME place the build
+    actually used, via the same ``leg_suffix`` the build itself passed to
+    ``cargo_env``, or a fan-out leg's artifacts silently miss."""
+    state = tmp_path / "state"
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    _fill(
+        state / "cargo-target" / "api" / "fanout-leg" / "gtk-abcd1234" / "debug",
+        4096, name="coord-tui",
+    )
+
+    unmatched: list[str] = []
+    copied = stash_artifacts_for_branch(
+        worktree,
+        "issue-1-x",
+        "api",
+        ["tui/target/debug/coord-tui"],
+        state,
+        unmatched_out=unmatched,
+        leg_suffix="gtk-abcd1234",
+    )
+
+    assert copied == 1
+    assert unmatched == []
+    assert (state / "artifacts" / "api" / "issue-1-x" / "coord-tui").exists()
+
+
+def test_stash_without_leg_suffix_misses_a_fanout_leg_build(tmp_path: Path) -> None:
+    """The flip side: with no ``leg_suffix`` (the pre-#3912 call shape), a
+    fan-out leg's nested build is NOT where the fallback looks — pinning
+    that this parameter is load-bearing, not cosmetic."""
+    state = tmp_path / "state"
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    _fill(
+        state / "cargo-target" / "api" / "fanout-leg" / "gtk-abcd1234" / "debug",
+        4096, name="coord-tui",
+    )
+
+    unmatched: list[str] = []
+    copied = stash_artifacts_for_branch(
+        worktree,
+        "issue-1-x",
+        "api",
+        ["tui/target/debug/coord-tui"],
+        state,
+        unmatched_out=unmatched,
+    )
+
+    assert copied == 0
+    assert unmatched == ["tui/target/debug/coord-tui"]
 
 
 def test_stash_prefers_the_worktree_copy_when_present(tmp_path: Path) -> None:

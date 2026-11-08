@@ -150,9 +150,14 @@ INCREMENTAL_DIRNAME = "incremental"
 BUILD_LOCK_NAME = ".cargo-lock"
 
 # How deep below a repo cache root we look for profile dirs / build locks.
-# ``<repo>/debug`` is depth 1 and ``<repo>/<triple>/debug`` is depth 2; nothing
-# cargo creates puts one deeper than that.
-_MAX_PROFILE_DEPTH = 2
+# ``<repo>/debug`` is depth 1 and ``<repo>/<triple>/debug`` is depth 2 for an
+# ordinary single-leg assignment's cache. #3912: a fan-out leg's own nested
+# cache (``<repo>/fanout-leg/<tag>/debug`` or ``<repo>/fanout-leg/<tag>/
+# <triple>/debug``, see `target_dir_for_repo`'s *leg_suffix*) puts the same
+# two shapes two levels deeper still — depth 3 and 4 — so this has to reach
+# depth 4 or `_build_lock_held`/`profile_dirs`/`incremental_dirs` silently
+# stop seeing a fan-out leg's own cache at all.
+_MAX_PROFILE_DEPTH = 4
 
 # `comm` values worth stat-ing a `/proc` entry for.  Truncated to 15 chars by
 # the kernel, which none of these reach.
@@ -164,8 +169,10 @@ _FALSEY = {"0", "false", "no", "off", ""}
 
 # Repo names become a path component, so they must be a single safe segment.
 # Anything else (a slash, "..", a control character) disables the cache for
-# that repo rather than writing outside the cache root.
-_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
+# that repo rather than writing outside the cache root. `\Z` (not `$`) on
+# the end anchor — `$` also matches just before a trailing newline, so
+# `"gtk\n"` would otherwise pass as one safe component.
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+\Z")
 
 
 def _env(env: dict[str, str] | None) -> dict[str, str]:
@@ -199,21 +206,21 @@ def target_dir_for_repo(
     safe single path component (never guessed, never sanitized into a
     collision — an unusable name simply opts that repo out).
 
-    *leg_suffix* (#3912, optional) nests the result under
+    *leg_suffix* (optional) nests the result under
     ``<repo>/fanout-leg/<leg_suffix>/`` instead of returning the bare
-    per-repo root — pass the #3182 fan-out leg's own capability-partition tag
-    (e.g. ``"gtk+windows"``) when dispatching a leg that is ONE OF SEVERAL
-    sibling partitions, never for an ordinary single-leg assignment. Two
-    sibling legs of one fan-out routed to the same machine at the same time
-    used to share the bare per-repo target dir and race on cargo's
-    ``deps/*.d`` files mid-build (the #3912 incident) — nesting under the
-    leg's own tag keeps that race from ever happening while still sharing
-    ONE cache across repeated retries of the SAME partition on the same
-    machine (unlike keying on the transient assignment id, which would cold-
-    build every single retry). Nested under the repo's own cache dir — not a
+    per-repo root — pass a #3182 fan-out leg's own capability-partition tag
+    (e.g. ``"gtk+windows-a1b2c3d4"``, see
+    :func:`coord.agent._fanout_leg_cargo_suffix` for why a short hash rides
+    along) when dispatching a leg that is ONE OF SEVERAL sibling
+    partitions, never for an ordinary single-leg assignment. Isolating each
+    partition's target dir keeps concurrent siblings routed to the same
+    machine from racing on cargo's ``deps/*.d`` files mid-build, while
+    still sharing ONE cache across repeated retries of the SAME partition
+    (unlike keying on the transient assignment id, which would cold-build
+    every single retry). Nested under the repo's own cache dir — not a
     sibling top-level entry — so :func:`sweep`'s existing repo-name-keyed
-    ``protect_repos``/:func:`build_active` live-build protection still
-    covers it with no changes of its own.
+    ``protect_repos``/:func:`build_active` live-build protection covers it
+    with no changes of its own.
 
     A *leg_suffix* that is not a single safe path component (anything
     outside ``+`` — which is remapped to ``-`` first, since every

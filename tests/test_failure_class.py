@@ -320,6 +320,18 @@ class TestClassifyInfra:
             # shape recorded a plain `failed` and spent a real fix round.
             "headless smoke: <the smoke command never returned an exit "
             "status within this session>",
+            # #3912: two #3182 fan-out legs racing on a shared cargo target
+            # dir on one machine — one leg's build deletes the other's
+            # dependency-info file mid-compile, or a concurrent worktree
+            # collision removes the toolchain binary out from under the
+            # invoking process. Both are observed field shapes, not
+            # synthetic examples (vimcode#2126/PR#2130, 2026-11-08).
+            "error: could not parse/generate dep info at: "
+            "/home/john/.coord/cargo-target/vimcode/debug/deps/"
+            "vimcode_core-623a3dccad0dbb40.d — No such file or directory",
+            "could not execute process "
+            "`/home/john/.rustup/toolchains/stable/bin/rustc --version` "
+            "(No such file or directory (os error 2))",
         ],
     )
     def test_infra_signatures_classify_environmental(self, reason: str) -> None:
@@ -343,6 +355,12 @@ class TestClassifyInfra:
             # worktree cleanup path must never be reclassified away.
             "test_cleanup_deletes_the_worktree failed: AssertionError",
             "test_process_is_killed_on_timeout failed",
+            # #3912: "could not execute process" alone, with no "(os error
+            # 2)" alongside it, is exactly as consistent with a test
+            # asserting subprocess-spawn behaviour as a genuine toolchain
+            # outage — must not be misread as infra on that phrase alone.
+            "test_subprocess_spawn: could not execute process `/bin/false`",
+            "AssertionError: dep info missing from the manifest",
         ],
     )
     def test_genuine_failures_are_not_misclassified_as_infra(
