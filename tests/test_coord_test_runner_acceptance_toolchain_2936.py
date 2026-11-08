@@ -45,15 +45,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "coord-test-runner.sh"
 
 #: Answers just enough pytest invocation shapes to get the ordinary suite to
-#: PASS and reach `run_python_post_arms` — `-c` probes (xdist detection) and
-#: the full-suite `-m pytest ... --ignore=tests/acceptance` run. Nothing here
-#: needs to answer a flake/baseline re-run (`::` node ids) or the
-#: populated-home arm's bare test-file invocation: the fixture repo's diff
-#: touches no python test files, so that arm SKIPs on its own before either
-#: shape would be needed.
+#: PASS and reach `run_python_post_arms` — the two `-c` probes (`import
+#: pytest`, the venv-usability check `run_python` makes before trusting its
+#: own setup; `import xdist`, parallelism detection) and the full-suite
+#: `-m pytest ... --ignore=tests/acceptance` run. Nothing here needs to answer
+#: a flake/baseline re-run (`::` node ids) or the populated-home arm's bare
+#: test-file invocation: the fixture repo's diff touches no python test files,
+#: so that arm SKIPs on its own before either shape would be needed.
 _FAKE_PYTHON = r"""#!/usr/bin/env bash
 if [[ "$1" == "-c" ]]; then
-    exit 1  # no xdist -> serial
+    case "$2" in
+        *xdist*) exit 1 ;;  # no xdist -> serial
+        *)       exit 0 ;;  # a usable venv: `import pytest` succeeds
+    esac
 fi
 if [[ "$1" == "-m" && "$2" == "pytest" ]]; then
     printf '1 passed\n'
