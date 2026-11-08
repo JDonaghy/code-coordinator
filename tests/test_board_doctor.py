@@ -2413,6 +2413,97 @@ class TestNoProgressRows:
         [reclassified] = _reclassify_ceiling_blocked(rows)
         assert reclassified.cause == CAUSE_CEILING_BLOCKED_MERGEABLE
 
+    def test_repo_ceiling_honours_systemd_max_parallel_per_repo_override(self) -> None:
+        # #3906: a `--max-parallel-per-repo` baked into the daemon host's
+        # installed systemd unit outranks `coordinator.yml` for the REAL
+        # tick (`resolve_max_parallel_per_repo`'s own contract). Before
+        # this fix, `_repo_parallel_ceiling` read ONLY `coordinator.yml`,
+        # so a fleet running a lower systemd override had the doctor
+        # compute a HIGHER ceiling than the tick ever enforces.
+        from coord.board_doctor import _repo_parallel_ceiling
+
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[],
+        )
+        config.pipeline.max_parallel_per_repo = 5
+
+        # No systemd override known (default posture, e.g. a non-daemon
+        # host): `coordinator.yml`'s own value wins, same as #3888.
+        assert _repo_parallel_ceiling(
+            "acme/widgets", config=config, systemd_flags={}
+        ) == 5
+        # The daemon host's installed unit hardcodes a lower ceiling: that
+        # number must win, exactly like `resolve_concurrency_report` (the
+        # SAME resolution the real tick uses) already honours.
+        assert _repo_parallel_ceiling(
+            "acme/widgets",
+            config=config,
+            systemd_flags={"max_parallel_per_repo": 2},
+        ) == 2
+
+    def test_waiting_row_deferred_by_systemd_override_is_not_classified(self) -> None:
+        # #3906 regression: N (=ceiling) `running` rows for one repo — one
+        # launched on a FOREIGN host — plus an aged-out `waiting` row whose
+        # `after=` deps have all landed. The repo's effective ceiling is
+        # the daemon host's systemd-unit override (2), lower than
+        # `coordinator.yml`'s `pipeline.max_parallel_per_repo` (5) — the
+        # exact 2026-11-07T18:26Z quadraui#2137-et-al. shape: the tick's
+        # own capacity read (2/2, deferring) must be the SAME number the
+        # doctor reads, so this produces ZERO no-progress rows and ZERO
+        # escalations for the repo, never `waiting-ready-not-launched`.
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[],
+        )
+        config.pipeline.max_parallel_per_repo = 5
+
+        running_local = QueueEntry(
+            repo="acme/widgets",
+            issue=2137,
+            state="running",
+            session_name="drive-acme-widgets-2137",
+            launched_at=0.0,
+        )
+        running_foreign = QueueEntry(
+            repo="acme/widgets",
+            issue=2138,
+            state="running",
+            launch_host="otherhost",
+            launched_at=0.0,
+        )
+        waiting = QueueEntry(
+            repo="acme/widgets",
+            issue=2139,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [running_local, running_foreign, waiting],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2137"}),
+            board_view=BoardView(
+                issues={"acme/widgets#2000": IssueFacts(issue_state="closed")},
+                # `BoardView.live_sessions` keys on `repo#issue`, the SAME
+                # occupancy verdict `_reconcile_running` reads — distinct
+                # from the top-level `live_sessions` collection above
+                # (local tmux session NAMES, used only by the `running`
+                # no-progress shape's own liveness check).
+                live_sessions=frozenset({running_local.key}),
+            ),
+            probe=probe,
+            config=config,
+            now=100_000.0,
+            local_host="thishost",
+            systemd_flags={"max_parallel_per_repo": 2},
+        )
+
+        assert rows == []
+        assert probe.calls == []
+
 
 class TestIntegrationRedClassification:
     """#3882: a `ci-red` row whose own branch Test verdict already read

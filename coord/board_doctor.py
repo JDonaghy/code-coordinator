@@ -1175,25 +1175,44 @@ def _repo_running_counts(
     return repo_occupied
 
 
-def _repo_parallel_ceiling(repo_name: str, *, config) -> int:
-    """*repo_name*'s effective ``max_parallel_per_repo`` ceiling (#3888).
+def _repo_parallel_ceiling(
+    repo_name: str, *, config, systemd_flags: Mapping[str, int] | None = None
+) -> int:
+    """*repo_name*'s effective ``max_parallel_per_repo`` ceiling (#3888, #3906).
 
     Delegates to the SAME resolution :func:`coord.drive_queue.
     resolve_repo_max_parallel` / :func:`coord.drive_queue.
     resolve_max_parallel_per_repo` the real tick uses to decide capacity
     (#2096: one question, one answer) — never a second, doctor-local guess
     at the ceiling. ``0`` means uncapped, mirroring that function's own
-    meaning. Deliberately ignores any ``--max-parallel-per-repo`` CLI
-    override: this sweep has no flag of its own, only `coordinator.yml`.
+    meaning.
+
+    #3906: a ``--max-parallel-per-repo`` baked into the daemon host's
+    installed ``coord-drive-queue`` systemd unit's ``ExecStart=`` line
+    outranks `coordinator.yml` for the REAL tick
+    (:func:`coord.drive_queue.resolve_max_parallel_per_repo`'s own
+    contract) — the exact number :func:`coord.drive_queue.
+    resolve_concurrency_report` reads for ``coord config --effective``.
+    Ignoring it here, as this sweep used to, let the doctor compute a
+    HIGHER ceiling than the tick ever enforces whenever that override is
+    set, reading room open where the tick itself read none (quadraui#2137
+    et al., 2026-11-07T18:26Z). *systemd_flags* is ``{}`` (no override
+    known — today's behaviour) unless the caller supplies the real read —
+    :func:`collect_rows` reads :func:`coord.drive_queue.
+    read_systemd_max_parallel_flags` once per sweep and threads it down,
+    the same posture it already has for *local_host*; this function never
+    touches the filesystem itself, so neither a test nor any other caller
+    is exposed to another machine's installed unit by surprise.
     """
     from coord.drive_queue import (  # noqa: PLC0415
         resolve_max_parallel_per_repo,
         resolve_repo_max_parallel,
     )
 
+    flags = systemd_flags or {}
     fleet = resolve_max_parallel_per_repo(
-        override_value=None,
-        override_source="",
+        override_value=flags.get("max_parallel_per_repo"),
+        override_source="systemd ExecStart --max-parallel-per-repo",
         config_value=config.pipeline.max_parallel_per_repo,
     )
     repo = config.repo(repo_name)
@@ -1335,6 +1354,7 @@ def no_progress_rows(
     trigger: str = "board-doctor-sweep",
     now: float | None = None,
     local_host: str | None = None,
+    systemd_flags: Mapping[str, int] | None = None,
 ) -> list[StuckRow]:
     """Classify every drive-queue row #3888 says the episode walk misses.
 
@@ -1377,6 +1397,13 @@ def no_progress_rows(
     :mod:`coord.board_doctor_policy` entry (`unknown` included) to the
     alert tier, so returning the row here is sufficient to make it alert;
     nothing downstream needs to special-case the cause name.
+
+    *systemd_flags* (#3906) is forwarded to :func:`_repo_parallel_ceiling`
+    unchanged — ``{}`` (no override known) unless the caller supplies the
+    real read; :func:`collect_rows` reads the daemon host's installed unit
+    once per sweep (the same posture it already has for *local_host*) and
+    passes it down here, so every repo's ceiling reads the SAME override
+    the real tick would.
     """
     stamp = _utcnow().timestamp() if now is None else now
     threshold_seconds = config.board_doctor.no_progress_minutes * 60
@@ -1389,7 +1416,9 @@ def no_progress_rows(
 
     def repo_ceiling(repo_name: str) -> int:
         if repo_name not in ceilings:
-            ceilings[repo_name] = _repo_parallel_ceiling(repo_name, config=config)
+            ceilings[repo_name] = _repo_parallel_ceiling(
+                repo_name, config=config, systemd_flags=systemd_flags
+            )
         return ceilings[repo_name]
 
     rows: list[StuckRow] = []
@@ -1465,11 +1494,28 @@ def no_progress_rows(
                     (),
                 )
 
+        # #3906: for the `waiting-ready` shape specifically, name the exact
+        # capacity numbers THIS sweep read — the repo's occupied count (the
+        # scheduler's own `compute_running_occupancy` verdict, see
+        # `_repo_running_counts`) and its ceiling (`_repo_parallel_ceiling`,
+        # now including any systemd-unit override) — so a human checking
+        # an alert against the tick's own `repo ... at its limit (N/M)`
+        # deferral text can tell at a glance whether the two numbers
+        # actually agree or this sweep read stale/incomplete evidence.
+        # Every other shape has no capacity question to answer, so this is
+        # never added for them.
+        capacity_note = (
+            f"; repo capacity this sweep read: "
+            f"{running_counts.get(entry.repo, 0)}/{repo_ceiling(entry.repo)} "
+            f"occupied"
+            if shape == _NO_PROGRESS_WAITING_READY
+            else ""
+        )
         evidence = extra_evidence + (
             f"{coverage_note}, and it has made no progress for over "
             f"{config.board_doctor.no_progress_minutes}m ({shape}, "
             f"queue-state={entry.state}); last queue reason: "
-            f"{entry.last_reason or '(none)'}",
+            f"{entry.last_reason or '(none)'}{capacity_note}",
         )
         rows.append(
             StuckRow(
@@ -1535,7 +1581,10 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
         _local_host_id,
     )
     from coord.drive import list_drive_sessions  # noqa: PLC0415
-    from coord.drive_queue import entries_from_rows  # noqa: PLC0415
+    from coord.drive_queue import (  # noqa: PLC0415
+        entries_from_rows,
+        read_systemd_max_parallel_flags,
+    )
     from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
     from coord.merge_queue import load_queue as load_merge_queue  # noqa: PLC0415
     from coord.state import (  # noqa: PLC0415
@@ -1561,6 +1610,11 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     )
     board = build_board()
     local_host = _local_host_id()
+    # #3906: read once per sweep, same posture as `local_host` above — the
+    # no-progress pass's repo ceilings must read the SAME systemd-unit
+    # override (if any) the real tick enforces, not a second, independent
+    # read that could land on a different mtime mid-sweep.
+    systemd_flags = read_systemd_max_parallel_flags()
     probe = queue_diagnose.GhLiveProbe(
         config=config,
         board=board,
@@ -1620,6 +1674,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
                 config=config,
                 trigger=trigger,
                 local_host=local_host,
+                systemd_flags=systemd_flags,
             )
         )
 
