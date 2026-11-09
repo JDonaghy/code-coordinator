@@ -126,7 +126,12 @@ class TestPolicyTierOf:
         # merge-conflict gets the ordinary mechanical conflict-fix leg
         # dispatched directly, moved off the investigate tier so it never
         # competes with every other alert-eligible cause for that tier's
-        # shared per-repo fix-it-leg budget.
+        # shared per-repo fix-it-leg budget. #3929 adds three more: a
+        # confirmed-stale review/test gets a fresh restage (never the
+        # generic fix-it leg, which cannot repair staleness by editing
+        # code), and a never-attempted-but-otherwise-clear merge row
+        # reuses the SAME "merge" action `CAUSE_MERGE_PENDING_STUCK`
+        # already does.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
             queue_diagnose.CAUSE_PR_MERGED: "mark_done",
@@ -137,6 +142,9 @@ class TestPolicyTierOf:
             CAUSE_CONFLICT_FIX_HEAD_UNMOVED: "conflict_fix_redispatch",
             CAUSE_AFTER_PREREQS_LANDED: "drive_queue_requeue",
             queue_diagnose.CAUSE_MERGE_CONFLICT: "conflict_fix_dispatch",
+            queue_diagnose.CAUSE_REVIEW_STALE: "restage",
+            queue_diagnose.CAUSE_TEST_STALE: "restage",
+            board_doctor_policy.CAUSE_MERGE_NEVER_ATTEMPTED: "merge",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:
