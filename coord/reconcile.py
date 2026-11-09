@@ -63,22 +63,23 @@ def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dic
 # Terminal statuses an agent reports in its /status `completed` history,
 # mapped to the board terminal status we persist. (#625)
 #
-# #2234/#3164: "refused_policy" (coord.agent.REFUSED_POLICY) and
-# "refused_premise" (coord.agent.REFUSED_PREMISE) join "advisory" as their
-# own pass-through entries — WITHOUT this, `reconcile_completed_
-# assignments` below (the daemon's passive tick, the primary production
-# path a completion is first observed on) reads `terminal = _AGENT_TERMINAL_
-# STATUS.get(...)` as `None` for an unrecognised status and just
-# `continue`s, leaving the board row on `status="running"` FOREVER — the
-# opposite of #2234's goal (the row would look perpetually in-flight,
-# `active_count` would never clear, and `coord drive` would wait forever
-# instead of ever reaching the terminal-status branch that avoids spending
-# an attempt).
+# #2234/#3164/#3931: "refused_policy" (coord.agent.REFUSED_POLICY),
+# "refused_premise" (coord.agent.REFUSED_PREMISE) and "needs_decomposition"
+# (coord.agent.NEEDS_DECOMPOSITION) join "advisory" as their own pass-through
+# entries — WITHOUT this, `reconcile_completed_assignments` below (the
+# daemon's passive tick, the primary production path a completion is first
+# observed on) reads `terminal = _AGENT_TERMINAL_STATUS.get(...)` as `None`
+# for an unrecognised status and just `continue`s, leaving the board row on
+# `status="running"` FOREVER — the opposite of #2234's goal (the row would
+# look perpetually in-flight, `active_count` would never clear, and `coord
+# drive` would wait forever instead of ever reaching the terminal-status
+# branch that avoids spending an attempt).
 _AGENT_TERMINAL_STATUS = {
     "done": "done",
     "advisory": "advisory",
     "refused_policy": "refused_policy",
     "refused_premise": "refused_premise",
+    "needs_decomposition": "needs_decomposition",
     "failed": "failed",
     "cancelled": "failed",
 }
@@ -148,7 +149,10 @@ _LATE_REPORT_CORRECTION_WINDOW_SECONDS = 6 * 3600.0
 # turns out to be `done` is left on its (safe, conservative) `failed`/
 # `advisory` guess — a human or `coord notify` can still promote it.
 _LATE_REPORT_SAFE_TARGETS = frozenset(
-    {"failed", "advisory", "refused_policy", "refused_premise"}
+    {
+        "failed", "advisory", "refused_policy", "refused_premise",
+        "needs_decomposition",
+    }
 )
 
 
@@ -2688,6 +2692,28 @@ def reconcile(board: Board, config: Config) -> list[str]:
             # NOTE: do NOT add to newly_failed — a premise refusal is never a
             # candidate for auto_reassign; retrying it reproduces the
             # identical, correct refusal every time.
+        elif agent_status == "needs_decomposition":
+            # #3931: worker exited cleanly, pushed 0 commits, and its own
+            # final message (or `WORK_OUTCOME: needs-decomposition` marker)
+            # concluded the issue needs epic decomposition — the #3922 shape.
+            # Mirrors the "refused_premise" branch immediately above exactly
+            # (move to completed, skip review, never a candidate for
+            # auto_reassign): a relaunch cannot produce a different split,
+            # only a second opinion on the one this leg already proposed.
+            done = board.mark_done_by_id(
+                a.assignment_id,
+                finished_at=entry.get("finished_at"),
+                branch=branch,
+            )
+            if done is not None:
+                # mark_done_by_id sets status="done"; correct it.
+                done.status = "needs_decomposition"
+                if done.type in WORK_LIKE_TYPES:
+                    # No code pushed → nothing to review.
+                    done.review_state = "advisory"
+                _record_usage_limit_reason(a.assignment_id, entry)
+            # NOTE: do NOT add to newly_failed — a relaunch would only
+            # re-propose the same split this leg already found.
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
             # the agent reports cancelled (e.g. after POST /cancel cleanup
