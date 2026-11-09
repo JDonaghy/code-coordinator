@@ -98,6 +98,17 @@ way, each wired below via :func:`_register_auto_action`:
   all; this cause only ever matters for a row that tick's own walk is no
   longer reaching (e.g. one #3888's `no_progress_rows` had to rescue from
   a budget-exhausted, silently-dropped episode).
+* ``queue_diagnose.CAUSE_MERGE_CONFLICT`` (#3918) — moved OFF the
+  investigate tier onto this allow-list: a merge conflict already has a
+  known-safe mechanical fix (the ordinary conflict-fix leg), so leaving it
+  on the investigate tier only meant it competed with every other
+  alert-eligible cause for the same scarce per-repo fix-it-leg budget
+  (quadraui#2160: that competition deferred it for six consecutive hourly
+  sweeps with nothing dispatched at all). ``conflict_fix_dispatch`` calls
+  the SAME `coord.conflict_fix.dispatch_conflict_fix` primitive the
+  reactive `coord merge` auto-drain tick already dispatches through the
+  instant IT raises a conflict — this is the periodic net for a STANDING
+  conflict that tick never revisits.
 
 Every other mechanical cause stays off this allow-list until it has the
 same kind of reviewed, narrowly-scoped evidence behind it — a wrong
@@ -734,6 +745,57 @@ def _redispatch_head_unmoved_conflict_fix(row: StuckRow) -> bool:
     return _run_mechanical_action("conflict_fix_redispatch", row, _body)
 
 
+def _dispatch_conflict_fix(row: StuckRow) -> bool:
+    """#3918: mechanically dispatch the ordinary conflict-fix for a
+    merge-queue entry GitHub already reports ``CONFLICT`` on, instead of
+    routing `queue_diagnose.CAUSE_MERGE_CONFLICT` through the investigate
+    tier's generic fix-it-leg budget.
+
+    A merge conflict has a known-safe mechanical fix — the SAME
+    `coord.conflict_fix.dispatch_conflict_fix` primitive the reactive
+    `coord merge` auto-drain tick already dispatches through the instant
+    IT raises a conflict — so it belongs on the C2 allow-list next to
+    ``CAUSE_MERGE_PENDING_STUCK``'s ``"merge"`` action, not in
+    :data:`INVESTIGATE_CAUSES` competing with every other cause for the
+    per-repo fix-it-leg budget (quadraui#2160: that competition deferred
+    this row for six consecutive hourly sweeps with no dispatch of any
+    kind).
+
+    Same shape as :func:`_redispatch_head_unmoved_conflict_fix` above —
+    calls `coord.board_doctor_permissions.dispatch_sweep_action` directly,
+    since this has no human-attended CLI verb either, so
+    `sweep_dispatch_conflict_fix` audits ``actor="sweep"`` itself. Returns
+    ``True`` only when the primitive confirms ``dispatched=True``; any
+    decline (no merge-queue entry, the entry no longer reads ``CONFLICT``,
+    no capable machine, one already in flight, or the retry cap already
+    spent) is a confirmed no-op, leaving the row for the normal convergence
+    counter to escalate if it recurs.
+    """
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
+
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="conflict_fix_dispatch",
+        )
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        result = dispatch_sweep_action(
+            "conflict_fix_dispatch", repo_name, issue_number, board, config,
+        )
+        if not result["dispatched"]:
+            return _warn_noop(
+                "conflict_fix_dispatch", repo_name, issue_number, result["detail"],
+            )
+        return True
+
+    return _run_mechanical_action("conflict_fix_dispatch", row, _body)
+
+
 def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
     """#3760 Action 5: re-dispatch a smoke leg that produced no verdict (#2244).
 
@@ -1041,6 +1103,11 @@ _register_auto_action(
     "conflict_fix_redispatch",
     _redispatch_head_unmoved_conflict_fix,
 )
+_register_auto_action(
+    queue_diagnose.CAUSE_MERGE_CONFLICT,
+    "conflict_fix_dispatch",
+    _dispatch_conflict_fix,
+)
 
 
 NO_INVESTIGATE_ENV_VAR = "COORD_BOARD_DOCTOR_NO_INVESTIGATE"
@@ -1314,23 +1381,21 @@ def _alert_fallback(row: StuckRow) -> bool:
 #: stop, as opposed to a row flailing on the same unresolved problem every
 #: round (vimcode#2018's ~14 legs/$31 overnight is exactly the blind
 #: relaunch the ceiling itself guards against; this set is strictly
-#: narrower than "the cause is still alert-eligible"). Extends #3777's
-#: original single-cause set (a HIGH-confidence diagnosed merge-conflict —
-#: the diagnosis itself is new evidence the ceiling's own
-#: ``remaining_fix_rounds`` exhaustion never saw, and the targeted remedy
-#: is a single bounded leg, not an open-ended retry stream) with the two
-#: causes that mean "this row's own history changed for reasons outside
-#: the fix itself": ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (the row already
-#: gave up on the ceiling but now reads completely clear live —
-#: review-approved, every check green, PR mergeable) and
-#: `queue_diagnose.CAUSE_CI_GREEN` (checks are green now, whatever broke
-#: them before has cleared). Every other cause, and every confidence
-#: `_fixit_rebudget_environmental` does not explicitly admit, stays
-#: governed by the ceiling exactly as before (#3767: uncertain defaults to
-#: NO, the conservative existing behavior).
+#: narrower than "the cause is still alert-eligible"): both mean "this
+#: row's own history changed for reasons outside the fix itself" —
+#: ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (the row already gave up on the
+#: ceiling but now reads completely clear live — review-approved, every
+#: check green, PR mergeable) and `queue_diagnose.CAUSE_CI_GREEN` (checks
+#: are green now, whatever broke them before has cleared). A diagnosed
+#: merge-conflict is NOT in this set (#3918 review): that cause moved off
+#: the investigate tier entirely onto the mechanical `conflict_fix_dispatch`
+#: allow-list action, which this ceiling never gates, so there is no
+#: `_investigate` call for it left to rebudget. Every other cause, and
+#: every confidence `_fixit_rebudget_environmental` does not explicitly
+#: admit, stays governed by the ceiling exactly as before (#3767: uncertain
+#: defaults to NO, the conservative existing behavior).
 _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES = frozenset(
     {
-        queue_diagnose.CAUSE_MERGE_CONFLICT,
         CAUSE_CEILING_BLOCKED_MERGEABLE,
         queue_diagnose.CAUSE_CI_GREEN,
     }
@@ -1355,18 +1420,13 @@ def _fixit_rebudget_environmental(row: StuckRow) -> bool:
     which can be arbitrarily stale (e.g. the PR has since merged) — that
     is not new evidence, so it must not count as environmental.
 
-    A diagnosed merge-conflict requires exactly `CONFIDENCE_HIGH` (#3777,
-    unchanged — the strongest signal `queue_diagnose` assigns).
-    ``CAUSE_CEILING_BLOCKED_MERGEABLE`` and `queue_diagnose.CAUSE_CI_GREEN`
-    instead require only ``confidence != CONFIDENCE_LOW``, because
-    `queue_diagnose` never assigns either of them `CONFIDENCE_HIGH` in the
-    first place — both always resolve to `CONFIDENCE_MEDIUM` — so a
+    Both admitted causes require only ``confidence != CONFIDENCE_LOW``,
+    because `queue_diagnose` never assigns either of them `CONFIDENCE_HIGH`
+    in the first place — both always resolve to `CONFIDENCE_MEDIUM` — so a
     ``== CONFIDENCE_HIGH`` bar would silently admit neither cause ever.
     """
     if not row.fresh or row.cause not in _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES:
         return False
-    if row.cause == queue_diagnose.CAUSE_MERGE_CONFLICT:
-        return row.confidence == queue_diagnose.CONFIDENCE_HIGH
     return row.confidence != queue_diagnose.CONFIDENCE_LOW
 
 
@@ -1790,7 +1850,11 @@ def _register_investigate_action(cause: str) -> None:
 
 for _investigate_cause in (
     queue_diagnose.CAUSE_PR_CLOSED,
-    queue_diagnose.CAUSE_MERGE_CONFLICT,
+    # #3918: `CAUSE_MERGE_CONFLICT` moved OFF the investigate tier onto the
+    # mechanical C2 allow-list above (`conflict_fix_dispatch`) — a merge
+    # conflict has a known-safe deterministic fix (the ordinary
+    # conflict-fix leg) and must never compete with every other
+    # alert-eligible cause for the shared per-repo fix-it-leg budget.
     queue_diagnose.CAUSE_DEAD_LEG,
     queue_diagnose.CAUSE_NO_PR,
     queue_diagnose.CAUSE_CI_RED,

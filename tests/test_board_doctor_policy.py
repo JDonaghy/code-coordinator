@@ -41,6 +41,7 @@ from coord.board_doctor_policy import (
     AUTO_DISPATCHERS,
     INVESTIGATE_CAUSES,
     _clear_stale_latch,
+    _dispatch_conflict_fix,
     _fixit_rebudget_eligible,
     _fixit_rebudget_environmental,
     _investigate,
@@ -121,7 +122,11 @@ class TestPolicyTierOf:
         # human-attended session would use. #3901 (#3887 case 4's
         # remainder) adds an eighth: a frozen blocked/parked row whose
         # `--after` prereqs have since landed gets the SAME requeue. Every
-        # other cause stays alert-tier.
+        # other cause stays alert-tier. #3918 adds a ninth: a diagnosed
+        # merge-conflict gets the ordinary mechanical conflict-fix leg
+        # dispatched directly, moved off the investigate tier so it never
+        # competes with every other alert-eligible cause for that tier's
+        # shared per-repo fix-it-leg budget.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
             queue_diagnose.CAUSE_PR_MERGED: "mark_done",
@@ -131,6 +136,7 @@ class TestPolicyTierOf:
             CAUSE_MERGE_PENDING_STUCK: "merge",
             CAUSE_CONFLICT_FIX_HEAD_UNMOVED: "conflict_fix_redispatch",
             CAUSE_AFTER_PREREQS_LANDED: "drive_queue_requeue",
+            queue_diagnose.CAUSE_MERGE_CONFLICT: "conflict_fix_dispatch",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:
@@ -164,9 +170,11 @@ class TestPolicyTierOf:
         # AUTO_DISPATCHERS (what the cause -> TIER_AUTO check actually
         # reads) but never in ALLOWLIST, which stays reserved for fixes
         # that touch the queue row itself (#3760).
+        # #3918: CAUSE_MERGE_CONFLICT moved OFF this tier onto the
+        # mechanical ALLOWLIST (`conflict_fix_dispatch`) — see
+        # test_allowlist_holds_exactly_the_3760_entries.
         assert INVESTIGATE_CAUSES == {
             queue_diagnose.CAUSE_PR_CLOSED,
-            queue_diagnose.CAUSE_MERGE_CONFLICT,
             queue_diagnose.CAUSE_DEAD_LEG,
             queue_diagnose.CAUSE_NO_PR,
             queue_diagnose.CAUSE_CI_RED,
@@ -1175,14 +1183,18 @@ class TestInvestigate:
         assert escalation is not None
         assert escalation["stage"] == "board-doctor:drive-queue"
 
-    def test_ceiling_bypass_dispatches_a_fixit_leg_for_a_high_confidence_merge_conflict(
+    def test_ceiling_bypass_dispatches_a_fixit_leg_for_a_fresh_ci_green_row(
         self, monkeypatch
     ) -> None:
         # #3777: the ceiling exists to stop a BLIND relaunch loop, not to
-        # suppress a fix-it leg a fresh, high-confidence diagnosis
-        # specifically calls for — a merge-conflict row still dispatches
-        # even though the drive-queue row already gave up on the #2972
-        # ceiling.
+        # suppress a fix-it leg a fresh, environmental diagnosis
+        # specifically calls for — a `ci-green` row (checks are green now,
+        # whatever broke them before has cleared) still dispatches even
+        # though the drive-queue row already gave up on the #2972 ceiling.
+        # #3918: `CAUSE_MERGE_CONFLICT` no longer exercises this bypass at
+        # all — it moved off the investigate tier onto the mechanical
+        # `conflict_fix_dispatch` allow-list action, which this ceiling
+        # never gates in the first place.
         monkeypatch.setattr(
             "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
             lambda repo_name, issue_number: True,
@@ -1200,63 +1212,22 @@ class TestInvestigate:
                 "detail": "acme/widgets#40 fix-it leg dispatched to mac1 (iteration 1)",
             },
         )
-        row = _row("acme/widgets#40", queue_diagnose.CAUSE_MERGE_CONFLICT)
+        row = _row(
+            "acme/widgets#40",
+            queue_diagnose.CAUSE_CI_GREEN,
+            confidence=queue_diagnose.CONFIDENCE_MEDIUM,
+            fresh=True,
+        )
 
         assert _investigate(row) is True
         assert state.list_drive_escalations() == []
 
-    def test_ceiling_still_blocks_a_merge_conflict_row_below_high_confidence(
-        self, monkeypatch
-    ) -> None:
-        # The bypass is HIGH-confidence only — a merge-conflict diagnosis
-        # that is not the fleet's strongest signal still falls back to the
-        # alert tier exactly like any other ceiling-blocked row.
-        monkeypatch.setattr(
-            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
-            lambda repo_name, issue_number: True,
-        )
-
-        def boom_if_called(path, **kwargs):
-            raise AssertionError(
-                "config must not be resolved once the ceiling check blocks"
-            )
-
-        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
-
-        def dispatch_must_not_be_called(*args, **kwargs):
-            raise AssertionError(
-                "dispatch_sweep_action must not run once the ceiling check blocks"
-            )
-
-        monkeypatch.setattr(
-            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
-        )
-
-        row = StuckRow(
-            queue="drive-queue",
-            key="acme/widgets#40",
-            state="stuck",
-            cause=queue_diagnose.CAUSE_MERGE_CONFLICT,
-            confidence=queue_diagnose.CONFIDENCE_MEDIUM,
-            evidence=("cause=merge-conflict",),
-            fresh=True,
-        )
-
-        assert _investigate(row) is False
-        escalation = state.get_drive_escalation("acme/widgets", 40)
-        assert escalation is not None
-        assert escalation["stage"] == "board-doctor:drive-queue"
-
-    def test_ceiling_still_blocks_a_stale_high_confidence_merge_conflict_row(
-        self, monkeypatch
-    ) -> None:
-        # #3777: a HIGH-confidence merge-conflict row is only new evidence
-        # when it is this sweep's own live verdict (`StuckRow.fresh`) — a
-        # row reconstructed from a possibly arbitrarily-old stored
-        # `block_log` diagnosis (`fresh=False`, e.g. via
-        # `coord.board_doctor._episode_stuck_row`) must not bypass the
-        # ceiling just because it happens to carry a stale high-confidence
-        # cause/confidence pair.
+    def test_ceiling_still_blocks_a_merge_conflict_row(self, monkeypatch) -> None:
+        # #3918: `CAUSE_MERGE_CONFLICT` is not in `INVESTIGATE_CAUSES`
+        # anymore, so `_fixit_rebudget_environmental` never admits it — a
+        # ceiling-blocked merge-conflict row (if `_investigate` were ever
+        # called for one, which the real sweep no longer does) falls back
+        # to the alert tier exactly like any other ceiling-blocked row.
         monkeypatch.setattr(
             "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
             lambda repo_name, issue_number: True,
@@ -1285,6 +1256,51 @@ class TestInvestigate:
             cause=queue_diagnose.CAUSE_MERGE_CONFLICT,
             confidence=queue_diagnose.CONFIDENCE_HIGH,
             evidence=("cause=merge-conflict",),
+            fresh=True,
+        )
+
+        assert _investigate(row) is False
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+
+    def test_ceiling_still_blocks_a_stale_ci_green_row(
+        self, monkeypatch
+    ) -> None:
+        # #3777: an environmental row is only new evidence when it is this
+        # sweep's own live verdict (`StuckRow.fresh`) — a row reconstructed
+        # from a possibly arbitrarily-old stored `block_log` diagnosis
+        # (`fresh=False`, e.g. via `coord.board_doctor._episode_stuck_row`)
+        # must not bypass the ceiling just because it happens to carry an
+        # otherwise-environmental cause/confidence pair.
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+
+        def boom_if_called(path, **kwargs):
+            raise AssertionError(
+                "config must not be resolved once the ceiling check blocks"
+            )
+
+        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "dispatch_sweep_action must not run once the ceiling check blocks"
+            )
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#40",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_CI_GREEN,
+            confidence=queue_diagnose.CONFIDENCE_MEDIUM,
+            evidence=("cause=ci-green",),
             fresh=False,
         )
 
@@ -1307,7 +1323,14 @@ class TestFixitRebudgetEnvironmental:
     classifies.
     """
 
-    def test_high_confidence_fresh_merge_conflict_is_environmental(self) -> None:
+    def test_merge_conflict_is_no_longer_environmental_even_at_high_confidence(
+        self,
+    ) -> None:
+        # #3918: CAUSE_MERGE_CONFLICT moved OFF the investigate tier onto
+        # the mechanical `conflict_fix_dispatch` allow-list action, which
+        # this ceiling never gates — there is no `_investigate` call for
+        # this cause left to rebudget, so it reads as flailing (never
+        # environmental) regardless of confidence.
         row = _row(
             "acme/widgets#40",
             queue_diagnose.CAUSE_MERGE_CONFLICT,
@@ -1315,11 +1338,9 @@ class TestFixitRebudgetEnvironmental:
             fresh=True,
         )
 
-        assert _fixit_rebudget_environmental(row) is True
+        assert _fixit_rebudget_environmental(row) is False
 
     def test_medium_confidence_merge_conflict_is_flailing(self) -> None:
-        # #3777: merge-conflict keeps its original HIGH-only bar — a
-        # weaker diagnosis is not the new evidence the bypass exists for.
         row = _row(
             "acme/widgets#40",
             queue_diagnose.CAUSE_MERGE_CONFLICT,
@@ -1406,8 +1427,8 @@ class TestFixitRebudgetEnvironmental:
 
         row = _row(
             "acme/widgets#40",
-            queue_diagnose.CAUSE_MERGE_CONFLICT,
-            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            queue_diagnose.CAUSE_CI_GREEN,
+            confidence=queue_diagnose.CONFIDENCE_MEDIUM,
             fresh=True,
         )
 
@@ -1782,11 +1803,14 @@ class TestInvestigateCapacityCheck:
     (`FIXIT_LEG_BUDGET_DEFAULT`, deliberately independent of a repo's
     `max_parallel` throughput ceiling) bounds how many fix-it legs one
     sweep dispatches — the rest defer to the next hourly sweep instead of
-    fanning out unbounded, and a deferred row carries no convergence or
-    escalation side effect of its own. Every test here is given a
-    `max_parallel` far above the budget, so a dispatch that got through
-    on ordinary queue capacity rather than the budget would show up as a
-    failure here.
+    fanning out unbounded. #3918: a deferred row's convergence counter
+    still bumps ("this cause observed again" regardless of whether this
+    sweep's own budget let it act), and a deferral that recurs for
+    `CONVERGENCE_LIMIT` consecutive sweeps escalates exactly like any
+    other row past the limit — see `TestDeferredRowEscalates` below. Every
+    test here is given a `max_parallel` far above the budget, so a
+    dispatch that got through on ordinary queue capacity rather than the
+    budget would show up as a failure here.
     """
 
     @staticmethod
@@ -1838,10 +1862,12 @@ class TestInvestigateCapacityCheck:
         assert actions["acme/widgets#42"] == "investigate-deferred"
         assert dispatched == ["acme/widgets#40"]
 
-        # Deferred rows never had their convergence counter bumped, and no
-        # escalation was ever filed for them.
-        assert state.board_doctor_row_state("drive-queue", "acme/widgets#41") == {}
-        assert state.board_doctor_row_state("drive-queue", "acme/widgets#42") == {}
+        # #3918: a deferred row's convergence counter DOES bump now — "this
+        # cause observed again" is true whether or not this sweep's own
+        # budget let it act on that observation — but one sweep is nowhere
+        # near `CONVERGENCE_LIMIT`, so neither deferred row escalates yet.
+        assert state.board_doctor_row_state("drive-queue", "acme/widgets#41")["count"] == 1
+        assert state.board_doctor_row_state("drive-queue", "acme/widgets#42")["count"] == 1
         for d in report.decisions:
             if d.action == "investigate-deferred":
                 assert d.escalated is False
@@ -2061,6 +2087,133 @@ class TestInvestigateCapacityCheck:
             ),
         )
         assert make_investigate_capacity_check(config)(row) is True
+
+
+class TestDeferredRowEscalates:
+    """#3918: a row the investigate tier's capacity gate keeps deferring
+    must still escalate once it has recurred for `CONVERGENCE_LIMIT`
+    consecutive sweeps — never deferred forever with a frozen counter
+    (quadraui#2160: six consecutive hourly sweeps all logged
+    `investigate-deferred, count=0`).
+    """
+
+    def test_deferral_bumps_the_convergence_counter(self, monkeypatch) -> None:
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        def always_defer(row: StuckRow) -> bool:
+            return True
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False,
+            capacity_check=always_defer,
+        )
+
+        assert report.decisions[0].action == "investigate-deferred"
+        assert report.decisions[0].count == 1
+        assert state.board_doctor_row_state("drive-queue", "acme/widgets#40")["count"] == 1
+
+    def test_deferral_past_the_convergence_limit_escalates(self, monkeypatch) -> None:
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        def always_defer(row: StuckRow) -> bool:
+            return True
+
+        alerted: list[str] = []
+
+        def alert_dispatcher(row: StuckRow) -> bool:
+            alerted.append(row.key)
+            return True
+
+        last_report = None
+        for _ in range(CONVERGENCE_LIMIT):
+            last_report = sweep(
+                [row],
+                tier_of=policy_tier_of,
+                auto_dispatchers=AUTO_DISPATCHERS,
+                alert_dispatcher=alert_dispatcher,
+                capacity_check=always_defer,
+            )
+
+        # The first CONVERGENCE_LIMIT - 1 sweeps only bumped the counter;
+        # the one that pushes count to CONVERGENCE_LIMIT escalates instead
+        # of deferring forever.
+        assert alerted == ["acme/widgets#40"]
+        decision = last_report.decisions[0]
+        assert decision.action == "alert"
+        assert decision.escalated is True
+        assert decision.count == CONVERGENCE_LIMIT
+        assert (
+            state.board_doctor_row_state("drive-queue", "acme/widgets#40")["escalated"]
+            is True
+        )
+
+    def test_a_row_let_through_never_escalates_via_the_deferred_path(
+        self, monkeypatch
+    ) -> None:
+        # A row that is never actually capacity-deferred must not pick up
+        # any side effect from the deferred branch at all.
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        def never_defer(row: StuckRow) -> bool:
+            return False
+
+        def alert_must_not_fire(row: StuckRow) -> bool:
+            raise AssertionError("a freshly-observed row must not alert yet")
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers={queue_diagnose.CAUSE_CI_RED: lambda row: True},
+            alert_dispatcher=alert_must_not_fire,
+            capacity_check=never_defer,
+        )
+
+        assert report.decisions[0].action == "auto-dispatch"
+        assert report.decisions[0].count == 1
+
+
+class TestDispatchConflictFixMechanical:
+    """#3918: `queue_diagnose.CAUSE_MERGE_CONFLICT` dispatches the ordinary
+    mechanical conflict-fix leg directly (`conflict_fix_dispatch`) rather
+    than competing for the investigate tier's shared fix-it-leg budget.
+    """
+
+    def test_dispatches_through_the_sweep_action(self, monkeypatch) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: object())
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {"dispatched": True, "detail": "dispatched conflict-fix-1"},
+        )
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_MERGE_CONFLICT)
+
+        assert _dispatch_conflict_fix(row) is True
+
+    def test_a_declined_dispatch_is_a_confirmed_noop_not_an_alert(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: object())
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {"dispatched": False, "detail": "no merge-queue entry"},
+        )
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_MERGE_CONFLICT)
+
+        assert _dispatch_conflict_fix(row) is False
+        # No `drive_escalations` row — a mechanical allow-list action has
+        # no alert-fallback of its own, unlike `_investigate`.
+        assert state.get_drive_escalation("acme/widgets", 40) is None
+
+    def test_unparseable_key_does_not_raise(self) -> None:
+        row = _row("no-hash-separator", queue_diagnose.CAUSE_MERGE_CONFLICT)
+
+        assert _dispatch_conflict_fix(row) is False
 
 
 class TestFixitLegBudgetConfigKnob:
@@ -2821,10 +2974,12 @@ class TestReclassifyStaleLatch:
         )
 
         assert reclassified[0].cause == queue_diagnose.CAUSE_MERGE_CONFLICT
-        # Still routes to the #3769 investigate lane, not the mechanical
-        # clear_latch allowlist entry — the whole point of not relabelling it.
-        assert queue_diagnose.CAUSE_MERGE_CONFLICT in INVESTIGATE_CAUSES
-        assert queue_diagnose.CAUSE_MERGE_CONFLICT not in ALLOWLIST
+        # Still routes to its own #3918 mechanical conflict-fix dispatch,
+        # not the `clear_latch` allowlist entry this reclassifier would
+        # otherwise promote a stale, non-conflict latch to — the whole
+        # point of not relabelling it.
+        assert ALLOWLIST.get(queue_diagnose.CAUSE_MERGE_CONFLICT) == "conflict_fix_dispatch"
+        assert ALLOWLIST.get(queue_diagnose.CAUSE_MERGE_CONFLICT) != "clear_latch"
         assert policy_tier_of(queue_diagnose.CAUSE_MERGE_CONFLICT) == TIER_AUTO
 
     def test_never_touches_a_drive_queue_row_with_the_same_cause_name(self, monkeypatch) -> None:
