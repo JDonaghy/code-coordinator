@@ -4681,10 +4681,11 @@ def claim_smoke_dispatch(work_assignment_id: str, capability_partition: str) -> 
     ``coord.smoke._dispatch_smoke_fanout``/``_dispatch_smoke_single_leg``
     themselves (a partition/row whose claim they won but then failed to
     dispatch on, e.g. no reachable machine this tick) and
-    :func:`release_smoke_claim_if_row_is_smoke_leg` (the leg's own
-    terminal-status write), so a legitimate later retry of the same
-    partition/row (an environmental death, or an operator ``coord stop``)
-    is never permanently stranded by a claim nothing will ever release.
+    :func:`release_smoke_claim_if_row_is_smoke_leg` (the leg's own terminal
+    transition and terminal-status write), so a legitimate later retry of
+    the same partition/row (an environmental death, or an operator ``coord
+    stop``) is never permanently stranded by a claim nothing will ever
+    release.
     """
     if not work_assignment_id or not capability_partition:
         return True
@@ -4831,8 +4832,12 @@ def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
     self-report / git-floor backstop path) and this module's own
     :func:`_mark_notified_local` (the ``coord notify`` polling path a
     reaped/cancelled leg's terminal write goes through when no daemon
-    reconcile tick got there first). One shared function closes the gap for
-    both existing callers and any future one, same #2096/#3206 reasoning.
+    reconcile tick got there first) — plus, for smoke legs only,
+    ``coord.notify._release_smoke_dispatch_claim_for_leg`` on the smoke
+    terminal-transition arms themselves, so the release does not hang off
+    whether the notification-ledger write happened. One shared function
+    closes the gap for every caller, present and future, same #2096/#3206
+    reasoning.
 
     #3920: before this, a single-leg row's claim had no release path at all
     here — ``smoke_leg_capabilities(row_title)`` reads ``None`` for an
