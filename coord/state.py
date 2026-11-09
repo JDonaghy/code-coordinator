@@ -3760,6 +3760,7 @@ def _mark_notified_local(
         EVENT_FAILURE,
         EVENT_LIVENESS_STALL,
         EVENT_NEEDS_ATTENTION,
+        EVENT_NEEDS_DECOMPOSITION,
         EVENT_PLAN,
         EVENT_REFUSED_POLICY,
         EVENT_REFUSED_PREMISE,
@@ -3827,6 +3828,17 @@ def _mark_notified_local(
         # the classification back to `status='failed'`.
         sql.execute(conn,
             "UPDATE assignments SET status='refused_premise', finished_at=? WHERE assignment_id=?",
+            (now, assignment_id),
+        )
+    elif event == EVENT_NEEDS_DECOMPOSITION:
+        # #3931: mirrors the EVENT_REFUSED_PREMISE branch immediately above,
+        # for the same reason — without this, the just-posted "Needs Epic
+        # Decomposition" GitHub comment would be followed by this same call
+        # falling into the bare `else` below and overwriting the
+        # classification back to `status='failed'`, which would also spend
+        # an attempt on the next reconcile instead of parking.
+        sql.execute(conn,
+            "UPDATE assignments SET status='needs_decomposition', finished_at=? WHERE assignment_id=?",
             (now, assignment_id),
         )
     else:
@@ -6223,15 +6235,19 @@ def _update_assignment_claude_session_id_local(
     conn.commit()
 
 
-# #3314: the terminal statuses `_mark_notified_local` ever writes to
+# #3314/#3931: the terminal statuses `_mark_notified_local` ever writes to
 # `assignments.status` — kept as one literal tuple so
 # `list_assignments_missing_claude_session_id`'s WHERE clause can't silently
-# drift from what a completed/failed/advisory/refused-* row actually looks
-# like on this table. `_mark_notified_local` folds EVENT_FAILURE *and*
-# entry_status=='cancelled' (see `coord.notify.detect_transitions`) into the
-# same `status='failed'` write, so 'cancelled' is deliberately not a separate
-# member here — no row is ever persisted with that literal status.
-_TERMINAL_ASSIGNMENT_STATUSES = ("done", "failed", "advisory", "refused_policy", "refused_premise")
+# drift from what a completed/failed/advisory/refused-*/needs_decomposition
+# row actually looks like on this table. `_mark_notified_local` folds
+# EVENT_FAILURE *and* entry_status=='cancelled' (see `coord.notify.
+# detect_transitions`) into the same `status='failed'` write, so 'cancelled'
+# is deliberately not a separate member here — no row is ever persisted
+# with that literal status.
+_TERMINAL_ASSIGNMENT_STATUSES = (
+    "done", "failed", "advisory", "refused_policy", "refused_premise",
+    "needs_decomposition",
+)
 
 
 def list_assignments_missing_claude_session_id(
@@ -6706,6 +6722,32 @@ def mark_refused_premise_settled(assignment_id: str) -> None:
     sql.execute(conn,
         "UPDATE assignments SET status='merged' WHERE assignment_id=? "
         "AND status='refused_premise'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
+def mark_needs_decomposition_settled(assignment_id: str) -> None:
+    """#3931: flip a needs_decomposition row to 'merged' when its issue is
+    terminal.
+
+    Same shape as `mark_refused_premise_settled` above, for the same
+    reason: a `needs_decomposition` row (a worker's 0-commit clean exit
+    concluding the issue needs epic decomposition — `coord.agent.
+    NEEDS_DECOMPOSITION`) is never touched by the #609 sweep (which only
+    looks at status='done' work rows), so it would otherwise linger on the
+    board forever even after the issue is decomposed/closed and lands.
+
+    Idempotent: only transitions rows still carrying status=
+    'needs_decomposition'. Silently no-ops when the row doesn't exist or is
+    already settled.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    sql.execute(conn,
+        "UPDATE assignments SET status='merged' WHERE assignment_id=? "
+        "AND status='needs_decomposition'",
         (assignment_id,),
     )
     conn.commit()

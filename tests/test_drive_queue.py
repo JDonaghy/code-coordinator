@@ -69,7 +69,12 @@ from coord.drive_queue import (
     unreachable_wait_alert,
     validate_enqueue,
 )
-from coord.models import EPIC_DECOMPOSE_TYPE, MERGE_LANDED_MARKER, PREMISE_REFUSAL_MARKER
+from coord.models import (
+    EPIC_DECOMPOSE_TYPE,
+    MERGE_LANDED_MARKER,
+    NEEDS_DECOMPOSITION_MARKER,
+    PREMISE_REFUSAL_MARKER,
+)
 
 REPO = "claude-coordinator"
 
@@ -479,10 +484,12 @@ def test_build_board_view_defaults_merge_resolution_to_resolved():
 
 
 def test_build_board_view_reads_already_done_off_a_refused_premise_row():
-    # #3931: a `refused_premise` row's own `completion_summary` carries the
-    # `WORK_OUTCOME: already-done` marker (or the #3923 prose heuristic) —
-    # read with no extra `gh` call, same precedent as `merge_resolution`
-    # above.
+    # #3931: a `refused_premise` row's own `completion_summary` carries an
+    # explicit `WORK_OUTCOME: already-done` marker — the ONLY way this flag
+    # is ever set True (the #3923 prose heuristic alone classifies the same
+    # finding as `"premise"`, never `"already_done"` — see the negative
+    # case below). Read with no extra `gh` call, same precedent as
+    # `merge_resolution` above.
     view = build_board_view(
         {
             "assignments": [
@@ -501,6 +508,35 @@ def test_build_board_view_reads_already_done_off_a_refused_premise_row():
     )
     facts = view.facts(entry_key(REPO, 2256))
     assert facts.already_done
+
+
+def test_build_board_view_does_not_flag_already_done_prose_without_a_marker():
+    """The #3923 prose heuristic alone (no `WORK_OUTCOME:` marker) matches
+    this text as an "already implemented" `refused_premise`
+    (`classify_zero_commit_refusal` → `"premise"`), but
+    `classify_zero_commit_outcome` only ever returns `"already_done"` from
+    an EXPLICIT marker — so this flag stays `False` even though the prose
+    reads exactly like the positive-marker test above. Closes the gap the
+    #3931 review flagged: a comment overclaiming prose coverage here would
+    be masking that every pre-#3931-marker already-done park still fails to
+    release its dependents."""
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 2258, "type": "work",
+                    "status": "refused_premise",
+                    "completion_summary": (
+                        "RowAlign and FormSpacing::padding are already "
+                        "fully implemented and merged into `develop`."
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2258))
+    assert not facts.already_done
 
 
 def test_build_board_view_does_not_flag_a_generic_premise_refusal_as_already_done():
@@ -4685,6 +4721,97 @@ def test_a_premise_refusal_and_a_policy_refusal_are_never_conflated():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #3931 item 3: a needs-decomposition leg — a worker that reaped
+# `coord.agent.NEEDS_DECOMPOSITION` (clean exit, 0 commits, its own final
+# message or `WORK_OUTCOME:` marker concludes the issue needs epic
+# decomposition) — parks exactly like a premise refusal above: same
+# no-attempt-spent accounting, same "never auto-resumes" posture. The remedy
+# text differs again: decompose + close/re-scope, no retarget and no
+# `clear-refusal`-style recheck.
+# ═══════════════════════════════════════════════════════════════════════════
+
+NEEDS_DECOMPOSITION_REASON = (
+    "drive exited for quadraui#3922 (exit_code=1): work 70028f73bfbb "
+    "concluded the issue needs epic decomposition rather than one leg of "
+    "work — the worker did the CORRECT thing (#3931). "
+    f"{NEEDS_DECOMPOSITION_MARKER}"
+)
+
+
+def test_a_needs_decomposition_leg_parks_without_spending_an_attempt():
+    entries = [entry(3922, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 3922): NEEDS_DECOMPOSITION_REASON},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == "parked"
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()  # NOT terminal `blocked`
+    assert plan.launch is None  # NOT relaunched — this is item 3's whole point
+    assert NEEDS_DECOMPOSITION_REASON in reconcile.reason
+    assert NEEDS_DECOMPOSITION_REASON in reconcile.updates["last_reason"]
+
+
+def test_a_needs_decomposition_park_reason_names_decomposition_not_retarget_or_recheck():
+    entries = [entry(3922, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 3922): NEEDS_DECOMPOSITION_REASON},
+    )
+    reason = plan.reconciles[0].reason
+    assert "retarget" not in reason
+    assert "clear-refusal" not in reason
+    assert "decompose" in reason
+
+
+def test_a_parked_needs_decomposition_leg_does_not_auto_resume_next_tick():
+    """Without the #3931 pre-pass check this reads exactly like a cleared
+    CI park and would flip back to `waiting`, relaunching into the identical
+    split proposal every tick — #3922's incident (three legs, ~$0.90, same
+    answer) replayed forever."""
+    entries = [
+        entry(3922, position=3, state="parked", attempts=0,
+              last_reason=NEEDS_DECOMPOSITION_REASON)
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()  # left alone — still parked
+    assert plan.launch is None
+
+
+def test_a_parked_needs_decomposition_leg_still_reconciles_to_done_if_it_lands_by_hand():
+    """A human decomposing the issue and merging it out of band must not
+    leave the entry parked forever — the #2055 landed-check still applies."""
+    entries = [entry(3922, position=3, state="parked", attempts=0,
+                      last_reason=NEEDS_DECOMPOSITION_REASON)]
+    plan = plan_tick(entries, board(merged=(3922,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_needs_decomposition_leg_and_a_premise_refusal_are_never_conflated():
+    entries = [
+        entry(3922, position=1, state=STATE_RUNNING, attempts=0),
+        entry(812, position=2, state=STATE_RUNNING, attempts=0),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        exit_reasons={
+            entry_key(REPO, 3922): NEEDS_DECOMPOSITION_REASON,
+            entry_key(REPO, 812): PREMISE_REFUSAL_REASON,
+        },
+    )
+    by_key = {r.key: r for r in plan.reconciles}
+    decomp_reason = by_key[entry_key(REPO, 3922)].reason
+    premise_reason = by_key[entry_key(REPO, 812)].reason
+    assert decomp_reason != premise_reason
+    assert "decompose" in decomp_reason
+    assert "decompose" not in premise_reason
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #3931 item 4: an `after=` pre-req parked `refused_premise` on the
 # "already implemented" finding satisfies its dependent immediately.
 #
@@ -4724,6 +4851,27 @@ def test_after_prereq_parked_as_a_generic_premise_refusal_still_waits():
         entry(1654, position=1, after=(dep_key,), state=STATE_WAITING),
     ]
     plan = plan_tick(entries, board(), capacity=2)
+    assert plan.launch is None
+
+
+def test_after_prereq_parked_as_already_done_then_reopened_does_not_release_dependent():
+    """#3384's `reopened` override, replayed through the #3931 `already_done`
+    door: `already_done` is read off a HISTORICAL `refused_premise` row's
+    `completion_summary` and is never invalidated on its own, so if the
+    issue is later reopened — GitHub's own witness that the earlier finding
+    did not actually finish the work — this must stop releasing the
+    dependent, exactly like `IssueFacts.landed`'s own `reopened` override.
+    Without this, claude-coordinator#3380's incident (every entry gated
+    `--after` it released anyway) replays through the new door."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(1650, position=0, state=STATE_PARKED, attempts=0,
+              last_reason=f"already implemented — {PREMISE_REFUSAL_MARKER}"),
+        entry(1654, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(already_done=(1650,), reopened=(1650,)), capacity=2,
+    )
     assert plan.launch is None
 
 

@@ -107,12 +107,15 @@ MIN_SCHEMA_VERSION = 1
 
 # #762: terminal assignment statuses.  Anything NOT in this set (running /
 # pending) is "in-flight" and always kept on the board projection.
-# #2234/#3164: "refused_policy"/"refused_premise" are terminal exactly like
-# "advisory" — see coord.agent.REFUSED_POLICY / REFUSED_PREMISE.
+# #2234/#3164/#3931: "refused_policy"/"refused_premise"/"needs_decomposition"
+# are terminal exactly like "advisory" — see coord.agent.REFUSED_POLICY /
+# REFUSED_PREMISE / NEEDS_DECOMPOSITION. Mirrored in
+# coord.entry_truth._TERMINAL_STATUSES and coord.drive_state.TERMINAL_STATUSES
+# — update all three together (#2096).
 TERMINAL_STATUSES = frozenset(
     {
         "done", "merged", "failed", "cancelled", "advisory",
-        "refused_policy", "refused_premise",
+        "refused_policy", "refused_premise", "needs_decomposition",
     }
 )
 

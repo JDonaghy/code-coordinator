@@ -113,6 +113,7 @@ from coord.models import (
     EPIC_DECOMPOSE_TYPE,
     DEFAULT_ISSUE_RESOLUTION,
     is_merge_landed_reason,
+    is_needs_decomposition_reason,
     is_policy_refusal_reason,
     is_premise_refusal_reason,
     parse_issue_resolution,
@@ -2176,10 +2177,15 @@ class IssueFacts:
     # #3931: a work-like assignment reaped `coord.agent.REFUSED_PREMISE`
     # whose own 0-commit refusal was specifically the "already implemented"
     # shape (`coord.worker_events.classify_zero_commit_outcome` ==
-    # ``"already_done"`` — an explicit `WORK_OUTCOME: already-done` marker,
-    # or the #3923 prose heuristic it overrides when both are present) —
-    # see `build_board_view`'s population of this field for exactly which
-    # text it reads this off.
+    # ``"already_done"``). That only ever happens from an EXPLICIT
+    # `WORK_OUTCOME: already-done` marker — the #3923 prose heuristic
+    # (`looks_like_premise_refusal`'s six-phrase list) classifies the exact
+    # same "already implemented" finding as plain ``"premise"``, never
+    # ``"already_done"``, so a pre-#3931 worker whose message matches only
+    # that prose still parks `refused_premise` but leaves this flag `False`
+    # — its dependent still waits on an operator's `clear-refusal`, same as
+    # before this issue. See `build_board_view`'s population of this field
+    # for exactly which text it reads this off.
     #
     # Distinct from the generic `refused_premise` shape (a worker finding the
     # issue's stated PREREQUISITE unmet, not already satisfied): that shape
@@ -2593,7 +2599,7 @@ def build_board_view(
                 summary = row.get("completion_summary")
                 if summary:
                     entry["merge_resolution"] = parse_issue_resolution(summary).value
-        if status == "refused_premise":
+        if status == "refused_premise" and (row.get("type") or "") in CLOSES_ISSUE_TYPES:
             # #3931: the SAME `completion_summary` column every other field
             # on this loop reads, checked for the "already implemented"
             # shape specifically — see `IssueFacts.already_done`'s
@@ -2603,6 +2609,13 @@ def build_board_view(
             # `entry.setdefault`'s own `False` default already covers "no
             # row said already_done yet", so only the positive case needs
             # writing here.
+            #
+            # Scoped to `CLOSES_ISSUE_TYPES`, mirroring the `merge_resolution`
+            # read immediately above (#3502's precedent in this same loop):
+            # a `mock-author`/`test-author`/`epic-decompose` row's merge does
+            # not close the issue, so its own "already implemented" finding
+            # must not flip the issue-level `already_done` flag or release
+            # every `--after` dependent on its say alone.
             summary = row.get("completion_summary")
             if summary and classify_zero_commit_outcome(summary) == "already_done":
                 entry["already_done"] = True
@@ -3659,7 +3672,7 @@ def _resolve_prereqs(
         if hold is not None:
             return _Verdict(False, False, _gate_defer_reason(dep, hold))
         facts = board.facts(dep)
-        if facts.landed or facts.already_done:
+        if facts.landed or (facts.already_done and not facts.reopened):
             # #3931: `already_done` — *dep* parked `refused_premise` on the
             # specific "already implemented" finding (`IssueFacts.
             # already_done`'s docstring) — satisfies this `--after` edge
@@ -3670,6 +3683,15 @@ def _resolve_prereqs(
             # that nothing was dispatching, wrong that anything needed to:
             # the whole reason for the park IS that the work is already
             # there.
+            #
+            # `not facts.reopened` mirrors `IssueFacts.landed`'s own
+            # `reopened` override (#3384): `already_done` is read off a
+            # historical `refused_premise` row's `completion_summary` and is
+            # never invalidated on its own, so an operator reopening the
+            # issue afterward — GitHub's own witness that the earlier
+            # finding did not actually finish the work — must stop this
+            # edge from releasing, the same claude-coordinator#3380 shape
+            # `landed` already guards against.
             continue
         dep_state = states.get(dep)
         if dep_state is not None:
@@ -3854,7 +3876,7 @@ def diagnose_blocked_after(
     unsatisfied = tuple(
         dep for dep in entry.after
         if not board.facts(dep).landed
-        and not board.facts(dep).already_done
+        and not (board.facts(dep).already_done and not board.facts(dep).reopened)
         and not live_terminal.get(dep)
         and states.get(dep) not in STATE_DONE_LIKE
     )
@@ -5690,6 +5712,40 @@ def _reconcile_running(
             "they assumed. If the prerequisite has since landed, `coord "
             "drive-queue clear-refusal <repo> <issue> --reason \"...\"` "
             "then `remove` + `add` dispatches fresh work (#3339)."
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
+    # #3931 rides the SAME evidence as `refused_policy`/`refused_premise`
+    # above — the drive's own `drive_exited` reason — for the THIRD
+    # permanent shape: `coord.drive.decide` marks a `needs_decomposition`
+    # work row with `NEEDS_DECOMPOSITION_MARKER` (coord.models) when the
+    # worker concluded the issue itself needs epic decomposition rather than
+    # one leg of work. Parks with no attempt spent, same as the other two —
+    # relaunching reproduces the identical split proposal (#3922's
+    # incident), so there is nothing a retry could discover that this leg
+    # did not already report. The remediation text names the operator
+    # action (decompose + close/re-scope) rather than a retarget or a
+    # `clear-refusal`-style recheck — unlike a premise refusal, there is no
+    # "the prerequisite has since landed" escape hatch here.
+    if own_reason and is_needs_decomposition_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt (#3931); "
+            "needs the coordinator, not a relaunch — decompose the issue "
+            "into the proposed sub-issues (posted to the issue) and close "
+            "or re-scope this one, then dispatch the replacements normally."
         )
         return (
             Reconcile(
@@ -8443,6 +8499,14 @@ def plan_tick(
         # human re-scopes/closes the issue and clears it by hand (`coord
         # drive-queue remove`).
         if is_premise_refusal_reason(entry.last_reason):
+            continue
+        # #3931: a needs-decomposition park has the SAME "no external
+        # verdict to poll for" shape as the two checks just above — the
+        # issue needs decomposing, and nothing on the board signals when
+        # that has happened, so this never resumes itself either. Stays
+        # parked until a human decomposes the issue and clears it by hand
+        # (`coord drive-queue remove`).
+        if is_needs_decomposition_reason(entry.last_reason):
             continue
         # #2977: a throttle-skip park (`github_ops.is_throttle_skip_reason`)
         # carries its OWN known wall-clock expiry (`until=<epoch>`, embedded

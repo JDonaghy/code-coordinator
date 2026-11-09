@@ -67,21 +67,29 @@ if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.merge_queue import GhOps
     from coord.models import Board
 
-# #2234/#3164 (see coord.dao.TERMINAL_STATUSES's own comment): the two
-# terminal `Assignment.status` values a worker leg ends in when it refused
-# to do the requested work rather than failing at it. Inlined as literals
-# here (mirroring dao.py's own convention) rather than importing coord.agent
-# — a large module this one has no other reason to pull in — for the two
-# string constants it defines: `coord.agent.REFUSED_POLICY`/`REFUSED_PREMISE`.
+# #2234/#3164/#3931 (see coord.dao.TERMINAL_STATUSES's own comment): the
+# three terminal `Assignment.status` values a worker leg ends in when it
+# refused to do the requested work rather than failing at it. Inlined as
+# literals here (mirroring dao.py's own convention) rather than importing
+# coord.agent — a large module this one has no other reason to pull in —
+# for the three string constants it defines: `coord.agent.REFUSED_POLICY`/
+# `REFUSED_PREMISE`/`NEEDS_DECOMPOSITION`.
 _REFUSED_POLICY = "refused_policy"
 _REFUSED_PREMISE = "refused_premise"
+_NEEDS_DECOMPOSITION = "needs_decomposition"
 
 # Mirrors `coord.dao.TERMINAL_STATUSES` (inlined for the same reason as the
-# two constants above — this module has no other reason to import `coord.dao`
-# or `coord.agent`). Anything NOT in this set is still running: dispatching a
-# review/test/merge action for it would race the in-flight leg.
+# three constants above — this module has no other reason to import
+# `coord.dao` or `coord.agent`). Anything NOT in this set is still running:
+# dispatching a review/test/merge action for it would race the in-flight
+# leg. Keep in sync with `coord.dao.TERMINAL_STATUSES` and
+# `coord.drive_state.TERMINAL_STATUSES` (#2096) — a status added to one and
+# not the others reads a reaped leg as still in flight, forever.
 _TERMINAL_STATUSES = frozenset(
-    {"done", "merged", "failed", "cancelled", "advisory", _REFUSED_POLICY, _REFUSED_PREMISE}
+    {
+        "done", "merged", "failed", "cancelled", "advisory",
+        _REFUSED_POLICY, _REFUSED_PREMISE, _NEEDS_DECOMPOSITION,
+    }
 )
 
 # next_action vocabulary. "unknown" is deliberately distinct from any of
@@ -343,7 +351,9 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         return NEXT_ACTION_MARK_DONE, "issue is already closed"
     if truth.pr_state == "merged":
         return NEXT_ACTION_MARK_DONE, "PR merged; issue should close"
-    if truth.latest_worker_status in (_REFUSED_PREMISE, _REFUSED_POLICY):
+    if truth.latest_worker_status in (
+        _REFUSED_PREMISE, _REFUSED_POLICY, _NEEDS_DECOMPOSITION,
+    ):
         return (
             NEXT_ACTION_ESCALATE,
             f"latest worker leg exited {truth.latest_worker_status!r} — needs "

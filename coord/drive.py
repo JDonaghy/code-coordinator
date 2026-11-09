@@ -134,6 +134,7 @@ from coord.models import (
     DELIVERABLE_ANALYSIS_LABEL,
     EPIC_DECOMPOSE_TYPE,
     MERGE_LANDED_MARKER,
+    NEEDS_DECOMPOSITION_MARKER,
     POLICY_REFUSAL_MARKER,
     PREMISE_REFUSAL_MARKER,
 )
@@ -3046,6 +3047,44 @@ def decide(
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}\n"
             f"   {PREMISE_REFUSAL_MARKER}"
+        )
+    elif state.work_status == "needs_decomposition":
+        # #3931: the worker exited cleanly, pushed 0 commits, and concluded
+        # the issue itself needs epic decomposition — either its own
+        # `WORK_OUTCOME: needs-decomposition` marker, or an
+        # `ISSUE_RESOLUTION: investigation` 0-commit exit with no other
+        # marker (`coord.agent.NEEDS_DECOMPOSITION` — see
+        # `coord.worker_events.classify_zero_commit_outcome`). Like
+        # `refused_premise` immediately above there is no #2871-style
+        # staleness/retarget bypass: a title rewrite does not make an issue
+        # smaller, so a fresh dispatch on the same row would just reproduce
+        # the identical split proposal (#3922's incident — three legs, same
+        # proposal, no new information). This is terminal after ONE leg;
+        # `_die()` here, like `refused_policy`/`refused_premise` above,
+        # embeds `NEEDS_DECOMPOSITION_MARKER` so `coord/drive_queue.py`'s
+        # `_reconcile_running` parks the queue entry without spending an
+        # attempt rather than relaunching into the same answer.
+        age_seconds = (
+            time.time() - state.work_finished_at
+            if state.work_finished_at is not None
+            else None
+        )
+        age = _format_age(age_seconds) if age_seconds is not None else "unknown age"
+        remedy = (
+            "Needs the coordinator: decompose the issue into the proposed "
+            "sub-issues (posted to the issue — see the worker's own split "
+            "proposal) and close or re-scope this one. Once replaced, "
+            "dispatch the new sub-issues normally; this row does not "
+            "auto-resume."
+        )
+        return _die(
+            f"pre-dispatch refusal on assignment {state.work_aid} "
+            f"(needs_decomposition, {age} old) — the worker concluded the "
+            "issue itself needs epic decomposition rather than one leg of "
+            f"work; the worker did the CORRECT thing (#3931). {remedy}\n"
+            f"   inspect: coord log {state.work_aid} --machine "
+            f"{state.work_machine or machine}\n"
+            f"   {NEEDS_DECOMPOSITION_MARKER}"
         )
     elif state.work_status == "cancelled":
         return _die(
