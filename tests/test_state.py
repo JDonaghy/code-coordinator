@@ -6281,12 +6281,17 @@ class TestReleaseSmokeClaimIfRowIsSmokeLeg:
 
         assert state.claim_smoke_dispatch("w1", "macos") is True  # released, reclaimable
 
-    def test_noop_for_an_untagged_single_leg_smoke_row(self, coord_db) -> None:
-        """An ordinary pre-#3182 single-partition smoke row carries no
-        `[smoke:...]` tag on its issue_title — never claimed, so releasing
-        it must be a pure no-op, never mistakenly release an unrelated
-        partition's claim."""
+    def test_releases_the_fixed_tag_for_an_untagged_single_leg_smoke_row(
+        self, coord_db,
+    ) -> None:
+        """#3920: an ordinary single-partition smoke row carries no
+        `[smoke:...]` tag on its issue_title — it is claimed (if at all)
+        under the fixed `SINGLE_LEG_SMOKE_PARTITION_TAG`, not a derived
+        capability set, so releasing it must release THAT tag — and must
+        never mistakenly touch an unrelated, genuinely-tagged partition's
+        claim on the same work row."""
         from coord.models import Assignment
+        from coord.smoke import SINGLE_LEG_SMOKE_PARTITION_TAG
 
         state.record_dispatched_assignment(
             assignment=Assignment(
@@ -6296,12 +6301,15 @@ class TestReleaseSmokeClaimIfRowIsSmokeLeg:
             ),
             repo_github="acme/api",
         )
+        assert state.claim_smoke_dispatch("w1", SINGLE_LEG_SMOKE_PARTITION_TAG) is True
         assert state.claim_smoke_dispatch("w1", "macos") is True
 
         state.release_smoke_claim_if_row_is_smoke_leg("leg1")
 
-        # Still held — "leg1" carries no capability tag to derive a
-        # partition key from.
+        # The single-leg tag released — reclaimable.
+        assert state.claim_smoke_dispatch("w1", SINGLE_LEG_SMOKE_PARTITION_TAG) is True
+        # An unrelated, genuinely-tagged partition on the SAME work row is
+        # untouched — still held.
         assert state.claim_smoke_dispatch("w1", "macos") is False
 
     def test_noop_for_a_non_smoke_row(self, coord_db) -> None:
@@ -6455,6 +6463,35 @@ class TestResetWorkTestStateReleasesSmokeClaims:
 
         assert updated == 1
         assert state.claim_smoke_dispatch("w1", "macos") is True
+
+    def test_reset_also_releases_the_single_leg_claim(self, coord_db) -> None:
+        """#3920: a single-leg row carries no `[[smoke-fanout:...]]` manifest
+        for the loop above to parse at all, so the identical "phantom leg
+        died without self-reporting" stranding needs its own unconditional
+        release of the fixed `SINGLE_LEG_SMOKE_PARTITION_TAG`."""
+        from coord.models import Assignment
+        from coord.smoke import SINGLE_LEG_SMOKE_PARTITION_TAG
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=9,
+                issue_title="Some other work", assignment_id="w2",
+                type="work", status="done",
+            ),
+            repo_github="acme/api",
+        )
+        state.record_test_verdict(
+            assignment_id="w2", test_state="running",
+            test_reason="dispatched: Test stage running (#1426)",
+        )
+        assert state.claim_smoke_dispatch("w2", SINGLE_LEG_SMOKE_PARTITION_TAG) is True
+
+        updated = state.reset_work_test_state("api", 9, assignment_id="w2")
+
+        assert updated == 1
+        assert state.claim_smoke_dispatch(
+            "w2", SINGLE_LEG_SMOKE_PARTITION_TAG,
+        ) is True
 
 
 # ── #3333 review: merge_smoke_fanout_manifest's atomic read-merge-write ─────

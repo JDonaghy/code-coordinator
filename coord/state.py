@@ -4642,33 +4642,49 @@ def claim_smoke_dispatch(work_assignment_id: str, capability_partition: str) -> 
     several legs for ONE parent (one per capability partition), never two for
     the SAME partition.
 
+    #3920: also called by the single-leg path
+    (``coord.smoke._dispatch_smoke_single_leg``), under the fixed
+    :data:`coord.smoke.SINGLE_LEG_SMOKE_PARTITION_TAG` rather than a derived
+    capability set — a single-leg row has exactly one partition by
+    construction, so one fixed tag is enough to make the pair unique per
+    row.
+
     Returns ``True`` when THIS call wins the claim, ``False`` when another
     caller already holds it.
 
     Before this, ``dispatch_smoke``'s only per-partition dedupe was
-    :func:`coord.smoke._find_leg_for_partition` — a read of the board, so two
-    ticks that both read before either writes both dispatch the same
-    partition. This is the DB-level conditional insert that closes the gap,
-    exactly like ``claim_review_dispatch`` does for reviews: a single
-    ``INSERT ... OR IGNORE`` is atomic even across two separate
-    processes/machines, so exactly one caller ever sees ``rowcount > 0`` for
-    a given ``(work_assignment_id, capability_partition)`` pair. This is what
-    the quadraui#952 incident needed — two ticks 8 seconds apart both
-    dispatched the same ``[smoke:macos]`` partition to a ``max_workers=1``
-    host, and the second leg's write silently overwrote the first leg's
-    ``[[smoke-fanout:...]]`` manifest entry.
+    :func:`coord.smoke._find_leg_for_partition` for the fan-out path, and
+    board reads (``coord.claim.has_active_followup`` /
+    ``has_active_branch_followup``) for the single-leg path — both just
+    reads of the board, so two ticks that both read before either writes
+    both dispatch the same partition/row. This is the DB-level conditional
+    insert that closes the gap, exactly like ``claim_review_dispatch`` does
+    for reviews: a single ``INSERT ... OR IGNORE`` is atomic even across two
+    separate processes/machines, so exactly one caller ever sees
+    ``rowcount > 0`` for a given ``(work_assignment_id,
+    capability_partition)`` pair. This is what the quadraui#952 incident
+    needed for the fan-out path — two ticks 8 seconds apart both dispatched
+    the same ``[smoke:macos]`` partition to a ``max_workers=1`` host, and
+    the second leg's write silently overwrote the first leg's
+    ``[[smoke-fanout:...]]`` manifest entry — and what claude-coordinator
+    #3920 needed for the single-leg path: two ticks (``passive_reconcile``
+    and a short-lived ``coord`` process) both dispatched the identical
+    single-leg Test stage for one work row 6 seconds apart, and the first
+    one's environment-setup failure recorded a ``test_state="failed"``
+    verdict before the second one's genuine, full-suite pass could land.
 
     Routes to the daemon when ``board_service`` is configured (the claim
     table lives on the shared canonical DB, same as ``assignments``), else
     writes the local DB directly.
 
     Released by :func:`release_smoke_dispatch_claim` — call sites are
-    ``coord.smoke._dispatch_smoke_fanout`` itself (a partition whose claim it
-    won but then failed to dispatch on, e.g. no reachable machine this tick)
-    and :func:`release_smoke_claim_if_row_is_smoke_leg` (the leg's own
+    ``coord.smoke._dispatch_smoke_fanout``/``_dispatch_smoke_single_leg``
+    themselves (a partition/row whose claim they won but then failed to
+    dispatch on, e.g. no reachable machine this tick) and
+    :func:`release_smoke_claim_if_row_is_smoke_leg` (the leg's own
     terminal-status write), so a legitimate later retry of the same
-    partition (an environmental death, or an operator ``coord stop``) is
-    never permanently stranded by a claim nothing will ever release.
+    partition/row (an environmental death, or an operator ``coord stop``)
+    is never permanently stranded by a claim nothing will ever release.
     """
     if not work_assignment_id or not capability_partition:
         return True
@@ -4803,12 +4819,14 @@ def _release_smoke_dispatch_claim_local(
 
 def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
     """Release *assignment_id*'s own smoke-dispatch claim, iff that row is
-    itself a #3182 fan-out leg (``type="smoke"`` with a capability tag in its
-    ``issue_title``) (#3333).
+    itself a Test-stage smoke leg (``type="smoke"``) — either a #3182
+    fan-out leg (a capability tag in its ``issue_title``, #3333) or a
+    #3920 single-leg dispatch (no tag, claimed under the fixed
+    :data:`coord.smoke.SINGLE_LEG_SMOKE_PARTITION_TAG`).
 
     Mirrors :func:`release_review_claim_if_row_is_review` exactly — the ONE
-    "did a smoke fan-out leg just reach a terminal status, and if so release
-    the claim it took" check, called from the same two chokepoints that
+    "did a smoke leg just reach a terminal status, and if so release the
+    claim it took" check, called from the same two chokepoints that
     function is: ``coord.issue_store._update_local_state`` (the worker
     self-report / git-floor backstop path) and this module's own
     :func:`_mark_notified_local` (the ``coord notify`` polling path a
@@ -4816,11 +4834,16 @@ def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
     reconcile tick got there first). One shared function closes the gap for
     both existing callers and any future one, same #2096/#3206 reasoning.
 
-    A no-op for every non-fan-out-leg row (an ordinary single-partition smoke
-    row, a work/review row, the composite ``f"{aid}:stuck"``-style keys
-    ``_mark_notified_local``'s override events pass) — none of those match
-    ``type == "smoke"`` with a parseable capability tag, so this is safe to
-    call unconditionally from either chokepoint.
+    #3920: before this, a single-leg row's claim had no release path at all
+    here — ``smoke_leg_capabilities(row_title)`` reads ``None`` for an
+    untagged single-leg row's ``issue_title``, and that used to mean "never
+    claimed" rather than "claimed under the fixed tag". Both shapes are a
+    real claim now, so both get released.
+
+    A no-op for every non-smoke row (a work/review row, the composite
+    ``f"{aid}:stuck"``-style keys ``_mark_notified_local``'s override events
+    pass) — none of those match ``type == "smoke"``, so this is safe to call
+    unconditionally from either chokepoint.
 
     Best-effort: a lookup failure here must never turn a successful status
     write into a raised exception.
@@ -4844,11 +4867,22 @@ def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
         row_title = row["issue_title"] if hasattr(row, "keys") else row[2]
         if row_type != "smoke" or not row_of_id:
             return
-        from coord.smoke import smoke_leg_capabilities  # noqa: PLC0415
+        from coord.smoke import (  # noqa: PLC0415
+            SINGLE_LEG_SMOKE_PARTITION_TAG,
+            smoke_leg_capabilities,
+        )
 
         caps = smoke_leg_capabilities(row_title)
         if caps is None:
-            return  # an ordinary untagged single-leg smoke row — never claimed
+            # #3920: an untagged row is a single-leg dispatch, claimed (if
+            # at all) under the fixed tag rather than a derived capability
+            # set — idempotent no-op if this row never actually took it
+            # (e.g. a pre-#3920 row, or a type="smoke" row some other path
+            # created without ever calling `claim_smoke_dispatch`).
+            _release_smoke_dispatch_claim_local(
+                row_of_id, SINGLE_LEG_SMOKE_PARTITION_TAG,
+            )
+            return
         _release_smoke_dispatch_claim_local(row_of_id, "+".join(sorted(caps)))
     except Exception:  # noqa: BLE001 — best-effort; never break the status write
         pass
@@ -5549,12 +5583,24 @@ def reset_work_test_state(
     failure mode :func:`claim_review_dispatch` was built to avoid for
     reviews. Best-effort: a manifest-parse failure here never blocks the
     reset itself.
+
+    #3920: unconditionally also releases the #3920 single-leg claim (the
+    fixed :data:`coord.smoke.SINGLE_LEG_SMOKE_PARTITION_TAG`) for every row
+    this clears — a single-leg row carries no manifest to parse, so the
+    fan-out loop above never touches it, and the identical "phantom leg
+    died without ever self-reporting" stranding applies to it too. Cheap
+    and safe even when the row never took that claim (an ordinary
+    non-smoke work row, a fan-out row, a row whose leg already
+    self-released): the underlying delete is idempotent.
     """
     conn = get_connection()
     where, params = _test_reset_where(repo_name, issue_number, assignment_id)
 
     try:
-        from coord.smoke import _parse_fanout_manifest  # noqa: PLC0415
+        from coord.smoke import (  # noqa: PLC0415
+            SINGLE_LEG_SMOKE_PARTITION_TAG,
+            _parse_fanout_manifest,
+        )
 
         rows = sql.execute(
             conn,
@@ -5564,7 +5610,10 @@ def reset_work_test_state(
         for row in rows:
             aid = row["assignment_id"] if hasattr(row, "keys") else row[0]
             reason = row["test_reason"] if hasattr(row, "keys") else row[1]
-            if not aid or not reason:
+            if not aid:
+                continue
+            _release_smoke_dispatch_claim_local(aid, SINGLE_LEG_SMOKE_PARTITION_TAG)
+            if not reason:
                 continue
             for _leg_id, caps, _cmd in _parse_fanout_manifest(reason) or []:
                 _release_smoke_dispatch_claim_local(aid, "+".join(sorted(caps)))
