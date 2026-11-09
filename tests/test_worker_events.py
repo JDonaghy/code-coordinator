@@ -9,8 +9,12 @@ import pytest
 
 from coord.worker_events import (
     USAGE_LIMIT_REASON_PREFIX,
+    WORK_OUTCOME_ALREADY_DONE,
+    WORK_OUTCOME_NEEDS_DECOMPOSITION,
     WorkerEvent,
     WorkerSummary,
+    WorkOutcome,
+    classify_zero_commit_outcome,
     classify_zero_commit_refusal,
     detect_anomalies,
     detect_usage_limit_kill,
@@ -28,6 +32,7 @@ from coord.worker_events import (
     looks_like_premise_refusal,
     parse_event,
     parse_log,
+    parse_work_outcome,
     render_event,
     render_log,
     update_summary,
@@ -1671,3 +1676,156 @@ class TestClassifyZeroCommitRefusal:
     @pytest.mark.parametrize("text", [None, ""])
     def test_empty_input_classifies_as_none(self, text) -> None:
         assert classify_zero_commit_refusal(text) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3931: `WORK_OUTCOME:` marker — structured zero-commit outcomes
+# (already-done / needs-decomposition), authoritative over the #2234/#3164/
+# #3923 prose heuristics above.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestParseWorkOutcome:
+    def test_already_done_marker_parses(self) -> None:
+        outcome = parse_work_outcome(
+            "WORK_OUTCOME: already-done — lives in coord/worker_events.py"
+        )
+        assert outcome.value == WORK_OUTCOME_ALREADY_DONE
+        assert outcome.reason == "lives in coord/worker_events.py"
+
+    def test_needs_decomposition_marker_parses(self) -> None:
+        outcome = parse_work_outcome(
+            "WORK_OUTCOME: needs-decomposition — split into 5-6 slices by "
+            "widget kind"
+        )
+        assert outcome.value == WORK_OUTCOME_NEEDS_DECOMPOSITION
+        assert outcome.reason == "split into 5-6 slices by widget kind"
+
+    def test_marker_tolerates_markdown_decoration(self) -> None:
+        outcome = parse_work_outcome("> **WORK_OUTCOME:** already-done")
+        assert outcome.value == WORK_OUTCOME_ALREADY_DONE
+        assert outcome.reason == ""
+
+    def test_mid_sentence_mention_does_not_count(self) -> None:
+        """#3915-style anchoring: a marker that doesn't start its own line
+        is a mention, not a claim."""
+        text = "...the WORK_OUTCOME: already-done marker lets a worker..."
+        assert parse_work_outcome(text) == WorkOutcome()
+
+    def test_last_occurrence_wins(self) -> None:
+        text = (
+            "WORK_OUTCOME: needs-decomposition — first guess\n"
+            "Actually, on reflection:\n"
+            "WORK_OUTCOME: already-done — found it in models.py"
+        )
+        outcome = parse_work_outcome(text)
+        assert outcome.value == WORK_OUTCOME_ALREADY_DONE
+        assert outcome.reason == "found it in models.py"
+
+    @pytest.mark.parametrize("text", [None, "", "no marker here at all"])
+    def test_absent_marker_is_none(self, text) -> None:
+        assert parse_work_outcome(text) == WorkOutcome()
+
+
+class TestClassifyZeroCommitOutcome:
+    """#3931 acceptance: both markers parse, and a marker overrides a
+    conflicting prose heuristic."""
+
+    def test_already_done_marker_classifies_as_already_done(self) -> None:
+        assert (
+            classify_zero_commit_outcome("WORK_OUTCOME: already-done — see X")
+            == "already_done"
+        )
+
+    def test_needs_decomposition_marker_classifies_as_needs_decomposition(
+        self,
+    ) -> None:
+        assert (
+            classify_zero_commit_outcome(
+                "WORK_OUTCOME: needs-decomposition — split by widget kind"
+            )
+            == "needs_decomposition"
+        )
+
+    def test_marker_overrides_conflicting_policy_prose(self) -> None:
+        """A message that ALSO reads as a #2234 policy refusal in prose
+        must still classify off the explicit marker, not the prose."""
+        text = (
+            "Only the coordinator writes docs, so I am stopping rather "
+            "than editing the doc.\n"
+            "WORK_OUTCOME: needs-decomposition — this is really 5 separate "
+            "issues"
+        )
+        assert looks_like_policy_refusal(text) is True  # mentions the rule
+        assert classify_zero_commit_outcome(text) == "needs_decomposition"
+
+    def test_marker_overrides_conflicting_already_implemented_prose(self) -> None:
+        """A message using the #3923 "already implemented" prose shape but
+        whose explicit marker says needs-decomposition must classify as
+        the marker says, not the prose."""
+        text = (
+            "Half of this is already fully implemented and merged into "
+            "main, but the rest is a much bigger lift than the issue "
+            "states.\n"
+            "WORK_OUTCOME: needs-decomposition — split the remaining half"
+        )
+        assert looks_like_premise_refusal(text) is True  # matches the prose
+        assert classify_zero_commit_outcome(text) == "needs_decomposition"
+
+    def test_prose_fallback_matches_classify_zero_commit_refusal(self) -> None:
+        """Absent a marker, behaves exactly like the #3164 classifier —
+        every log that predates the marker classifies unchanged."""
+        assert (
+            classify_zero_commit_outcome(_QUADRAUI_812_FINAL_MESSAGE)
+            == classify_zero_commit_refusal(_QUADRAUI_812_FINAL_MESSAGE)
+            == "premise"
+        )
+        assert (
+            classify_zero_commit_outcome(_CLAUDE_2195_FINAL_MESSAGE)
+            == classify_zero_commit_refusal(_CLAUDE_2195_FINAL_MESSAGE)
+            == "policy"
+        )
+
+    def test_investigation_resolution_with_no_marker_is_needs_decomposition(
+        self,
+    ) -> None:
+        """#3931 item 3: a worker reporting `ISSUE_RESOLUTION: investigation`
+        with 0 commits also counts as needs_decomposition, unless another
+        marker says otherwise."""
+        text = "Ran out of leads. ISSUE_RESOLUTION: investigation — unclear"
+        assert (
+            classify_zero_commit_outcome(text, issue_resolution="investigation")
+            == "needs_decomposition"
+        )
+
+    def test_investigation_resolution_does_not_override_a_premise_match(
+        self,
+    ) -> None:
+        """"unless another marker says otherwise": a prose premise match
+        (checked first) wins over the issue_resolution fallback."""
+        assert (
+            classify_zero_commit_outcome(
+                _QUADRAUI_812_FINAL_MESSAGE, issue_resolution="investigation"
+            )
+            == "premise"
+        )
+
+    def test_investigation_resolution_does_not_override_an_already_done_marker(
+        self,
+    ) -> None:
+        text = "WORK_OUTCOME: already-done — see grep output above"
+        assert (
+            classify_zero_commit_outcome(text, issue_resolution="investigation")
+            == "already_done"
+        )
+
+    def test_no_marker_no_investigation_stays_none(self) -> None:
+        """The #448 ADVISORY fallback is unchanged when nothing at all
+        matches."""
+        text = "STUCK: ran out of turns before finding the relevant module."
+        assert classify_zero_commit_outcome(text) is None
+        assert classify_zero_commit_outcome(text, issue_resolution="resolved") is None
+
+    @pytest.mark.parametrize("text", [None, ""])
+    def test_empty_input_classifies_as_none(self, text) -> None:
+        assert classify_zero_commit_outcome(text) is None

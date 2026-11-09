@@ -163,6 +163,26 @@ REFUSED_POLICY = "refused_policy"
 # relaunch re-proving what the first one already found.
 REFUSED_PREMISE = "refused_premise"
 
+# #3931: a THIRD zero-commit clean-exit shape, distinct from both REFUSED_
+# POLICY and REFUSED_PREMISE above — the worker's own final message (or an
+# explicit `WORK_OUTCOME: needs-decomposition` marker, see `coord.
+# worker_events.classify_zero_commit_outcome`) concludes the issue is too
+# large for one leg and proposes a split, rather than finding a standing
+# rule or a false/already-met premise. The #3922 incident this exists for:
+# three independent work legs, ~20 minutes, each separately concluding "this
+# needs epic decomposition" with the same proposed 5-6-way split, each
+# landing as an ordinary #448 ADVISORY and getting relaunched — spending the
+# entire #2972 fix-round budget rediscovering the first leg's own answer
+# before the row blocked on the ceiling. The first leg's answer was already
+# correct and complete; the other two cost money and did nothing new.
+#
+# Terminal after exactly ONE leg, same "no attempt spent" posture as REFUSED_
+# POLICY/REFUSED_PREMISE: relaunching cannot produce a different split, only
+# a second opinion on the same one. The remedy is epic decomposition itself
+# (filing the proposed split as separate issues), which is coordinator/
+# operator work, not something a relaunch can do.
+NEEDS_DECOMPOSITION = "needs_decomposition"
+
 # #448: spec types that are expected to push commits, so a clean exit with
 # zero commits is interesting (advisory).  Review/smoke workers commit
 # nothing by design and must NOT be flagged advisory.
@@ -4260,6 +4280,17 @@ class AgentAssignment:
     # `analysis_deliverable` for the same reason those four are mutually
     # exclusive with each other.
     premise_refusal_reason: str | None = None
+    # #3931: the worker's own final message (or its `WORK_OUTCOME:` marker's
+    # free-text reason) when `_reap` classifies a clean (exit_code==0),
+    # 0-commit exit as needing epic decomposition (`status ==
+    # NEEDS_DECOMPOSITION`) — see `coord.worker_events.
+    # classify_zero_commit_outcome`. Mirrors `premise_refusal_reason`/
+    # `policy_refusal_reason` exactly, as its own field for the same reason:
+    # a caller can tell which of the three shapes it's looking at from the
+    # field name alone. `None` on every other outcome, mutually exclusive
+    # with the other four zero-commit fields above for the same reason they
+    # are mutually exclusive with each other.
+    needs_decomposition_reason: str | None = None
     # #2316: set when `_reap` classifies a clean (exit_code==0), 0-commit
     # exit as a TRUNCATION — the worker's last `result`/`step_finish` event
     # carries a `stop_reason` in `_TRUNCATION_STOP_REASONS` (opencode's
@@ -4464,6 +4495,30 @@ outstanding.
 Before writing any code, verify the feature or fix isn't already implemented. \
 Grep for relevant function names, check existing modules, and read related files. \
 If it already exists, report back instead of reimplementing.
+
+If you end this leg with 0 commits because there is genuinely nothing \
+correct to build right now, say which shape it is with a structured, \
+line-anchored marker (the coordinator treats this as authoritative — it \
+is read before any attempt to infer the same thing from your prose):
+
+  WORK_OUTCOME: already-done — <where it lives>
+
+or
+
+  WORK_OUTCOME: needs-decomposition — <the split you'd propose>
+
+Use `already-done` when you verified the requested behavior already \
+exists (merged/shipped under a different name, a prior leg, etc.) — this \
+parks the issue for an operator to confirm, spending no further attempt, \
+instead of a relaunch rediscovering the same finding. Use \
+`needs-decomposition` when the issue is genuinely too large for one leg \
+and should be split into separate issues — state your proposed split in \
+the marker's reason text (or in your final message) so the coordinator can \
+file it; this is terminal after this one leg too, since a relaunch would \
+only re-propose the same split. Omit the marker entirely for every other \
+0-commit outcome (a standing repo-rule refusal, a genuinely stuck session, \
+or a false/unmet premise that is NOT "already done") — those still read \
+off your prose exactly as before.
 
 Progress reporting:
 - After each significant step (first build, test run, approach change), \
@@ -7594,6 +7649,7 @@ class AgentServer:
                 for a in self._assignments.values()
                 if a.status in (
                     DONE, FAILED, CANCELLED, ADVISORY, REFUSED_POLICY, REFUSED_PREMISE,
+                    NEEDS_DECOMPOSITION,
                 )
             )
         _mark("assignment_tally")
@@ -10185,7 +10241,8 @@ class AgentServer:
         status, so a dirty worktree left behind by an otherwise-correct
         policy refusal needs the same visibility, on the field that surface
         actually reads. #3164 mirrors it a second time for REFUSED_PREMISE /
-        ``premise_refusal_reason``.
+        ``premise_refusal_reason``. #3931 mirrors it a third time for
+        NEEDS_DECOMPOSITION / ``needs_decomposition_reason``.
         """
         with self._lock:
             live = self._assignments.get(assignment.id, assignment)
@@ -10196,6 +10253,8 @@ class AgentServer:
                 live.policy_refusal_reason = reason
             elif live.status == REFUSED_PREMISE:
                 live.premise_refusal_reason = reason
+            elif live.status == NEEDS_DECOMPOSITION:
+                live.needs_decomposition_reason = reason
             # Keep the caller's object in sync when it isn't the live one, so
             # a caller holding a detached copy still sees the outcome.
             assignment.dirty_worktree_reason = reason
@@ -10205,6 +10264,8 @@ class AgentServer:
                 assignment.policy_refusal_reason = reason
             elif assignment.status == REFUSED_PREMISE:
                 assignment.premise_refusal_reason = reason
+            elif assignment.status == NEEDS_DECOMPOSITION:
+                assignment.needs_decomposition_reason = reason
         self._persist()
 
     def _rescue_uncommitted_work(
@@ -12049,16 +12110,26 @@ class AgentServer:
         # readings of "0 commits" can never disagree about which one applies
         # to this assignment.
         _policy_refusal_reason: str | None = None
-        # #3164: the PREMISE sibling of `_policy_refusal_reason` — see
-        # `coord.worker_events.classify_zero_commit_refusal` and
-        # `REFUSED_PREMISE`'s module-level docstring. Mutually exclusive with
-        # it by construction (the classifier returns exactly one of
-        # "premise"/"policy"/`None`), decided in the same `_ahead == 0`
-        # branch below.
+        # #3164/#3931: the PREMISE sibling of `_policy_refusal_reason` — see
+        # `coord.worker_events.classify_zero_commit_outcome` (which now
+        # decides `_refusal_kind` below; it folds in the #3931 `WORK_
+        # OUTCOME:` marker ahead of `classify_zero_commit_refusal`'s own
+        # premise/policy prose heuristics) and `REFUSED_PREMISE`'s module-
+        # level docstring. Mutually exclusive with the other three refusal
+        # reasons by construction (the classifier returns exactly one of
+        # "already_done"/"needs_decomposition"/"premise"/"policy"/`None`),
+        # decided in the same `_ahead == 0` branch below.
         _premise_refusal_reason: str | None = None
+        # #3931: the THIRD sibling — see `NEEDS_DECOMPOSITION`'s module-level
+        # docstring. Mutually exclusive with the other two refusal reasons by
+        # construction (`classify_zero_commit_outcome` returns exactly one of
+        # "already_done"/"needs_decomposition"/"premise"/"policy"/`None`),
+        # decided in the same `_ahead == 0` branch below.
+        _needs_decomposition_reason: str | None = None
         # #2316: checked FIRST in the `_ahead == 0` branch below, ahead of
         # `_analysis_deliverable`/`_policy_refusal_reason`/
-        # `_premise_refusal_reason`/`_zero_commit_reason` — a truncated run's
+        # `_premise_refusal_reason`/`_needs_decomposition_reason`/
+        # `_zero_commit_reason` — a truncated run's
         # `result_text` is whatever the model managed to emit before the
         # ceiling cut it off, not a considered final message, so it must not
         # be read as a positive "deliverable" or "refusal" signal just
@@ -12072,16 +12143,30 @@ class AgentServer:
                 _base = assignment.spec.branch or "main"
                 _ahead = self._commits_ahead(_wt_advisory, _base)
                 if _ahead == 0:
-                    # #3164: computed ONCE, unconditionally, so both the
-                    # "premise" and "policy" branches below can read it
-                    # without re-parsing `result_text` or risking a
-                    # short-circuited walrus leaving it unbound in the
-                    # `_worker_summary is None` case.
+                    # #3164/#3931: computed ONCE, unconditionally, so every
+                    # branch below can read it without re-parsing
+                    # `result_text` or risking a short-circuited walrus
+                    # leaving it unbound in the `_worker_summary is None`
+                    # case. `_issue_resolution_value` feeds
+                    # `classify_zero_commit_outcome`'s item-3 fallback ("a
+                    # worker reporting ISSUE_RESOLUTION: investigation with 0
+                    # commits also counts as needs_decomposition unless
+                    # another marker says otherwise") — parsed here, not in
+                    # `coord.worker_events`, since that marker's home is
+                    # `coord.models`.
+                    from coord.models import parse_issue_resolution  # noqa: PLC0415
                     from coord.worker_events import (  # noqa: PLC0415
-                        classify_zero_commit_refusal,
+                        classify_zero_commit_outcome,
+                    )
+                    _issue_resolution_value = (
+                        parse_issue_resolution(_worker_summary.result_text).value
+                        if _worker_summary is not None else None
                     )
                     _refusal_kind = (
-                        classify_zero_commit_refusal(_worker_summary.result_text)
+                        classify_zero_commit_outcome(
+                            _worker_summary.result_text,
+                            issue_resolution=_issue_resolution_value,
+                        )
                         if _worker_summary is not None else None
                     )
                     if (_worker_summary is not None
@@ -12117,7 +12202,7 @@ class AgentServer:
                                 )
                         except OSError:
                             pass
-                    elif _refusal_kind == "premise":
+                    elif _refusal_kind in ("premise", "already_done"):
                         # #3164: the worker investigated and found the
                         # ISSUE'S OWN PREMISE false or its stated prerequisite
                         # unmet — no rule was involved, there is simply
@@ -12128,6 +12213,15 @@ class AgentServer:
                         # module-level docstring. Like a policy refusal,
                         # retrying reproduces the identical, correct outcome,
                         # so it must not consume the queue's attempt budget.
+                        #
+                        # #3931: `"already_done"` — the worker's own `WORK_
+                        # OUTCOME: already-done` marker, or the #3923 prose
+                        # heuristic it now overrides when both are present —
+                        # rides this SAME branch. It is the narrower #3926
+                        # shape of a premise refusal (the requested behaviour
+                        # already exists, so the issue's own IMPLICIT premise
+                        # is what's refuted), not a different status: the
+                        # operator remedy is identical either way.
                         _premise_refusal_reason = _worker_summary.result_text or (
                             "worker investigated and found the issue's "
                             "premise false or its prerequisite unmet"
@@ -12139,7 +12233,31 @@ class AgentServer:
                                     f"of {_base}; worker's final message "
                                     "reports an investigated, refuted issue "
                                     "premise, status set to refused_premise "
-                                    "(#3164)\n"
+                                    f"(#3164{', already-done #3931' if _refusal_kind == 'already_done' else ''})\n"
+                                )
+                        except OSError:
+                            pass
+                    elif _refusal_kind == "needs_decomposition":
+                        # #3931: the worker's own `WORK_OUTCOME: needs-
+                        # decomposition` marker, or an `ISSUE_RESOLUTION:
+                        # investigation` verdict with no other marker
+                        # present — the #3922 shape: the issue is too large
+                        # for one leg, and a relaunch would only re-propose
+                        # the same split a first leg already found. Terminal
+                        # after this one leg, no attempt spent — see
+                        # NEEDS_DECOMPOSITION's module-level docstring.
+                        _needs_decomposition_reason = _worker_summary.result_text or (
+                            "worker concluded the issue needs epic "
+                            "decomposition"
+                        )
+                        try:
+                            with open(assignment.log_path, "a", encoding="utf-8") as reopen:
+                                reopen.write(
+                                    "# reap: needs_decomposition — 0 commits "
+                                    f"ahead of {_base}; worker's final message "
+                                    "reports the issue needs epic "
+                                    "decomposition, status set to "
+                                    "needs_decomposition (#3931)\n"
                                 )
                         except OSError:
                             pass
@@ -12269,6 +12387,19 @@ class AgentServer:
                         # readability).
                         assignment.status = REFUSED_PREMISE
                         assignment.premise_refusal_reason = _premise_refusal_reason
+                    elif _needs_decomposition_reason is not None:
+                        # #3931: clean exit, no commits, and the worker's own
+                        # final message (or `WORK_OUTCOME`/`ISSUE_RESOLUTION`
+                        # marker) reports the issue needs epic decomposition
+                        # — terminal after this one leg, see
+                        # NEEDS_DECOMPOSITION's module docstring. Checked
+                        # alongside the other refusal reasons (all mutually
+                        # exclusive by construction — see the `_reap`
+                        # computation above).
+                        assignment.status = NEEDS_DECOMPOSITION
+                        assignment.needs_decomposition_reason = (
+                            _needs_decomposition_reason
+                        )
                     elif _policy_refusal_reason is not None:
                         # #2234: clean exit, no commits, and the worker's own
                         # final message cites a standing repo-rule
@@ -12482,13 +12613,15 @@ class AgentServer:
         # output. Recompute from `repo_path` (not the worktree, which may
         # already be gone) whether the rescue's push actually reached
         # origin, and correct the status when it did. Only ADVISORY/
-        # REFUSED_POLICY/REFUSED_PREMISE are ever reachable here (all three
-        # are set exclusively in the `_ahead == 0` branch above, itself gated
-        # on `spec.type in _ZERO_COMMIT_TYPES`) — DONE, FAILED-for-other-
-        # reasons, CANCELLED etc. are untouched.
+        # REFUSED_POLICY/REFUSED_PREMISE/NEEDS_DECOMPOSITION are ever
+        # reachable here (all four are set exclusively in the `_ahead == 0`
+        # branch above, itself gated on `spec.type in _ZERO_COMMIT_TYPES`) —
+        # DONE, FAILED-for-other-reasons, CANCELLED etc. are untouched.
         if (
             assignment is not None
-            and assignment.status in (ADVISORY, REFUSED_POLICY, REFUSED_PREMISE)
+            and assignment.status in (
+                ADVISORY, REFUSED_POLICY, REFUSED_PREMISE, NEEDS_DECOMPOSITION,
+            )
             and assignment.dirty_worktree_reason is not None
         ):
             _rescue_branch = assignment.branch or assignment.spec.target_branch
@@ -12596,16 +12729,19 @@ class AgentServer:
             ):
                 return
             self._last_advisory_terminal_check = now
-            # #2234/#3164: REFUSED_POLICY/REFUSED_PREMISE join ADVISORY here
-            # for the same reason — all three are terminal, zero-commit
-            # statuses the agent would otherwise keep serving indefinitely
-            # from its own `/status` feed once GitHub confirms the work is
-            # done, forcing every downstream consumer (dashboard, TUI, any
-            # future client) to reimplement the same GitHub-terminality
-            # filter this method exists to spare them.
+            # #2234/#3164/#3931: REFUSED_POLICY/REFUSED_PREMISE/
+            # NEEDS_DECOMPOSITION join ADVISORY here for the same reason —
+            # all four are terminal, zero-commit statuses the agent would
+            # otherwise keep serving indefinitely from its own `/status` feed
+            # once GitHub confirms the work is done, forcing every downstream
+            # consumer (dashboard, TUI, any future client) to reimplement the
+            # same GitHub-terminality filter this method exists to spare
+            # them.
             candidates = [
                 a for a in self._assignments.values()
-                if a.status in (ADVISORY, REFUSED_POLICY, REFUSED_PREMISE)
+                if a.status in (
+                    ADVISORY, REFUSED_POLICY, REFUSED_PREMISE, NEEDS_DECOMPOSITION,
+                )
             ]
         if not candidates:
             return
@@ -12685,15 +12821,19 @@ class AgentServer:
             ordered = list(self._assignments.values())
             superseded_ids: list[str] = []
             for i, a in enumerate(ordered):
-                # #2234/#3164: REFUSED_POLICY/REFUSED_PREMISE join ADVISORY
-                # here too — a refusal for issue X can be superseded the same
-                # way an advisory can (e.g. the coordinator re-scopes the
-                # issue so a later dispatch's deliverable is no longer
-                # coordinator-only, or a later dispatch lands once the
-                # premise it refuted has since become true). Same in-memory
-                # comparison, same root cause as `_prune_terminal_advisory`
-                # above.
-                if a.status not in (ADVISORY, REFUSED_POLICY, REFUSED_PREMISE):
+                # #2234/#3164/#3931: REFUSED_POLICY/REFUSED_PREMISE/
+                # NEEDS_DECOMPOSITION join ADVISORY here too — a refusal for
+                # issue X can be superseded the same way an advisory can
+                # (e.g. the coordinator re-scopes the issue so a later
+                # dispatch's deliverable is no longer coordinator-only, or a
+                # later dispatch lands once the premise it refuted has since
+                # become true, or the proposed decomposition was filed and a
+                # later dispatch targets one of the resulting slices). Same
+                # in-memory comparison, same root cause as
+                # `_prune_terminal_advisory` above.
+                if a.status not in (
+                    ADVISORY, REFUSED_POLICY, REFUSED_PREMISE, NEEDS_DECOMPOSITION,
+                ):
                     continue
                 key = (a.spec.repo_name, a.spec.issue_number)
                 for later in ordered[i + 1 :]:

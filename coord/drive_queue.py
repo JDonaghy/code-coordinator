@@ -117,6 +117,7 @@ from coord.models import (
     is_premise_refusal_reason,
     parse_issue_resolution,
 )
+from coord.worker_events import classify_zero_commit_outcome
 
 # ── dispatch type selection (#3132) ─────────────────────────────────────────
 #
@@ -2172,6 +2173,33 @@ class IssueFacts:
     # identically to a genuine pre-`coord assign` crash unless this is
     # checked separately.
     work_done: bool = False
+    # #3931: a work-like assignment reaped `coord.agent.REFUSED_PREMISE`
+    # whose own 0-commit refusal was specifically the "already implemented"
+    # shape (`coord.worker_events.classify_zero_commit_outcome` ==
+    # ``"already_done"`` — an explicit `WORK_OUTCOME: already-done` marker,
+    # or the #3923 prose heuristic it overrides when both are present) —
+    # see `build_board_view`'s population of this field for exactly which
+    # text it reads this off.
+    #
+    # Distinct from the generic `refused_premise` shape (a worker finding the
+    # issue's stated PREREQUISITE unmet, not already satisfied): that shape
+    # genuinely has nothing to satisfy a dependent with, so it must NOT
+    # release anything `--after` it — only "already done" means the
+    # prerequisite the dependent names actually exists, just without a
+    # commit/merge `facts.landed` can see. `_resolve_prereqs` treats this
+    # exactly like `landed` for THAT purpose, releasing any entry chained
+    # `--after` this issue (#3931 item 4) without waiting for an operator to
+    # notice the park and run `clear-refusal` — the queue's own evidence
+    # already answers the question `landed` alone could not.
+    #
+    # Best-effort, same caveat as `merge_resolution` below: the worker's
+    # final message is only visible here when it was captured into
+    # `completion_summary` (a "### Summary" heading in the transcript,
+    # `coord.notify._capture_completion_summary`) — a refusal whose message
+    # never used that heading leaves this `False`, same as #3923 left the
+    # bare ADVISORY default for a worker whose prose matched none of its
+    # markers.
+    already_done: bool = False
     # #1891: this issue's CURRENT merge-queue entry is refused for nothing
     # stronger than "CI checks have not reported yet" — see
     # `build_board_view`'s population of this field for exactly which board
@@ -2565,6 +2593,19 @@ def build_board_view(
                 summary = row.get("completion_summary")
                 if summary:
                     entry["merge_resolution"] = parse_issue_resolution(summary).value
+        if status == "refused_premise":
+            # #3931: the SAME `completion_summary` column every other field
+            # on this loop reads, checked for the "already implemented"
+            # shape specifically — see `IssueFacts.already_done`'s
+            # docstring. `or` rather than overwrite: once any row for this
+            # key has set it True, a later row with no (or a plain, non-
+            # already-done) refusal must never flip it back to False —
+            # `entry.setdefault`'s own `False` default already covers "no
+            # row said already_done yet", so only the positive case needs
+            # writing here.
+            summary = row.get("completion_summary")
+            if summary and classify_zero_commit_outcome(summary) == "already_done":
+                entry["already_done"] = True
         if status not in TERMINAL_STATUSES:
             entry["active_work"] = True
         # #2273: high-water mark of `dispatched_at`, regardless of `status` —
@@ -3618,7 +3659,17 @@ def _resolve_prereqs(
         if hold is not None:
             return _Verdict(False, False, _gate_defer_reason(dep, hold))
         facts = board.facts(dep)
-        if facts.landed:
+        if facts.landed or facts.already_done:
+            # #3931: `already_done` — *dep* parked `refused_premise` on the
+            # specific "already implemented" finding (`IssueFacts.
+            # already_done`'s docstring) — satisfies this `--after` edge
+            # exactly like `landed`: the prerequisite the dependent names
+            # genuinely exists, it just has no commit/merge `landed` alone
+            # can see. Before this, a dependent chained behind such a park
+            # read "waiting on {dep} (queued, parked)" forever — correct
+            # that nothing was dispatching, wrong that anything needed to:
+            # the whole reason for the park IS that the work is already
+            # there.
             continue
         dep_state = states.get(dep)
         if dep_state is not None:
@@ -3803,6 +3854,7 @@ def diagnose_blocked_after(
     unsatisfied = tuple(
         dep for dep in entry.after
         if not board.facts(dep).landed
+        and not board.facts(dep).already_done
         and not live_terminal.get(dep)
         and states.get(dep) not in STATE_DONE_LIKE
     )
