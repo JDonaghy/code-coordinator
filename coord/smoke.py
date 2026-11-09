@@ -2113,6 +2113,17 @@ def _fetch_touched_files(repo_github: str, branch: str) -> list[str]:
 TEST_STATE_BLOCKED = "blocked"
 
 
+#: The fixed ``capability_partition`` tag :func:`_dispatch_smoke_single_leg`
+#: claims under via :func:`coord.state.claim_smoke_dispatch` (#3920) — the
+#: single-leg path's peer of the #3182/#3333 fan-out's per-capability-set
+#: tag. A single-leg row has exactly one partition by construction
+#: (``dispatch_smoke`` only takes this path when at most one partition
+#: survives — see its own docstring), so a single constant tag is enough to
+#: make ``(work_assignment_id, tag)`` unique per row; there is no capability
+#: set to derive it from the way the fan-out does.
+SINGLE_LEG_SMOKE_PARTITION_TAG = "single-leg"
+
+
 def _test_verdict_is_stale(
     completed: Assignment,
     board: Board,
@@ -3414,10 +3425,19 @@ def _dispatch_smoke_single_leg(
     http_client: httpx.Client | None = None,
     now: float | None = None,
 ) -> Assignment | None:
-    """The pre-#3182 single-Test-stage-leg dispatch path, unchanged — used
-    whenever a diff's matched capability rules partition (#3177) into AT MOST
-    one machine-satisfiable set. See `dispatch_smoke` for the #3182 fan-out
-    this now sits beside for the multi-partition case.
+    """The pre-#3182 single-Test-stage-leg dispatch path — used whenever a
+    diff's matched capability rules partition (#3177) into AT MOST one
+    machine-satisfiable set. See `dispatch_smoke` for the #3182 fan-out this
+    now sits beside for the multi-partition case.
+
+    #3920: takes `claim_smoke_dispatch` (the same atomic DB-level claim
+    `_dispatch_smoke_fanout` has taken since #3333) before dispatching, under
+    the fixed `SINGLE_LEG_SMOKE_PARTITION_TAG` rather than a derived
+    capability set. Before this, the dedupe below was BOARD READS only —
+    `has_active_followup`/`has_active_branch_followup` — so two ticks that
+    both read "nothing in flight" before either writes both fell through and
+    both dispatched. See `claim_smoke_dispatch`'s docstring for the
+    claude-coordinator#3920 incident this closes.
     """
     smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
     repo = config.repo(completed.repo_name)
@@ -3535,6 +3555,36 @@ def _dispatch_smoke_single_leg(
             smoke_command, resolved.source, repo.github, repo.name,
         )
 
+    # #3920: `has_active_followup`/`has_active_branch_followup` above are
+    # BOARD READS — two ticks that both read "nothing in flight" before
+    # either writes both fall through to here and would both dispatch, the
+    # exact race #3333 closed for the fan-out path (`_dispatch_smoke_fanout`)
+    # but left open here. This atomic `INSERT ... OR IGNORE` closes the same
+    # window on the single-leg path: exactly one caller ever wins
+    # `claim_smoke_dispatch` for this `(work_assignment_id,
+    # SINGLE_LEG_SMOKE_PARTITION_TAG)` pair. The loser skips this tick
+    # entirely — never spending a metered Test-stage leg, candidate ranking,
+    # or an `/assign` round trip — leaving it for a later tick's dedupe reads
+    # above to find the winner's leg once it has actually landed on the
+    # board. Released by `coord.state.release_smoke_claim_if_row_is_smoke_leg`
+    # once the dispatched leg's own assignment reaches a terminal status, and
+    # by the `dispatched is None`/exception paths just below when this call
+    # won the claim but never actually dispatched anything with it.
+    from coord.state import (  # noqa: PLC0415
+        claim_smoke_dispatch,
+        release_smoke_dispatch_claim,
+    )
+
+    if not claim_smoke_dispatch(
+        completed.assignment_id or "", SINGLE_LEG_SMOKE_PARTITION_TAG,
+    ):
+        logger.debug(
+            "dispatch_smoke: %s#%s — lost the atomic single-leg dispatch-"
+            "claim race (#3920); another in-flight tick is dispatching it.",
+            completed.repo_name, completed.issue_number,
+        )
+        return None
+
     # #1672: the FULL capability-matched candidate list, best first. Picking
     # one machine and giving up on it meant a single bad candidate ended the
     # whole Test stage — #1678, where the router re-chose the same unhealthy
@@ -3624,60 +3674,80 @@ def _dispatch_smoke_single_leg(
             native_unverified=native_unverified,
         )
 
-    dispatched, attempts = _walk_candidates_and_dispatch(
-        candidates,
-        completed=completed, repo=repo, required_caps=required_caps,
-        issue_title=f"[smoke] {completed.issue_title}",
-        build_briefing=_build_briefing,
-        smoke_model_wire=smoke_model_wire,
-        http_client=http_client,
-        native_execution_capabilities=smoke_cfg.native_execution_capabilities,
-        smoke_command=smoke_command,
-        smoke_needs_judgement=smoke_needs_judgement(
-            required_caps, smoke_cfg.native_execution_capabilities,
-        ),
-        smoke_timeout_s=smoke_cfg.timeout_seconds,
-    )
-
-    if dispatched is None:
-        # Every capability-matched machine was tried and none could take it
-        # (or there were none at all, including "none — they're all paused
-        # or in quiet hours right now", #2636). Report it where the board
-        # can show it, exactly once — never the silent 30 s spin of #1678.
-        _report_unroutable_smoke(
-            completed, required_caps, attempts, paused_capable=paused_capable,
-            cordon_only_capable=cordon_only_capable, busy_capable=busy_capable,
+    # #3920 review: everything from here through the
+    # `record_dispatched_assignment` write below runs with the claim taken
+    # above already held — mirroring `_dispatch_smoke_fanout`'s identical
+    # `try`/`except` (#3333 review). A `dispatched is None` fall-through
+    # releases it itself (nothing to persist, handled just below); an
+    # exception ANYWHERE in this window must release it too, or it would
+    # otherwise strand the claim with no assignment row and nothing in
+    # `release_smoke_claim_if_row_is_smoke_leg`'s reach to ever find it.
+    try:
+        dispatched, attempts = _walk_candidates_and_dispatch(
+            candidates,
+            completed=completed, repo=repo, required_caps=required_caps,
+            issue_title=f"[smoke] {completed.issue_title}",
+            build_briefing=_build_briefing,
+            smoke_model_wire=smoke_model_wire,
+            http_client=http_client,
+            native_execution_capabilities=smoke_cfg.native_execution_capabilities,
+            smoke_command=smoke_command,
+            smoke_needs_judgement=smoke_needs_judgement(
+                required_caps, smoke_cfg.native_execution_capabilities,
+            ),
+            smoke_timeout_s=smoke_cfg.timeout_seconds,
         )
-        return None
 
-    choice, briefing, agent_response = dispatched
+        if dispatched is None:
+            # Every capability-matched machine was tried and none could take
+            # it (or there were none at all, including "none — they're all
+            # paused or in quiet hours right now", #2636). Report it where
+            # the board can show it, exactly once — never the silent 30 s
+            # spin of #1678. #3920: release the claim so a LATER tick (this
+            # row still needs a leg either way) isn't permanently blocked by
+            # an orphaned claim nothing will ever fulfill.
+            release_smoke_dispatch_claim(
+                completed.assignment_id or "", SINGLE_LEG_SMOKE_PARTITION_TAG,
+            )
+            _report_unroutable_smoke(
+                completed, required_caps, attempts, paused_capable=paused_capable,
+                cordon_only_capable=cordon_only_capable, busy_capable=busy_capable,
+            )
+            return None
 
-    smoke_assignment = Assignment(
-        machine_name=choice.machine.name,
-        repo_name=completed.repo_name,
-        issue_number=completed.issue_number,
-        issue_title=f"[smoke] {completed.issue_title}",
-        files_allowed=[],
-        files_forbidden=[],
-        briefing=briefing,
-        assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
-        status="running",
-        branch=completed.branch,
-        pr_url=completed.pr_url,
-        dispatched_at=now if now is not None else time.time(),
-        type="smoke",
-        review_target=completed.branch,
-        review_of_assignment_id=completed.assignment_id,
-        model=smoke_model_alias,
-    )
-    board.active.append(smoke_assignment)
+        choice, briefing, agent_response = dispatched
 
-    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+        smoke_assignment = Assignment(
+            machine_name=choice.machine.name,
+            repo_name=completed.repo_name,
+            issue_number=completed.issue_number,
+            issue_title=f"[smoke] {completed.issue_title}",
+            files_allowed=[],
+            files_forbidden=[],
+            briefing=briefing,
+            assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+            status="running",
+            branch=completed.branch,
+            pr_url=completed.pr_url,
+            dispatched_at=now if now is not None else time.time(),
+            type="smoke",
+            review_target=completed.branch,
+            review_of_assignment_id=completed.assignment_id,
+            model=smoke_model_alias,
+        )
+        board.active.append(smoke_assignment)
 
-    record_dispatched_assignment(
-        assignment=smoke_assignment,
-        repo_github=repo.github,
-    )
+        from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+        record_dispatched_assignment(
+            assignment=smoke_assignment,
+            repo_github=repo.github,
+        )
+    except Exception:
+        release_smoke_dispatch_claim(
+            completed.assignment_id or "", SINGLE_LEG_SMOKE_PARTITION_TAG,
+        )
+        raise
 
     # #1395/#1426: mark the PARENT work row's Test verdict "running" the
     # moment the smoke assignment is dispatched — the same marker

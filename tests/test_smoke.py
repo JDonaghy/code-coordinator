@@ -3751,6 +3751,90 @@ def test_dispatch_smoke_fanout_concurrent_ticks_never_double_dispatch_a_partitio
     assert client_b.calls == []
 
 
+def test_dispatch_smoke_single_leg_concurrent_ticks_never_double_dispatch(
+    gtk_and_server_config: Config, coord_db,
+) -> None:
+    """#3920 regression (claude-coordinator#3917/#3918): two coordinator
+    ticks racing each other on the SINGLE-leg path — `passive_reconcile` and
+    a short-lived `coord notify`/`coord drive-queue` process, both reading
+    "nothing in flight yet" before either records its own dispatch — must
+    not both dispatch a Test-stage leg for the same work row. Before the
+    atomic claim, the dedupe here was board reads only
+    (`has_active_followup`/`has_active_branch_followup`), so the second tick
+    sailed straight through: the real incident's first leg died in ~40s on
+    an environment-setup failure and recorded `test_state="failed"`, and the
+    second leg's genuine ~18-minute passing run had nowhere left to land.
+
+    `claim_smoke_dispatch` lives on the shared DB, not on either tick's own
+    in-memory `Board` — so even though this test hands each call its own
+    fresh, empty `Board` (exactly what two racing processes would each
+    observe), the second call must still lose.
+    """
+    diff = lambda repo, branch: ["docs/README.md"]  # noqa: E731 — no capability rule matches
+
+    completed_a = _completed()
+    legs_a = dispatch_smoke(
+        completed_a, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "leg-a"}),
+        diff_lookup=diff,
+    )
+    assert legs_a is not None
+    assert legs_a.assignment_id == "leg-a"
+
+    # The second tick: a separate `Assignment` object (same assignment_id —
+    # the same work row) and a separate, empty `Board` — it has no idea the
+    # first tick dispatched anything.
+    completed_b = _completed()
+    client_b = _FakeClient({"id": "leg-b"})
+    legs_b = dispatch_smoke(
+        completed_b, Board(), gtk_and_server_config,
+        http_client=client_b,
+        diff_lookup=diff,
+    )
+
+    assert legs_b is None
+    # No machine was ever contacted for the second tick's dispatch — this
+    # loses the atomic claim BEFORE ranking candidates or spending a real
+    # `/assign` call, never after.
+    assert client_b.calls == []
+
+
+def test_dispatch_smoke_single_leg_claim_released_once_leg_self_reports(
+    gtk_and_server_config: Config, coord_db,
+) -> None:
+    """#3920: once the dispatched single leg's own assignment reaches a
+    terminal status, its claim must release — a legitimate LATER retry
+    (an environmental death, `coord diagnose --stage test --reset`) must
+    never find the row permanently stranded behind a claim nothing will
+    ever release again, the same guarantee #3333 already gives the fan-out
+    path."""
+    from coord.smoke import SINGLE_LEG_SMOKE_PARTITION_TAG
+    from coord.state import claim_smoke_dispatch, release_smoke_claim_if_row_is_smoke_leg
+
+    diff = lambda repo, branch: ["docs/README.md"]  # noqa: E731
+
+    completed = _completed()
+    leg = dispatch_smoke(
+        completed, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "leg-self-report"}),
+        diff_lookup=diff,
+    )
+    assert leg is not None
+
+    # The claim is held — a fresh dispatch attempt for the same row loses it.
+    assert claim_smoke_dispatch(
+        completed.assignment_id or "", SINGLE_LEG_SMOKE_PARTITION_TAG,
+    ) is False
+
+    # The leg's own terminal-status write (worker self-report / `coord
+    # notify` reap) releases it.
+    release_smoke_claim_if_row_is_smoke_leg(leg.assignment_id or "")
+
+    assert claim_smoke_dispatch(
+        completed.assignment_id or "", SINGLE_LEG_SMOKE_PARTITION_TAG,
+    ) is True
+
+
 def test_dispatch_smoke_fanout_concurrent_ticks_on_different_partitions_never_drop_either(
     repo: Repo, coord_db,
 ) -> None:
