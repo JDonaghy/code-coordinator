@@ -7488,6 +7488,69 @@ class TestRefreshEntryAssignment:
         assert load_queue() == []
 
 
+class TestClearStaleSmokeErrorForAssignment:
+    """#3917: a fresh terminal test verdict clears a persisted stale-smoke
+    `error`, mirroring `refresh_entry_assignment`'s review-error clear above
+    for the one gate that had no analogous eager clear."""
+
+    def _work(self, aid: str, branch: str = "worker/orig") -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=branch,
+        )
+
+    def test_clears_stale_smoke_error(self, coord_db) -> None:
+        work = self._work("w1")
+        mq.enqueue(work, repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        items[0].error = (
+            "smoke test verdict is stale: recorded against branch "
+            "c6ef8e6, branch is now 4fb8bea — re-verify against the "
+            "current base, then `coord test w1 --passed`"
+        )
+        mq.save_queue(items)
+
+        result = mq.clear_stale_smoke_error_for_assignment("w1")
+        assert result is True
+        assert load_queue()[0].error is None
+
+    def test_noop_when_no_matching_entry(self, coord_db) -> None:
+        assert mq.clear_stale_smoke_error_for_assignment("does-not-exist") is False
+
+    def test_noop_when_error_is_not_stale_smoke(self, coord_db) -> None:
+        work = self._work("w1")
+        mq.enqueue(work, repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        items[0].error = "review required but not approved"
+        mq.save_queue(items)
+
+        result = mq.clear_stale_smoke_error_for_assignment("w1")
+        assert result is False
+        assert load_queue()[0].error == "review required but not approved"
+
+    def test_does_not_touch_merged_entry(self, coord_db) -> None:
+        work = self._work("w1")
+        mq.enqueue(work, repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        items[0].state = mq.MERGED
+        items[0].error = "smoke test verdict is stale: recorded against branch a, branch is now b"
+        mq.save_queue(items)
+
+        result = mq.clear_stale_smoke_error_for_assignment("w1")
+        assert result is False
+        assert load_queue()[0].error is not None
+
+    def test_empty_assignment_id_is_noop(self, coord_db) -> None:
+        assert mq.clear_stale_smoke_error_for_assignment("") is False
+        assert mq.clear_stale_smoke_error_for_assignment(None) is False
+
+
 class TestReconcileConflictEntries:
     """#1477: a CONFLICT entry re-tests its cached verdict on every tick
     instead of trusting the `gh pr merge` failure recorded whenever the

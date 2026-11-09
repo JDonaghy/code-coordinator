@@ -5826,7 +5826,18 @@ def test_stale_smoke_divergence_also_matches_the_plan_wording():
 def test_stale_smoke_redispatch_is_bounded_by_max_fix_rounds():
     """The re-test arm shares the SAME `fix_rounds` budget as the test-failed
     and review-fix arms (#1738) — it must converge to an escalation, not spin
-    forever, if the verdict keeps going stale."""
+    forever, if the verdict keeps going stale.
+
+    #3917: a board-sourced stale-smoke `merge_reason` is now latched exactly
+    like a diagnostic-sourced one — `coord.merge_queue.process()` only ever
+    rewrites the persisted `error` this reason is read from on a REAL merge
+    attempt (#420), so re-testing it twice in a row with no such attempt in
+    between would spend two `fix_rounds` on byte-identical evidence. Each
+    re-test is now followed by a real `coord merge --only` attempt (which
+    releases the latch and spends no `fix_rounds`) before the NEXT re-test
+    is allowed to fire — so with `max_fix_rounds=2` the sequence is
+    re-test / merge-attempt / re-test / merge-attempt / escalate, not the
+    pre-#3917 back-to-back re-test / re-test / escalate."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_fix_rounds=2)
     s = approved_work(
@@ -5836,8 +5847,30 @@ def test_stale_smoke_redispatch_is_bounded_by_max_fix_rounds():
 
     first = step(s, opts, counters=counters)
     assert first.kind == RUN
+    assert first.command[0] == "diagnose"
+    assert counters.fix_rounds == 1
+
+    # Latched: no real merge attempt has re-validated the first re-test yet,
+    # so this poll re-attempts the merge for real instead of re-testing
+    # again — and spends no `fix_rounds` unit doing so.
     second = step(s, opts, counters=counters)
     assert second.kind == RUN
+    assert second.command[0] == "merge"
+    assert counters.fix_rounds == 1
+    assert counters.merge_attempts == 1
+
+    # The real attempt above released the latch — a second re-test may fire.
+    third = step(s, opts, counters=counters)
+    assert third.kind == RUN
+    assert third.command[0] == "diagnose"
+    assert counters.fix_rounds == 2
+
+    fourth = step(s, opts, counters=counters)
+    assert fourth.kind == RUN
+    assert fourth.command[0] == "merge"
+    assert counters.fix_rounds == 2
+    assert counters.merge_attempts == 2
+
     exhausted = step(s, opts, counters=counters)
     assert exhausted.is_exit
     assert exhausted.exit_code == EXIT_ESCALATED
@@ -6170,6 +6203,38 @@ def test_diagnostic_derived_retest_fires_once_per_captured_snapshot():
     assert counters.fix_rounds == 1
 
     # Same frozen diagnostic, same board — must NOT spend a second fix round.
+    second = step(s, opts, counters=counters)
+    assert second.kind == RUN
+    assert second.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert counters.fix_rounds == 1
+    assert counters.merge_attempts == 1
+
+
+def test_board_sourced_retest_fires_once_per_reason_too():
+    """#3917 (quadraui#2173): the SAME one-re-test-per-snapshot latch the
+    previous test proves for a diagnostic-sourced reason must ALSO cover a
+    reason read straight off the board's own `merge_reason` — the incident
+    this closes re-tested a board-sourced "smoke test verdict is stale"
+    reason five times across two drive runs, all passing, because nothing
+    had ever cleared the persisted `QueuedMerge.error` it was read from
+    (#420) and the pre-#3917 latch only armed for the diagnostic source."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+    s = approved_work(
+        merge_status="READY",
+        merge_reason=(
+            "smoke test verdict is stale: recorded against branch "
+            "c6ef8e6, branch is now 4fb8bea — re-verify against the "
+            "current base, then `coord test w1 --passed`"
+        ),
+    )
+
+    first = step(s, opts, counters=counters)
+    assert first.command[0] == "diagnose"
+    assert counters.fix_rounds == 1
+
+    # Same board reason, no real merge attempt in between — must NOT spend
+    # a second fix round re-testing evidence that cannot have changed.
     second = step(s, opts, counters=counters)
     assert second.kind == RUN
     assert second.command == ("merge", "--only", "w1", "--method", "rebase")
