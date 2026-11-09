@@ -220,6 +220,7 @@ from coord.board_doctor import (
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CONFLICT_FIX_HEAD_UNMOVED,
     CAUSE_LATCH_STALE_MERGEABLE,
+    CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_MERGE_PENDING_STUCK,
     CAUSE_SMOKE_NO_VERDICT,
     TIER_ALERT,
@@ -697,6 +698,62 @@ def _merge_pending_stuck_row(row: StuckRow) -> bool:
     return _run_mechanical_action("merge", row, _body)
 
 
+def _restage_stale_gate_row(row: StuckRow, *, stage: str) -> bool:
+    """#3929: re-dispatch a fresh review or test for a row the merge gate's
+    own freshness check confirms is stale (:data:`coord.queue_diagnose.
+    CAUSE_REVIEW_STALE` / :data:`coord.queue_diagnose.CAUSE_TEST_STALE`) —
+    never the generic investigate-tier fix-it leg, which cannot fix a
+    staleness problem by editing code.
+
+    Calls the SAME ``restage`` wrapper #3881's investigator session would
+    (`coord.board_doctor_permissions.sweep_restage`), with ``actor="sweep"``.
+    Returns ``True`` only when the wrapper confirms ``restaged=True`` — no
+    completed work assignment to restage against is a confirmed no-op, not
+    a false success. Any OTHER exception — `coord.review.dispatch_review`/
+    the smoke-requeue primitive are live-GitHub/network-bound — is caught
+    by :func:`_run_mechanical_action` rather than aborting the sweep.
+    """
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
+
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="restage",
+        )
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        result = dispatch_investigator_action(
+            "restage", repo_name, issue_number, board, config,
+            stage=stage, reason=_SWEEP_REASON, actor="sweep",
+        )
+        if not result["acted"]:
+            return _warn_noop("restage", repo_name, issue_number, result["detail"])
+        return True
+
+    return _run_mechanical_action("restage", row, _body)
+
+
+def _restage_review_stale_row(row: StuckRow) -> bool:
+    """#3929: :func:`_restage_stale_gate_row` bound to ``stage="review"`` —
+    the handler :func:`_register_auto_action` registers against
+    :data:`coord.queue_diagnose.CAUSE_REVIEW_STALE`."""
+    return _restage_stale_gate_row(row, stage="review")
+
+
+def _restage_test_stale_row(row: StuckRow) -> bool:
+    """#3929: :func:`_restage_stale_gate_row` bound to ``stage="test"`` —
+    the handler :func:`_register_auto_action` registers against
+    :data:`coord.queue_diagnose.CAUSE_TEST_STALE`. Reuses ``sweep_smoke_
+    requeue`` under the hood (`sweep_restage`'s own dispatch for this
+    stage), clearing the stale verdict's fields so it re-enters the
+    ordinary Test-stage dispatch scan."""
+    return _restage_stale_gate_row(row, stage="test")
+
+
 def _redispatch_head_unmoved_conflict_fix(row: StuckRow) -> bool:
     """#3887 case 3, pairs with #3871: re-dispatch the ordinary
     conflict-fix for a `HUMAN_REQUIRED` row whose last attempt completed
@@ -1107,6 +1164,29 @@ _register_auto_action(
     queue_diagnose.CAUSE_MERGE_CONFLICT,
     "conflict_fix_dispatch",
     _dispatch_conflict_fix,
+)
+# #3929: a row the merge gate's own freshness re-check confirms is stale
+# gets a fresh review/test, never the generic investigate-tier fix-it leg
+# (which cannot repair staleness by editing code) — see
+# `_restage_stale_gate_row`'s docstring.
+_register_auto_action(
+    queue_diagnose.CAUSE_REVIEW_STALE,
+    "restage",
+    _restage_review_stale_row,
+)
+_register_auto_action(
+    queue_diagnose.CAUSE_TEST_STALE,
+    "restage",
+    _restage_test_stale_row,
+)
+# #3929: a never-attempted-but-otherwise-clear merge row reuses the EXACT
+# same "merge" action/handler `CAUSE_MERGE_PENDING_STUCK` already does —
+# the dispatcher itself never branches on which cause named the row, only
+# on the row's own key, so one handler legitimately serves both causes.
+_register_auto_action(
+    CAUSE_MERGE_NEVER_ATTEMPTED,
+    "merge",
+    _merge_pending_stuck_row,
 )
 
 

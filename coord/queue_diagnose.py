@@ -67,6 +67,8 @@ __all__ = [
     "CAUSE_INTEGRATION_RED",
     "CAUSE_NEVER_DISPATCHED",
     "CAUSE_PROSE",
+    "CAUSE_REVIEW_STALE",
+    "CAUSE_TEST_STALE",
     "CAUSE_UNKNOWN",
     "CONFIDENCE_HIGH",
     "CONFIDENCE_LOW",
@@ -156,6 +158,34 @@ CAUSE_AGENT_UNREACHABLE = "agent-unreachable"
 #: budget recorded as `unknown` stays `unknown` — `needs_diagnosis` refuses
 #: to re-probe it — so only new or unspent episodes reach this cause.
 CAUSE_NEVER_DISPATCHED = "never-dispatched"
+#: #3929 (#3918 gap 3): the merge gate's OWN freshness check
+#: (:func:`coord.merge_queue.find_scoped_review_candidate`, built on the
+#: same :func:`~coord.merge_queue.scan_approved_reviews` ``has_approved_
+#: review`` relies on) confirms an approve verdict exists for this branch's
+#: work chain but no longer covers it — the branch head/patch-id moved past
+#: what that review actually looked at, and none of the rebase-equivalence
+#: escape hatches (#1475 content-identical patch-id, #3707 ancillary-only,
+#: #3749 context-only) apply. ``coord gates`` itself calls the SAME
+#: underlying scan (see ``build_gate_report``'s own "review" decision), so
+#: a live, DIRECT call here is never a second implementation of the
+#: freshness math — it is the one place in this module that refuses to
+#: trust `coord gates`'s cached decision and re-derives the answer itself
+#: (quadraui#2173: `coord gates` read "every required gate reads clear"
+#: while the approving review's own `review_patch_id` no longer matched the
+#: branch — a cause that reached :data:`CAUSE_UNKNOWN` and dispatched a
+#: blind fix-it work leg instead of a fresh review). The fix here is a
+#: review, never a worker leg — see :mod:`coord.board_doctor_policy`'s
+#: ``restage`` wiring for this cause.
+CAUSE_REVIEW_STALE = "review-stale"
+#: #3929 (#3918 gap 3), the Test-gate twin of :data:`CAUSE_REVIEW_STALE`:
+#: :func:`coord.merge_queue.evaluate_smoke_verdict`'s own ``kind`` reads
+#: :data:`coord.merge_queue.SMOKE_STALE` — a ``passed``/``skipped`` verdict
+#: recorded against a branch/base SHA pair that has since moved. Never
+#: ``SMOKE_MISSING`` (nothing was ever recorded — that is a plain gate
+#: refusal, not staleness) or ``SMOKE_UNKNOWN`` (the live SHA needed to
+#: judge staleness could not even be read — abstain, don't guess). The fix
+#: is a fresh test, never a worker leg.
+CAUSE_TEST_STALE = "test-stale"
 CAUSE_UNKNOWN = "unknown"
 
 CAUSE_PROSE: dict[str, str] = {
@@ -178,6 +208,8 @@ CAUSE_PROSE: dict[str, str] = {
     CAUSE_CI_GREEN: "every check has reported success; the CI-shaped reason no longer describes anything live",
     CAUSE_AGENT_UNREACHABLE: "the machine that owns this entry is not answering /health",
     CAUSE_NEVER_DISPATCHED: "this row has no branch, no PR and no merge-queue row behind it — it was never dispatched, so no amount of re-probing a merge gate can ever learn anything new; resetting it to waiting re-runs nothing that already ran",
+    CAUSE_REVIEW_STALE: "the merge gate's own freshness check confirms an approval exists but no longer covers this branch's current head/patch-id — needs a fresh review, not a fix-it leg",
+    CAUSE_TEST_STALE: "the merge gate's own freshness check confirms a recorded test verdict is stale against the current branch/base — needs a fresh test, not a fix-it leg",
     CAUSE_UNKNOWN: "evidence was too thin to name a cause, and a guess here would poison the corpus Phase 2 is scoped from",
 }
 
@@ -278,6 +310,26 @@ class LiveState:
     #: that assignment has no branch recorded yet (dispatched, just not
     #: pushed). Only a confirmed ``True`` may ever upgrade a verdict.
     no_assignment_ever: bool | None = None
+    #: #3929: ``True`` only when the merge gate's OWN freshness check
+    #: (:func:`coord.merge_queue.find_scoped_review_candidate`) confirms a
+    #: prior approve verdict exists for this branch but no longer covers
+    #: its current head/patch-id. ``False`` when review isn't required at
+    #: all, or the requirement reads fresh (approved-and-current, or never
+    #: approved in the first place — there is nothing stale to report
+    #: either way). ``None`` — "could not tell" — when the check was never
+    #: attempted (no board/config, no work-like assignment to anchor it
+    #: to) or raised. Never derived from ``coord gates``'s own cached
+    #: decision (see :data:`CAUSE_REVIEW_STALE`): a direct call, every
+    #: time, is the whole point.
+    review_stale: bool | None = None
+    #: #3929, the Test-gate twin of `review_stale`: ``True`` only when
+    #: :func:`coord.merge_queue.evaluate_smoke_verdict`'s own ``kind``
+    #: reads :data:`coord.merge_queue.SMOKE_STALE`. ``False`` when Test
+    #: isn't required, or the verdict reads fresh/missing/unknown — a
+    #: verdict that was simply never recorded is a plain gate refusal, not
+    #: staleness, and an unreadable live SHA is "could not tell", not
+    #: "confirmed not stale". ``None`` when the check was never attempted.
+    test_stale: bool | None = None
 
     @property
     def read_anything(self) -> bool:
@@ -352,6 +404,26 @@ def _branch_test_line(live: LiveState) -> str:
     return f"coord gates (test decision): branch Test verdict reads {live.branch_test_state!r}"
 
 
+def _staleness_line(live: LiveState) -> str:
+    """Rendered unconditionally, same posture as :func:`_branch_test_line` —
+    the one place an operator reading ANY cause can see what the merge
+    gate's own direct freshness re-check found, independent of what
+    ``coord gates``'s cached decision said (#3929)."""
+
+    def _bit(label: str, value: bool | None, stale_word: str) -> str:
+        if value is None:
+            return f"{label}: not read"
+        if value:
+            return f"{label}: {stale_word}"
+        return f"{label}: fresh (or not required/never approved)"
+
+    return (
+        "merge-gate freshness recheck — "
+        f"{_bit('review', live.review_stale, 'APPROVED BUT STALE')}; "
+        f"{_bit('test', live.test_stale, 'RECORDED BUT STALE')}"
+    )
+
+
 def _health_line(entry: QueueEntry, live: LiveState) -> str:
     machine = entry.machine or entry.launch_host or "unassigned"
     if live.agent_reachable is None:
@@ -382,6 +454,7 @@ def _evidence(entry: QueueEntry, live: LiveState) -> list[str]:
         _checks_line(live),
         _gate_line(live),
         _branch_test_line(live),
+        _staleness_line(live),
         _health_line(entry, live),
     ]
     lines.extend(f"probe failed: {err}" for err in live.probe_errors)
@@ -541,6 +614,30 @@ def _rule_no_pr(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | No
     return None
 
 
+def _rule_review_stale(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
+    """#3929: fires straight off the merge gate's own direct freshness
+    re-check (:attr:`LiveState.review_stale`) — never off ``coord
+    gates``'s cached decision, which can read "every required gate reads
+    clear" for the exact row this is meant to catch (quadraui#2173, see
+    :data:`CAUSE_REVIEW_STALE`). Checked ahead of
+    :func:`_rule_integration_red`/:func:`_rule_ci_red`/:func:`_rule_gate_
+    blocked`: a confirmed-stale approval is a sharper, more actionable
+    answer than any of those three generic reads, and must win the race
+    against :data:`CAUSE_UNKNOWN` long before this module gives up.
+    """
+    if live.review_stale is True:
+        return CAUSE_REVIEW_STALE, CONFIDENCE_HIGH, _staleness_line(live)
+    return None
+
+
+def _rule_test_stale(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
+    """#3929, the Test-gate twin of :func:`_rule_review_stale` — see that
+    rule's docstring."""
+    if live.test_stale is True:
+        return CAUSE_TEST_STALE, CONFIDENCE_HIGH, _staleness_line(live)
+    return None
+
+
 def _rule_integration_red(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
     """A live-failing check whose branch Test verdict is already green is a
     property of the MERGE, not the branch — see
@@ -630,6 +727,12 @@ _RULES = (
     _rule_conflict,
     _rule_dead_leg,
     _rule_no_pr,
+    # #3929: a confirmed-stale review/test, straight off a direct re-check
+    # of the merge gate's own freshness functions, outranks every rule
+    # below — including the generic `gate-blocked`/`ci-red` reads that a
+    # STALE `coord gates` cache can otherwise hide behind (quadraui#2173).
+    _rule_review_stale,
+    _rule_test_stale,
     # #3882: integration-red must be tried before the generic ci-red rule
     # below, or a branch whose own Test verdict is clean would always be
     # misclassified as a plain (local) regression.
@@ -880,9 +983,10 @@ class GhLiveProbe:
 
     def probe(self, entry: QueueEntry) -> LiveState:
         errors: list[str] = []
-        branch, gate_ready, gate_blockers, no_assignment_ever, branch_test_state = (
-            self._gates(entry, errors)
-        )
+        (
+            branch, gate_ready, gate_blockers, no_assignment_ever, branch_test_state,
+            review_stale, test_stale,
+        ) = self._gates(entry, errors)
         pr_number, pr_state, mergeable, checks = self._github(entry, branch, errors)
         reachable, has_session, crits = self._health(entry)
         return LiveState(
@@ -898,14 +1002,16 @@ class GhLiveProbe:
             probe_errors=tuple(errors),
             no_assignment_ever=no_assignment_ever,
             branch_test_state=branch_test_state,
+            review_stale=review_stale,
+            test_stale=test_stale,
         )
 
     # -- `coord gates`, verbatim ------------------------------------------
     def _gates(
         self, entry: QueueEntry, errors: list[str]
-    ) -> tuple[str, bool | None, list[str], bool | None, str | None]:
+    ) -> tuple[str, bool | None, list[str], bool | None, str | None, bool | None, bool | None]:
         if self.board is None or self.config is None:
-            return "", None, [], None, None
+            return "", None, [], None, None, None, None
         try:
             from coord import github_ops  # noqa: PLC0415
             from coord.gates import build_gate_report  # noqa: PLC0415
@@ -915,7 +1021,8 @@ class GhLiveProbe:
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"coord gates: {type(exc).__name__}: {exc}")
-            return "", None, [], None, None
+            return "", None, [], None, None, None, None
+        review_stale, test_stale = self._staleness(entry, errors)
         # `build_gate_report` returns early, with `report.rows` empty, ONLY
         # when `assignments_for_issue` found nothing on the board for this
         # issue at all (coord/gates.py) — never for an assignment that
@@ -966,14 +1073,87 @@ class GhLiveProbe:
                     branch_test_state = row.test_state
         decisions = [d for d in report.decisions if getattr(d, "required", False)]
         if not decisions:
-            return str(report.branch or ""), None, [], no_assignment_ever, branch_test_state
+            return (
+                str(report.branch or ""), None, [], no_assignment_ever, branch_test_state,
+                review_stale, test_stale,
+            )
         blockers = [
             f"{d.gate}: {d.reason or 'refused'}" for d in decisions if not d.ok
         ]
         return (
             str(report.branch or ""), not blockers, blockers, no_assignment_ever,
-            branch_test_state,
+            branch_test_state, review_stale, test_stale,
         )
+
+    # -- #3929: the merge gate's OWN freshness functions, called DIRECTLY --
+    def _staleness(
+        self, entry: QueueEntry, errors: list[str]
+    ) -> tuple[bool | None, bool | None]:
+        """Re-derive review/test staleness straight from
+        :mod:`coord.merge_queue` — never from ``coord gates``'s own cached
+        decision (see :data:`CAUSE_REVIEW_STALE`'s docstring for why that
+        distinction is the whole point of #3929).
+
+        Builds the SAME synthetic, never-persisted
+        :class:`~coord.merge_queue.QueuedMerge` :func:`coord.gates.
+        build_gate_report` builds internally
+        (:func:`coord.merge_queue.live_gate_entry`), off the SAME winning
+        work-like assignment :func:`coord.gates._select_winning_work_
+        assignment` would pick — read-only diagnosis of a row that may
+        still be in flight, exactly like that helper's own docstring
+        describes, which is why this reuses it rather than growing a THIRD
+        copy of the tie-break (#2096).
+
+        ``(None, None)`` whenever there is nothing to anchor the check to
+        (no work-like assignment, no repo config) or a live call raises —
+        "could not tell", never "confirmed not stale".
+        """
+        try:
+            from coord import github_ops  # noqa: PLC0415
+            from coord import merge_queue as mq  # noqa: PLC0415
+            from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+            from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
+            from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+            repo_cfg = self.config.repo(entry.repo) if self.config is not None else None
+            if repo_cfg is None:
+                return None, None
+            work_like = [
+                a
+                for a in assignments_for_issue(self.board, entry.repo, entry.issue)
+                if a.type in WORK_LIKE_TYPES
+            ]
+            if not work_like:
+                return None, None
+            winner = _select_winning_work_assignment(work_like)
+            if not winner.branch:
+                return None, None
+            target_branch = resolve_base_branch_for_issue_number(
+                repo_cfg, repo_cfg.github, entry.issue,
+            )
+            mq_entry = mq.live_gate_entry(
+                winner, repo_cfg.github, target_branch, github_ops,
+            )
+
+            review_stale: bool | None = None
+            if mq.requires_review(mq_entry, self.config):
+                candidate = mq.find_scoped_review_candidate(
+                    mq_entry, self.board, github_ops, config=self.config,
+                )
+                review_stale = candidate is not None
+            else:
+                review_stale = False
+
+            test_stale: bool | None = None
+            if mq.requires_smoke(mq_entry, self.config):
+                smoke = mq.evaluate_smoke_verdict(mq_entry, self.board, github_ops)
+                test_stale = smoke.kind == mq.SMOKE_STALE
+            else:
+                test_stale = False
+        except Exception as exc:  # noqa: BLE001 — a probe, never a decision
+            errors.append(f"merge-gate freshness recheck: {type(exc).__name__}: {exc}")
+            return None, None
+        return review_stale, test_stale
 
     # -- `gh pr view` / `gh pr checks` ------------------------------------
     def _github(

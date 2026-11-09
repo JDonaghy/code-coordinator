@@ -1142,6 +1142,95 @@ def _reclassify_after_prereqs_landed(
     return reclassified
 
 
+#: #3929 (#3918 gap 1, second half): a merge-queue entry that has NEVER been
+#: attempted at all (``entry.last_attempt is None``) is invisible to both
+#: :func:`merge_queue_rows` (its own #3918-review carve-out: a `pending`
+#: entry is only ever labelled stuck there via LAST-ATTEMPT staleness,
+#: deliberately never off an unset `last_attempt` — see that function's
+#: docstring for why) and :data:`_MERGE_QUEUE_STUCK_CAUSE` (same reason).
+#: quadraui#2160: a row whose test and review both read fresh and whose
+#: merge-queue row sits `PENDING` with no attempt recorded escalated or
+#: idled toward the 240-minute deadline instead of this sweep just running
+#: the one merge attempt that unblocks it. Minted ONLY by
+#: :func:`_reclassify_merge_never_attempted`, from a row that reclassifier
+#: independently re-confirms LIVE via `coord.merge_queue.entry_gate_status`
+#: — the SAME re-confirmation :func:`_confirm_merge_pending_stuck` already
+#: trusts for the STALE-pending shape — never from the bare PENDING/
+#: unset-`last_attempt` shape alone.
+CAUSE_MERGE_NEVER_ATTEMPTED = "merge-never-attempted"
+
+
+def _reclassify_merge_never_attempted(
+    rows: list[StuckRow], merge_entries: Sequence[Any], *, board: Board, config,
+) -> list[StuckRow]:
+    """#3929: promote a no-progress drive-queue row to
+    :data:`CAUSE_MERGE_NEVER_ATTEMPTED` when its merge-queue row is
+    `PENDING` with ``last_attempt is None`` (never evaluated at all) AND a
+    live re-check confirms every gate ahead of the merge attempt itself
+    already reads clear.
+
+    Same "promote only an independently-confirmed subset of a broader
+    cause" shape as :func:`_reclassify_after_prereqs_landed` — the incoming
+    cause must be one of :data:`_AFTER_PREREQS_LANDED_SAFE_CAUSES` (`unknown`
+    or `no-pr`: the live PR/branch-lifecycle diagnosis found nothing
+    actionable of its own, which is exactly what a row stuck ONLY because
+    `coord merge` never got to it looks like — #2096, the same incoming-
+    cause precondition, not a second independently-maintained judgment
+    call under a new name), and :func:`coord.merge_queue.entry_gate_status`
+    — the SAME function :func:`_confirm_merge_pending_stuck` already trusts
+    for the STALE-pending shape — must read `PLAN_READY` right now. A row
+    whose review/smoke genuinely is not ready yet reads `PLAN_BLOCKED` here
+    and is left exactly as the caller already classified it, so a row that
+    is not actually ready for a merge attempt is never mis-labelled as one
+    that is.
+    """
+    from coord import github_ops  # noqa: PLC0415
+    from coord.ci_store import build_ci_store  # noqa: PLC0415
+    from coord.merge_queue import PENDING, PLAN_READY, entry_gate_status  # noqa: PLC0415
+
+    entries_by_key = {
+        f"{entry.repo_name}#{entry.issue_number}": entry for entry in merge_entries
+    }
+    out: list[StuckRow] = []
+    for row in rows:
+        if row.queue != "drive-queue" or row.cause not in _AFTER_PREREQS_LANDED_SAFE_CAUSES:
+            out.append(row)
+            continue
+        entry = entries_by_key.get(row.key)
+        if entry is None or entry.state != PENDING or entry.last_attempt is not None:
+            out.append(row)
+            continue
+        live_ready = False
+        try:
+            ci_cfg = config.ci_store
+            ci_store = build_ci_store(
+                ci_cfg.type or "github", host=ci_cfg.host, token_env=ci_cfg.token_env,
+            )
+            status, _reason = entry_gate_status(entry, board, config, ci_store, github_ops)
+            live_ready = status == PLAN_READY
+        except Exception:  # noqa: BLE001 — best-effort live confirm; see docstring
+            _log.debug(
+                "board-doctor: merge-never-attempted live confirm failed for %s",
+                row.key, exc_info=True,
+            )
+            live_ready = False
+        if live_ready:
+            row = replace(
+                row,
+                cause=CAUSE_MERGE_NEVER_ATTEMPTED,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=row.evidence
+                + (
+                    f"merge_queue.state={entry.state} last_attempt=None — the "
+                    "merge gate has never actually been evaluated at all; a "
+                    "live re-check confirms every gate ahead of the merge "
+                    "attempt itself reads clear (#3929)",
+                ),
+            )
+        out.append(row)
+    return out
+
+
 #: #3888: the three drive-queue shapes that can sit making no progress while
 #: carrying neither a `block_log` episode (only `blocked`/`parked`
 #: transitions ever open one — :data:`coord.block_log.STALL_STATES`) nor a
@@ -1896,6 +1985,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
         rows, entries_by_key, board=board, board_view=board_view,
     )
     rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
+    rows = _reclassify_merge_never_attempted(rows, merge_entries, board=board, config=config)
     rows.extend(smoke_no_verdict_rows(board))
 
     blocked_streaks = {

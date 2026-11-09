@@ -22,12 +22,14 @@ from coord.board_doctor import (
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CHECKS_STALE_RACE,
+    CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_SMOKE_NO_VERDICT,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
     _reclassify_ceiling_blocked,
     _reclassify_checks_stale_race,
+    _reclassify_merge_never_attempted,
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
     drive_queue_rows,
@@ -37,7 +39,7 @@ from coord.board_doctor import (
 )
 from coord.config import BoardDoctorConfig, Config, ConfigError, _parse_board_doctor
 from coord.drive_queue import BoardView, IssueFacts, QueueEntry
-from coord.models import Assignment, Board, BoardDoctorRepoConfig, Repo
+from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
 from coord.queue_diagnose import LiveState
 from coord.smoke import (
     ABANDONED_BACKGROUND_SMOKE_MARKER,
@@ -545,6 +547,178 @@ class TestReclassifyChecksStaleRace:
         )
 
         assert out == row
+
+
+def _widgets_config() -> Config:
+    repo = Repo(
+        name="acme/widgets", github="acme/widgets",
+        default_branch="main", test_command="pytest",
+    )
+    return Config(
+        repos=[repo],
+        machines=[
+            Machine(
+                name="laptop", host="laptop.tail",
+                repos=["acme/widgets"], repo_paths={"acme/widgets": "/work"},
+            ),
+        ],
+    )
+
+
+class TestReclassifyMergeNeverAttempted:
+    """#3929 (#3918 gap 1, second half), quadraui#2160: a merge-queue entry
+    that has NEVER been attempted at all (``last_attempt is None``) is
+    invisible to both :func:`coord.board_doctor.merge_queue_rows` and
+    :data:`coord.board_doctor._MERGE_QUEUE_STUCK_CAUSE` — a no-progress
+    drive-queue row stuck only because `coord merge` never got to it must
+    be promoted to :data:`CAUSE_MERGE_NEVER_ATTEMPTED` instead of idling or
+    escalating toward the deadline, but ONLY once a live re-check confirms
+    every gate ahead of the merge attempt itself actually reads clear.
+    """
+
+    @staticmethod
+    def _merge_entry(**overrides):
+        from coord import merge_queue as mq
+
+        base = dict(
+            assignment_id="w2160", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2160-fix", target_branch="main", issue_number=2160,
+            issue_title="Fix the thing", state=mq.PENDING, last_attempt=None,
+            # No open PR and an explicit, gate-free required_gates list:
+            # keeps `entry_gate_status` hermetic (no `gh` call at all), same
+            # trick `tests/test_board_doctor_policy.py::
+            # TestConfirmMergePendingStuck` uses — these tests exercise the
+            # LIVE-CONFIRM CONTROL FLOW, not a live network read.
+            pr_number=None, required_gates=["merge"], error="",
+        )
+        base.update(overrides)
+        return mq.QueuedMerge(**base)
+
+    def test_an_unknown_no_progress_row_with_a_never_attempted_merge_row_is_promoted(
+        self,
+    ) -> None:
+        entry = self._merge_entry()
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out.cause == CAUSE_MERGE_NEVER_ATTEMPTED
+        assert out.evidence[:-1] == row.evidence
+        assert "last_attempt=None" in out.evidence[-1]
+
+    def test_a_no_pr_row_with_a_never_attempted_merge_row_is_also_promoted(self) -> None:
+        # `CAUSE_NO_PR` is the OTHER incoming cause this reclassifier may
+        # promote away from (`_AFTER_PREREQS_LANDED_SAFE_CAUSES`) — a merge
+        # never attempted at all usually means `coord merge` never even
+        # created the PR yet.
+        entry = self._merge_entry()
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_NO_PR, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out.cause == CAUSE_MERGE_NEVER_ATTEMPTED
+
+    def test_an_attempted_and_refused_merge_row_keeps_todays_behaviour(self) -> None:
+        """Acceptance item 3: a row whose merge WAS attempted (and is
+        refused/pending its ordinary turn) must be left exactly as the
+        caller already classified it — `last_attempt` set at all disables
+        this reclassifier entirely, regardless of what the live gate would
+        say."""
+        entry = self._merge_entry(last_attempt=1000.0, error="review not approved")
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == row
+
+    def test_a_row_whose_gates_are_not_actually_clear_is_left_alone(self) -> None:
+        # The merge gate itself still refuses (review required) — a
+        # never-attempted merge row is not, on its own, proof the row is
+        # ready for a merge attempt.
+        entry = self._merge_entry(required_gates=["review", "merge"])
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == row
+
+    def test_drops_the_row_when_no_matching_merge_entry_is_found(self) -> None:
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == row
+
+    def test_a_row_whose_live_confirm_raises_is_left_alone(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh hiccup")
+
+        monkeypatch.setattr("coord.merge_queue.entry_gate_status", _boom)
+
+        entry = self._merge_entry()
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == row
+
+    def test_leaves_other_causes_and_queues_untouched(self) -> None:
+        other = _row("acme/widgets#1", queue_diagnose.CAUSE_PR_MERGED, queue="drive-queue")
+
+        [out] = _reclassify_merge_never_attempted(
+            [other], [], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == other
+
+    def test_merge_queue_rows_are_never_promoted(self) -> None:
+        entry = self._merge_entry()
+        row = _row(
+            "acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN,
+            queue="merge-queue", fresh=True,
+        )
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == row
+
+
+class TestMergeNeverAttemptedAndReviewTestStaleAreWiredToRealActions:
+    """Acceptance (#3929): `CAUSE_REVIEW_STALE`/`CAUSE_TEST_STALE` dispatch
+    a fresh review/test, and `CAUSE_MERGE_NEVER_ATTEMPTED` dispatches a
+    merge attempt — never the generic investigate-tier fix-it leg. Asserts
+    on `coord.board_doctor_policy`'s own closed allow-list (the same
+    surface `coord.board_doctor.default_tier_of`/`sweep` consult), not a
+    duplicate of that module's own dispatcher-level tests
+    (`tests/test_board_doctor_policy.py`)."""
+
+    def test_review_stale_and_test_stale_dispatch_a_restage_never_a_fixit_leg(self) -> None:
+        import coord.board_doctor_policy as board_doctor_policy
+
+        assert board_doctor_policy.ALLOWLIST[queue_diagnose.CAUSE_REVIEW_STALE] == "restage"
+        assert board_doctor_policy.ALLOWLIST[queue_diagnose.CAUSE_TEST_STALE] == "restage"
+        assert queue_diagnose.CAUSE_REVIEW_STALE not in board_doctor_policy.INVESTIGATE_CAUSES
+        assert queue_diagnose.CAUSE_TEST_STALE not in board_doctor_policy.INVESTIGATE_CAUSES
+
+    def test_merge_never_attempted_dispatches_a_merge_attempt(self) -> None:
+        import coord.board_doctor_policy as board_doctor_policy
+
+        assert board_doctor_policy.ALLOWLIST[CAUSE_MERGE_NEVER_ATTEMPTED] == "merge"
+        assert CAUSE_MERGE_NEVER_ATTEMPTED not in board_doctor_policy.INVESTIGATE_CAUSES
 
 
 class TestSweepClassifiesAndDispatches:
