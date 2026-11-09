@@ -2296,6 +2296,96 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
         assert captured["capacity_check"] is None
 
 
+class TestNoProgressAgeSeconds:
+    """Direct unit coverage of `_no_progress_age_seconds`'s stall-nudge
+    branch, including the edge the black-box `no_progress_rows` tests
+    cannot reach: a malformed `stalled_for` value.
+    """
+
+    def test_unparseable_stalled_for_falls_back_to_launched_at(self) -> None:
+        from coord.board_doctor import _no_progress_age_seconds
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=1, state="running", launched_at=100.0,
+        )
+        age = _no_progress_age_seconds(
+            entry, now=500.0, stall_nudge={"stalled_for": "not-a-number"},
+        )
+        assert age == 400.0
+
+    def test_stall_nudge_with_stalled_for_none_falls_back_to_launched_at(self) -> None:
+        from coord.board_doctor import _no_progress_age_seconds
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=1, state="running", launched_at=100.0,
+        )
+        age = _no_progress_age_seconds(
+            entry, now=500.0, stall_nudge={"stalled_for": None},
+        )
+        assert age == 400.0
+
+
+class TestFreshStallNudge:
+    """Direct unit coverage of `_fresh_stall_nudge`: the #3918 review's
+    recency/launch bound on a notifier stall-nudge record, isolated from
+    the rest of `no_progress_rows`'s plumbing.
+    """
+
+    def test_none_nudge_stays_none(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        assert _fresh_stall_nudge(
+            None, now=100.0, launched_at=0.0, ttl_seconds=60.0,
+        ) is None
+
+    def test_missing_at_is_rejected(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        assert _fresh_stall_nudge(
+            {"stalled_for": 5.0}, now=100.0, launched_at=0.0, ttl_seconds=60.0,
+        ) is None
+
+    def test_unparseable_at_is_rejected(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        assert _fresh_stall_nudge(
+            {"at": "not-a-number", "stalled_for": 5.0},
+            now=100.0, launched_at=0.0, ttl_seconds=60.0,
+        ) is None
+
+    def test_at_before_launched_at_is_rejected(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        assert _fresh_stall_nudge(
+            {"at": 50.0, "stalled_for": 5.0},
+            now=100.0, launched_at=60.0, ttl_seconds=60.0,
+        ) is None
+
+    def test_at_past_ttl_is_rejected(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        assert _fresh_stall_nudge(
+            {"at": 0.0, "stalled_for": 5.0},
+            now=200.0, launched_at=None, ttl_seconds=60.0,
+        ) is None
+
+    def test_fresh_nudge_within_bounds_passes_through(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        nudge = {"at": 90.0, "stalled_for": 5.0}
+        assert _fresh_stall_nudge(
+            nudge, now=100.0, launched_at=60.0, ttl_seconds=60.0,
+        ) is nudge
+
+    def test_no_launched_at_known_skips_the_launch_bound(self) -> None:
+        from coord.board_doctor import _fresh_stall_nudge
+
+        nudge = {"at": 90.0, "stalled_for": 5.0}
+        assert _fresh_stall_nudge(
+            nudge, now=100.0, launched_at=None, ttl_seconds=60.0,
+        ) is nudge
+
+
 class TestNoProgressRows:
     """#3888: classify every no-progress drive-queue row, not just the
     subset `block_log`'s episode walk and :func:`merge_queue_rows` already
@@ -2397,6 +2487,42 @@ class TestNoProgressRows:
         assert "running-live-no-state-change" in row.evidence[-1]
         assert "150m" in row.evidence[-1]
 
+    def test_running_live_but_idle_with_active_work_is_not_classified(self) -> None:
+        # #3918 review (blocking): the issue's own condition is a `running`
+        # entry with "nothing active" — a stall nudge alone must not
+        # override a live, non-terminal work-like assignment the board
+        # still has recorded for this row. The ordinary case of a live
+        # session making real progress carries `active_work=True` for
+        # almost its entire run, so this guard is what keeps that case
+        # from reading as idle just because a nudge happens to be on file
+        # from an earlier, now-resolved stall.
+        from coord.notifier.store import record_nudge
+
+        record_nudge("acme/widgets", 2163, at=100_000.0, stalled_for=9_000.0)
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2163,
+            state="running",
+            session_name="drive-acme-widgets-2163",
+            launched_at=100_000.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2163"}),
+            board_view=BoardView(
+                issues={"acme/widgets#2163": IssueFacts(active_work=True)},
+            ),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert rows == []
+
     def test_running_live_but_idle_under_threshold_is_not_classified(self) -> None:
         # A stall nudge that hasn't aged past `no_progress_minutes` yet is
         # not a no-progress row — same grace window every other shape gets.
@@ -2445,6 +2571,69 @@ class TestNoProgressRows:
             probe=probe,
             config=self._config(),
             now=100_000.0,
+        )
+
+        assert rows == []
+
+    def test_running_live_but_idle_nudge_predating_launch_is_not_classified(self) -> None:
+        # #3918 review: a nudge dated BEFORE this session's own
+        # `launched_at` describes an earlier (possibly already-ended)
+        # session for the same (repo, issue) — it must not be read as
+        # evidence about the current one just because the key matches.
+        from coord.notifier.store import record_nudge
+
+        record_nudge("acme/widgets", 2164, at=50_000.0, stalled_for=9_000.0)
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2164,
+            state="running",
+            session_name="drive-acme-widgets-2164",
+            launched_at=100_000.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2164"}),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert rows == []
+
+    def test_running_live_but_idle_nudge_past_ttl_is_not_classified(self) -> None:
+        # #3918 review: `load_state` applies no expiry of its own, so a
+        # record that has outlived the notifier's own `NUDGE_TTL_SECS`
+        # must not be read as live evidence either, even when it postdates
+        # `launched_at`.
+        from coord.notifier.store import NUDGE_TTL_SECS, record_nudge
+
+        launched_at = 100_000.0
+        nudge_at = launched_at + 10.0
+        now = nudge_at + NUDGE_TTL_SECS + 1.0
+        record_nudge("acme/widgets", 2165, at=nudge_at, stalled_for=9_000.0)
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2165,
+            state="running",
+            session_name="drive-acme-widgets-2165",
+            launched_at=launched_at,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2165"}),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=now,
         )
 
         assert rows == []

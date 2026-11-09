@@ -2829,6 +2829,41 @@ class TestSweepDispatchConflictFix:
         assert len(log["entries"]) == 1
         assert log["entries"][0]["actor"] == "sweep"
 
+    def test_retry_cap_already_spent_latches_human_required(self, monkeypatch) -> None:
+        # #3918 review: a prior FAILED conflict-fix for this same entry
+        # means `dispatch_conflict_fix` itself would decline before ever
+        # selecting a machine — the sweep must recognize that cap-spent
+        # shape itself and latch HUMAN_REQUIRED, the same outcome
+        # `coord.commands.merge`'s reactive call site reaches, rather than
+        # reporting the same ambiguous "could not be dispatched" a bare
+        # no-machine refusal gets.
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import sweep_dispatch_conflict_fix
+
+        self._queue_one(mq.CONFLICT, 11)
+        self._must_not_dispatch(monkeypatch)
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=11,
+            issue_title="[conflict-fix] Fix the thing",
+            assignment_id="cf-11-prior", type="conflict-fix",
+            review_of_assignment_id="w11", status="failed",
+        ))
+
+        result = sweep_dispatch_conflict_fix("api", 11, board, _fixit_config(_fixit_repo()))
+
+        assert result["dispatched"] is False
+        assert "retry cap" in result["detail"]
+        assert "HUMAN_REQUIRED" in result["detail"]
+        entries = [e for e in mq.load_queue() if e.issue_number == 11]
+        assert len(entries) == 1
+        assert entries[0].state == mq.HUMAN_REQUIRED
+        log = query_audit_log(
+            event_type="conflict_fix_dispatch_refused", repo="api", issue=11,
+        )
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
+
     def test_a_row_with_no_merge_queue_entry_is_a_refused_noop(self, monkeypatch) -> None:
         from coord.board_doctor_permissions import sweep_dispatch_conflict_fix
 

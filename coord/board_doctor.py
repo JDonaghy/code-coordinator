@@ -1254,6 +1254,41 @@ def _render_ceiling(resolution: Any) -> str:
     return "uncapped" if resolution.value == 0 else str(resolution.value)
 
 
+def _fresh_stall_nudge(
+    nudge: Mapping[str, Any] | None,
+    *,
+    now: float,
+    launched_at: float | None,
+    ttl_seconds: float,
+) -> Mapping[str, Any] | None:
+    """*nudge* only if it still plausibly describes the entry's current session.
+
+    A stall-nudge record carries no link back to any particular drive
+    session and `load_state` applies no expiry of its own (pruning only
+    happens inside `save_state`, which the record's own retraction path
+    does not pass through) — so, read in isolation, a record can describe
+    a session that already ended. A record is accepted here only if it is
+    both recent (within *ttl_seconds*) and dated on or after *launched_at*,
+    the start of the session it is being read against; either check
+    failing means the record predates (or has outlived) the thing it would
+    be used to explain, so it is treated the same as no record at all.
+    """
+    if not nudge:
+        return None
+    at = nudge.get("at")
+    if at is None:
+        return None
+    try:
+        at = float(at)
+    except (TypeError, ValueError):
+        return None
+    if now - at > ttl_seconds:
+        return None
+    if launched_at is not None and at < launched_at:
+        return None
+    return nudge
+
+
 def _no_progress_shape(
     entry: Any,
     *,
@@ -1265,6 +1300,7 @@ def _no_progress_shape(
     fleet_occupied: int,
     dep_states: Mapping[str, str],
     local_host: str | None,
+    now: float = 0.0,
     stall_nudge_of: Callable[[str, int], Mapping[str, Any] | None] = lambda repo, issue: None,
 ) -> str | None:
     """Which of the #3888/#3918 no-progress shapes *entry* matches, or
@@ -1284,22 +1320,32 @@ def _no_progress_shape(
     the queue still calls ``running`` whose real work already finished (by
     hand or otherwise) with nobody telling the queue.
 
-    ``running``, live-but-idle (#3918): the session IS alive (so the
-    dead-leg check above never matches), but *stall_nudge_of* — a thin
-    wrapper over :func:`coord.notifier.store.nudge_for`, the SAME persisted
-    record the notifier's own stall-survived-its-nudge condition reads —
-    reports a ``stalled_for`` duration for this row's ``(repo, issue)``.
-    `coord.drive.Driver._loop` publishes that record every time its own
-    ``--stall``-driven nudge fires (#1593), and clears it the instant the
-    board fingerprint it describes moves — so a record present here means
-    the OWNING drive session itself has observed no pipeline state change
-    for that long, not a guess this function makes from session liveness
-    alone. A session being alive proves the TMUX PROCESS is up; it says
-    nothing about whether the pipeline inside it is moving (quadraui#2160:
-    test passed, then the pane printed `!! no state change in 20m … 40m …
-    161m (nothing active)` for over two hours with the doctor never
-    writing a row for it, because the dead-leg check above — the only
-    `running` check that existed — stops at "the session is alive").
+    ``running``, live-but-idle (#3918): gated on the SAME ``no non-terminal
+    work-like assignment on the board`` check the dead-leg shape above
+    uses — the issue's own condition names a `running` row with "nothing
+    active", and an idle nudge alone must never override a live,
+    non-terminal assignment the board still has recorded for this row
+    (the ordinary "making real progress" case). Past that guard: the
+    session IS alive (so the dead-leg check above never matches), but
+    *stall_nudge_of* — a thin wrapper over
+    :func:`coord.notifier.store.nudge_for`, the SAME persisted record the
+    notifier's own stall-survived-its-nudge condition reads, filtered
+    through :func:`_fresh_stall_nudge` so a record from an earlier
+    session (predating this row's own ``launched_at``) or one that has
+    simply outlived :data:`coord.notifier.store.NUDGE_TTL_SECS` is never
+    read as describing the CURRENT session — reports a ``stalled_for``
+    duration for this row's ``(repo, issue)``. `coord.drive.Driver._loop`
+    publishes that record every time its own ``--stall``-driven nudge
+    fires (#1593), and clears it the instant the board fingerprint it
+    describes moves — so a record present here means the OWNING drive
+    session itself has observed no pipeline state change for that long,
+    not a guess this function makes from session liveness alone. A
+    session being alive proves the TMUX PROCESS is up; it says nothing
+    about whether the pipeline inside it is moving (quadraui#2160: test
+    passed, then the pane printed `!! no state change in 20m … 40m … 161m
+    (nothing active)` for over two hours with the doctor never writing a
+    row for it, because the dead-leg check above — the only `running`
+    check that existed — stops at "the session is alive").
     *_no_progress_age_seconds* reads the SAME record (passed down by the
     caller) rather than this function's own ``launched_at``-based age for
     this one shape, since "idle since when" is this record's own
@@ -1346,12 +1392,19 @@ def _no_progress_shape(
     if entry.state == STATE_RUNNING:
         if queue_diagnose.is_foreign_launch(entry, local_host):
             return None
+        if facts_of(entry.key).active_work:
+            return None
         if entry.session_name and entry.session_name in live_sessions:
-            nudge = stall_nudge_of(entry.repo, entry.issue)
+            from coord.notifier.store import NUDGE_TTL_SECS  # noqa: PLC0415
+
+            nudge = _fresh_stall_nudge(
+                stall_nudge_of(entry.repo, entry.issue),
+                now=now,
+                launched_at=entry.launched_at,
+                ttl_seconds=NUDGE_TTL_SECS,
+            )
             if nudge is not None and nudge.get("stalled_for") is not None:
                 return _NO_PROGRESS_RUNNING_IDLE
-            return None
-        if facts_of(entry.key).active_work:
             return None
         return _NO_PROGRESS_RUNNING_DEAD
     if entry.state in (STATE_BLOCKED, STATE_PARKED):
@@ -1513,6 +1566,8 @@ def no_progress_rows(
     # known" (every entry reads as not-idle from this signal) rather than
     # failing the whole no-progress pass — the dead-leg/blocked/waiting
     # shapes above are unaffected either way.
+    from coord.notifier.store import NUDGE_TTL_SECS as _NUDGE_TTL_SECS  # noqa: PLC0415
+
     try:
         from coord.notifier.store import load_state as _load_notifier_state
         from coord.notifier.store import nudge_for as _nudge_for
@@ -1562,12 +1617,18 @@ def no_progress_rows(
             fleet_occupied=fleet_occupied,
             dep_states=dep_states,
             local_host=local_host,
+            now=stamp,
             stall_nudge_of=stall_nudge_of,
         )
         if shape is None:
             continue
         nudge = (
-            stall_nudge_of(entry.repo, entry.issue)
+            _fresh_stall_nudge(
+                stall_nudge_of(entry.repo, entry.issue),
+                now=stamp,
+                launched_at=entry.launched_at,
+                ttl_seconds=_NUDGE_TTL_SECS,
+            )
             if shape == _NO_PROGRESS_RUNNING_IDLE
             else None
         )
@@ -1592,7 +1653,7 @@ def no_progress_rows(
             coverage_note = (
                 "board_doctor: the drive session is alive but its own "
                 f"stall nudge reports no pipeline state change for "
-                f"{(nudge or {}).get('stalled_for', 0) / 60.0:g}m "
+                f"{(nudge or {}).get('stalled_for', None) / 60.0:g}m "
                 "(coord.notifier.store nudge record) — a live session "
                 "alone is not evidence of progress"
             )
@@ -2436,6 +2497,15 @@ def sweep(
             count, escalated = counter_state["count"], counter_state["escalated"]
             action = "investigate-deferred"
             if count >= convergence_limit:
+                # Escalation is the only outcome a row can reach from here:
+                # unlike the non-deferred branch below (which keeps a row
+                # under `convergence_limit` eligible for `auto_dispatchers`
+                # on every sweep), a row that has spent its whole counter
+                # being deferred for capacity never gets routed back
+                # through the dispatch path even once capacity frees up —
+                # it alerts instead. A capacity-starved row that would
+                # otherwise self-resolve on the next free slot is traded
+                # for a human seeing it sooner.
                 alert_due = not escalated or state.board_doctor_alert_due(
                     counter_state, now=moment, backoff_initial_hours=backoff_initial_hours,
                 )

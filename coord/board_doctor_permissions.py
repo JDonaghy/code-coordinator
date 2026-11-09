@@ -2441,18 +2441,27 @@ def sweep_dispatch_conflict_fix(
     a different row's attention.
 
     Returns ``dispatched=False`` (never raises) when the row has no
-    merge-queue entry, the entry no longer reads ``CONFLICT`` live, or
-    `dispatch_conflict_fix` itself declines (no capable machine, one
-    already in flight, or the retry cap already spent) — any of those
-    leaves the row exactly where :func:`coord.board_doctor.sweep`'s own
-    convergence counter already tracks it, so a row this never actually
-    helps still escalates once ``CONVERGENCE_LIMIT`` sweeps pass, the same
-    as every other mechanical action's noop.
+    merge-queue entry, the entry no longer reads ``CONFLICT`` live, the
+    retry cap is already spent, or `dispatch_conflict_fix` itself declines
+    for a different reason (no capable machine, one already in flight) —
+    any of those leaves the row exactly where :func:`coord.board_doctor.
+    sweep`'s own convergence counter already tracks it, so a row this
+    never actually helps still escalates once ``CONVERGENCE_LIMIT`` sweeps
+    pass, the same as every other mechanical action's noop.
+
+    The retry-cap case is checked explicitly, with :func:`coord.merge_queue.
+    HUMAN_REQUIRED` latched here when it fires — mirroring
+    `coord.commands.merge`'s own reactive call site rather than leaving it
+    to `dispatch_conflict_fix`'s internal ``None`` return, which collapses
+    "cap spent" and "no machine right now" into the same signal and would
+    otherwise leave this sweep re-attempting (and `_conflict_fix_dispatch_result`
+    re-auditing) a dispatch that can never succeed on every tick until the
+    convergence counter alone escalates it.
     """
     authorize_sweep_action("conflict_fix_dispatch")
 
-    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
-    from coord.merge_queue import CONFLICT, load_queue  # noqa: PLC0415
+    from coord.conflict_fix import dispatch_conflict_fix, has_prior_conflict_fix  # noqa: PLC0415
+    from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, load_queue, save_queue  # noqa: PLC0415
     from coord.network import fetch_status  # noqa: PLC0415
 
     queue = load_queue()
@@ -2474,14 +2483,26 @@ def sweep_dispatch_conflict_fix(
             ),
         )
 
+    if has_prior_conflict_fix(board, entry.assignment_id, current_error=entry.error):
+        entry.state = HUMAN_REQUIRED
+        fresh_queue = load_queue()
+        by_id = {entry.assignment_id: entry}
+        save_queue([by_id.get(x.assignment_id, x) for x in fresh_queue])
+        return _conflict_fix_dispatch_result(
+            repo_name, issue_number, dispatched=False,
+            detail=(
+                f"{repo_name}#{issue_number}: conflict-fix retry cap already "
+                "spent — latched HUMAN_REQUIRED, manual resolution required"
+            ),
+        )
+
     fix = dispatch_conflict_fix(entry, board, config, status_fetcher=fetch_status)
     if fix is None:
         return _conflict_fix_dispatch_result(
             repo_name, issue_number, dispatched=False,
             detail=(
                 f"{repo_name}#{issue_number}: a conflict-fix could not be "
-                "dispatched (no capable machine, one already active, or the "
-                "retry cap was already spent)"
+                "dispatched (no capable machine or one already active)"
             ),
         )
 
