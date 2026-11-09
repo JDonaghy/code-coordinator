@@ -647,23 +647,30 @@ def _clear_stale_latch(row: StuckRow) -> bool:
 
 
 def _merge_pending_stuck_row(row: StuckRow) -> bool:
-    """#3887 case 5: merge a `PENDING` merge-queue row that already looks
-    fully green/approved/mergeable but the ordinary merge tick keeps
-    missing.
+    """Merge a `PENDING` merge-queue row that already looks fully
+    green/approved/mergeable but the ordinary merge tick keeps missing.
+    Registered against two distinct causes with two distinct staleness
+    preconditions:
 
-    :data:`CAUSE_MERGE_PENDING_STUCK` only fires
-    (:func:`coord.board_doctor.merge_queue_rows`) once the entry has sat
-    past :data:`coord.board_doctor.MERGE_PENDING_STALE_AFTER_SECONDS`
-    since its last attempt, so this calls the SAME `merge` wrapper #3881's
-    investigator session would — plain ``coord merge --only`` of an
-    already-approved row (`coord.board_doctor_permissions.
-    investigator_merge`) — with ``actor="sweep"``. Every live gate (CI
-    green, approval still bound to current content, mergeable) is
-    re-confirmed by `coord.merge_queue.process()` itself the moment it
-    runs; a fresh conflict or CI failure there is reported ``acted=False``,
-    never treated as this call's own failure. Any OTHER exception —
-    `process()` is live-GitHub/network-bound — is caught by
-    :func:`_run_mechanical_action` rather than aborting the sweep.
+    - :data:`CAUSE_MERGE_PENDING_STUCK` (#3887 case 5), which only fires
+      (:func:`coord.board_doctor.merge_queue_rows`) once the entry has sat
+      past :data:`coord.board_doctor.MERGE_PENDING_STALE_AFTER_SECONDS`
+      since its last attempt.
+    - :data:`coord.board_doctor.CAUSE_MERGE_NEVER_ATTEMPTED` (#3929), which
+      fires with NO age bound at all — see that cause's own docstring for
+      why a never-attempted entry has no "last attempt" to measure a delay
+      against in the first place.
+
+    Either way this calls the SAME `merge` wrapper #3881's investigator
+    session would — plain ``coord merge --only`` of an already-approved row
+    (`coord.board_doctor_permissions.investigator_merge`) — with
+    ``actor="sweep"``. Every live gate (CI green, approval still bound to
+    current content, mergeable) is re-confirmed by `coord.merge_queue.
+    process()` itself the moment it runs; a fresh conflict or CI failure
+    there is reported ``acted=False``, never treated as this call's own
+    failure. Any OTHER exception — `process()` is live-GitHub/network-bound
+    — is caught by :func:`_run_mechanical_action` rather than aborting the
+    sweep.
     """
     def _body() -> bool:
         parsed = _parse_row_key(row.key)
@@ -750,7 +757,11 @@ def _restage_test_stale_row(row: StuckRow) -> bool:
     :data:`coord.queue_diagnose.CAUSE_TEST_STALE`. Reuses ``sweep_smoke_
     requeue`` under the hood (`sweep_restage`'s own dispatch for this
     stage), clearing the stale verdict's fields so it re-enters the
-    ordinary Test-stage dispatch scan."""
+    ordinary Test-stage dispatch scan. Shares `coord.smoke.
+    BOARD_DOCTOR_REQUEUE_BUDGET` with :data:`CAUSE_SMOKE_NO_VERDICT`'s own
+    restage — a row that alternates between the two causes spends one
+    shared budget for two different reasons, which is the existing #3810
+    posture for that counter, not a new one this cause introduces."""
     return _restage_stale_gate_row(row, stage="test")
 
 

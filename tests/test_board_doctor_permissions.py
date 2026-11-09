@@ -2228,6 +2228,104 @@ class TestInvestigatorRestage:
         assert persisted_work.review_state == "dispatched"
 
 
+class TestSweepRestageRoutesStaleApprovalsToScopedReview:
+    """#3929 review (blocking): a work assignment that already carries a
+    terminal review verdict makes :func:`coord.review.dispatch_review` hard
+    -refuse under #3670 — "ONE review per leg" — so `sweep_restage(stage=
+    "review")` must route through the #1476 scoped-review primitive
+    (:func:`coord.review.dispatch_scoped_reviews_for_queue`) instead of
+    guaranteeing a confirmed no-op for exactly the shape
+    :data:`coord.queue_diagnose.CAUSE_REVIEW_STALE` is minted for."""
+
+    def test_restages_via_the_scoped_review_primitive_when_a_verdict_is_already_recorded(
+        self, monkeypatch,
+    ) -> None:
+        from coord.board_doctor_permissions import sweep_restage
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        work.review_verdict = "approve"
+        board.completed.append(work)
+
+        scoped_review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[scoped-review] t", assignment_id="scoped-r1",
+            type="review", status="running", branch=work.branch,
+        )
+
+        def _fake_dispatch_scoped_reviews_for_queue(b, c):
+            assert b is board
+            assert c is config
+            return [scoped_review]
+
+        monkeypatch.setattr(
+            "coord.review.dispatch_scoped_reviews_for_queue",
+            _fake_dispatch_scoped_reviews_for_queue,
+        )
+
+        result = sweep_restage("api", 1, board, config, stage="review")
+
+        assert result["restaged"] is True
+        assert "scoped-r1" in result["detail"]
+
+    def test_reports_a_confirmed_no_op_when_no_scoped_candidate_is_found(
+        self, monkeypatch,
+    ) -> None:
+        from coord.board_doctor_permissions import sweep_restage
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        work.review_verdict = "approve"
+        board.completed.append(work)
+
+        monkeypatch.setattr(
+            "coord.review.dispatch_scoped_reviews_for_queue", lambda b, c: [],
+        )
+
+        result = sweep_restage("api", 1, board, config, stage="review")
+
+        assert result["restaged"] is False
+        assert "#3670" in result["detail"]
+
+    def test_a_never_reviewed_work_assignment_still_uses_the_plain_dispatch_review(
+        self, monkeypatch,
+    ) -> None:
+        """No terminal verdict recorded yet — today's existing path (plain
+        `dispatch_review`) must still run; routing this shape through the
+        scoped-review primitive instead would find nothing (there is no
+        prior approval to scope a delta against) and silently no-op."""
+        from coord.board_doctor_permissions import sweep_restage
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        board.completed.append(work)
+
+        class _Dispatched:
+            assignment_id = "review-fresh"
+
+        monkeypatch.setattr(
+            "coord.review.dispatch_review", lambda w, b, c: _Dispatched(),
+        )
+
+        def _must_not_be_called(*a, **k):
+            raise AssertionError("must not call the scoped-review primitive")
+
+        monkeypatch.setattr(
+            "coord.review.dispatch_scoped_reviews_for_queue", _must_not_be_called,
+        )
+
+        result = sweep_restage("api", 1, board, config, stage="review")
+
+        assert result["restaged"] is True
+        assert "review-fresh" in result["detail"]
+
+
 class TestInvestigatorIntegrationFix:
     def test_dispatches_against_the_sibling_issue_never_the_original(self) -> None:
         from coord.board_doctor_permissions import investigator_integration_fix
