@@ -45,6 +45,7 @@ from coord.agent import (
     default_worker_command,
     is_runtime_ceiling_reason,
     worker_coord_reachable,
+    worker_disallowed_tools,
 )
 
 from .conftest import noop_default_worker_command
@@ -2153,6 +2154,48 @@ def test_worker_system_prompt_tells_partial_investigation_workers_to_use_refs():
     # The prompt must also tell a worker who already wrote the commit the
     # wrong way how to fix it before pushing, not just what not to do.
     assert "git commit --amend" in WORKER_SYSTEM_PROMPT
+
+
+def test_worker_system_prompt_does_not_offer_subagent_fan_out():
+    """#3932: the over-scoping guidance must not tell a worker to fan out
+    via `Task` subagents — a non-opted-in `type="work"` leg (the
+    overwhelming majority; `workflow=False` is the default) never gets
+    `Task` in --allowedTools, so a worker that reached for it would be
+    told to use a tool it does not have, check for it, and then stop
+    anyway. The only sanctioned response to an oversized issue is to stop
+    and report a split, via the `needs-decomposition` WORK_OUTCOME
+    marker."""
+    assert "Agent tool" not in WORKER_SYSTEM_PROMPT
+    assert "spawn narrowly-scoped" not in WORKER_SYSTEM_PROMPT
+    assert "use the Agent" not in WORKER_SYSTEM_PROMPT
+    # The prompt may still explain that fan-out is unavailable (it does, to
+    # head off a worker that checks for the tool and then just stops without
+    # saying why) — what it must never do is instruct spawning one.
+    assert "`Task` is disallowed" in WORKER_SYSTEM_PROMPT
+    assert "needs-decomposition" in WORKER_SYSTEM_PROMPT
+
+
+def test_worker_system_prompt_fan_out_guidance_matches_tool_surface():
+    """#3932: pin the prompt to the real tool surface rather than letting
+    the two drift independently (#2096 — one question, one answer). `Task`
+    is the tool a subagent fan-out would need; confirm it is actually
+    disallowed for a default (non-workflow) work leg — the exact spec
+    shape WORKER_SYSTEM_PROMPT is written for — so the prompt's refusal to
+    offer fan-out is correct, not just convenient wording."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        type="work",
+        workflow=False,
+    )
+    disallowed = worker_disallowed_tools(spec, allowed_tools="Read,Edit,Write,Bash")
+    assert "Task" in disallowed
+    # If this repo ever decides to grant Task to plain work legs, this test
+    # (and the prompt text it pins) must change in the same diff.
+    assert "Agent tool" not in WORKER_SYSTEM_PROMPT
 
 
 def test_mock_author_system_prompt_forbids_the_base_checkout():
