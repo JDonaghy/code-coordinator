@@ -2362,6 +2362,93 @@ class TestNoProgressRows:
         assert rows == []
         assert probe.calls == []
 
+    def test_running_live_but_idle_is_classified(self) -> None:
+        # #3918 / quadraui#2160 shape: the tmux session IS alive (so the
+        # dead-leg check never matches), but `coord drive`'s own stall
+        # nudge reports no state change for well past the no-progress
+        # threshold. Must still reach this sweep's output instead of
+        # being silently invisible just because a live session exists.
+        from coord.notifier.store import record_nudge
+
+        record_nudge("acme/widgets", 2160, at=100_000.0, stalled_for=9_000.0)
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2160,
+            state="running",
+            session_name="drive-acme-widgets-2160",
+            launched_at=100_000.0,
+        )
+        probe = _FakeProbe({"acme/widgets#2160": LiveState()})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2160"}),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        [row] = rows
+        assert row.key == entry.key
+        assert row.cause == queue_diagnose.CAUSE_UNKNOWN
+        assert "running-live-no-state-change" in row.evidence[-1]
+        assert "150m" in row.evidence[-1]
+
+    def test_running_live_but_idle_under_threshold_is_not_classified(self) -> None:
+        # A stall nudge that hasn't aged past `no_progress_minutes` yet is
+        # not a no-progress row — same grace window every other shape gets.
+        from coord.notifier.store import record_nudge
+
+        record_nudge("acme/widgets", 2161, at=100_000.0, stalled_for=60.0)
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2161,
+            state="running",
+            session_name="drive-acme-widgets-2161",
+            launched_at=100_000.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2161"}),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert rows == []
+
+    def test_running_live_with_no_stall_nudge_is_not_classified(self) -> None:
+        # A live session with no published nudge at all is the ordinary
+        # "making progress" case — never flagged from liveness alone.
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2162,
+            state="running",
+            session_name="drive-acme-widgets-2162",
+            launched_at=100_000.0,
+        )
+        probe = _FakeProbe({})
+
+        rows = no_progress_rows(
+            [entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset({"drive-acme-widgets-2162"}),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert rows == []
+
     def test_blocked_row_with_no_episode_is_classified_unknown_and_alerts(self) -> None:
         # quadraui#2035 shape: no probe evidence at all survives to explain
         # it, so this must land on `unknown` rather than being dropped.

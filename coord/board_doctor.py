@@ -404,7 +404,20 @@ def merge_queue_rows(entries: Sequence[Any], *, now: float | None = None) -> lis
       (see :func:`_confirm_merge_pending_stuck`'s docstring), so this
       label never reaches a caller un-confirmed: :func:`collect_rows`
       always runs it through that live re-check before the cause is
-      acted on or escalated.
+      acted on or escalated. #3918 review: an entry whose ``last_attempt``
+      is ``None`` (the merge gate has never actually been evaluated at
+      all) is deliberately NOT folded into this filter even though it
+      looks like the same shape aged off ``enqueued_at`` instead — this
+      function's own ``cause`` becomes the caller's ``covered_keys``
+      BEFORE :func:`_confirm_merge_pending_stuck` gets a chance to drop an
+      unconfirmed candidate, so minting a row here that confirmation then
+      silently drops (its own documented, correct behavior for a row that
+      is merely waiting on something ordinary — CI still running, a
+      #3886 reservation held) would make the row invisible to
+      :func:`no_progress_rows` too, for the one state that caller's own
+      nudge-based `running` shape (#3918) is positioned to catch instead:
+      the owning drive is very likely still alive and polling, so leaving
+      this entry OFF this filter is what lets that shape see it.
 
     *now* defaults to :func:`time.time` — overridable so a replay test can
     assert on a fixed, reproducible staleness window.
@@ -1142,6 +1155,20 @@ def _reclassify_after_prereqs_landed(
 #: string constants are evidence labels only — never branched on by a
 #: caller outside this module.
 _NO_PROGRESS_RUNNING_DEAD = "running-no-session-no-activity"
+#: #3918: a FOURTH shape — a `running` row whose tmux session is alive (so
+#: the dead-leg shape above never matches) but whose own drive loop has
+#: published :func:`coord.drive._publish_stall_nudge`'s record of "no state
+#: change, nothing active" for longer than this sweep's own
+#: ``no_progress_minutes`` threshold (quadraui#2160: the pane printed `!!
+#: no state change in 20m … 40m … 161m (nothing active)` for over two
+#: hours while the doctor wrote nothing, because a live session alone was
+#: treated as proof of progress). Reuses the SAME persisted record
+#: `coord.notifier.collect.worker_probes` already reads to answer the
+#: identical question for its own `CONDITION_STALL_NUDGED` alert
+#: (#2096) — never a second, independently-derived "is this stalled"
+#: signal — rather than re-deriving staleness from `coord drive`'s raw
+#: pane output here.
+_NO_PROGRESS_RUNNING_IDLE = "running-live-no-state-change"
 _NO_PROGRESS_BLOCKED = "blocked"
 _NO_PROGRESS_WAITING_READY = "waiting-ready-not-launched"
 
@@ -1238,10 +1265,12 @@ def _no_progress_shape(
     fleet_occupied: int,
     dep_states: Mapping[str, str],
     local_host: str | None,
+    stall_nudge_of: Callable[[str, int], Mapping[str, Any] | None] = lambda repo, issue: None,
 ) -> str | None:
-    """Which of the #3888 no-progress shapes *entry* matches, or ``None``.
+    """Which of the #3888/#3918 no-progress shapes *entry* matches, or
+    ``None``.
 
-    ``running``: launched on *this* host — a foreign-launched row
+    ``running``, dead-leg: launched on *this* host — a foreign-launched row
     (:func:`coord.queue_diagnose.is_foreign_launch`) is never judged dead
     from here, same guard :meth:`coord.queue_diagnose.GhLiveProbe._foreign`
     and :func:`coord.drive_queue._reconcile_running`'s own #1870 branch
@@ -1255,8 +1284,29 @@ def _no_progress_shape(
     the queue still calls ``running`` whose real work already finished (by
     hand or otherwise) with nobody telling the queue.
 
-    ``blocked``/``parked``: always a candidate — unlike the other two
-    shapes this one needs no extra evidence to be WORTH a fresh look, since
+    ``running``, live-but-idle (#3918): the session IS alive (so the
+    dead-leg check above never matches), but *stall_nudge_of* — a thin
+    wrapper over :func:`coord.notifier.store.nudge_for`, the SAME persisted
+    record the notifier's own stall-survived-its-nudge condition reads —
+    reports a ``stalled_for`` duration for this row's ``(repo, issue)``.
+    `coord.drive.Driver._loop` publishes that record every time its own
+    ``--stall``-driven nudge fires (#1593), and clears it the instant the
+    board fingerprint it describes moves — so a record present here means
+    the OWNING drive session itself has observed no pipeline state change
+    for that long, not a guess this function makes from session liveness
+    alone. A session being alive proves the TMUX PROCESS is up; it says
+    nothing about whether the pipeline inside it is moving (quadraui#2160:
+    test passed, then the pane printed `!! no state change in 20m … 40m …
+    161m (nothing active)` for over two hours with the doctor never
+    writing a row for it, because the dead-leg check above — the only
+    `running` check that existed — stops at "the session is alive").
+    *_no_progress_age_seconds* reads the SAME record (passed down by the
+    caller) rather than this function's own ``launched_at``-based age for
+    this one shape, since "idle since when" is this record's own
+    ``stalled_for``, not how long ago the session happened to launch.
+
+    ``blocked``/``parked``: always a candidate — unlike the other shapes
+    this one needs no extra evidence to be WORTH a fresh look, since
     sitting blocked already means nothing is progressing; the N-minute
     grace window (applied by the caller) is what keeps a merely-just-blocked
     row out, not this predicate.
@@ -1297,6 +1347,9 @@ def _no_progress_shape(
         if queue_diagnose.is_foreign_launch(entry, local_host):
             return None
         if entry.session_name and entry.session_name in live_sessions:
+            nudge = stall_nudge_of(entry.repo, entry.issue)
+            if nudge is not None and nudge.get("stalled_for") is not None:
+                return _NO_PROGRESS_RUNNING_IDLE
             return None
         if facts_of(entry.key).active_work:
             return None
@@ -1318,16 +1371,29 @@ def _no_progress_shape(
     return None
 
 
-def _no_progress_age_seconds(entry: Any, *, now: float) -> float | None:
+def _no_progress_age_seconds(
+    entry: Any, *, now: float, stall_nudge: Mapping[str, Any] | None = None,
+) -> float | None:
     """How long *entry* has sat in its current shape, or ``None`` if unknown.
 
-    ``running`` ages off ``launched_at`` (when THIS session started);
-    every other state ages off ``reason_at`` (#2133's "when was this text
-    last true" stamp). ``None`` — a row predating either column, or one
-    whose field was never written — is deliberately never treated as "just
-    now" (the same rule :class:`coord.drive_queue.QueueEntry` documents for
-    ``reason_at`` itself): the caller treats an unknown age as past the
-    grace window rather than silently exempting it.
+    ``running``/live-but-idle (#3918): when *stall_nudge* is given (the
+    SAME record :func:`_no_progress_shape` consulted to mint
+    :data:`_NO_PROGRESS_RUNNING_IDLE` for this entry), its own
+    ``stalled_for`` IS the age — "idle since when" is a duration the
+    drive's own stall nudge already computed, not a timestamp this
+    function would have to subtract from *now* itself. ``launched_at``
+    (when THIS session started) would silently understate a long-running,
+    long-healthy session that only went idle recently, or overstate one
+    that went idle almost immediately — neither is "how long has nothing
+    changed", which is the only question this shape asks.
+
+    ``running``, otherwise, ages off ``launched_at``; every other state
+    ages off ``reason_at`` (#2133's "when was this text last true" stamp).
+    ``None`` — a row predating either column, or one whose field was never
+    written — is deliberately never treated as "just now" (the same rule
+    :class:`coord.drive_queue.QueueEntry` documents for ``reason_at``
+    itself): the caller treats an unknown age as past the grace window
+    rather than silently exempting it.
 
     #3888 review: ``reason_at`` is re-stamped on every ``last_reason``
     write, not only on a real state change (:class:`coord.drive_queue.
@@ -1346,6 +1412,15 @@ def _no_progress_age_seconds(entry: Any, *, now: float) -> float | None:
     """
     from coord.drive_queue import STATE_RUNNING  # noqa: PLC0415
 
+    if (
+        entry.state == STATE_RUNNING
+        and stall_nudge is not None
+        and stall_nudge.get("stalled_for") is not None
+    ):
+        try:
+            return max(0.0, float(stall_nudge["stalled_for"]))
+        except (TypeError, ValueError):
+            pass
     stamp = entry.launched_at if entry.state == STATE_RUNNING else entry.reason_at
     if stamp is None:
         return None
@@ -1383,12 +1458,13 @@ def no_progress_rows(
     `block_log` opened an episode for — exclusively `blocked`/`parked`
     transitions (:data:`coord.block_log.STALL_STATES`) — plus whatever
     :func:`merge_queue_rows` covers. A `running` row whose work finished out
-    of band, or a `waiting` row the scheduler should have launched, carries
-    neither, so it never reached this sweep's output at all (#3875 ask D).
-    This walks the FULL current *entries* instead and, for every one NOT
+    of band, one whose drive session is alive but reports no state change
+    (#3918), or a `waiting` row the scheduler should have launched, carries
+    none of that, so it never reached this sweep's output at all (#3875 ask
+    D). This walks the FULL current *entries* instead and, for every one NOT
     already in *covered_keys* (so a row the episode walk already explained
     is never double-classified or double-alerted), asks :func:`_no_progress_
-    shape` whether it matches one of the three no-progress shapes and
+    shape` whether it matches one of the four no-progress shapes and
     :func:`_no_progress_age_seconds` whether it has sat there past
     ``config.board_doctor.no_progress_minutes`` (#2096: one threshold, read
     from one place).
@@ -1429,6 +1505,30 @@ def no_progress_rows(
     threshold_seconds = config.board_doctor.no_progress_minutes * 60
     facts_of = board_view.facts
     dep_states = {entry.key: entry.state for entry in entries}
+    # #3918: one notifier-state read for the whole sweep (not one per
+    # entry) — `coord.notifier.store.nudge_for` is a pure dict lookup once
+    # the state is loaded, same posture `collect_rows`' own single
+    # `live_sessions`/`systemd_flags` reads already take. Advisory: a
+    # notifier whose state file is unreadable degrades to "no nudges
+    # known" (every entry reads as not-idle from this signal) rather than
+    # failing the whole no-progress pass — the dead-leg/blocked/waiting
+    # shapes above are unaffected either way.
+    try:
+        from coord.notifier.store import load_state as _load_notifier_state
+        from coord.notifier.store import nudge_for as _nudge_for
+
+        _notifier_state = _load_notifier_state()
+    except Exception:  # noqa: BLE001 — advisory channel, see comment above
+        _log.debug(
+            "board-doctor: could not read notifier state for the "
+            "running-idle no-progress shape this sweep", exc_info=True,
+        )
+        _notifier_state = None
+
+    def stall_nudge_of(repo_name: str, issue_number: int) -> Mapping[str, Any] | None:
+        if _notifier_state is None:
+            return None
+        return _nudge_for(_notifier_state, repo_name, issue_number)
     concurrency = _resolve_no_progress_concurrency(
         entries,
         board_view,
@@ -1462,18 +1562,24 @@ def no_progress_rows(
             fleet_occupied=fleet_occupied,
             dep_states=dep_states,
             local_host=local_host,
+            stall_nudge_of=stall_nudge_of,
         )
         if shape is None:
             continue
-        age = _no_progress_age_seconds(entry, now=stamp)
+        nudge = (
+            stall_nudge_of(entry.repo, entry.issue)
+            if shape == _NO_PROGRESS_RUNNING_IDLE
+            else None
+        )
+        age = _no_progress_age_seconds(entry, now=stamp, stall_nudge=nudge)
         if age is not None and age < threshold_seconds:
             continue
 
         # #3888 review nit: an episode can exist for the `blocked`/`parked`
         # shape and still have been dropped by `_episode_stuck_row` (its
         # stored cause is still `CAUSE_UNKNOWN` — budget-exhausted or never
-        # diagnosed); the other two shapes genuinely carry no episode at
-        # all. Phrasing this one sentence per shape keeps the alert from
+        # diagnosed); the other shapes genuinely carry no episode at all.
+        # Phrasing this one sentence per shape keeps the alert from
         # pointing an operator at "no episode exists" when one does, just
         # an unresolved one.
         if shape == _NO_PROGRESS_BLOCKED:
@@ -1481,6 +1587,14 @@ def no_progress_rows(
                 "board_doctor: any block_log episode for this entry was "
                 "dropped (its stored cause is still unresolved) or none "
                 "was ever opened, and no merge-queue row covers it either"
+            )
+        elif shape == _NO_PROGRESS_RUNNING_IDLE:
+            coverage_note = (
+                "board_doctor: the drive session is alive but its own "
+                f"stall nudge reports no pipeline state change for "
+                f"{(nudge or {}).get('stalled_for', 0) / 60.0:g}m "
+                "(coord.notifier.store nudge record) — a live session "
+                "alone is not evidence of progress"
             )
         else:
             coverage_note = (
@@ -2114,16 +2228,15 @@ def sweep(
     responsibility to swallow, exactly like *alert_dispatcher* is expected
     to never raise.
 
-    *capacity_check*, if given, is consulted BEFORE the convergence
-    counter is bumped or ``tier_of``/dispatch runs (#3770): a row for
-    which ``capacity_check(row)`` returns ``True`` is deferred — logged
-    with ``action="investigate-deferred"`` at whatever count/escalated
-    state the prior sweep left it at, added to ``touched`` (so
+    *capacity_check*, if given, is consulted BEFORE ``tier_of``/dispatch
+    runs (#3770): a row for which ``capacity_check(row)`` returns ``True``
+    is deferred — never dispatched this sweep, logged with
+    ``action="investigate-deferred"`` (or ``"alert"`` once its own count
+    reaches *convergence_limit*, see below), added to ``touched`` (so
     *clear_absent_rows* leaves it alone; it is still present, just not
-    reached this sweep), and otherwise skipped entirely: no counter
-    movement, no dispatch, no escalation. Peeking ``capacity_check(row)``
-    never itself claims a slot — only a row whose dispatch is actually
-    CONFIRMED this sweep (``action == "auto-dispatch"``) does, via
+    acted on this sweep). Peeking ``capacity_check(row)`` never itself
+    claims a slot — only a row whose dispatch is actually CONFIRMED this
+    sweep (``action == "auto-dispatch"``) does, via
     ``capacity_check.confirm_dispatch(row)`` if that method exists (see
     :class:`coord.board_doctor_policy.InvestigateCapacityGate`). That is
     what makes "bounding how many legs one sweep can fan out" true
@@ -2132,6 +2245,21 @@ def sweep(
     fallback, or an in-flight no-op never holds a slot it never used, so
     the next row in *rows* — not the same row again next sweep — is the
     one that gets the freed capacity.
+
+    #3918: a deferred row's convergence counter is NOT frozen — it bumps
+    the exact same per-row counter (:func:`coord.state.
+    record_board_doctor_observation`/:func:`coord.state.
+    next_board_doctor_counter`) a non-deferred row's cause-observation
+    bumps, "this cause observed again" meaning the same thing whether or
+    not this sweep's own budget let it act on that observation. Once that
+    count reaches *convergence_limit*, a deferred row escalates through
+    the SAME :func:`_alert_action` path (subject to the same backoff via
+    ``board_doctor_alert_due``) a non-deferred row past the limit already
+    takes, instead of deferring indefinitely. Without this, a row the
+    investigate tier's own budget keeps deferring sat at a permanently
+    frozen ``count=0`` and could never escalate no matter how many sweeps
+    it was deferred for (quadraui#2160: six consecutive hourly sweeps, all
+    `investigate-deferred, count=0`).
 
     *log_retention_days*/*backoff_initial_hours*/*backoff_cap_hours*
     (#3889, #3875 asks B/C) default to ``None``, resolved below to
@@ -2280,23 +2408,50 @@ def sweep(
                 )
             continue
         if capacity_check is not None and capacity_check(row):
-            # #3770: the row's repo has no free investigate-tier slot this
-            # sweep — present (so `clear_absent_rows` leaves its counter
-            # and any live escalation alone) but deliberately neither
-            # counted nor dispatched, same shape as the suppressed branch
-            # above. Reads (never writes) the persisted counter so the
-            # decision log / CLI still shows the row's last known count
-            # instead of a misleading ``count=0``, and a deferred row
-            # carries no escalation side effect of its own.
-            prior = state.board_doctor_row_state(row.queue, row.key) or {}
+            # #3770/#3918: the row's repo has no free investigate-tier slot
+            # this sweep — never dispatched, same as before. But deferred no
+            # longer means "frozen forever": this bumps the SAME per-row
+            # convergence counter the dispatch path below bumps for a row
+            # that IS let through ("this cause observed again", regardless
+            # of whether capacity allowed acting on it), so a row the
+            # investigate tier's own per-repo budget keeps deferring still
+            # advances toward `convergence_limit` sweep over sweep — and
+            # once it reaches it, escalates through the SAME `_alert_action`
+            # path a non-deferred row takes past the limit, rather than
+            # deferring with a permanently frozen `count=0` (quadraui#2160:
+            # six consecutive hourly sweeps all logged
+            # `investigate-deferred, count=0`, because nothing here ever
+            # moved the counter that decides when to stop deferring and
+            # page a human instead).
+            if dry_run:
+                prior = state.board_doctor_row_state(row.queue, row.key) or None
+                counter_state = state.next_board_doctor_counter(
+                    prior, row.cause, backoff_initial_hours=backoff_initial_hours,
+                )
+            else:
+                counter_state = state.record_board_doctor_observation(
+                    row.queue, row.key, row.cause,
+                    backoff_initial_hours=backoff_initial_hours,
+                )
+            count, escalated = counter_state["count"], counter_state["escalated"]
+            action = "investigate-deferred"
+            if count >= convergence_limit:
+                alert_due = not escalated or state.board_doctor_alert_due(
+                    counter_state, now=moment, backoff_initial_hours=backoff_initial_hours,
+                )
+                if alert_due:
+                    escalated, action = _alert_action(row)
+            current_by_row[(row.queue, row.key)] = {
+                "cause": row.cause, "escalated": escalated,
+            }
             decision = Decision(
                 queue=row.queue,
                 key=row.key,
                 cause=row.cause,
                 tier=tier_of(row.cause),
-                action="investigate-deferred",
-                count=int(prior.get("count", 0)),
-                escalated=bool(prior.get("escalated", False)),
+                action=action,
+                count=count,
+                escalated=escalated,
                 dry_run=dry_run,
             )
             report.decisions.append(decision)

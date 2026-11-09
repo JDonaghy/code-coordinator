@@ -8545,31 +8545,33 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     assert logged[0]["key"] == f"{REPO}#1762"
     assert logged[0]["cause"] == "merge-conflict"
 
-    # #3769: merge-conflict is investigate-tier now, so the dispatcher is
-    # `_investigate`, not a direct alert. In this test's process there is no
-    # resolvable `--config`/`$COORD_CONFIG` for `_investigate`'s own config
-    # load, so it falls back to `_alert_fallback` — the same
-    # `drive_escalations` write #2268's C4 always made, just reached via the
-    # fallback path instead of a direct alert dispatch.
-    escalation = state.get_drive_escalation(REPO, 1762)
-    assert escalation is not None
-    assert escalation["stage"] == "board-doctor:drive-queue"
-    assert escalation["proposed_command"] == "coord status"
-    assert "merge-conflict" in escalation["reason"]
+    # #3918: merge-conflict is a mechanical C2 allow-list action now
+    # (`conflict_fix_dispatch`), not the investigate tier — there is no
+    # merge-queue entry for this row in this test's fixture (and no
+    # resolvable `--config`/`$COORD_CONFIG` for the dispatcher's own config
+    # load either way), so it declines as a confirmed noop. Unlike the old
+    # investigate-tier `_investigate`, a mechanical allow-list dispatcher
+    # has no alert-fallback of its own — a decline here leaves the row
+    # exactly where the ordinary convergence counter tracks it, with no
+    # `drive_escalations` write until that counter actually reaches
+    # `CONVERGENCE_LIMIT`.
+    assert logged[0]["action"] == "auto-dispatch-noop"
+    assert state.get_drive_escalation(REPO, 1762) is None
 
     second = cli("sweep")
     assert second.exit_code == 0, second.output
     assert "count=2" in second.output
     decisions = state.board_doctor_decisions()
     assert len(decisions) == 2
-    # Still under the convergence limit, so the auto tier's dispatcher
-    # (`_investigate`) runs again on every sweep regardless of the prior
-    # fallback alert — it never "performed" a dispatch (no fix-it leg
-    # started), hence "auto-dispatch-noop", not "converged-noop" (that
-    # label is reserved for a row that is ALREADY escalated under the
-    # alert tier, or past the convergence limit).
+    # Still under the convergence limit, so the mechanical dispatcher
+    # (`conflict_fix_dispatch`) runs again on every sweep — it never
+    # "performed" a dispatch (no merge-queue entry to act on), hence
+    # "auto-dispatch-noop", not "converged-noop" (that label is reserved
+    # for a row that is ALREADY escalated under the alert tier, or past
+    # the convergence limit).
     assert decisions[-1]["action"] == "auto-dispatch-noop"
     assert "action=auto-dispatch-noop" in second.output
+    assert state.get_drive_escalation(REPO, 1762) is None
 
 
 def test_doctor_log_reads_back_recorded_decisions(cli):
@@ -8918,15 +8920,18 @@ def _sweep_json(output: str) -> dict:
 def test_sweep_reports_alert_failed_when_the_escalation_cannot_be_written(
     cli, seed, block_log, gh_world, monkeypatch
 ):
-    """merge-conflict's investigate-tier dispatcher (`_investigate`) falls
-    back to the SAME `_alert_fallback` escalation write as a direct alert
-    would, and that write failing must not record the row as escalated —
+    """ci-red's investigate-tier dispatcher (`_investigate`) falls back to
+    the SAME `_alert_fallback` escalation write as a direct alert would,
+    and that write failing must not record the row as escalated —
     otherwise #3758's "escalate exactly once" contract suppresses every
-    future attempt for that cause."""
+    future attempt for that cause. #3918: merge-conflict moved OFF the
+    investigate tier onto a mechanical allow-list action with no
+    alert-fallback of its own, so this exercises the fallback through a
+    cause that is still investigate-eligible."""
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
-    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
-    gh_world["mergeable"] = False
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+    gh_world["checks"] = [_Check("test", "failure")]
 
     real_record = state.record_drive_escalation
 
@@ -8983,10 +8988,11 @@ def test_sweep_json_reports_alert_failed_for_an_undeliverable_alert(
     result = cli("sweep", "--json")
     assert result.exit_code == 0, result.output
     payload = _sweep_json(result.output)
-    # Same investigate-tier fallback as the text-output test above: the
-    # dispatcher never reports "performed", so the action is
-    # "auto-dispatch-noop", not an "alert-failed" that implies the alert
-    # tier ran directly for this cause.
+    # #3918: merge-conflict is a mechanical allow-list action
+    # (`conflict_fix_dispatch`) with no alert-fallback of its own — it
+    # never even attempts the (here broken) escalation write, so the
+    # action is "auto-dispatch-noop", not an "alert-failed" that would
+    # imply the alert tier ran directly for this cause.
     assert [d["action"] for d in payload["decisions"]] == ["auto-dispatch-noop"]
     assert payload["decisions"][0]["escalated"] is False
 

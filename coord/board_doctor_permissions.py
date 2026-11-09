@@ -195,6 +195,13 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: #3871 did not already intend this row to have — this is the periodic
 #: retry for when that one-shot, synchronous redispatch had no capable
 #: machine right then, never a second or larger budget.
+#: #3918 adds ``"conflict_fix_dispatch"``: the FIRST mechanical conflict-fix
+#: attempt for a merge-queue entry GitHub already reports ``CONFLICT`` on,
+#: standing (no in-pass `merge_queue.process()` tick raised it just now) —
+#: the shape the reactive auto-drain tick's own conflict dispatch never
+#: revisits. Same underlying `dispatch_conflict_fix` primitive as
+#: ``"conflict_fix_redispatch"``, just without that one's head-unmoved
+#: retry-cap carve-out, since this is the ordinary first attempt.
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
         "merge",
@@ -205,6 +212,7 @@ SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
         "dispatch_fixit_leg",
         "dispatch_finisher_leg",
         "conflict_fix_redispatch",
+        "conflict_fix_dispatch",
         "smoke_requeue",
         "raise_budget",
         "bounce",
@@ -2374,6 +2382,122 @@ def sweep_redispatch_head_unmoved_conflict_fix(
     )
 
 
+class ConflictFixDispatchResult(TypedDict):
+    """:func:`sweep_dispatch_conflict_fix`'s return shape."""
+
+    dispatched: bool
+    detail: str
+
+
+def _conflict_fix_dispatch_result(
+    repo_name: str, issue_number: int, *, dispatched: bool, detail: str,
+) -> ConflictFixDispatchResult:
+    """Build a :class:`ConflictFixDispatchResult` and audit it (#3918) —
+    mirrors :func:`_redispatch_result`'s own audit shape for the identical
+    reason: this action has no human-attended CLI call site, so
+    ``actor="sweep"`` is the only attribution it will ever carry. Never
+    raises — :func:`coord.audit.record_audit`'s own best-effort contract.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="board_doctor",
+        event_type="conflict_fix_dispatched" if dispatched else "conflict_fix_dispatch_refused",
+        actor="sweep",
+        summary=detail,
+        repo=repo_name,
+        issue=issue_number,
+        details={"dispatched": dispatched},
+    )
+    return ConflictFixDispatchResult(dispatched=dispatched, detail=detail)
+
+
+def sweep_dispatch_conflict_fix(
+    repo_name: str, issue_number: int, board: "Board", config: "Config",
+) -> ConflictFixDispatchResult:
+    """Dispatch the ordinary mechanical conflict-fix for a merge-queue entry
+    GitHub itself already reports ``CONFLICT`` on, standing (#3918).
+
+    `queue_diagnose.CAUSE_MERGE_CONFLICT` used to route through the
+    investigate tier's generic ``dispatch_fixit_leg`` — a plain
+    ``type="work"`` worker, not the dedicated ``type="conflict-fix"`` leg
+    the auto-drain tick (`coord.commands.merge._dispatch_conflict_fixes`)
+    sends the instant it raises the SAME conflict itself. That tick only
+    ever reacts to a conflict it JUST produced this pass — a standing
+    ``CONFLICT`` row nothing re-attempted is never retried by it
+    (quadraui#2160: the investigate tier's fix-it-leg budget kept deferring
+    this row for six hours with no dispatch at all, mechanical or
+    otherwise). This is the periodic net for exactly that gap: the SAME
+    :func:`coord.conflict_fix.dispatch_conflict_fix` primitive the reactive
+    path calls, with its own retry-cap bookkeeping (one mechanical attempt,
+    then ``HUMAN_REQUIRED``) completely untouched — this can never spend a
+    budget that primitive would otherwise refuse.
+
+    Deliberately NOT routed through `InvestigateCapacityGate`/the per-repo
+    ``fixit_leg_budget`` — like ``CAUSE_MERGE_PENDING_STUCK``'s ``"merge"``
+    action, this is a mechanical allow-list fix (#3745's C2), not a worker
+    leg, so it never competes with the investigate tier's scarce budget for
+    a different row's attention.
+
+    Returns ``dispatched=False`` (never raises) when the row has no
+    merge-queue entry, the entry no longer reads ``CONFLICT`` live, or
+    `dispatch_conflict_fix` itself declines (no capable machine, one
+    already in flight, or the retry cap already spent) — any of those
+    leaves the row exactly where :func:`coord.board_doctor.sweep`'s own
+    convergence counter already tracks it, so a row this never actually
+    helps still escalates once ``CONVERGENCE_LIMIT`` sweeps pass, the same
+    as every other mechanical action's noop.
+    """
+    authorize_sweep_action("conflict_fix_dispatch")
+
+    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+    from coord.merge_queue import CONFLICT, load_queue  # noqa: PLC0415
+    from coord.network import fetch_status  # noqa: PLC0415
+
+    queue = load_queue()
+    entry = next(
+        (e for e in queue if e.repo_name == repo_name and e.issue_number == issue_number),
+        None,
+    )
+    if entry is None:
+        return _conflict_fix_dispatch_result(
+            repo_name, issue_number, dispatched=False,
+            detail=f"{repo_name}#{issue_number} has no merge-queue entry",
+        )
+    if entry.state != CONFLICT:
+        return _conflict_fix_dispatch_result(
+            repo_name, issue_number, dispatched=False,
+            detail=(
+                f"{repo_name}#{issue_number} merge-queue entry no longer "
+                f"reads CONFLICT (state={entry.state})"
+            ),
+        )
+
+    fix = dispatch_conflict_fix(entry, board, config, status_fetcher=fetch_status)
+    if fix is None:
+        return _conflict_fix_dispatch_result(
+            repo_name, issue_number, dispatched=False,
+            detail=(
+                f"{repo_name}#{issue_number}: a conflict-fix could not be "
+                "dispatched (no capable machine, one already active, or the "
+                "retry cap was already spent)"
+            ),
+        )
+
+    from coord.board_service import write_board  # noqa: PLC0415
+
+    write_board(board)
+
+    return _conflict_fix_dispatch_result(
+        repo_name, issue_number, dispatched=True,
+        detail=(
+            f"{repo_name}#{issue_number}: dispatched conflict-fix "
+            f"{fix.assignment_id} on {fix.machine_name}"
+        ),
+    )
+
+
 class MarkDoneResult(TypedDict):
     """:func:`sweep_mark_done`'s return shape."""
 
@@ -2536,6 +2660,7 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "clear_latch": sweep_clear_latch,
     "mark_done": sweep_mark_done,
     "conflict_fix_redispatch": sweep_redispatch_head_unmoved_conflict_fix,
+    "conflict_fix_dispatch": sweep_dispatch_conflict_fix,
 }
 
 
