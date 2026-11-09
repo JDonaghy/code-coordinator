@@ -4676,6 +4676,11 @@ def reconcile_board_merges(
             # `refused_policy`/`refused_premise` forever.
             or a.status == "refused_policy"
             or a.status == "refused_premise"
+            # #3931: same "ghost sibling" shape as refused_policy/
+            # refused_premise above — a needs_decomposition row should
+            # auto-settle to `merged` once GitHub confirms the issue went
+            # terminal, rather than sitting on the board forever.
+            or a.status == "needs_decomposition"
             or (
                 a.type == "work"
                 and a.status == "merged"
@@ -4747,6 +4752,19 @@ def reconcile_board_merges(
             if not dry_run:
                 a.status = "merged"
                 state.mark_refused_premise_settled(a.assignment_id or "")
+        elif a.status == "needs_decomposition":
+            # #3931: same settling as refused_premise above — once GitHub
+            # confirms the issue went terminal, a needs_decomposition row
+            # auto-settles to 'merged' rather than sitting on the board
+            # forever.
+            actions.append(
+                f"settle needs_decomposition {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.status = "merged"
+                state.mark_needs_decomposition_settled(a.assignment_id or "")
         elif a.type == "work":
             # #951: type=work, status=merged, review_state=pending — a row
             # that already fell out of sweep (b)'s status=='done' candidates

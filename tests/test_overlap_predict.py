@@ -513,6 +513,10 @@ def test_inflight_scans_the_completed_bucket_where_open_prs_actually_live():
             _assignment(issue_number=2, status="done", branch="issue-2"),
             _assignment(issue_number=3, status="merged", branch="issue-3"),
             _assignment(issue_number=4, status="failed", branch="issue-4"),
+            # #3931: a needs_decomposition row is terminal (LANDED_STATUSES)
+            # exactly like refused_policy/refused_premise — its branch can
+            # no longer collide with a newcomer.
+            _assignment(issue_number=5, status="needs_decomposition", branch="issue-5"),
         ],
     )
     assert [a.issue_number for a in inflight_assignments(board, REPO)] == [2]

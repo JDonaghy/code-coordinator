@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from coord.upstream_gaps import UPSTREAM_GAP_MARKER
+
 
 # ── Data classes ────────────────────────────────────────────────────────────
 
@@ -714,7 +716,14 @@ def classify_zero_commit_outcome(
        `WORK_OUTCOME:` marker nor a premise/policy prose match also counts as
        ``"needs_decomposition"`` (#3931 item 3's "unless another marker says
        otherwise": steps 1 and 2 above already took priority, so this is
-       only ever consulted once both came back empty).
+       only ever consulted once both came back empty) — UNLESS *text* also
+       carries a `BLOCKED_ON_UPSTREAM:` marker (`coord.upstream_gaps.
+       UPSTREAM_GAP_MARKER`): a leg that found the root cause in another
+       repo and reported it that way is a distinct, common fleet shape (the
+       dependency gap is already named and actionable — file the upstream
+       issue, `coord.notify.file_pending_upstream_gaps` already does this)
+       and must not read as "needs epic decomposition", which would hand
+       the operator the wrong remedy for it.
     """
     outcome = parse_work_outcome(text)
     if outcome.value == WORK_OUTCOME_ALREADY_DONE:
@@ -724,7 +733,10 @@ def classify_zero_commit_outcome(
     prose = classify_zero_commit_refusal(text)
     if prose is not None:
         return prose
-    if issue_resolution == "investigation":
+    if (
+        issue_resolution == "investigation"
+        and not (text and UPSTREAM_GAP_MARKER in text)
+    ):
         return "needs_decomposition"
     return None
 

@@ -102,6 +102,11 @@ def _patch_probes(
         state, "mark_refused_premise_settled",
         lambda aid: writes.append(("refused_premise_settled", aid)),
     )
+    # #3931: stub the needs_decomposition sibling-settling function the same way.
+    monkeypatch.setattr(
+        state, "mark_needs_decomposition_settled",
+        lambda aid: writes.append(("needs_decomposition_settled", aid)),
+    )
     # #951: stub the type=work review_state settle so sweep (b) never touches
     # the DB in these tests.
     monkeypatch.setattr(
@@ -1364,6 +1369,43 @@ def test_refused_premise_row_not_settled_when_issue_not_terminal(
 
     assert refused.status == "refused_premise"  # untouched
     assert ("refused_premise_settled", "rpr-live") not in writes
+
+
+def test_settles_needs_decomposition_row_when_issue_terminal(monkeypatch, config) -> None:
+    """#3931: a status=needs_decomposition row must be flipped to merged
+    when work_is_terminal — same shape as the refused_premise settle above."""
+    work = _done_work(assignment_id="work-6", issue_number=43, branch="issue-43-fix")
+    refused = _ghost_sibling(
+        assignment_id="ndc-1", sibling_type="work",
+        status="needs_decomposition", review_state=None,
+    )
+    board = Board(completed=[work, refused])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert refused.status == "merged"
+    assert ("needs_decomposition_settled", "ndc-1") in writes
+    assert any("settle needs_decomposition" in s and "ndc-1" in s for s in actions)
+
+
+def test_needs_decomposition_row_not_settled_when_issue_not_terminal(
+    monkeypatch, config
+) -> None:
+    """#3931: a needs_decomposition row for a still-open/unmerged issue is
+    left untouched, mirroring the refused_premise case."""
+    work = _done_work(assignment_id="w-live4", issue_number=10, branch="issue-10-fix")
+    refused = _ghost_sibling(
+        assignment_id="ndc-live", sibling_type="work",
+        issue_number=10, status="needs_decomposition", review_state=None,
+    )
+    board = Board(completed=[work, refused])
+    writes = _patch_probes(monkeypatch, terminal=False)  # issue NOT terminal
+
+    reconcile_board_merges(board, config)
+
+    assert refused.status == "needs_decomposition"  # untouched
+    assert ("needs_decomposition_settled", "ndc-live") not in writes
 
 
 def test_settles_all_ghost_types_in_one_pass(monkeypatch, config) -> None:
