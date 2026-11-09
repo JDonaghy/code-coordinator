@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +16,9 @@ from coord.models import Machine, Repo
 from coord.upstream_gaps import (
     UPSTREAM_GAP_SOURCE,
     UpstreamGap,
+    _named_symbols,
     _queue_upstream,
+    _verify_symbols,
     final_message_from_log_text,
     gap_key,
     parse_upstream_markers,
@@ -300,6 +303,206 @@ def _row(issue: int, repo: str = "vimcode") -> dict:
 def _after(row: dict) -> list[str]:
     after = row["after_json"]
     return after if isinstance(after, list) else json.loads(after)
+
+
+# ── gap verification (#3930) ──────────────────────────────────────────────
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def quadraui_checkout(tmp_path: Path) -> Path:
+    """A real local checkout of a `main` branch that already has `RowAlign`
+    on disk but no `FormSpacing::padding` — the fixture upstream #3930's
+    acceptance means by "the fixture upstream's default branch"."""
+    seed = tmp_path / "quadraui-seed"
+    origin = tmp_path / "quadraui-origin.git"
+    checkout = tmp_path / "quadraui-checkout"
+
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "config", "user.email", "t@example.com")
+    _git(seed, "config", "user.name", "t")
+    (seed / "layout.rs").write_text("pub enum RowAlign { Start, Center, End }\n")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-q", "-m", "base")
+
+    subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(origin)],
+                   check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(checkout)],
+                   check=True, capture_output=True, text=True)
+    return checkout
+
+
+@pytest.fixture
+def verify_config(quadraui_checkout: Path) -> Config:
+    return Config(
+        repos=[
+            Repo(name="vimcode", github="acme/vimcode"),
+            Repo(name="quadraui", github="acme/quadraui"),
+        ],
+        machines=[
+            Machine(name="laptop", host="laptop.tailnet", repos=["vimcode", "quadraui"],
+                    repo_paths={"quadraui": str(quadraui_checkout)}),
+        ],
+    )
+
+
+class TestNamedSymbols:
+    def test_backtick_identifiers_are_symbols(self) -> None:
+        gap = UpstreamGap(repo="quadraui", title="Expose `RowAlign`",
+                           body="also needs `FormSpacing::padding` and `foo()`.")
+        assert _named_symbols(gap) == ["RowAlign", "FormSpacing::padding", "foo()"]
+
+    def test_prose_and_commands_are_not_symbols(self) -> None:
+        gap = UpstreamGap(repo="quadraui", title="Expose the scroll offset",
+                           body="run `cargo build` then check the offset is f32.")
+        assert _named_symbols(gap) == []
+
+    def test_no_backticks_yields_no_symbols(self) -> None:
+        gap = UpstreamGap(repo="quadraui", title="Expose per-pane scroll offset",
+                           body="today only the integer line index is public.")
+        assert _named_symbols(gap) == []
+
+    def test_duplicates_collapse_to_first_seen(self) -> None:
+        gap = UpstreamGap(repo="quadraui", title="`RowAlign`", body="`RowAlign` again")
+        assert _named_symbols(gap) == ["RowAlign"]
+
+
+class TestVerifySymbols:
+    """Direct coverage of the mechanical fetch+grep check — #3930 wants it
+    cheap, real, and honest about when it couldn't run at all."""
+
+    def test_existing_symbol_is_found_with_a_location(
+        self, verify_config: Config,
+    ) -> None:
+        quadraui = verify_config.repo("quadraui")
+        result = _verify_symbols(quadraui, verify_config, ["RowAlign"])
+        assert result.checked is True
+        assert result.missing == ()
+        assert "layout.rs" in result.found_at["RowAlign"]
+
+    def test_missing_symbol_is_reported_missing(self, verify_config: Config) -> None:
+        quadraui = verify_config.repo("quadraui")
+        result = _verify_symbols(quadraui, verify_config, ["FormSpacing::padding"])
+        assert result.checked is True
+        assert result.missing == ("FormSpacing::padding",)
+
+    def test_mixed_symbols_report_each_correctly(self, verify_config: Config) -> None:
+        quadraui = verify_config.repo("quadraui")
+        result = _verify_symbols(quadraui, verify_config, ["RowAlign", "FormSpacing::padding"])
+        assert result.checked is True
+        assert result.missing == ("FormSpacing::padding",)
+        assert "RowAlign" in result.found_at
+
+    def test_no_local_checkout_is_unchecked_not_missing(self, config: Config) -> None:
+        # `config` (module fixture) points quadraui at a path that doesn't
+        # exist on this machine — the check must say so, not claim either a
+        # confirmation or a refutation it never actually performed.
+        quadraui = config.repo("quadraui")
+        result = _verify_symbols(quadraui, config, ["RowAlign"])
+        assert result.checked is False
+        assert result.missing == ()
+        assert "no local checkout" in result.detail
+
+
+class TestVerifyGapFiling:
+    """#3930 acceptance: filing consults the upstream repo before it ever
+    files or blocks anything."""
+
+    def test_every_symbol_present_files_nothing_and_adds_no_after_edge(
+        self, tracker, verify_config: Config,
+    ) -> None:
+        state.enqueue_drive_queue("vimcode", 42, after=["vimcode#40"])
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose RowAlign\n"
+            "vimcode's layout needs `RowAlign`.\n"
+        )
+
+        outcomes = process_upstream_gaps(msg, config=verify_config,
+                                         repo_name="vimcode", issue_number=42)
+
+        assert [o.status for o in outcomes] == ["not-a-gap"]
+        assert tracker.created == []  # nothing filed upstream
+        row = _row(42)
+        assert _after(row) == ["vimcode#40"]  # no edge added
+        # The next leg reads where the symbol was found, not just that it
+        # wasn't filed.
+        assert tracker.comments and tracker.comments[0][:2] == ("acme/vimcode", 42)
+        comment = tracker.comments[0][2]
+        assert "RowAlign" in comment and "layout.rs" in comment
+        # A ledger entry IS recorded (so a replay never re-greps or re-posts
+        # the same finding) — but it is not a "filed" entry: a later real
+        # gap on this issue must still be able to file normally.
+        ctx = [e for e in state.list_issue_context("vimcode", 42)
+               if e["source"] == UPSTREAM_GAP_SOURCE]
+        assert len(ctx) == 1 and ctx[0]["pinned"]
+        assert "RowAlign" in ctx[0]["body"]
+
+        # Replaying the same message re-checks nothing and posts nothing new.
+        again = process_upstream_gaps(msg, config=verify_config,
+                                      repo_name="vimcode", issue_number=42)
+        assert [o.status for o in again] == ["not-a-gap"]
+        assert len(tracker.comments) == 1
+        assert len(state.list_issue_context("vimcode", 42)) == 1
+
+    def test_one_missing_symbol_files_as_today(
+        self, tracker, verify_config: Config,
+    ) -> None:
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Add FormSpacing::padding\n"
+            "vimcode needs `RowAlign` (already there) and `FormSpacing::padding` "
+            "(missing).\n"
+        )
+
+        outcomes = process_upstream_gaps(msg, config=verify_config,
+                                         repo_name="vimcode", issue_number=42)
+
+        assert [o.status for o in outcomes] == ["filed"]
+        assert len(tracker.created) == 1
+        body = tracker.created[0]["body"]
+        assert "Not verified" not in body  # a real check ran and confirmed it
+        # Unqueued downstream: nothing to hold, but the upstream is still
+        # auto-filed exactly as an unverified gap would be.
+        assert outcomes[0].number == 501
+
+    def test_no_checkable_symbols_files_with_a_note(
+        self, tracker, verify_config: Config,
+    ) -> None:
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose per-pane scroll offset\n"
+            "vimcode's minimap needs the f32 scroll offset of a pane; today "
+            "only the integer line index is public.\n"
+        )
+
+        outcomes = process_upstream_gaps(msg, config=verify_config,
+                                         repo_name="vimcode", issue_number=42)
+
+        assert [o.status for o in outcomes] == ["filed"]
+        body = tracker.created[0]["body"]
+        assert "Not verified against upstream before filing" in body
+        assert "no checkable symbols" in body
+
+    def test_unverifiable_check_still_files_with_a_note(
+        self, tracker, config: Config,
+    ) -> None:
+        """`config` (module fixture) has no real local checkout for
+        quadraui, so the check itself cannot run — that must never be read
+        as a refutation, only as "not verified"."""
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose RowAlign\n"
+            "vimcode's layout needs `RowAlign`.\n"
+        )
+
+        outcomes = process_upstream_gaps(msg, config=config,
+                                         repo_name="vimcode", issue_number=42)
+
+        assert [o.status for o in outcomes] == ["filed"]
+        body = tracker.created[0]["body"]
+        assert "Not verified against upstream before filing" in body
+        assert "no local checkout" in body
 
 
 class TestInFlightRow:

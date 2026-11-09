@@ -38,6 +38,22 @@ deterministic key from (upstream repo, normalised title), stored in the
 pinned context entry, and a gap whose key is already recorded on the
 downstream issue is never filed again — re-reading the same final message
 (a replayed transition, a manual re-run) files nothing new.
+
+Before filing, :func:`_verify_gap` checks the worker's claim against the
+upstream repo itself (#3930): the quadraui#2256 incident filed and chained a
+dependency for primitives (``RowAlign``, ``FormSpacing::padding``) that
+already existed on quadraui's ``develop`` — three work legs were then spent
+confirming the gap wasn't real before anyone looked upstream. The check is
+cheap and mechanical, never a judgement call: every inline-code symbol
+(`` `Foo::bar` ``) named in the marker's title/body is ``git grep``'d against
+the upstream repo's own fetched ``default_branch`` (see :func:`_verify_symbols`
+— no local checkout step beyond the fetch; ``git grep <ref>`` reads the tree
+object directly). If every named symbol is already there, nothing is filed,
+no ``after=`` edge is added, and a comment naming the symbols and where they
+were found goes on the downstream issue instead. A marker naming no checkable
+symbols, or one the check itself couldn't run (no local checkout, a dead
+fetch), still files as before — a tool failure must never silently swallow a
+real gap — but the filed issue carries a note that it was not verified.
 """
 
 from __future__ import annotations
@@ -45,6 +61,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import subprocess
 import textwrap
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -116,7 +133,11 @@ class UpstreamGapOutcome:
     """What :func:`process_upstream_gaps` did with one gap."""
 
     gap: UpstreamGap
-    # "filed" | "already-filed" | "unknown-repo" | "error"
+    # "filed" | "already-filed" | "not-a-gap" | "unknown-repo" | "error"
+    # "not-a-gap" (#3930): every symbol the marker named was confirmed, by a
+    # cheap mechanical check against the upstream repo's own fetched default
+    # branch, to already exist there — nothing filed, no `after=` edge added,
+    # a comment naming the symbols posted on the downstream issue instead.
     status: str
     upstream_repo: str | None = None
     number: int | None = None
@@ -276,6 +297,159 @@ def final_message_from_log_text(text: str) -> str:
     return latest_assistant_turn_text_from_text(text) or ""
 
 
+# ── verification (#3930) ─────────────────────────────────────────────────────
+
+# An inline-code span in the marker's title/body — `` `like_this` `` — is a
+# candidate symbol. Only one whose content reads as a single identifier (not
+# a sentence, not a shell command, not free prose) is actually checked: this
+# is a mechanical filter, not an attempt to understand the marker, so a
+# backtick-quoted command or phrase is simply never grepped rather than
+# mis-grepped.
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_SYMBOL_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?$"
+)
+
+
+def _named_symbols(gap: UpstreamGap) -> list[str]:
+    """The checkable symbols *gap*'s title/body actually name, in first-seen
+    order, de-duplicated. Empty when the marker names none — a prose-only
+    gap description, with no inline code at all, is the common case and is
+    never treated as unverifiable-but-checkable."""
+    seen: list[str] = []
+    for text in (gap.title, gap.body):
+        for m in _INLINE_CODE_RE.finditer(text or ""):
+            candidate = m.group(1).strip()
+            if _SYMBOL_RE.match(candidate) and candidate not in seen:
+                seen.append(candidate)
+    return seen
+
+
+@dataclass(frozen=True)
+class _SymbolCheck:
+    """Outcome of :func:`_verify_symbols` — whether the check itself ran."""
+
+    checked: bool
+    missing: tuple[str, ...] = ()
+    found_at: dict[str, str] = field(default_factory=dict)
+    detail: str = ""
+
+
+def _run_git(args: list[str], *, cwd, timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _verify_symbols(upstream: "Repo", config: "Config", symbols: list[str]) -> _SymbolCheck:
+    """Check *symbols* against *upstream*'s fetched ``default_branch``.
+
+    Mechanical, not semantic: ``git fetch`` the branch fresh from ``origin``
+    into *upstream*'s locally-configured checkout (:func:`coord.revalidate.
+    local_repo_dir` — the same repo-path resolution ``coord test``/
+    ``coord merge --revalidate`` use), then ``git grep`` each symbol against
+    the fetched ref directly. No worktree/checkout step beyond the fetch is
+    needed — ``git grep <ref>`` reads the tree object in place.
+
+    ``checked=False`` means the check itself could not run (no local
+    checkout of *upstream* on this machine, or the fetch/grep failed) — this
+    is distinct from both "ran, found every symbol" and "ran, found a
+    missing symbol". A caller must never read an unrunnable check as either
+    a confirmation or a refutation of the gap.
+    """
+    from coord.revalidate import local_repo_dir  # noqa: PLC0415
+
+    repo_dir = local_repo_dir(config, upstream.name)
+    if repo_dir is None or not repo_dir.exists():
+        return _SymbolCheck(
+            checked=False,
+            detail=f"no local checkout of {upstream.name} configured on this machine",
+        )
+
+    branch = upstream.default_branch or "main"
+    try:
+        fetched = _run_git(["git", "fetch", "origin", branch], cwd=repo_dir, timeout=120)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _SymbolCheck(checked=False, detail=f"git fetch {branch} failed: {exc}")
+    if fetched.returncode != 0:
+        return _SymbolCheck(
+            checked=False,
+            detail=f"git fetch {branch} failed: {fetched.stderr.strip() or fetched.returncode}",
+        )
+
+    missing: list[str] = []
+    found_at: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            res = _run_git(
+                ["git", "grep", "-I", "-n", "-F", "-e", symbol, "FETCH_HEAD"],
+                cwd=repo_dir,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return _SymbolCheck(checked=False, detail=f"git grep {symbol!r} failed: {exc}")
+        if res.returncode == 0 and res.stdout.strip():
+            # "FETCH_HEAD:path:line:text" -> "path:line".
+            parts = res.stdout.strip().splitlines()[0].split(":", 3)
+            found_at[symbol] = f"{parts[1]}:{parts[2]}" if len(parts) >= 3 else symbol
+        elif res.returncode == 1:
+            missing.append(symbol)
+        else:
+            return _SymbolCheck(
+                checked=False,
+                detail=f"git grep {symbol!r} exited {res.returncode}: {res.stderr.strip()}",
+            )
+    return _SymbolCheck(checked=True, missing=tuple(missing), found_at=found_at)
+
+
+@dataclass(frozen=True)
+class _GapVerification:
+    """What :func:`_verify_gap` concluded before filing."""
+
+    # False only when every named symbol was confirmed, by a real check, to
+    # already exist upstream — the one case where the gap is refuted.
+    # Everything else (nothing to check, or the check itself didn't run)
+    # defaults True: a tool failure must never silently swallow a real gap.
+    real: bool
+    # Appended to the filed issue body when `real` but not actually
+    # confirmed (no checkable symbols, or verification couldn't run).
+    note: str = ""
+    # Why — used for the not-a-gap comment/outcome, and for logging.
+    detail: str = ""
+
+
+def _verify_gap(gap: UpstreamGap, upstream: "Repo", config: "Config") -> _GapVerification:
+    """Is *gap* real, as far as a cheap grep of *upstream* can tell (#3930)?"""
+    symbols = _named_symbols(gap)
+    if not symbols:
+        return _GapVerification(
+            real=True,
+            note=(
+                "_Not verified against upstream before filing: the marker names "
+                "no checkable symbols (an inline-code span like `` `Foo::bar` ``) "
+                "— filed on the worker's word alone._"
+            ),
+        )
+    check = _verify_symbols(upstream, config, symbols)
+    if not check.checked:
+        return _GapVerification(
+            real=True,
+            note=f"_Not verified against upstream before filing: {check.detail}._",
+        )
+    if not check.missing:
+        branch = upstream.default_branch or "main"
+        locations = "; ".join(
+            f"`{s}` ({check.found_at[s]})" for s in symbols if s in check.found_at
+        )
+        return _GapVerification(
+            real=False,
+            detail=(
+                f"every named symbol already exists on {upstream.name}@{branch} "
+                f"({locations}) — not filed, the gap is not real"
+            ),
+        )
+    return _GapVerification(real=True)
+
+
 # ── filing ───────────────────────────────────────────────────────────────────
 
 
@@ -298,29 +472,55 @@ def _ledger_tag(key: str) -> str:
     return f"(gap-key {key})"
 
 
-def _already_filed(repo_name: str, issue_number: int, key: str) -> dict | None:
-    """The downstream issue's existing ledger entry for *key*, if any."""
+# Marks a ledger entry recorded by the `not-a-gap` path (#3930) rather than an
+# actual filing — distinguishes the two in `_already_filed`'s loose
+# source+tag match, which would otherwise treat either kind as "filed".
+_NOT_A_GAP_MARK = "(verified not-a-gap)"
+
+
+def _already_verified_not_a_gap(repo_name: str, issue_number: int, key: str) -> dict | None:
+    """The downstream issue's existing "checked, not real" ledger entry for
+    *key*, if any — a replayed transition must not re-run the fetch+grep
+    (nor repost the comment) for a gap already confirmed unreal."""
     from coord.state import list_issue_context  # noqa: PLC0415
 
     tag = _ledger_tag(key)
     for entry in list_issue_context(repo_name, issue_number):
-        if entry.get("source") == UPSTREAM_GAP_SOURCE and tag in (entry.get("body") or ""):
+        body = entry.get("body") or ""
+        if entry.get("source") == UPSTREAM_GAP_SOURCE and tag in body and _NOT_A_GAP_MARK in body:
+            return entry
+    return None
+
+
+def _already_filed(repo_name: str, issue_number: int, key: str) -> dict | None:
+    """The downstream issue's existing "filed" ledger entry for *key*, if
+    any — never a `not-a-gap` entry (see :func:`_already_verified_not_a_gap`,
+    checked first by :func:`_file_one`)."""
+    from coord.state import list_issue_context  # noqa: PLC0415
+
+    tag = _ledger_tag(key)
+    for entry in list_issue_context(repo_name, issue_number):
+        body = entry.get("body") or ""
+        if (entry.get("source") == UPSTREAM_GAP_SOURCE and tag in body
+                and _NOT_A_GAP_MARK not in body):
             return entry
     return None
 
 
 def _upstream_issue_body(
     gap: UpstreamGap, *, downstream_ref: str, assignment_id: str | None,
+    verify_note: str = "",
 ) -> str:
     detail = gap.body or "_(The worker gave no further detail.)_"
     leg = f" (assignment `{assignment_id}`)" if assignment_id else ""
+    extra = f"\n\n{verify_note}" if verify_note else ""
     return (
         f"{detail}\n\n"
         "---\n\n"
         f"Blocks {downstream_ref}. Auto-filed by the coordinator from a "
         f"`{UPSTREAM_GAP_MARKER}` marker in the final message of a worker on "
         f"{downstream_ref}{leg} (#3676). That issue's drive-queue row waits "
-        "on this one.\n\n"
+        f"on this one.{extra}\n\n"
         f"<!-- coord:upstream-gap key={gap.key} downstream={downstream_ref} -->"
     )
 
@@ -549,6 +749,12 @@ def _file_one(
         else f"{repo_name}#{issue_number}"
     )
 
+    if _already_verified_not_a_gap(repo_name, issue_number, gap.key) is not None:
+        return UpstreamGapOutcome(
+            gap, "not-a-gap", upstream_repo=upstream.name,
+            detail="already checked against upstream and confirmed not real — not re-checked",
+        )
+
     existing = _already_filed(repo_name, issue_number, gap.key)
     if existing is not None:
         m = re.search(r"#(\d+)", existing.get("body") or "")
@@ -580,10 +786,46 @@ def _file_one(
                 outcome.notes.append(f"upstream enqueue failed: {exc}")
         return outcome
 
+    # #3930: a cheap, mechanical check before filing anything — is the gap
+    # actually real, against the upstream repo's own fetched default branch?
+    verification = _verify_gap(gap, upstream, config)
+    if not verification.real:
+        # The ledger entry goes first, same discipline as a real filing
+        # below: it is what makes a replay a no-op, so the window between
+        # "decided" and "recorded" is kept as short as possible.
+        add_issue_context_entry(
+            repo_name,
+            issue_number,
+            f"Checked `{UPSTREAM_GAP_MARKER}: {gap.repo}: {gap.title}` against "
+            f"{upstream.name} — {verification.detail}; not filed. "
+            f"{_ledger_tag(gap.key)} {_NOT_A_GAP_MARK}",
+            pinned=True,
+            source=UPSTREAM_GAP_SOURCE,
+        )
+        try:
+            comment_on_issue(
+                repo_name,
+                issue_number,
+                f"Checked `{UPSTREAM_GAP_MARKER}: {gap.repo}: {gap.title}` "
+                f"against {upstream.name} before filing: {verification.detail}. "
+                "Not filed — build on what's already there rather than "
+                "re-requesting it (#3930).",
+                repo_github=downstream.github if downstream is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — the ledger entry already records why
+            log.warning("upstream gap %s: not-a-gap comment failed: %s", gap.key, exc)
+        return UpstreamGapOutcome(
+            gap, "not-a-gap", upstream_repo=upstream.name,
+            detail=verification.detail,
+        )
+
     created = create_issue(
         upstream.name,
         gap.title,
-        _upstream_issue_body(gap, downstream_ref=downstream_ref, assignment_id=assignment_id),
+        _upstream_issue_body(
+            gap, downstream_ref=downstream_ref, assignment_id=assignment_id,
+            verify_note=verification.note,
+        ),
         repo_github=upstream.github or None,
     )
     number = int(created["number"])
