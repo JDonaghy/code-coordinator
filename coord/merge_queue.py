@@ -6051,6 +6051,60 @@ def refresh_entry_assignment(
     return True
 
 
+def clear_stale_smoke_error_for_assignment(assignment_id: str) -> bool:
+    """Clear a persisted ``"smoke test verdict is stale: …"`` ``error`` on
+    every ``PENDING`` queue entry keyed to *assignment_id* (#3917).
+
+    Mirrors :func:`refresh_entry_assignment`'s "clear a stale 'review
+    required' error now that a fresh approval arrived" step just above, for
+    the smoke gate's own #420 staleness wording — the one case that step
+    never covered. ``entry.error`` is otherwise only refreshed by
+    :func:`process` (a real merge attempt) or ``refresh_entry_assignment``
+    (a review approval); a *test* verdict re-stamped outside either of
+    those (the normal case — a conflict-fix push, then a re-test, with no
+    `coord merge` tick in between) left a stale-smoke refusal standing
+    indefinitely, naming a branch/base pair the fresh verdict had already
+    superseded (quadraui#2173: five re-tests against a correctly-updated
+    head, all aimed at a persisted error nothing had cleared).
+
+    Called from :func:`coord.state._stamp_test_staleness_anchor`
+    immediately after a terminal (passed/skipped) verdict's own fresh
+    anchor SHAs are captured — i.e. only once that caller has a *confirmed*
+    live observation that a new verdict landed, never merely because a
+    verdict of some kind was recorded. This does not assert the smoke gate
+    now passes (only a live :func:`evaluate_smoke_verdict` call, with real
+    ``gh_ops``, can confirm that) — it only retires a diagnostic string that
+    is provably about the SUPERSEDED verdict, so the next reader (a live
+    ``coord merge`` attempt, ``coord drive``, board-doctor) re-derives the
+    current gate state instead of parroting stale text forever.
+
+    Best-effort by design (same posture as its caller): returns ``False``
+    on any lookup failure rather than raising, since a failed cache-clear
+    must never fail the verdict write it rides along with.
+    """
+    if not assignment_id:
+        return False
+    try:
+        items = load_queue()
+    except Exception:  # noqa: BLE001 — best-effort; see docstring.
+        return False
+    changed = False
+    for entry in items:
+        if entry.assignment_id != assignment_id:
+            continue
+        if entry.state != PENDING:
+            continue
+        if entry.error and entry.error.startswith(_STALE_GATE_ERROR_PREFIXES):
+            entry.error = None
+            changed = True
+    if changed:
+        try:
+            save_queue(items)
+        except Exception:  # noqa: BLE001 — best-effort; see docstring.
+            return False
+    return changed
+
+
 # ── Stale-conflict reconciliation (#1477) ───────────────────────────────────
 
 # A HUMAN_REQUIRED entry's `error` is not always the pristine original

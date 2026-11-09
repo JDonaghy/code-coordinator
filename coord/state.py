@@ -3605,6 +3605,30 @@ def _stamp_test_staleness_anchor(
     )
     conn.commit()
 
+    # #3917: a *persisted* `coord.merge_queue.QueuedMerge.error` naming the
+    # smoke gate as stale ("smoke test verdict is stale: recorded against
+    # branch <old>, branch is now <new>") describes the verdict THIS write
+    # just superseded — nothing else clears it short of a real `coord
+    # merge` attempt (#420). Retire it here, the moment a fresh terminal
+    # verdict's anchors are actually confirmed live (never on the
+    # all-``None`` fail-open branch above — that proves nothing moved, only
+    # that the probe didn't run) so a conflict-fix push followed by a
+    # re-test doesn't leave `coord drive`/board-doctor re-reading a
+    # diagnostic about a branch head that no longer exists. Best-effort:
+    # a failure here must never fail the verdict write it rides along
+    # with, and it only ever CLEARS a stale string — it never asserts the
+    # gate now passes, which only a live `evaluate_smoke_verdict` call can
+    # confirm.
+    if test_head_sha is not None and test_patch_id is not None:
+        try:
+            from coord.merge_queue import (  # noqa: PLC0415
+                clear_stale_smoke_error_for_assignment,
+            )
+
+            clear_stale_smoke_error_for_assignment(assignment_id)
+        except Exception:  # noqa: BLE001 — best-effort; see above.
+            pass
+
 
 def record_test_staleness_anchor(
     *,

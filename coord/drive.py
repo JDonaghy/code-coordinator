@@ -633,19 +633,27 @@ class DriveCounters:
     # forced retry.
     gate_wait_rounds: int = 0
     # #2229: the value `merge_attempts` held when the #1738 stale-smoke
-    # re-test last fired off a reason read out of `last_merge_diagnostic`
-    # rather than off the board (`-1` = never). A de-duplication latch in the
-    # same spirit as `review_fix_dispatched_for` above, for the same reason:
-    # `coord diagnose --stage test --reset` clears `test_state`, but the board
-    # this driver polls needs a beat to show it, and until it does the state
-    # is byte-for-byte identical to the one that triggered the re-test —
-    # except that, unlike a board `merge_reason`, the captured diagnostic is
-    # frozen and CANNOT change on its own. Without the latch a lagging board
-    # would burn the whole `max_fix_rounds` budget re-testing off one stale
-    # snapshot. Releases when `merge_attempts` advances, i.e. when a real
-    # `coord merge --only` attempt has re-captured the diagnostic — which is
-    # #2149's rule (act on the snapshot, then go re-validate it for real)
-    # expressed as a latch rather than a wait counter.
+    # re-test last fired. A de-duplication latch in the same spirit as
+    # `review_fix_dispatched_for` above, for the same reason: `coord
+    # diagnose --stage test --reset` clears `test_state`, but the board this
+    # driver polls needs a beat to show it, and until it does the state is
+    # byte-for-byte identical to the one that triggered the re-test. Without
+    # the latch a lagging board would burn the whole `max_fix_rounds` budget
+    # re-testing off one stale reading. Releases when `merge_attempts`
+    # advances, i.e. when a real `coord merge --only` attempt has
+    # re-evaluated the gate for real — #2149's rule (act on the snapshot,
+    # then go re-validate it for real) expressed as a latch rather than a
+    # wait counter.
+    #
+    # #3917: originally armed only for a reason read out of the frozen
+    # `last_merge_diagnostic` snapshot (`gate_reason_from_diagnostic=True`)
+    # — a reason read straight off the BOARD was assumed to self-refresh on
+    # its own. It doesn't: the persisted `QueuedMerge.error` a board
+    # `merge_reason` falls back to (`_effective_merge_gate_reason`) is
+    # itself only rewritten by a real merge attempt (#420), so it is
+    # exactly as frozen as the diagnostic snapshot until one happens. This
+    # latch now arms for either source — see `_decide_merge`'s stale-smoke
+    # arm.
     stale_smoke_diagnostic_attempt: int = -1
     # #2199: bounded retry for the trust gate's OWN dispatch — distinct from
     # `fix_rounds` (which bounds "the work needs another round" once a
@@ -4943,16 +4951,28 @@ def _decide_merge(
             serialize_merge=True,
         )
     if (
-        gate_reason_from_diagnostic
-        and divergence == "smoke"
+        divergence == "smoke"
         and _is_stale_smoke_reason(gate_reason)
         and counters.stale_smoke_diagnostic_attempt == counters.merge_attempts
     ):
-        # A re-test already fired off THIS snapshot and no real attempt has
-        # re-captured it since, so re-firing would spend a second fix round
-        # on evidence that literally cannot have changed. Drop to the bounded
-        # retry below instead: that attempt refreshes the diagnostic, which
-        # either lands the merge or re-arms this arm against fresh evidence.
+        # A re-test already fired off THIS exact snapshot and no real
+        # `coord merge` attempt has re-captured it since, so re-firing would
+        # spend a second fix round on evidence that literally cannot have
+        # changed. Drop to the bounded retry below instead: that attempt
+        # re-evaluates the gate for real, which either lands the merge or
+        # re-arms this arm against fresh evidence.
+        #
+        # #3917: this used to gate on `gate_reason_from_diagnostic` — i.e.
+        # only when *gate_reason* came from this driver's own captured
+        # `last_merge_diagnostic` snapshot. A `gate_reason` read straight off
+        # the BOARD (`gate_reason_from_diagnostic=False`) is no less stale
+        # when nothing has cleared the persisted `QueuedMerge.error` it is
+        # read from (#420) — quadraui#2173's incident re-tested a
+        # board-sourced stale-smoke reason five times across two drive runs,
+        # all passing, because this latch never armed for that source. The
+        # latch's own contract (one re-test per snapshot, released only by a
+        # real merge attempt) applies identically regardless of which of
+        # `_effective_merge_gate_reason`'s two sources produced the text.
         divergence = None
     if divergence == "smoke" and _is_stale_smoke_reason(gate_reason):
         # #1738: a STALE (not missing) smoke verdict has a safe, bounded
@@ -4973,10 +4993,11 @@ def _decide_merge(
                 gate_reason=gate_reason,
             )
         counters.fix_rounds += 1
-        if gate_reason_from_diagnostic:
-            # #2229: arm the latch above — one re-test per captured
-            # diagnostic, then a real attempt has to re-validate it.
-            counters.stale_smoke_diagnostic_attempt = counters.merge_attempts
+        # #2229/#3917: arm the latch above — one re-test per captured
+        # reason (diagnostic-sourced OR read straight off the board), then
+        # a real `coord merge` attempt has to re-validate it before another
+        # re-test can fire.
+        counters.stale_smoke_diagnostic_attempt = counters.merge_attempts
         return Action(
             kind=RUN,
             label=(

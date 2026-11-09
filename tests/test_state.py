@@ -3067,6 +3067,76 @@ class TestTestVerdictStalenessAnchor:
         assert row["test_base_sha"] == "sha-for-feature/ms-7"
         assert "feature/ms-7" in seen_bases
 
+    def test_fresh_verdict_clears_persisted_stale_smoke_merge_error(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#3917: a merge-queue entry parked on "smoke test verdict is
+        stale" against the OLD branch head must not keep showing that error
+        once a fresh terminal verdict's anchors are actually confirmed live
+        — nothing but a real `coord merge` attempt used to clear it (#420),
+        which is exactly what let quadraui#2173 re-test the same stale
+        reading five times."""
+        from coord import merge_queue as mq
+        from coord.models import Assignment
+
+        self._seed_assignment(coord_db)
+        self._config(monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: {"worker/aid-1": "4fb8bea", "main": "main-sha"}[branch],
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_patch_id",
+            lambda repo, base, branch: "fdfcd8d",
+        )
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="aid-1", type="work", status="done", branch="worker/aid-1",
+        )
+        mq.enqueue(work, repo_github="acme/api", target_branch="main")
+        items = mq.load_queue()
+        items[0].error = (
+            "smoke test verdict is stale: recorded against branch "
+            "c6ef8e6, branch is now 4fb8bea — re-verify against the "
+            "current base, then `coord test aid-1 --passed`"
+        )
+        mq.save_queue(items)
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        assert mq.load_queue()[0].error is None
+
+    def test_failed_anchor_probe_does_not_clear_stale_smoke_merge_error(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Only a CONFIRMED live observation (both anchor probes resolved)
+        clears the stale-smoke error — a probe failure proves nothing
+        moved, so the stale text must stand rather than being cleared on
+        unconfirmed evidence."""
+        from coord import merge_queue as mq
+        from coord.models import Assignment
+
+        self._seed_assignment(coord_db)
+        self._config(monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: (_ for _ in ()).throw(RuntimeError("gh unavailable")),
+        )
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="aid-1", type="work", status="done", branch="worker/aid-1",
+        )
+        mq.enqueue(work, repo_github="acme/api", target_branch="main")
+        items = mq.load_queue()
+        items[0].error = "smoke test verdict is stale: recorded against branch a, branch is now b"
+        mq.save_queue(items)
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        assert mq.load_queue()[0].error is not None
+
 
 class TestRecordTestVerdictToolchain:
     """#1629 (H-2): `test_toolchain` — the toolchain that produced a Test
