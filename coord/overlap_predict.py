@@ -126,7 +126,10 @@ from coord.drive_queue import entry_key
 # terminal (the tick's question is "is this issue still being worked"), and
 # ``done`` is precisely the state a finished-but-unmerged PR sits in.
 LANDED_STATUSES = frozenset(
-    {"merged", "cancelled", "advisory", "refused_policy", "refused_premise", "failed"}
+    {
+        "merged", "cancelled", "advisory", "refused_policy", "refused_premise",
+        "needs_decomposition", "failed",
+    }
 )
 
 # Where one side's file list came from. Recorded on every overlap so a later

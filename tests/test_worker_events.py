@@ -1798,6 +1798,25 @@ class TestClassifyZeroCommitOutcome:
             == "needs_decomposition"
         )
 
+    def test_investigation_resolution_with_blocked_on_upstream_is_not_needs_decomposition(
+        self,
+    ) -> None:
+        """A leg that found the root cause in another repo and reported it
+        via `BLOCKED_ON_UPSTREAM:` is a distinct, actionable shape — it
+        must not relabel as "needs epic decomposition", which would hand
+        the operator the wrong remedy (the gap is already named; it needs
+        filing upstream, not splitting this issue)."""
+        text = (
+            "Ran out of leads locally — the capability lives in another "
+            "repo.\n"
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose per-pane scroll offsets\n"
+            "ISSUE_RESOLUTION: investigation — blocked on upstream"
+        )
+        assert (
+            classify_zero_commit_outcome(text, issue_resolution="investigation")
+            is None
+        )
+
     def test_investigation_resolution_does_not_override_a_premise_match(
         self,
     ) -> None:
