@@ -278,6 +278,30 @@ class TestIssueResolutionMarker:
         result = parse_issue_resolution("> ISSUE_RESOLUTION: investigation — n/a")
         assert result.value == "investigation"
 
+    def test_list_and_heading_prefixed_marker_still_parses(self) -> None:
+        """#3928: `-`/`+`/`#` prefixes (Markdown list items/headings) are a
+        real claim, just like `*` already was — not a fail-open default."""
+        from coord.models import parse_issue_resolution
+
+        result = parse_issue_resolution("- ISSUE_RESOLUTION: partial — X")
+        assert result.value == "partial"
+        assert result.reason == "X"
+
+        result = parse_issue_resolution("## ISSUE_RESOLUTION: partial — X")
+        assert result.value == "partial"
+        assert result.reason == "X"
+
+    def test_backtick_quoted_marker_at_line_start_is_not_a_claim(self) -> None:
+        """#3928: a line-leading backtick-quoted mention of the marker
+        (its code span closing again later on the same line) is a
+        quotation, not a claim — this is the exact #3916 review-text shape
+        that made #3915 itself merge as "partial"."""
+        from coord.models import parse_issue_resolution
+
+        text = "`ISSUE_RESOLUTION: partial`. This matches exactly what review expected."
+        result = parse_issue_resolution(text)
+        assert result.value == "resolved"
+
     def test_punctuation_only_reason_reads_as_empty(self) -> None:
         """A reason left over after separator-stripping that is nothing but
         trailing punctuation (e.g. the quoting sentence's own "`.") must
@@ -1125,6 +1149,34 @@ class TestProcess:
         assert "What remains: ." not in comment_body
         assert "What remains: \n" not in comment_body
         assert "marked this PR as not fully" in comment_body
+
+    def test_remainder_builder_falls_back_on_a_handbuilt_blank_reason(
+        self,
+    ) -> None:
+        # #3928: `coord.models.parse_issue_resolution` already normalises a
+        # punctuation-only reason down to `""`, so the generic fallback
+        # inside `_issue_resolution_remainder_text` is unreachable through
+        # that parser alone — every `IssueResolution` it returns already
+        # satisfies `is_blank_issue_resolution_reason` only when the raw
+        # reason is actually empty. Exercise the builder directly with a
+        # hand-built `IssueResolution` whose `reason` is non-empty but
+        # still blank (nothing but markdown punctuation) to prove the
+        # fallback itself still fires, rather than only re-testing the
+        # parser's own normalisation under a different name.
+        from coord.merge_queue import _issue_resolution_remainder_text
+        from coord.models import IssueResolution
+
+        remainder = _issue_resolution_remainder_text(
+            IssueResolution("partial", "**`.`**")
+        )
+        assert remainder == (
+            "the worker/reviewer marked this PR as not fully "
+            "resolving the issue — see the PR for details."
+        )
+        assert _issue_resolution_remainder_text(
+            IssueResolution("partial", "root cause elsewhere")
+        ) == "root cause elsewhere"
+        assert _issue_resolution_remainder_text(IssueResolution("resolved", "")) == ""
 
     def test_comment_failure_does_not_revert_the_merge(self) -> None:
         # Same best-effort posture as `close_issue` failures (#806).

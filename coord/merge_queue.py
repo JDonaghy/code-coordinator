@@ -8706,6 +8706,29 @@ def _maybe_post_verification(
     )
 
 
+def _issue_resolution_remainder_text(issue_resolution: IssueResolution) -> str:
+    """The "What remains:" text for *issue_resolution* (#3502), or "" when
+    it's "resolved" (nothing to report).
+
+    Falls back to a generic sentence when `issue_resolution.reason` is
+    blank (:func:`coord.models.is_blank_issue_resolution_reason`) rather
+    than printing a dangling fragment (#3915). In production every
+    `IssueResolution` reaching this function was built by
+    :func:`coord.models.parse_issue_resolution`, which already normalises
+    a punctuation-only reason down to `""` before this ever runs — so the
+    fallback branch is exercised directly in tests via a hand-built
+    `IssueResolution` (#3928), not indirectly through a marker string.
+    """
+    if issue_resolution.value == "resolved":
+        return ""
+    if not is_blank_issue_resolution_reason(issue_resolution.reason):
+        return issue_resolution.reason
+    return (
+        "the worker/reviewer marked this PR as not fully "
+        "resolving the issue — see the PR for details."
+    )
+
+
 def _finalize_merged_entry(
     entry: QueuedMerge,
     gh_ops: "GhOps",
@@ -8851,16 +8874,7 @@ def _finalize_merged_entry(
         # Blocked — never close it, and ALWAYS tell anyone watching the
         # issue (not just the queue DB) why, regardless of which of the
         # three reasons fired.
-        remainder = (
-            (
-                issue_resolution.reason
-                if not is_blank_issue_resolution_reason(issue_resolution.reason)
-                else "the worker/reviewer marked this PR as not fully "
-                "resolving the issue — see the PR for details."
-            )
-            if issue_resolution.value != "resolved"
-            else ""
-        )
+        remainder = _issue_resolution_remainder_text(issue_resolution)
         comment_body = (
             f"Merged PR #{entry.pr_number}, but issue "
             f"#{entry.issue_number} {issue_close_block_reason} "

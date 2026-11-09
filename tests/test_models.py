@@ -11,9 +11,11 @@ from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
     Board,
+    IssueResolution,
     Machine,
     Repo,
     is_blank_issue_resolution_reason,
+    parse_issue_resolution,
     trust_issue_closed_for,
 )
 
@@ -394,3 +396,54 @@ def test_is_blank_issue_resolution_reason(reason: str | None, expected: bool) ->
     over after separator-stripping as blank when it carries nothing but
     whitespace/markdown punctuation — never a real explanation."""
     assert is_blank_issue_resolution_reason(reason) is expected
+
+
+def test_parse_issue_resolution_backtick_quoted_marker_is_not_a_claim() -> None:
+    """#3928: a line-leading backtick-quoted mention of the marker (e.g. a
+    reviewer's prose repeating the literal marker text inside an inline
+    code span) must not read as a real claim — the code span's opening
+    backtick closes again later on the same line, which is what tells a
+    quotation apart from a real marker."""
+    text = "`ISSUE_RESOLUTION: partial`. This matches exactly what review expected."
+    assert parse_issue_resolution(text) == IssueResolution("resolved", "")
+
+
+def test_parse_issue_resolution_real_marker_wins_over_later_quoted_one() -> None:
+    """#3928: a real, unquoted `ISSUE_RESOLUTION: resolved` line followed
+    later by a backtick-quoted mention must still read as "resolved" — the
+    quoted line is skipped, not treated as a later, winning claim."""
+    text = (
+        "ISSUE_RESOLUTION: resolved\n\n"
+        "Reviewer note: `ISSUE_RESOLUTION: partial`. This matches exactly "
+        "what review expected."
+    )
+    assert parse_issue_resolution(text) == IssueResolution("resolved", "")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["-", "+", "#", "##", "###", "*"],
+)
+def test_parse_issue_resolution_list_and_heading_prefixes(prefix: str) -> None:
+    """#3928: `-`/`+`/`#` prefixes (Markdown list items and headings) must
+    parse exactly like a `*` bullet already did — not fail open to the
+    "resolved" default."""
+    text = f"{prefix} ISSUE_RESOLUTION: partial — X"
+    assert parse_issue_resolution(text) == IssueResolution("partial", "X")
+
+
+def test_parse_issue_resolution_3916_review_text_regression() -> None:
+    """Regression fixture for #3928: the #3916 review comment text that
+    made #3915 itself merge as "partial" must now read as "resolved". The
+    review approved #3916 but flagged a residual non-blocking finding in
+    prose, which happened to wrap so one line began with a backtick-quoted
+    repetition of the marker itself."""
+    text = (
+        "Verdict: resolved. The start-of-line anchoring fix is correct. "
+        "One residual worth a follow-up: a reviewer quoting the marker "
+        "verbatim still reads as a claim, e.g. if the text wraps so a line "
+        "begins\n"
+        "`ISSUE_RESOLUTION: partial`. This matches exactly what review "
+        "expected."
+    )
+    assert parse_issue_resolution(text) == IssueResolution("resolved", "")
