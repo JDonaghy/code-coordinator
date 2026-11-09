@@ -49,14 +49,34 @@ def _review() -> Assignment:
     )
 
 
-def _patch_live_facts(monkeypatch, *, pr: dict | None, pr_merged: bool, issue_state: str):
+def _patch_live_facts(
+    monkeypatch,
+    *,
+    pr: dict | None,
+    pr_merged: bool,
+    issue_state: str,
+    checks: list | None = None,
+    expects_checks: bool = False,
+):
+    """*expects_checks* defaults to False — "this repo has no CI gate wired"
+    — so a bare, un-opted-in test keeps reading the CI gate as satisfied
+    (`ci_state="none"`) rather than silently depending on whatever
+    `GitHubCi._fetch_expects_checks`'s fail-closed `gh` subprocess call
+    happens to resolve to in the environment the suite runs in (#1904's own
+    fail-closed default, which is `True` and would otherwise make every
+    caller here see `checks_absent` and `next_action: dispatch_ci_fix`)."""
     monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: "sha123")
     monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda repo, base, branch: "patchid")
     monkeypatch.setattr(github_ops, "get_issue_state", lambda repo, issue: issue_state)
     monkeypatch.setattr(github_ops, "find_pr_for_branch", lambda repo, branch: pr)
     monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: pr_merged)
     monkeypatch.setattr(github_ops, "check_pr_mergeable", lambda repo, number: True)
-    monkeypatch.setattr(GitHubCi, "list_checks_for_pr", lambda self, repo, number: [])
+    monkeypatch.setattr(
+        GitHubCi, "list_checks_for_pr", lambda self, repo, number: checks or [],
+    )
+    monkeypatch.setattr(
+        GitHubCi, "expects_checks", lambda self, repo, number: expects_checks,
+    )
 
 
 def _run_gates(valid_config_path, monkeypatch, *, as_json: bool = False):
@@ -100,3 +120,24 @@ def test_json_output_carries_next_action_fields(
     payload = json.loads(output)
     assert payload["next_action"] == "merge"
     assert "next_action_reason" in payload
+
+
+def test_checks_absent_fails_closed_never_merge(
+    valid_config_path, monkeypatch, coord_db,
+) -> None:
+    """#1904/#3922: an empty check list on a repo that DOES declare CI must
+    never read `next_action: merge` — that is exactly the "CI never ran"
+    hole `coord.merge_queue`'s own `checks_absent` refusal exists to close,
+    and `coord gates` printing `merge` here would once again let an
+    operator see "go" on an entry `coord merge` refuses outright."""
+    _patch_live_facts(
+        monkeypatch,
+        pr={"number": 7, "mergeable": True},
+        pr_merged=False,
+        issue_state="open",
+        checks=[],
+        expects_checks=True,
+    )
+    output = _run_gates(valid_config_path, monkeypatch)
+    assert "next_action: dispatch_ci_fix" in output, output
+    assert "1904" in output, output
