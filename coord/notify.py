@@ -3157,6 +3157,42 @@ _HARNESS_CRASH_REASON = (
 )
 
 
+def _release_smoke_dispatch_claim_for_leg(leg_assignment_id: str) -> None:
+    """Release the ``smoke_claims`` row a terminal Test-stage leg took when
+    it was dispatched, keyed on the LEG's own assignment id.
+
+    Thin wrapper over :func:`coord.state.release_smoke_claim_if_row_is_smoke_leg`
+    — the ONE "is this row a smoke leg, and if so release its dispatch
+    claim" answer, shared with ``coord.issue_store._update_local_state`` and
+    ``coord.state._mark_notified_local``. It is a no-op for every row that is
+    not a ``type="smoke"`` leg, so both call sites in :func:`post_transition`
+    can invoke it unconditionally on the arm they already know is a smoke
+    terminal event.
+
+    Called from `post_transition` on the smoke COMPLETION and smoke FAILURE
+    arms, immediately after that arm's `mark_notified`. `mark_notified` also
+    reaches the same release (via `_mark_notified_local`), but only as a side
+    effect of writing the notification ledger — a write that routes over HTTP
+    to the `coord serve` daemon whenever `board_service` is configured, and
+    that some callers stub out entirely. Coupling claim release to it means a
+    leg can reach a terminal event with its claim still held and nothing left
+    to release it: `_dispatch_smoke_single_leg` claims under one fixed
+    partition tag per work row, so a single stranded claim silently blocks
+    EVERY future Test dispatch for that row — no leg, no verdict, and a
+    `test_state` that no gate ever resolves. Releasing here derives the
+    release from the terminal transition itself, which is the observation
+    that actually proves the leg is done.
+
+    Idempotent: the underlying delete is a no-op when the claim is already
+    gone, which is the normal case once `mark_notified` has run.
+    """
+    from coord.state import (  # noqa: PLC0415
+        release_smoke_claim_if_row_is_smoke_leg,
+    )
+
+    release_smoke_claim_if_row_is_smoke_leg(leg_assignment_id)
+
+
 def _record_smoke_verdict(
     transition: Transition, entry: dict, parent_id: str,
 ) -> None:
@@ -4681,6 +4717,7 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             transition.event,
             branch=entry.get("branch"),
         )
+        _release_smoke_dispatch_claim_for_leg(transition.assignment_id)
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
             # Guard: only auto-certify when the issue's test-mode is "auto"
@@ -4760,6 +4797,7 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             failure_reason=_failure_reason,
             exit_code=transition.exit_code,
         )
+        _release_smoke_dispatch_claim_for_leg(transition.assignment_id)
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
             from coord.reconcile import (  # noqa: PLC0415

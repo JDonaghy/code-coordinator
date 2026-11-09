@@ -3567,7 +3567,8 @@ def _dispatch_smoke_single_leg(
     # or an `/assign` round trip — leaving it for a later tick's dedupe reads
     # above to find the winner's leg once it has actually landed on the
     # board. Released by `coord.state.release_smoke_claim_if_row_is_smoke_leg`
-    # once the dispatched leg's own assignment reaches a terminal status, and
+    # once the dispatched leg reaches a terminal transition (on the smoke
+    # arms of `coord.notify.post_transition`) or a terminal status write, and
     # by the `dispatched is None`/exception paths just below when this call
     # won the claim but never actually dispatched anything with it.
     from coord.state import (  # noqa: PLC0415

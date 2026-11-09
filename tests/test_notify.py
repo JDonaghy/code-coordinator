@@ -4590,6 +4590,201 @@ class TestMuteSmokeLegLoopTerminates:
         )
 
 
+class TestSmokeDispatchClaimReleasedByTerminalTransition:
+    """#3920: the `smoke_claims` row a Test-stage leg takes at dispatch is
+    released by the leg's own TERMINAL TRANSITION — not merely as a side
+    effect of the notification-ledger write (`mark_notified`), which routes
+    over HTTP to the board daemon and is stubbed out by several callers.
+
+    `coord.smoke._dispatch_smoke_single_leg` claims ONE fixed partition tag
+    per work row, so a claim that outlives its leg silently blocks every
+    future Test dispatch for that row: no leg, no verdict, and a `test_state`
+    no gate ever resolves.
+    """
+
+    @staticmethod
+    def _record(assignment_id: str, *, atype: str, title: str,
+                parent_id: str | None = None) -> None:
+        from coord.models import Assignment  # noqa: PLC0415
+        from coord.state import _record_dispatched_assignment_local  # noqa: PLC0415
+
+        _record_dispatched_assignment_local(
+            assignment=Assignment(
+                assignment_id=assignment_id,
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=42,
+                issue_title=title,
+                type=atype,
+                status="running",
+                review_of_assignment_id=parent_id,
+                branch="issue-42-fix-thing",
+            ),
+            repo_github="acme/api",
+        )
+
+    @staticmethod
+    def _held(work_assignment_id: str, tag: str) -> bool:
+        from coord.state import get_connection  # noqa: PLC0415
+
+        return get_connection().execute(
+            "SELECT 1 FROM smoke_claims WHERE work_assignment_id=? "
+            "AND capability_partition=?",
+            (work_assignment_id, tag),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _transition(assignment_id: str, event: str):
+        from coord.notify import Transition  # noqa: PLC0415
+
+        return Transition(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=event,
+            exit_code=0,
+        )
+
+    def _post(self, transition, record, entry) -> None:
+        """Drive the real `post_transition` with every GitHub-touching and
+        ledger-writing seam stubbed — `mark_notified` included, so only a
+        release derived from the transition itself can clear the claim."""
+        from coord.notify import post_transition  # noqa: PLC0415
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.post_failure"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.notify._agent_host", return_value=None),
+        ):
+            post_transition(transition, record, entry)
+
+    def test_single_leg_completion_releases_its_claim(self, coord_db, tmp_path) -> None:
+        from coord.notify import EVENT_COMPLETION  # noqa: PLC0415
+        from coord.smoke import SINGLE_LEG_SMOKE_PARTITION_TAG  # noqa: PLC0415
+        from coord.state import claim_smoke_dispatch  # noqa: PLC0415
+
+        self._record("work-1", atype="work", title="Fix thing")
+        self._record(
+            "leg-1", atype="smoke", title="[smoke] Fix thing", parent_id="work-1",
+        )
+        assert claim_smoke_dispatch("work-1", SINGLE_LEG_SMOKE_PARTITION_TAG) is True
+
+        log = tmp_path / "leg-1.log"
+        log.write_text(
+            '{"type":"assistant","message":{"content":[{"type":"text",'
+            '"text":"SMOKE: pass"}]}}\n',
+            encoding="utf-8",
+        )
+        self._post(
+            self._transition("leg-1", EVENT_COMPLETION),
+            {"repo_github": "acme/api", "type": "smoke",
+             "issue_title": "[smoke] Fix thing",
+             "review_of_assignment_id": "work-1"},
+            {"started_at": 1000.0, "finished_at": 1010.0,
+             "branch": "issue-42-fix-thing", "log_path": str(log)},
+        )
+
+        assert not self._held("work-1", SINGLE_LEG_SMOKE_PARTITION_TAG), (
+            "a completed single-leg Test dispatch left its claim held — the "
+            "work row can never be re-tested"
+        )
+
+    def test_single_leg_failure_releases_its_claim(self, coord_db) -> None:
+        from coord.notify import EVENT_FAILURE  # noqa: PLC0415
+        from coord.smoke import SINGLE_LEG_SMOKE_PARTITION_TAG  # noqa: PLC0415
+        from coord.state import claim_smoke_dispatch  # noqa: PLC0415
+
+        self._record("work-1", atype="work", title="Fix thing")
+        self._record(
+            "leg-1", atype="smoke", title="[smoke] Fix thing", parent_id="work-1",
+        )
+        assert claim_smoke_dispatch("work-1", SINGLE_LEG_SMOKE_PARTITION_TAG) is True
+
+        self._post(
+            self._transition("leg-1", EVENT_FAILURE),
+            {"repo_github": "acme/api", "type": "smoke",
+             "issue_title": "[smoke] Fix thing",
+             "review_of_assignment_id": "work-1"},
+            {"started_at": 1000.0, "finished_at": 1010.0,
+             "branch": "issue-42-fix-thing", "log_path": None,
+             "error": "the agent died"},
+        )
+
+        assert not self._held("work-1", SINGLE_LEG_SMOKE_PARTITION_TAG), (
+            "a leg that died without a verdict left its claim held — #1605's "
+            "bounded re-dispatch can never fire"
+        )
+
+    def test_fanout_leg_releases_only_its_own_partition(
+        self, coord_db, tmp_path
+    ) -> None:
+        """The release is per-partition: a sibling partition still in flight
+        keeps its claim, or one finishing leg would re-open the dispatch race
+        for every other partition of the same fan-out."""
+        from coord.notify import EVENT_COMPLETION  # noqa: PLC0415
+        from coord.smoke import smoke_leg_issue_title  # noqa: PLC0415
+        from coord.state import claim_smoke_dispatch  # noqa: PLC0415
+
+        title = smoke_leg_issue_title("Fix thing", ("macos",))
+        self._record("work-1", atype="work", title="Fix thing")
+        self._record("leg-mac", atype="smoke", title=title, parent_id="work-1")
+        assert claim_smoke_dispatch("work-1", "macos") is True
+        assert claim_smoke_dispatch("work-1", "gtk") is True
+
+        log = tmp_path / "leg-mac.log"
+        log.write_text(
+            '{"type":"assistant","message":{"content":[{"type":"text",'
+            '"text":"SMOKE: pass"}]}}\n',
+            encoding="utf-8",
+        )
+        self._post(
+            self._transition("leg-mac", EVENT_COMPLETION),
+            {"repo_github": "acme/api", "type": "smoke",
+             "issue_title": title, "review_of_assignment_id": "work-1"},
+            {"started_at": 1000.0, "finished_at": 1010.0,
+             "branch": "issue-42-fix-thing", "log_path": str(log)},
+        )
+
+        assert not self._held("work-1", "macos")
+        assert self._held("work-1", "gtk"), (
+            "a finishing leg released a SIBLING partition's claim — that "
+            "partition's own in-flight dispatch is no longer serialized"
+        )
+
+    def test_non_smoke_terminal_transition_releases_nothing(
+        self, coord_db, tmp_path
+    ) -> None:
+        """The gate can fail: a WORK row's own completion must leave the
+        smoke claim keyed on it alone. A leg is still in flight — only the
+        leg's terminal transition proves otherwise."""
+        from coord.notify import EVENT_COMPLETION  # noqa: PLC0415
+        from coord.smoke import SINGLE_LEG_SMOKE_PARTITION_TAG  # noqa: PLC0415
+        from coord.state import claim_smoke_dispatch  # noqa: PLC0415
+
+        self._record("work-1", atype="work", title="Fix thing")
+        assert claim_smoke_dispatch("work-1", SINGLE_LEG_SMOKE_PARTITION_TAG) is True
+
+        log = tmp_path / "work-1.log"
+        log.write_text("done\n", encoding="utf-8")
+        self._post(
+            self._transition("work-1", EVENT_COMPLETION),
+            {"repo_github": "acme/api", "type": "work", "issue_title": "Fix thing"},
+            {"started_at": 1000.0, "finished_at": 1010.0,
+             "branch": "issue-42-fix-thing", "log_path": str(log)},
+        )
+
+        assert self._held("work-1", SINGLE_LEG_SMOKE_PARTITION_TAG), (
+            "a non-smoke row's terminal transition released a smoke-dispatch "
+            "claim — the dedupe window is open while the leg still runs"
+        )
+
+
 class TestConfirmedPassVerdictSignalKill:
     """#2527: a confirmation subprocess killed by an external signal (a
     `coord-agent`/`coord-serve` restart landing mid-run, a manual `kill`, ...)
