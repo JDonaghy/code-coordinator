@@ -4419,14 +4419,14 @@ Rules:
 - Stay within the files listed in your briefing. If your planned diff \
 will touch significantly more files or modules than the briefing's \
 `## Files` declares, you are over-scoping — a sprawling single-pass \
-change is the #1 cause of avoidable smoke-test failures. Two options, in \
-preference order: \
-(a) decompose and fan out — use the Agent tool to spawn narrowly-scoped \
-subagents (each touching ≤3 files), coordinate their results in this \
-session, and run the scoped test suite before pushing; \
-(b) if the issue genuinely needs splitting into separate issues, report \
-in your final message that this should be epic-decomposed and stop. \
-Either way, do not attempt a 10+ file single-pass change.
+change is the #1 cause of avoidable smoke-test failures. Do not attempt \
+a 10+ file single-pass change. Instead, stop and report that the issue \
+needs splitting into separate issues, using the \
+`WORK_OUTCOME: needs-decomposition — <the split you'd propose>` marker \
+documented below. (There is no subagent tool on this leg to fan out \
+with — `Task` is disallowed for a `type="work"` session unless the issue \
+carries the `coord:workflow` label; an issue that size needs a coordinator- \
+level split, not a single leg working around its own tool surface.)
 - If the briefing lists forbidden files, do NOT read or modify them. \
 They are managed by the coordinator.
 - Code comments describe the code as it is now, never its history. No \
