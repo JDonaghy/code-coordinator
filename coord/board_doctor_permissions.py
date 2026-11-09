@@ -2014,10 +2014,21 @@ def sweep_restage(
     that action under a name an investigator session reads more plainly.
 
     ``"review"`` finds the row's own most recent completed ``work``
-    assignment and calls :func:`coord.review.dispatch_review` against it
+    assignment. When it has no RECORDED terminal verdict yet (``review_
+    verdict is None`` — a review never ran, or raised before it could post
+    one), this calls :func:`coord.review.dispatch_review` against it
     directly — the same primitive the auto-loop's own review-dispatch tick
-    calls, never a bespoke HTTP POST. No completed work assignment to
-    restage a review for is reported ``restaged=False``, not an error.
+    calls, never a bespoke HTTP POST. When it already carries a terminal
+    verdict — #3929's :data:`coord.queue_diagnose.CAUSE_REVIEW_STALE` shape,
+    an ``approve`` the merge gate's own freshness check confirms no longer
+    covers the branch's current head/patch-id — :func:`dispatch_review`
+    would hard-refuse it outright (#3670: ONE review per leg), so this
+    routes through :func:`coord.review.dispatch_scoped_reviews_for_queue`
+    instead, the same #1476 scoped-re-review primitive the ordinary
+    reconcile/notify ticks already run on their own schedule. No completed
+    work assignment to restage a review for, and no scoped candidate the
+    merge gate's freshness check can confirm, are both reported
+    ``restaged=False``, not an error.
     """
     authorize_sweep_action("restage")
 
@@ -2047,6 +2058,9 @@ def sweep_restage(
             ),
         )
 
+    if work.review_verdict is not None:
+        return _sweep_scoped_review_restage(repo_name, issue_number, board, config, work)
+
     from coord.board_service import write_board  # noqa: PLC0415
     from coord.review import dispatch_review  # noqa: PLC0415
 
@@ -2071,6 +2085,64 @@ def sweep_restage(
         detail=(
             f"{repo_name}#{issue_number} re-dispatched a review "
             f"({getattr(dispatched, 'assignment_id', dispatched)!r})"
+        ),
+    )
+
+
+def _sweep_scoped_review_restage(
+    repo_name: str, issue_number: int, board: "Board", config: "Config", work: "Assignment",
+) -> RestageResult:
+    """#3929: the ``"review"`` branch of :func:`sweep_restage` for a *work*
+    assignment that already carries a recorded terminal review verdict —
+    the shape :func:`coord.review.dispatch_review` hard-refuses under
+    #3670, and the shape :data:`coord.queue_diagnose.CAUSE_REVIEW_STALE`
+    names: a prior ``approve`` the merge gate's own freshness check
+    (:func:`coord.merge_queue.find_scoped_review_candidate`) confirms no
+    longer covers the branch's current head/patch-id.
+
+    Calls :func:`coord.review.dispatch_scoped_reviews_for_queue` — the
+    SAME #1476 scoped-re-review primitive the ordinary reconcile/notify
+    ticks already run on their own schedule, never a bespoke re-derivation
+    of its eligibility chain (``has_approved_review`` /
+    ``find_scoped_review_candidate`` / ``only_bounded_fix_since_review`` /
+    the ``already_handled`` dedupe) — against the WHOLE merge queue, since
+    that function owns its own queue read/write and a filtered single-entry
+    call would skip persisting any SHA/patch-id it backfills for every
+    OTHER pending row along the way. A miss here is reported ``restaged=
+    False``: either the merge gate's own freshness check does not confirm a
+    scoped candidate for this row at all (the branch is actually fresh, or
+    needs a FULL re-review, not a scoped one), or the per-pass dispatch cap
+    / flood guard deferred it to a later tick — never an error either way.
+    """
+    from coord.review import dispatch_scoped_reviews_for_queue  # noqa: PLC0415
+
+    dispatched = dispatch_scoped_reviews_for_queue(board, config)
+    hit = next(
+        (
+            a
+            for a in dispatched
+            if a.repo_name == repo_name and a.issue_number == issue_number
+        ),
+        None,
+    )
+    if hit is None:
+        return RestageResult(
+            restaged=False,
+            detail=(
+                f"{repo_name}#{issue_number}: work assignment "
+                f"{work.assignment_id!r} already has a recorded review "
+                f"verdict {work.review_verdict!r} (#3670) and the merge "
+                "gate's own freshness check found no scoped re-review "
+                "candidate for it this pass — not eligible, or deferred by "
+                "the flood guard/per-pass cap"
+            ),
+        )
+    return RestageResult(
+        restaged=True,
+        detail=(
+            f"{repo_name}#{issue_number} re-dispatched a SCOPED review "
+            f"({hit.assignment_id!r}) for the stale {work.review_verdict!r} "
+            f"on {work.assignment_id!r}"
         ),
     )
 

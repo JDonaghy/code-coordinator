@@ -1159,45 +1159,112 @@ def _reclassify_after_prereqs_landed(
 #: unset-`last_attempt` shape alone.
 CAUSE_MERGE_NEVER_ATTEMPTED = "merge-never-attempted"
 
+#: The incoming `queue_diagnose` causes :func:`_reclassify_merge_never_
+#: attempted` may promote away from. Starts from
+#: :data:`_AFTER_PREREQS_LANDED_SAFE_CAUSES` (`unknown`/`no-pr`: the live
+#: PR/branch-lifecycle diagnosis found nothing actionable of its own) and
+#: widens it with `queue_diagnose.CAUSE_NOTHING_BLOCKING` — quadraui#2160's
+#: own row has an open PR with every check green, review approved and
+#: `mergeable` true, which `queue_diagnose._rule_nothing_blocking` reads as
+#: `nothing-blocking`, not `unknown`/`no-pr`. A SEPARATE constant from
+#: `_AFTER_PREREQS_LANDED_SAFE_CAUSES` rather than widening that one in
+#: place: `_reclassify_after_prereqs_landed` promotes to a `drive_queue_
+#: requeue`, a completely different action with its own, already-settled
+#: #3901 scope — this cause's own live `entry_gate_status` re-check below
+#: is the independent confirmation that makes `CAUSE_NOTHING_BLOCKING`
+#: safe to add HERE without touching that one.
+_MERGE_NEVER_ATTEMPTED_SAFE_CAUSES = _AFTER_PREREQS_LANDED_SAFE_CAUSES | frozenset(
+    {queue_diagnose.CAUSE_NOTHING_BLOCKING}
+)
+
 
 def _reclassify_merge_never_attempted(
-    rows: list[StuckRow], merge_entries: Sequence[Any], *, board: Board, config,
+    rows: list[StuckRow],
+    merge_entries: Sequence[Any],
+    *,
+    board: Board,
+    config,
+    now: float | None = None,
 ) -> list[StuckRow]:
     """#3929: promote a no-progress drive-queue row to
     :data:`CAUSE_MERGE_NEVER_ATTEMPTED` when its merge-queue row is
-    `PENDING` with ``last_attempt is None`` (never evaluated at all) AND a
-    live re-check confirms every gate ahead of the merge attempt itself
-    already reads clear.
+    `PENDING` with ``last_attempt is None`` (never evaluated at all), has
+    sat at least :data:`MERGE_PENDING_STALE_AFTER_SECONDS` since
+    ``enqueued_at``, AND a live re-check confirms every gate ahead of the
+    merge attempt itself already reads clear.
+
+    The ``enqueued_at`` age bound mirrors :func:`merge_queue_rows`'s own
+    staleness filter for the STALE-pending shape (same threshold, same
+    reasoning): a `PENDING` entry with no attempt recorded yet that was
+    JUST enqueued is, per that function's own docstring, "very likely
+    still alive and polling" under the ordinary auto-drain tick — minting
+    this cause (and the `coord merge --only` it dispatches) off a
+    freshly-enqueued entry would race that tick rather than rescue a row
+    it has genuinely stopped reaching. An entry with no ``enqueued_at`` at
+    all (pre-#274 rows, hand-edited queue state) is treated as already
+    past the bound — the same fail-open convention every other optional
+    ``QueuedMerge`` anchor in this module uses — rather than permanently
+    exempted from this cause.
 
     Same "promote only an independently-confirmed subset of a broader
     cause" shape as :func:`_reclassify_after_prereqs_landed` — the incoming
-    cause must be one of :data:`_AFTER_PREREQS_LANDED_SAFE_CAUSES` (`unknown`
-    or `no-pr`: the live PR/branch-lifecycle diagnosis found nothing
-    actionable of its own, which is exactly what a row stuck ONLY because
-    `coord merge` never got to it looks like — #2096, the same incoming-
-    cause precondition, not a second independently-maintained judgment
-    call under a new name), and :func:`coord.merge_queue.entry_gate_status`
+    cause must be one of :data:`_MERGE_NEVER_ATTEMPTED_SAFE_CAUSES`
+    (`unknown`/`no-pr`: the live PR/branch-lifecycle diagnosis found
+    nothing actionable of its own, which is exactly what a row stuck ONLY
+    because `coord merge` never got to it looks like; `nothing-blocking`:
+    the live diagnosis found an open PR with every check green, review
+    approved and `mergeable` true — quadraui#2160's own shape — #2096, the
+    same incoming-cause precondition, not a second independently-maintained
+    judgment call under a new name), and :func:`coord.merge_queue.entry_gate_status`
     — the SAME function :func:`_confirm_merge_pending_stuck` already trusts
     for the STALE-pending shape — must read `PLAN_READY` right now. A row
     whose review/smoke genuinely is not ready yet reads `PLAN_BLOCKED` here
     and is left exactly as the caller already classified it, so a row that
     is not actually ready for a merge attempt is never mis-labelled as one
     that is.
+
+    Also requires :attr:`StuckRow.fresh` — the SAME guard `_reclassify_
+    after_prereqs_landed`/`_reclassify_ceiling_blocked`/`_reclassify_checks_
+    stale_race` all apply, and for the same reason: a row rebuilt by
+    `_episode_stuck_row` from an arbitrarily old stored `cause=unknown`
+    carries no live evidence of its own, so promoting IT off a merge-queue
+    row that merely happens to still read `PENDING`/`last_attempt is None`
+    right now would be reasoning from a snapshot this sweep never actually
+    re-diagnosed.
+
+    *now* defaults to :func:`time.time` — overridable so a replay test can
+    assert on a fixed, reproducible staleness window, same convention as
+    :func:`merge_queue_rows`.
     """
+    import time as _time  # noqa: PLC0415
+
     from coord import github_ops  # noqa: PLC0415
     from coord.ci_store import build_ci_store  # noqa: PLC0415
     from coord.merge_queue import PENDING, PLAN_READY, entry_gate_status  # noqa: PLC0415
 
+    moment = _time.time() if now is None else now
     entries_by_key = {
         f"{entry.repo_name}#{entry.issue_number}": entry for entry in merge_entries
     }
     out: list[StuckRow] = []
     for row in rows:
-        if row.queue != "drive-queue" or row.cause not in _AFTER_PREREQS_LANDED_SAFE_CAUSES:
+        if (
+            row.queue != "drive-queue"
+            or not row.fresh
+            or row.cause not in _MERGE_NEVER_ATTEMPTED_SAFE_CAUSES
+        ):
             out.append(row)
             continue
         entry = entries_by_key.get(row.key)
-        if entry is None or entry.state != PENDING or entry.last_attempt is not None:
+        if (
+            entry is None
+            or entry.state != PENDING
+            or entry.last_attempt is not None
+            or (
+                entry.enqueued_at is not None
+                and moment - entry.enqueued_at < MERGE_PENDING_STALE_AFTER_SECONDS
+            )
+        ):
             out.append(row)
             continue
         live_ready = False

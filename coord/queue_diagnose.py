@@ -415,7 +415,14 @@ def _staleness_line(live: LiveState) -> str:
             return f"{label}: not read"
         if value:
             return f"{label}: {stale_word}"
-        return f"{label}: fresh (or not required/never approved)"
+        # `False` deliberately collapses three materially different
+        # readings the live recheck does not distinguish further: fresh
+        # (approved/passed and current), not required at all, or never
+        # approved/recorded in the first place. None of the three is
+        # actionable the way a confirmed-stale reading is, so this module
+        # does not split them — but say so plainly rather than implying
+        # "fresh" is the confirmed answer.
+        return f"{label}: not confirmed stale (fresh, not required, or never recorded)"
 
     return (
         "merge-gate freshness recheck — "
@@ -619,11 +626,16 @@ def _rule_review_stale(entry: QueueEntry, live: LiveState) -> tuple[str, str, st
     re-check (:attr:`LiveState.review_stale`) — never off ``coord
     gates``'s cached decision, which can read "every required gate reads
     clear" for the exact row this is meant to catch (quadraui#2173, see
-    :data:`CAUSE_REVIEW_STALE`). Checked ahead of
-    :func:`_rule_integration_red`/:func:`_rule_ci_red`/:func:`_rule_gate_
+    :data:`CAUSE_REVIEW_STALE`). Checked ahead of :func:`_rule_gate_
     blocked`: a confirmed-stale approval is a sharper, more actionable
-    answer than any of those three generic reads, and must win the race
-    against :data:`CAUSE_UNKNOWN` long before this module gives up.
+    answer than the generic "a merge gate is genuinely refusing right
+    now" read, and must win the race against :data:`CAUSE_UNKNOWN` long
+    before this module gives up. Checked AFTER :func:`_rule_integration_
+    red`/:func:`_rule_ci_red`/:func:`_rule_ci_pending` on purpose — the
+    issue this closes is staleness outranking a CLEAR gate reading, not a
+    genuinely red or pending required check, which is the row's more
+    actionable, more local problem regardless of what the prior approval
+    says.
     """
     if live.review_stale is True:
         return CAUSE_REVIEW_STALE, CONFIDENCE_HIGH, _staleness_line(live)
@@ -727,18 +739,25 @@ _RULES = (
     _rule_conflict,
     _rule_dead_leg,
     _rule_no_pr,
-    # #3929: a confirmed-stale review/test, straight off a direct re-check
-    # of the merge gate's own freshness functions, outranks every rule
-    # below — including the generic `gate-blocked`/`ci-red` reads that a
-    # STALE `coord gates` cache can otherwise hide behind (quadraui#2173).
-    _rule_review_stale,
-    _rule_test_stale,
     # #3882: integration-red must be tried before the generic ci-red rule
     # below, or a branch whose own Test verdict is clean would always be
     # misclassified as a plain (local) regression.
     _rule_integration_red,
     _rule_ci_red,
     _rule_ci_pending,
+    # #3929: a confirmed-stale review/test, straight off a direct re-check
+    # of the merge gate's own freshness functions, outranks the generic
+    # `gate-blocked` read that a STALE `coord gates` cache can otherwise
+    # hide behind (quadraui#2173) — a named staleness is a sharper, more
+    # actionable answer than "a merge gate is genuinely refusing right
+    # now". Deliberately tried AFTER the CI rules above rather than ahead
+    # of them: the issue this closes is staleness outranking a CLEAR gate
+    # reading, not a genuinely red required check — a row that is both
+    # failing CI right now AND carries a superseded prior approval is a CI
+    # problem first; the stale approval cannot matter again until the CI
+    # failure is fixed and a fresh review is needed anyway.
+    _rule_review_stale,
+    _rule_test_stale,
     _rule_gate_blocked,
     # #2276 review: this sits ABOVE `nothing-blocking` deliberately.  Every
     # rule above it names a positive blocker (a conflict, a red check, a
@@ -1010,8 +1029,15 @@ class GhLiveProbe:
     def _gates(
         self, entry: QueueEntry, errors: list[str]
     ) -> tuple[str, bool | None, list[str], bool | None, str | None, bool | None, bool | None]:
+        # #3929 review: run BEFORE `build_gate_report`, and independently of
+        # whether it raises — the whole point of this recheck is that it
+        # does not trust `coord gates`'s cached decision, so it must not be
+        # coupled to that decision having succeeded in the first place. A
+        # raising `build_gate_report` still leaves `review_stale`/
+        # `test_stale` as the one reading this pass got to confirm.
+        review_stale, test_stale = self._staleness(entry, errors)
         if self.board is None or self.config is None:
-            return "", None, [], None, None, None, None
+            return "", None, [], None, None, review_stale, test_stale
         try:
             from coord import github_ops  # noqa: PLC0415
             from coord.gates import build_gate_report  # noqa: PLC0415
@@ -1021,8 +1047,7 @@ class GhLiveProbe:
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"coord gates: {type(exc).__name__}: {exc}")
-            return "", None, [], None, None, None, None
-        review_stale, test_stale = self._staleness(entry, errors)
+            return "", None, [], None, None, review_stale, test_stale
         # `build_gate_report` returns early, with `report.rows` empty, ONLY
         # when `assignments_for_issue` found nothing on the board for this
         # issue at all (coord/gates.py) — never for an assignment that
@@ -1104,9 +1129,35 @@ class GhLiveProbe:
         describes, which is why this reuses it rather than growing a THIRD
         copy of the tie-break (#2096).
 
+        **Blocking review finding:** :func:`~coord.merge_queue.
+        find_scoped_review_candidate` is NOT a freshness oracle on its own
+        — every other caller
+        (:func:`coord.commands.review.reaffirm`, :func:`coord.review.
+        dispatch_scoped_reviews_for_queue`,
+        :func:`coord.review.maybe_scoped_review_for_completed_fix`) gates it
+        behind :func:`~coord.merge_queue.scan_approved_reviews`/
+        :func:`~coord.merge_queue.has_approved_review` first, because the
+        two can disagree: ``scan_approved_reviews`` returns ``approved=
+        True`` on the FIRST approve review matching the live head, while
+        ``find_scoped_review_candidate`` walks newest-first, skips the
+        SHA/patch-id match, and keeps walking to an OLDER approve whose
+        SHA/patch-id moved. On a branch carrying two approve verdicts at
+        different SHAs (any #1476 scoped re-review, or a conflict-fix/ci-fix
+        leg that was itself approved), asking ``find_scoped_review_
+        candidate`` alone reports stale when the gate itself reads
+        approved-and-current. So this asks the gate's own verdict FIRST:
+        only when ``scan_approved_reviews`` confirms there is no fresh
+        approval does it fall through to ``find_scoped_review_candidate``
+        to tell "genuinely stale" apart from "never approved at all" (see
+        :attr:`LiveState.review_stale`'s docstring for that distinction).
+
         ``(None, None)`` whenever there is nothing to anchor the check to
         (no work-like assignment, no repo config) or a live call raises —
-        "could not tell", never "confirmed not stale".
+        "could not tell", never "confirmed not stale". The review side also
+        reads ``None`` when the live branch head itself could not be
+        confirmed (``ApprovalScan.unknown_head`` — e.g. a `gh` read
+        failure), rather than folding that into "fresh" the way the
+        "never approved at all" case does.
         """
         try:
             from coord import github_ops  # noqa: PLC0415
@@ -1115,7 +1166,9 @@ class GhLiveProbe:
             from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
             from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
 
-            repo_cfg = self.config.repo(entry.repo) if self.config is not None else None
+            if self.board is None or self.config is None:
+                return None, None
+            repo_cfg = self.config.repo(entry.repo)
             if repo_cfg is None:
                 return None, None
             work_like = [
@@ -1137,17 +1190,36 @@ class GhLiveProbe:
 
             review_stale: bool | None = None
             if mq.requires_review(mq_entry, self.config):
-                candidate = mq.find_scoped_review_candidate(
+                scan = mq.scan_approved_reviews(
                     mq_entry, self.board, github_ops, config=self.config,
                 )
-                review_stale = candidate is not None
+                if scan.approved:
+                    # The gate's own verdict is approved-and-current — never
+                    # relabel that `review-stale` off a second surface that
+                    # can (and does) disagree with it.
+                    review_stale = False
+                elif scan.unknown_head:
+                    # Refused purely because the live branch head could not
+                    # be confirmed right now — "could not tell", not
+                    # "confirmed fresh" and not "confirmed stale" either.
+                    review_stale = None
+                else:
+                    candidate = mq.find_scoped_review_candidate(
+                        mq_entry, self.board, github_ops, config=self.config,
+                    )
+                    review_stale = candidate is not None
             else:
                 review_stale = False
 
             test_stale: bool | None = None
             if mq.requires_smoke(mq_entry, self.config):
                 smoke = mq.evaluate_smoke_verdict(mq_entry, self.board, github_ops)
-                test_stale = smoke.kind == mq.SMOKE_STALE
+                if smoke.kind == mq.SMOKE_UNKNOWN:
+                    # The live SHA needed to judge staleness could not even
+                    # be read — "could not tell", never "confirmed fresh".
+                    test_stale = None
+                else:
+                    test_stale = smoke.kind == mq.SMOKE_STALE
             else:
                 test_stale = False
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision

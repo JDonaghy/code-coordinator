@@ -92,12 +92,18 @@ def test_review_stale_outranks_a_generic_gate_blocked_reading():
     assert got.cause == qd.CAUSE_REVIEW_STALE
 
 
-def test_review_stale_outranks_plain_ci_red():
+def test_plain_ci_red_outranks_review_stale():
+    """#3929 review (non-blocking): staleness is only meant to outrank a
+    CLEAR gate reading (`gate-blocked`), never a genuinely red required
+    check — a row that is both failing CI right now AND carries a
+    superseded prior approval is a CI problem first; the stale approval
+    cannot matter again until the CI failure is fixed and a fresh review
+    is needed anyway."""
     got = qd.diagnose(
         entry(4),
         live(review_stale=True, checks=(qd.CheckReading("build", "failure"),)),
     )
-    assert got.cause == qd.CAUSE_REVIEW_STALE
+    assert got.cause == qd.CAUSE_CI_RED
 
 
 def test_a_fresh_review_and_test_never_mint_either_stale_cause():
@@ -125,7 +131,7 @@ def test_true_cause_prose_names_a_review_not_a_fixit_leg():
     problem."""
     got = qd.diagnose(entry(7), live(review_stale=True))
     assert "review" in got.true_cause
-    assert "fix-it leg" not in got.true_cause or "not a fix-it leg" in got.true_cause
+    assert "not a fix-it leg" in got.true_cause
 
 
 # ── `GhLiveProbe._staleness` drives the REAL merge-gate functions ──────────
@@ -267,6 +273,99 @@ def test_a_fresh_passed_verdict_reads_test_stale_false(monkeypatch):
     _review_stale, test_stale = probe._staleness(entry(77), errors)  # noqa: SLF001
 
     assert test_stale is False
+
+
+def test_an_older_stale_approve_never_outvotes_a_newer_approve_covering_the_head(
+    monkeypatch,
+):
+    """Blocking review finding: `find_scoped_review_candidate` is NOT a
+    freshness oracle on its own — it walks newest-first, skips the review
+    whose SHA matches the live head, and keeps walking to an OLDER approve
+    whose SHA/patch-id moved, returning THAT as a "candidate" even though
+    the merge gate's own `scan_approved_reviews` already reads this branch
+    as approved-and-current via the newer review. A branch carrying two
+    approve verdicts at different SHAs — any #1476 scoped re-review, or a
+    conflict-fix/ci-fix leg that was itself approved — must read
+    `review_stale=False`, never `True`, or every such branch falsely mints
+    `CAUSE_REVIEW_STALE` ahead of whatever is ACTUALLY blocking it."""
+    _patch_gh_ops(monkeypatch, branch_sha="new-sha", patch_id="patch-new")
+    work = _work()
+    older_approve = _review(
+        work.assignment_id, head_sha="old-sha", patch_id="patch-old",
+    )
+    older_approve.assignment_id = "r-old"
+    older_approve.dispatched_at = 2.0
+    newer_approve = _review(
+        work.assignment_id, head_sha="new-sha", patch_id="patch-new",
+    )
+    newer_approve.assignment_id = "r-new"
+    newer_approve.dispatched_at = 3.0
+    board = Board(completed=[work, older_approve, newer_approve])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    errors: list[str] = []
+
+    # Pin the disagreement this test guards against: the two merge-gate
+    # primitives really do disagree on this board.
+    from coord import github_ops
+    from coord import merge_queue as mq
+
+    mq_entry = mq.live_gate_entry(work, "acme/api", "main", github_ops)
+    assert mq.scan_approved_reviews(mq_entry, board, github_ops, config=_config()).approved is True
+    assert mq.find_scoped_review_candidate(mq_entry, board, github_ops, config=_config()) is not None
+
+    review_stale, _test_stale = probe._staleness(entry(77), errors)  # noqa: SLF001
+
+    assert review_stale is False
+    assert not errors
+
+
+def test_an_unconfirmable_branch_head_reads_could_not_tell_not_fresh(monkeypatch):
+    """`ApprovalScan.unknown_head` — refused purely because the live branch
+    head could not be confirmed — must surface as `None` ("could not
+    tell"), never the confirmed-fresh `False` a row with nothing stale
+    would get."""
+    _patch_gh_ops(monkeypatch)
+    monkeypatch.setattr(
+        "coord.github_ops.get_branch_sha", lambda repo, branch: None,
+    )
+    work = _work()
+    review = _review(work.assignment_id)
+    board = Board(completed=[work, review])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    errors: list[str] = []
+
+    review_stale, _test_stale = probe._staleness(entry(77), errors)  # noqa: SLF001
+
+    assert review_stale is None
+
+
+def test_an_unreadable_live_sha_reads_test_stale_could_not_tell(monkeypatch):
+    """`evaluate_smoke_verdict`'s `SMOKE_UNKNOWN` — the live SHA needed to
+    judge staleness could not even be read — must surface as `None`, never
+    the confirmed-fresh `False` a genuinely fresh verdict would get."""
+    from coord.github_ops import GhTransientError
+
+    _patch_gh_ops(monkeypatch)
+
+    def _confirmed_transient_failure(repo, branch, raise_on_transient=False):
+        if raise_on_transient:
+            raise GhTransientError("gh unreachable")
+        return None
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_branch_sha", _confirmed_transient_failure,
+    )
+    work = _work(
+        test_state="passed", test_head_sha="old-sha", test_base_sha="base-sha",
+        test_patch_id="patch-old",
+    )
+    board = Board(completed=[work])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    errors: list[str] = []
+
+    _review_stale, test_stale = probe._staleness(entry(77), errors)  # noqa: SLF001
+
+    assert test_stale is None
 
 
 def test_no_work_assignment_at_all_cannot_tell_not_confirmed_fresh(monkeypatch):

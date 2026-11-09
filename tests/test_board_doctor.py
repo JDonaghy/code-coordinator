@@ -24,6 +24,7 @@ from coord.board_doctor import (
     CAUSE_CHECKS_STALE_RACE,
     CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_SMOKE_NO_VERDICT,
+    MERGE_PENDING_STALE_AFTER_SECONDS,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
@@ -695,6 +696,64 @@ class TestReclassifyMergeNeverAttempted:
         )
 
         assert out == row
+
+    def test_a_stale_episode_reconstruction_is_never_promoted(self) -> None:
+        """Non-blocking review finding: `row.fresh=False` — a row rebuilt by
+        `_episode_stuck_row` from an arbitrarily old stored `cause=unknown`
+        — carries no live evidence of its own, same guard
+        `_reclassify_after_prereqs_landed`/`_reclassify_ceiling_blocked`/
+        `_reclassify_checks_stale_race` already apply."""
+        entry = self._merge_entry()
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=False)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out == row
+
+    def test_a_clear_gates_nothing_blocking_row_with_a_pr_is_also_promoted(self) -> None:
+        """Non-blocking review finding: quadraui#2160's own shape is an open
+        PR with every check green, review approved and `mergeable` true —
+        `queue_diagnose._rule_nothing_blocking` reads that as `nothing-
+        blocking`, not `unknown`/`no-pr`, so this cause must be eligible
+        too."""
+        entry = self._merge_entry()
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(),
+        )
+
+        assert out.cause == CAUSE_MERGE_NEVER_ATTEMPTED
+
+    def test_a_freshly_enqueued_entry_is_not_raced_by_this_sweep(self) -> None:
+        """Non-blocking review finding: a `PENDING`/`last_attempt is None`
+        entry enqueued only moments ago is, per `merge_queue_rows`'s own
+        reasoning for the STALE-pending shape, "very likely still alive and
+        polling" under the ordinary auto-drain tick — this sweep must not
+        race it with its own merge attempt before it has had a chance to
+        age past `MERGE_PENDING_STALE_AFTER_SECONDS`."""
+        now = 10_000.0
+        entry = self._merge_entry(enqueued_at=now - 60.0)
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(), now=now,
+        )
+
+        assert out == row
+
+    def test_an_aged_past_the_bound_entry_is_still_promoted(self) -> None:
+        now = 10_000.0
+        entry = self._merge_entry(enqueued_at=now - MERGE_PENDING_STALE_AFTER_SECONDS - 1.0)
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [out] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(), now=now,
+        )
+
+        assert out.cause == CAUSE_MERGE_NEVER_ATTEMPTED
 
 
 class TestMergeNeverAttemptedAndReviewTestStaleAreWiredToRealActions:
