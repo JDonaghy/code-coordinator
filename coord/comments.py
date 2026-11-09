@@ -40,6 +40,14 @@ EVENT_REFUSED_POLICY = "refused_policy"
 # `after=` edges, never a title retarget — and folding it in would print the
 # wrong advice on GitHub, exactly the failure #3164 was filed to fix.
 EVENT_REFUSED_PREMISE = "refused_premise"
+# #3931: a THIRD sibling to EVENT_REFUSED_POLICY/EVENT_REFUSED_PREMISE above —
+# a worker exited cleanly (exit_code 0), pushed 0 commits, and its own final
+# message (or `WORK_OUTCOME: needs-decomposition` marker) concluded the issue
+# itself needs epic decomposition rather than one leg of work. Kept as its
+# own event for the same reason the other two are kept distinct: the operator
+# remedy differs again — decompose into the proposed sub-issues and close or
+# re-scope this one, never a title retarget or a prerequisite recheck.
+EVENT_NEEDS_DECOMPOSITION = "needs_decomposition"
 # #846: an assignment running past its wall-clock threshold, or thrashing
 # through fix/review rounds without converging. Distinct from EVENT_STUCK
 # (a worker self-reported STATUS/STUCK line) — this fires from time/round
@@ -916,6 +924,58 @@ def format_refused_premise(
     if reason.strip():
         lines.append("")
         lines.append("### Worker note")
+        lines.append(reason.strip())
+    return "\n".join(lines)
+
+
+def format_needs_decomposition(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> str:
+    """Format a comment for a #3931 needs-decomposition outcome — a 0-commit
+    clean exit whose worker concluded the issue itself needs epic
+    decomposition rather than one leg of work.
+
+    Mirrors `format_refused_premise`/`format_refused_policy` except for the
+    remedy: this names decomposing the issue into the proposed sub-issues
+    (carried in *reason*, the worker's own proposal) and closing or
+    re-scoping this one — no title rewrite and no prerequisite recheck apply
+    here.
+    """
+    marker = _marker(
+        EVENT_NEEDS_DECOMPOSITION,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        issue=issue_number,
+    )
+    lines = [
+        "## Coordinator: Needs Epic Decomposition",
+        marker,
+        f"**Machine:** {machine_name}",
+        "**Status:** needs_decomposition",
+        f"**Duration:** {_fmt_duration(duration_seconds)}",
+    ]
+    if log_path:
+        lines.append(f"**Log:** `{log_path}`")
+    lines.append("")
+    lines.append(
+        "The worker exited cleanly (exit code 0) and pushed **no commits** "
+        "because it concluded this issue is too large for one leg and needs "
+        "epic decomposition. This is not a failure — retrying will reproduce "
+        "the same proposal, since the issue's scope hasn't changed. Needs "
+        "the coordinator: decompose into the sub-issues proposed below (or "
+        "re-scope this one), then dispatch the replacements normally."
+    )
+    if reason.strip():
+        lines.append("")
+        lines.append("### Proposed split")
         lines.append(reason.strip())
     return "\n".join(lines)
 

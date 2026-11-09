@@ -800,6 +800,138 @@ class TestRefusedPremiseNotify:
         )
 
 
+class TestNeedsDecompositionNotify:
+    """A needs-decomposition leg must post a distinctive GitHub comment with
+    the worker's proposed split, not be dropped and not be conflated with a
+    premise refusal.
+
+    Before this fix, `needs_decomposition` matched none of the
+    `entry_status` branches in `_collect_transitions`'s loop and fell into
+    the final `else: continue` — no comment was ever posted, exactly the
+    #2234-style regression the `refused_premise`/`refused_policy` arms this
+    status is modeled on were themselves added to fix.
+    """
+
+    def test_needs_decomposition_posts_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("ndc-run1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("ndc-run1", "needs_decomposition", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
+        assert len(posted) == 1, "needs_decomposition transition must appear in posted list"
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        assert "Decomposition" in body
+        assert "decompose" in body.lower()
+
+    def test_needs_decomposition_not_failure_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("ndc-run2")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("ndc-run2", "needs_decomposition", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Assignment Failed" not in body
+        assert "❌" not in body
+
+    def test_needs_decomposition_marked_notified(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("ndc-run3")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("ndc-run3", "needs_decomposition", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        assert "ndc-run3" in state_mod.load_notified()
+
+    def test_needs_decomposition_persists_status_column(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """The `assignments.status` column must end up `needs_decomposition`,
+        not `failed` — mirrors `test_refused_premise_persists_status_column`
+        for the same `_mark_notified_local` gap."""
+        _record("ndc-run4")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("ndc-run4", "needs_decomposition", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("ndc-run4",),
+        ).fetchone()
+        assert row is not None, "assignment row must exist"
+        assert row["status"] == "needs_decomposition"
+
+    def test_needs_decomposition_idempotent(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("ndc-run5")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("ndc-run5", "needs_decomposition", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+            posted_again, _, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
+        assert mock_post.call_count == 1, "needs_decomposition comment must post exactly once"
+        assert posted_again == []
+
+    def test_needs_decomposition_includes_needs_decomposition_reason(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """When needs_decomposition_reason is set (the worker's proposed
+        split), it appears in the comment — Expected item 3's "the proposed
+        split is posted to the issue"."""
+        _record("ndc-run6")
+        reason = "Split into: (1) auth, (2) billing, (3) notifications, (4) UI, (5) docs"
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "ndc-run6",
+                    "needs_decomposition",
+                    exit_code=0,
+                    needs_decomposition_reason=reason,
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert reason in body, (
+            "needs_decomposition_reason must appear in the "
+            "needs_decomposition comment"
+        )
+
+
 class TestBranchCapture:
     def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:
         _record("abc")
@@ -1928,7 +2060,10 @@ class TestClaudeSessionIdMissingQuery:
         from coord.db import get_connection
         conn = get_connection()
         for i, status in enumerate(
-            ("done", "failed", "advisory", "refused_policy", "refused_premise"),
+            (
+                "done", "failed", "advisory", "refused_policy",
+                "refused_premise", "needs_decomposition",
+            ),
         ):
             aid = f"term{i}"
             _record(aid)
@@ -1944,7 +2079,9 @@ class TestClaudeSessionIdMissingQuery:
                 max_age_seconds=3600,
             )
         }
-        assert pending_ids == {"term0", "term1", "term2", "term3", "term4"}
+        assert pending_ids == {
+            "term0", "term1", "term2", "term3", "term4", "term5",
+        }
 
 
 class TestClaudeSessionIdRetrySweep:

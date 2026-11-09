@@ -1049,6 +1049,45 @@ def is_premise_refusal_reason(text: str | None) -> bool:
     return bool(text) and PREMISE_REFUSAL_MARKER in text
 
 
+# #3931: the machine-readable tag `coord.drive.decide` embeds in its `_die()`
+# message when a work row reaps as `coord.agent.NEEDS_DECOMPOSITION` — a
+# THIRD permanent, zero-attempt-spent shape alongside `POLICY_REFUSAL_MARKER`
+# and `PREMISE_REFUSAL_MARKER` above. The worker exited cleanly, pushed 0
+# commits, and concluded the issue itself is too large for one leg (its own
+# `WORK_OUTCOME: needs-decomposition` marker, or an `ISSUE_RESOLUTION:
+# investigation` 0-commit exit with no other marker — see
+# `coord.worker_events.classify_zero_commit_outcome`). Unlike a premise
+# refusal, there is no missing prerequisite to wait on and no repo rule to
+# retarget past — the remedy is epic decomposition by the coordinator, which
+# cannot happen on a retry of the SAME issue, so relaunching would just
+# reproduce the identical split proposal (#3922's incident: three legs, same
+# proposal, ~$0.90 for nothing).
+#
+# Text-marker matching (not a dedicated exit code), same rationale as
+# `POLICY_REFUSAL_MARKER`/`PREMISE_REFUSAL_MARKER`: `coord/drive_queue.py`'s
+# `_reconcile_running` recognises this straight out of the drive's own
+# `drive_exited` audit summary (`own_reason`) and routes it to
+# `STATE_PARKED` — no attempt spent re-proposing the same split.
+NEEDS_DECOMPOSITION_MARKER = "[needs-decomposition #3931]"
+
+
+def is_needs_decomposition_reason(text: str | None) -> bool:
+    """Whether *text* is a #3931 needs-decomposition park reason.
+
+    Like a policy or premise refusal (`is_policy_refusal_reason`/
+    `is_premise_refusal_reason`), this has no external verdict that can
+    arrive and clear it on its own — the issue needs decomposing, and
+    nothing on the board signals when that has happened — so nothing
+    auto-resumes an entry parked for this reason. An operator clears it by
+    decomposing the issue into the proposed sub-issues (posted to the issue
+    by the coordinator — see `coord.notify.post_transition`'s
+    `EVENT_NEEDS_DECOMPOSITION` arm) and closing or re-scoping this one, then
+    `coord drive-queue remove` + `add` for a fresh queue row on whatever
+    replaces it.
+    """
+    return bool(text) and NEEDS_DECOMPOSITION_MARKER in text
+
+
 # #2850: the machine-readable tag `coord.drive.decide` embeds in its
 # `_succeed()` message when the "terminal: merged" branch's own LIVE check
 # (`MergeVerifier.verify_merged`) confirms the issue has genuinely landed —
@@ -1084,7 +1123,7 @@ class Assignment:
     files_forbidden: list[str] = field(default_factory=list)
     briefing: str = ""
     assignment_id: str | None = None
-    status: str = "pending"  # pending | running | done | failed | advisory | refused_policy | refused_premise
+    status: str = "pending"  # pending | running | done | failed | advisory | refused_policy | refused_premise | needs_decomposition
     branch: str | None = None
     pr_url: str | None = None
     dispatched_at: float | None = None

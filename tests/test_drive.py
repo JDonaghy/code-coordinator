@@ -79,6 +79,7 @@ from coord.drive_queue import entry_key
 from coord.failure_class import environmental_backoff_secs
 from coord.models import (
     EPIC_DECOMPOSE_TYPE,
+    NEEDS_DECOMPOSITION_MARKER,
     POLICY_REFUSAL_MARKER,
     PREMISE_REFUSAL_MARKER,
     Machine,
@@ -2276,6 +2277,55 @@ def test_refused_premise_is_not_bypassed_without_an_explicit_recheck():
     assert action.is_exit
     assert PREMISE_REFUSAL_MARKER in action.message
     assert action.audit_event is None
+
+
+# ── needs_decomposition: #3931's distinct terminal shape ────────────────────
+
+
+def test_needs_decomposition_work_is_terminal_and_carries_the_3931_marker():
+    """`coord.agent.NEEDS_DECOMPOSITION` reaches here as `work_status ==
+    "needs_decomposition"` and must exit — never wait, never relaunch. The
+    message embeds `NEEDS_DECOMPOSITION_MARKER` so `coord/drive_queue.py`'s
+    `_reconcile_running` can recognise it out of this run's own
+    `drive_exited` audit summary and park the queue entry (STATE_PARKED)
+    without spending an attempt, instead of relaunching into the identical
+    split proposal (#3922's incident)."""
+    action = step(state(work_aid="w1", work_status="needs_decomposition"))
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert NEEDS_DECOMPOSITION_MARKER in action.message
+    assert "needs the coordinator" in action.message.lower()
+
+
+def test_needs_decomposition_still_blocking_names_the_assignment_and_age():
+    """Mirrors refused_premise's naming guarantee: the message names the
+    pre-dispatch assignment it refused on and the row's age."""
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="needs_decomposition",
+            work_finished_at=1000.0,
+        )
+    )
+    assert action.is_exit
+    assert "pre-dispatch refusal on assignment w1" in action.message
+    assert "needs_decomposition" in action.message
+    assert NEEDS_DECOMPOSITION_MARKER in action.message
+
+
+def test_needs_decomposition_remedy_names_decomposition_not_retarget_or_recheck():
+    """Unlike refused_policy, the remedy must never suggest a title
+    retarget. Unlike refused_premise, it must never suggest `clear-refusal`
+    — there is no "the prerequisite has since landed" escape hatch for an
+    issue that still needs decomposing; the only remedy is to decompose it."""
+    action = step(
+        state(work_aid="w1", work_status="needs_decomposition", work_finished_at=1000.0)
+    )
+    assert action.is_exit
+    message_lower = action.message.lower()
+    assert "retarget" not in message_lower
+    assert "clear-refusal" not in message_lower
+    assert "decompose" in message_lower
 
 
 def test_an_unknown_terminal_status_refuses_to_guess():

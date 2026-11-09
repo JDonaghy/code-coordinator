@@ -35,6 +35,7 @@ from coord.comments import (
     EVENT_FAILURE,
     EVENT_LIVENESS_STALL,
     EVENT_NEEDS_ATTENTION,
+    EVENT_NEEDS_DECOMPOSITION,
     EVENT_PLAN,
     EVENT_REFUSED_POLICY,
     EVENT_REFUSED_PREMISE,
@@ -53,6 +54,7 @@ from coord.dispatch import (
     post_advisory,
     post_completion,
     post_failure,
+    post_needs_decomposition,
     post_refused_policy,
     post_refused_premise,
 )
@@ -2102,6 +2104,17 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
                 # reasoning, distinct event so the comment prints the
                 # re-scope/close remedy rather than the title-retarget one.
                 event = EVENT_REFUSED_PREMISE
+            elif entry_status == "needs_decomposition":
+                # #3931: a THIRD sibling of the refused_policy/refused_premise
+                # arms above — the worker exited cleanly, pushed 0 commits,
+                # and concluded the issue itself needs epic decomposition
+                # (`coord.agent.NEEDS_DECOMPOSITION`). Without this arm the
+                # event fell into the catch-all `else` below, which drops
+                # everything else — exactly the "no comment at all"
+                # regression #2234's review caught, replayed for this
+                # status: the worker's proposed split never reached the
+                # issue, no `mark_notified`, no completion-summary capture.
+                event = EVENT_NEEDS_DECOMPOSITION
             else:
                 continue
             transitions.append(
@@ -4904,6 +4917,22 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # catch-all `else` below would silently drop it).
         post_refused_premise(
             reason=entry.get("premise_refusal_reason") or "",
+            **common,
+        )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_NEEDS_DECOMPOSITION:
+        # #3931: a THIRD sibling of the refused_policy/refused_premise arms
+        # above — 0-commit clean exit whose worker concluded the issue
+        # itself needs epic decomposition. Same reasoning for why this
+        # needs its own arm (the catch-all `else` below would silently
+        # drop it, and Expected item 3 requires the proposed split actually
+        # reach the issue).
+        post_needs_decomposition(
+            reason=entry.get("needs_decomposition_reason") or "",
             **common,
         )
         mark_notified(

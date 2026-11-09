@@ -319,13 +319,14 @@ def superseding_work_row(board: Board, assignment) -> "Assignment | None":
     left it, so the earlier row is still the branch's author. Without
     excluding these here, a `--fix-of` round that lands zero commits would
     falsely mark the row it was fixing as superseded — and since none of
-    ``advisory``/``refused_policy``/``refused_premise`` is itself a valid
-    dispatch target (``dispatch_smoke`` requires ``status == "done"``), the
-    branch would then never get *any* Test dispatch. (#2234 added
-    ``refused_policy`` to this exclusion, #3164 added ``refused_premise`` —
-    both are drawn from the same ``_ZERO_COMMIT_TYPES`` gate as ``advisory``
-    in ``coord/agent.py``'s ``_reap`` and reproduce the identical failure
-    mode if left out.)
+    ``advisory``/``refused_policy``/``refused_premise``/
+    ``needs_decomposition`` is itself a valid dispatch target
+    (``dispatch_smoke`` requires ``status == "done"``), the branch would
+    then never get *any* Test dispatch. (#2234 added ``refused_policy`` to
+    this exclusion, #3164 added ``refused_premise``, #3931 added
+    ``needs_decomposition`` — all three are drawn from the same
+    ``_ZERO_COMMIT_TYPES`` gate as ``advisory`` in ``coord/agent.py``'s
+    ``_reap`` and reproduce the identical failure mode if left out.)
 
     Returns the (newest) superseding row so callers can name it in a log line,
     or ``None`` when *assignment* is the branch's current work row. Related but
@@ -346,7 +347,10 @@ def superseding_work_row(board: Board, assignment) -> "Assignment | None":
             continue
         if a.type not in WORK_LIKE_TYPES:
             continue
-        if a.status in ("failed", "advisory", "refused_policy", "refused_premise"):
+        if a.status in (
+            "failed", "advisory", "refused_policy", "refused_premise",
+            "needs_decomposition",
+        ):
             continue
         if a.repo_name != assignment.repo_name or a.branch != branch:
             continue
