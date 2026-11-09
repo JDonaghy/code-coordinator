@@ -21,6 +21,7 @@ from coord.agent import (
     ADVISORY,
     DONE,
     FAILED,
+    NEEDS_DECOMPOSITION,
     REFUSED_POLICY,
     REFUSED_PREMISE,
     AgentServer,
@@ -960,6 +961,266 @@ def test_health_counts_refused_premise_as_completed(
     h = server.health()
     assert h["active"] == 0, "REFUSED_PREMISE must not count as active"
     assert h["completed"] >= 1, "REFUSED_PREMISE must count as completed"
+    server.shutdown()
+
+
+# ── structured zero-commit outcomes: WORK_OUTCOME marker (#3931) ────────────
+#
+# #3926 only recognised "already implemented" via the #3923 prose heuristic's
+# six exact phrases. A worker reporting the SAME finding in different words
+# (e.g. "already exists in the codebase") matched none of them and fell
+# through to the bare #448 ADVISORY default. An explicit `WORK_OUTCOME:
+# already-done` marker is the fix: authoritative, not a prose guess, and
+# still routes to REFUSED_PREMISE (the #3923 landing spot) — one leg, parked,
+# no attempt spent.
+
+_ALREADY_DONE_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "Grepped for the requested helper and found it already '
+    'lives in coord/worker_events.py as classify_zero_commit_outcome. '
+    'Nothing left to build.\\nWORK_OUTCOME: already-done -- lives in '
+    'coord/worker_events.py"}'
+)
+
+
+def test_already_done_marker_is_refused_premise_not_advisory(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#3931 acceptance: a final message with `WORK_OUTCOME: already-done`
+    gives a park with no attempt spent — i.e. REFUSED_PREMISE, not ADVISORY
+    (ADVISORY is the status a fix-round relaunch budget is spent against)."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_ALREADY_DONE_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=3931,
+        issue_title="add already-done classifier",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == REFUSED_PREMISE, (
+        f"expected REFUSED_PREMISE for a WORK_OUTCOME: already-done 0-commit "
+        f"exit, got {final.status!r}"
+    )
+    assert final.status != ADVISORY, (
+        "must not land in ADVISORY — that status is what a fix-round "
+        "relaunch budget gets spent against"
+    )
+    assert final.exit_code == 0
+    assert final.zero_commit_reason is None
+    assert final.policy_refusal_reason is None
+    assert final.premise_refusal_reason is not None
+    assert "WORK_OUTCOME: already-done" in final.premise_refusal_reason
+    server.shutdown()
+
+
+def test_already_done_marker_overrides_a_stuck_sounding_message(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """The marker is authoritative even when the surrounding prose reads
+    like neither the #2234 nor the #3164/#3923 heuristics would catch it on
+    their own — e.g. "already exists in the codebase", which matches none of
+    `_PREMISE_REFUSAL_MARKERS`'s six exact phrases."""
+    result_line = (
+        '{"type": "result", "subtype": "success", "is_error": false, '
+        '"result": "The feature already exists in the codebase under a '
+        'different name.\\nWORK_OUTCOME: already-done -- see grep output"}'
+    )
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({result_line!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=3932,
+        issue_title="a differently-worded already-done report",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == REFUSED_PREMISE
+    server.shutdown()
+
+
+# ── structured zero-commit outcomes: NEEDS_DECOMPOSITION (#3931) ────────────
+#
+# The #3922 incident: three independent work legs each separately concluded
+# "this needs epic decomposition" with the same proposed split, each landing
+# as an ordinary ADVISORY and getting relaunched until the row hit the #2972
+# fix-round ceiling. A `WORK_OUTCOME: needs-decomposition` marker (or an
+# `ISSUE_RESOLUTION: investigation` verdict with no other marker) makes the
+# FIRST leg's finding terminal instead — a single leg, parked, no relaunch.
+
+_NEEDS_DECOMPOSITION_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "This issue bundles 6 independent primitives across 3 '
+    "modules; a single leg cannot safely touch all of them. Proposing a "
+    '5-way split by primitive kind.\\nWORK_OUTCOME: needs-decomposition -- '
+    'split by primitive kind (5 slices)"}'
+)
+
+
+def test_needs_decomposition_marker_gives_a_single_leg_terminal_row(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#3931 acceptance: a final message with `WORK_OUTCOME: needs-
+    decomposition` gives a single leg and a needs-decomposition row with no
+    relaunch — i.e. NEEDS_DECOMPOSITION, never ADVISORY (the status a
+    fix-round relaunch budget is spent against)."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_NEEDS_DECOMPOSITION_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=3922,
+        issue_title="a bundle of 6 primitives across 3 modules",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == NEEDS_DECOMPOSITION, (
+        f"expected NEEDS_DECOMPOSITION for a needs-decomposition 0-commit "
+        f"exit, got {final.status!r}"
+    )
+    assert final.status != ADVISORY, (
+        "must not land in ADVISORY — that status is what a fix-round "
+        "relaunch budget is spent against (the #3922 incident: three legs, "
+        "same finding, ceiling reached)"
+    )
+    assert final.exit_code == 0
+    assert final.zero_commit_reason is None
+    assert final.policy_refusal_reason is None
+    assert final.premise_refusal_reason is None
+    assert final.needs_decomposition_reason is not None
+    assert "needs-decomposition" in final.needs_decomposition_reason.lower()
+    server.shutdown()
+
+
+def test_needs_decomposition_reason_appears_in_log(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_NEEDS_DECOMPOSITION_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=3923,
+        issue_title="another bundle needing a split",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == NEEDS_DECOMPOSITION
+    assert final.log_path is not None
+    log_text = Path(final.log_path).read_text()
+    assert "needs_decomposition" in log_text.lower(), (
+        f"expected 'needs_decomposition' in log, got:\n{log_text}"
+    )
+    server.shutdown()
+
+
+def test_health_counts_needs_decomposition_as_completed(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """health() must count NEEDS_DECOMPOSITION assignments as completed, not
+    active — mirrors the existing REFUSED_POLICY/REFUSED_PREMISE/ADVISORY
+    guarantee."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({_NEEDS_DECOMPOSITION_RESULT_LINE!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=3924,
+        issue_title="yet another bundle needing a split",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == NEEDS_DECOMPOSITION
+
+    h = server.health()
+    assert h["active"] == 0, "NEEDS_DECOMPOSITION must not count as active"
+    assert h["completed"] >= 1, "NEEDS_DECOMPOSITION must count as completed"
+    server.shutdown()
+
+
+def test_investigation_resolution_with_no_marker_is_needs_decomposition(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#3931 item 3: `ISSUE_RESOLUTION: investigation` with 0 commits and no
+    other marker also counts as NEEDS_DECOMPOSITION."""
+    result_line = (
+        '{"type": "result", "subtype": "success", "is_error": false, '
+        '"result": "Could not determine the right split without more '
+        'context from the operator.\\nISSUE_RESOLUTION: investigation -- '
+        'unclear how to proceed"}'
+    )
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            sys.executable, "-c", f"print({result_line!r})"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=3925,
+        issue_title="an issue resolution: investigation report",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == NEEDS_DECOMPOSITION
     server.shutdown()
 
 

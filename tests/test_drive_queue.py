@@ -130,12 +130,16 @@ def board(
     # shorthand tuple for the common "partial" case.
     partial: tuple[int, ...] = (),
     merge_resolution: dict[int, str] | None = None,
+    # #3931: issues whose `refused_premise` row was specifically the
+    # "already implemented" shape — see `IssueFacts.already_done`.
+    already_done: tuple[int, ...] = (),
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
     merge_resolution = merge_resolution or {}
     for issue in {
         *merged, *closed, *open_, *reopened, *active,
         *ci_pending, *ci_pending_live, *ci_absent, *partial, *merge_resolution,
+        *already_done,
     }:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
@@ -143,6 +147,7 @@ def board(
                 "closed" if issue in closed else ("open" if issue in open_ or issue in reopened else "")
             ),
             merged=issue in merged,
+            already_done=issue in already_done,
             merge_resolution=(
                 merge_resolution.get(issue)
                 or ("partial" if issue in partial else "resolved")
@@ -471,6 +476,68 @@ def test_build_board_view_defaults_merge_resolution_to_resolved():
     facts = view.facts(entry_key(REPO, 1650))
     assert facts.merge_resolution == "resolved"
     assert not facts.merged_partial
+
+
+def test_build_board_view_reads_already_done_off_a_refused_premise_row():
+    # #3931: a `refused_premise` row's own `completion_summary` carries the
+    # `WORK_OUTCOME: already-done` marker (or the #3923 prose heuristic) —
+    # read with no extra `gh` call, same precedent as `merge_resolution`
+    # above.
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 2256, "type": "work",
+                    "status": "refused_premise",
+                    "completion_summary": (
+                        "RowAlign and FormSpacing::padding are already "
+                        "fully implemented and merged into `develop`.\n"
+                        "WORK_OUTCOME: already-done — see grep output above"
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2256))
+    assert facts.already_done
+
+
+def test_build_board_view_does_not_flag_a_generic_premise_refusal_as_already_done():
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 812, "type": "work",
+                    "status": "refused_premise",
+                    "completion_summary": (
+                        "Investigated the stated dependency: it is only "
+                        "about 8% met, so the premise is false — there is "
+                        "nothing correct to build yet."
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 812))
+    assert not facts.already_done
+
+
+def test_build_board_view_already_done_defaults_false_with_no_summary():
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 2257, "type": "work",
+                    "status": "refused_premise",
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2257))
+    assert not facts.already_done
 
 
 def test_build_board_view_ignores_issue_resolution_marker_for_mock_author():
@@ -4615,6 +4682,49 @@ def test_a_premise_refusal_and_a_policy_refusal_are_never_conflated():
     assert premise_reason != policy_reason
     assert "retarget" not in premise_reason
     assert "retarget" in policy_reason
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3931 item 4: an `after=` pre-req parked `refused_premise` on the
+# "already implemented" finding satisfies its dependent immediately.
+#
+# Before this, a dependent chained `--after` an already-done park read
+# "waiting on {dep} (queued, parked)" forever — correct that nothing was
+# dispatching the pre-req (an operator's `clear-refusal` is needed before
+# THAT row un-parks), wrong that the dependent had anything left to wait
+# for: the whole reason for the park is that the prerequisite already
+# exists. `IssueFacts.already_done` (set by `build_board_view` off the
+# SAME `completion_summary` column every other board-derived field reads)
+# is what `_resolve_prereqs` now checks alongside `facts.landed`.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_after_prereq_parked_as_already_done_satisfies_its_dependent():
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(1650, position=0, state=STATE_PARKED, attempts=0,
+              last_reason=f"already implemented — {PREMISE_REFUSAL_MARKER}"),
+        entry(1654, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(already_done=(1650,)), capacity=2)
+    assert plan.launch is not None and plan.launch.issue == 1654
+    # The dependent itself must not show up as blocked/deferred by its
+    # already-done pre-req — nothing to reconcile about it this tick.
+    assert not any(r.key == entry_key(REPO, 1654) for r in plan.reconciles)
+
+
+def test_after_prereq_parked_as_a_generic_premise_refusal_still_waits():
+    """The negative case: a GENERIC premise refusal (prerequisite unmet, not
+    already satisfied) must NOT release a dependent — the dependent
+    genuinely has nothing to build against yet, same as before #3931."""
+    dep_key = entry_key(REPO, 812)
+    entries = [
+        entry(812, position=0, state=STATE_PARKED, attempts=0,
+              last_reason=f"prerequisite unmet — {PREMISE_REFUSAL_MARKER}"),
+        entry(1654, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(), capacity=2)
+    assert plan.launch is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
