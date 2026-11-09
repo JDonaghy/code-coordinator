@@ -33,6 +33,7 @@ from click.testing import CliRunner
 
 from coord import state
 from coord.audit import query_audit_log
+from coord.board_doctor import CONVERGENCE_LIMIT
 from coord.cli import main
 from coord.models import Assignment
 from tests import backends
@@ -318,6 +319,36 @@ def test_a_blocked_row_in_an_opted_in_repo_gets_a_real_fixit_leg(
     }
     assert _dispatched_issues() == [101, 102]
     assert fake_dispatch == [101, 102]
+
+
+def test_a_perpetually_deferred_row_escalates_after_convergence_limit(
+    config_path, cli, seed, gh_world, block_log, fake_dispatch,
+):
+    """#3918: unlike the companion test above (where removing row 101
+    frees the budget on the very next sweep), row 201 here is never
+    removed — its own dispatched fix-it leg stays active/pending on the
+    board, so it keeps occupying the repo's one-slot budget sweep over
+    sweep. Row 202 is deferred every time and must still escalate once
+    its own convergence counter reaches `CONVERGENCE_LIMIT`, driven end to
+    end through the real `coord drive-queue sweep` command rather than a
+    synthetic `capacity_check` calling `sweep()` directly."""
+    _write_config(config_path, repo_investigate=True, max_parallel=2)
+    seed(issues={201: "open", 202: "open"})
+    cli("add", REPO, "201")
+    cli("add", REPO, "202")
+    _stall(201, _CI_RED_REASON, block_log)
+    _stall(202, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
+
+    last_payload = None
+    for _ in range(CONVERGENCE_LIMIT):
+        result = cli("sweep", "--json")
+        assert result.exit_code == 0, result.output
+        last_payload = _sweep_json(result.output)
+
+    actions = {d["key"]: d["action"] for d in last_payload["decisions"]}
+    assert actions[f"{REPO}#202"] == "alert"
+    assert state.get_drive_escalation(REPO, 202) is not None
 
 
 def test_no_blocked_rows_dispatches_nothing(config_path, cli):

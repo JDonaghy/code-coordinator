@@ -8908,6 +8908,48 @@ def test_doctor_log_backfill_outcomes_regrades_a_stale_regressed_entry(cli):
     assert payload["entries"][0]["outcome"] == "progressed"
 
 
+def test_sweep_surfaces_a_live_but_idle_running_row(cli, seed, monkeypatch):
+    """#3918 / quadraui#2160, end to end through the real `coord
+    drive-queue sweep` command rather than `no_progress_rows` called
+    directly: a `running` drive-queue row whose tmux session the fleet
+    still reports alive, but whose own `coord drive` stall nudge says
+    nothing has changed well past the no-progress threshold, must reach
+    the sweep's output — not read as "making progress" just because a
+    live session exists."""
+    import time as _time
+
+    from coord.notifier.store import record_nudge
+
+    now = _time.time()
+    session = f"coord-drive-{REPO}-1860"
+    seed(issues={1860: "open"})
+    cli("add", REPO, "1860")
+    state._update_drive_queue_entry_local(
+        REPO, 1860, state="running", session_name=session, launched_at=now - 10_000.0,
+    )
+    monkeypatch.setattr(
+        "coord.drive.list_drive_sessions",
+        lambda *a, **k: [{"repo": REPO, "issue": 1860, "session_name": session}],
+    )
+    record_nudge(REPO, 1860, at=now - 60.0, stalled_for=9_000.0)
+
+    result = cli("sweep", "--json")
+    assert result.exit_code == 0, result.output
+    payload = _sweep_json(result.output)
+    decisions = {d["key"]: d for d in payload["decisions"]}
+    decision = decisions[f"{REPO}#1860"]
+    assert decision["cause"] == "unknown"
+    # `unknown` is investigate-eligible (`policy_tier_of` -> TIER_AUTO), and
+    # `_investigate` has no resolvable `--config`/`$COORD_CONFIG` in this
+    # test's process, so it falls back to `_alert_fallback` and reports
+    # "auto-dispatch-noop" rather than "alert" — same posture
+    # `test_sweep_reports_alert_failed_when_the_escalation_cannot_be_written`
+    # documents for `ci_red`. The row still surfaces, which is the point:
+    # the fallback alert itself gets through.
+    assert decision["action"] == "auto-dispatch-noop"
+    assert state.get_drive_escalation(REPO, 1860) is not None
+
+
 def _sweep_json(output: str) -> dict:
     """The sweep report from `--json` output, ignoring any `warning:` lines.
 
