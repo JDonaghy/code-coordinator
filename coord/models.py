@@ -729,18 +729,37 @@ class IssueResolution:
 # read the same remainder.
 #
 # #3915: anchored to the START of a line (`re.MULTILINE`'s `^`), with only
-# leading whitespace and markdown emphasis/blockquote/backtick decoration
-# allowed before the literal marker — so prose that merely *mentions* the
-# marker mid-sentence (e.g. "...whose merge carried ISSUE_RESOLUTION:
-# partial drives the real...", or a quoted "`ISSUE_RESOLUTION: partial`"
-# inside a longer sentence) never counts as a claim. A real marker still
-# starts the line it's on, optionally after `>`/`*`/`_`/backtick decoration.
-# The same decoration is also tolerated between the colon and the value
+# leading whitespace and markdown emphasis/blockquote/backtick/list/heading
+# decoration allowed before the literal marker — so prose that merely
+# *mentions* the marker mid-sentence (e.g. "...whose merge carried
+# ISSUE_RESOLUTION: partial drives the real...") never counts as a claim.
+# A real marker still starts the line it's on, optionally after
+# `>`/`*`/`_`/`#`/`+`/`-`/backtick decoration — #3928 widened the prefix to
+# `#`/`+`/`-` so a Markdown list item ("- ISSUE_RESOLUTION: …") or heading
+# ("## ISSUE_RESOLUTION: …") parses exactly like a `*` bullet already did;
+# before that, those two prefixes fell through to the "no match" default
+# ("resolved") instead of being read as the claim they are. The same
+# decoration is also tolerated between the colon and the value
 # (`**ISSUE_RESOLUTION:** partial`, where the bold closes right after the
 # colon) — same reasoning as `_MD` in `coord/review.py`'s `REVIEW_VERDICT:`
 # parser.
+#
+# #3928: a backtick immediately before the marker is ALSO how prose quotes
+# the literal marker text (e.g. a review comment's "`ISSUE_RESOLUTION:
+# partial`. This matches exactly what review expected.") — accepting that
+# backtick unconditionally as mere decoration (as #3915 did) let a quoted
+# example masquerade as a real claim, which is exactly what made #3915
+# itself merge as "partial". `prefix`/`mid`/`reason` are captured as named
+# groups so :func:`parse_issue_resolution` can tell "real marker" apart
+# from "quoted mention" after the fact: a backtick in `prefix` that is
+# closed by another backtick later on the same line (anywhere in `mid` or
+# `reason`) means the whole marker sits inside an inline code span —
+# i.e. is quoted, not claimed — regardless of what precedes that opening
+# backtick.
 _ISSUE_RESOLUTION_RE = re.compile(
-    r"^[ \t>*_`]*ISSUE_RESOLUTION:[ \t*_`]*(resolved|partial|investigation)\b[ \t]*(.*)$",
+    r"^(?P<prefix>[ \t>*_#+`-]*)ISSUE_RESOLUTION:"
+    r"(?P<mid>[ \t*_`]*)(?P<value>resolved|partial|investigation)\b"
+    r"[ \t]*(?P<reason>.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 _ISSUE_RESOLUTION_REASON_SEP_RE = re.compile(r"^[\s*_`:—–-]+")
@@ -768,17 +787,29 @@ def parse_issue_resolution(text: str | None) -> IssueResolution:
     value, which this regex simply never matches (#3502 acceptance:
     absent/malformed both read as "resolved", today's unconditional
     behaviour, never a crash and never a silently-invented new value).
+
+    Walks matches from the last line backwards, same "last occurrence
+    wins" precedent as before, but skips any match whose marker sits
+    inside a backtick-quoted code span on its own line (#3928) — those are
+    quotations of the marker text, not claims. A real, unquoted marker
+    earlier in the text still wins once every later quoted mention has
+    been skipped, rather than falling all the way back to the default.
     """
     if not text:
         return IssueResolution()
-    matches = list(_ISSUE_RESOLUTION_RE.finditer(text))
-    if not matches:
-        return IssueResolution()
-    value = matches[-1].group(1).lower()
-    reason = _ISSUE_RESOLUTION_REASON_SEP_RE.sub("", matches[-1].group(2).strip()).strip()
-    if is_blank_issue_resolution_reason(reason):
-        reason = ""
-    return IssueResolution(value=value, reason=reason)
+    for match in reversed(list(_ISSUE_RESOLUTION_RE.finditer(text))):
+        prefix = match.group("prefix")
+        rest_of_line = match.group("mid") + match.group("reason")
+        if "`" in prefix and "`" in rest_of_line:
+            continue  # quoted mention, not a claim — keep looking.
+        value = match.group("value").lower()
+        reason = _ISSUE_RESOLUTION_REASON_SEP_RE.sub(
+            "", match.group("reason").strip()
+        ).strip()
+        if is_blank_issue_resolution_reason(reason):
+            reason = ""
+        return IssueResolution(value=value, reason=reason)
+    return IssueResolution()
 
 
 def effective_issue_resolution(
