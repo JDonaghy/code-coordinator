@@ -2771,6 +2771,121 @@ class TestSweepRedispatchHeadUnmovedConflictFixRefused:
         assert log["entries"][0]["actor"] == "sweep"
 
 
+class TestSweepDispatchConflictFix:
+    """#3918: a merge-queue entry GitHub already reports ``CONFLICT`` on,
+    standing (no in-pass `merge_queue.process()` tick raised it just now),
+    gets the SAME mechanical ``type="conflict-fix"`` leg the reactive
+    auto-drain tick sends — the shape that tick never revisits, because it
+    only ever dispatches for a conflict it raised itself in that pass.
+    """
+
+    @staticmethod
+    def _queue_one(entry_state: str, issue: int) -> None:
+        from coord import merge_queue as mq
+
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id=f"w{issue}", repo_name="api", repo_github="acme/api",
+                branch=f"issue-{issue}-fix", target_branch="main",
+                issue_number=issue, issue_title="Fix the thing", state=entry_state,
+            )
+        ])
+
+    @staticmethod
+    def _must_not_dispatch(monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise AssertionError("dispatch_conflict_fix must not be reached")
+
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _boom)
+
+    def test_dispatches_for_a_standing_conflict_row(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import sweep_dispatch_conflict_fix
+
+        self._queue_one(mq.CONFLICT, 7)
+        board = Board()
+        config = _fixit_config(_fixit_repo())
+
+        def _fake_dispatch(entry_, board_, config_, **kwargs):
+            leg = Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="Fix the thing", assignment_id="cf-7",
+                type="conflict-fix", status="pending",
+            )
+            board_.active.append(leg)
+            return leg
+
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _fake_dispatch)
+
+        result = sweep_dispatch_conflict_fix("api", 7, board, config)
+
+        assert result["dispatched"] is True
+        assert "cf-7" in result["detail"]
+        assert "laptop" in result["detail"]
+        # The board write is read BACK off the board rather than inferred
+        # from `write_board` not raising.
+        assert [a.assignment_id for a in state.build_board().active] == ["cf-7"]
+        log = query_audit_log(event_type="conflict_fix_dispatched", repo="api", issue=7)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
+
+    def test_a_row_with_no_merge_queue_entry_is_a_refused_noop(self, monkeypatch) -> None:
+        from coord.board_doctor_permissions import sweep_dispatch_conflict_fix
+
+        self._must_not_dispatch(monkeypatch)
+
+        result = sweep_dispatch_conflict_fix("api", 8, Board(), _fixit_config(_fixit_repo()))
+
+        assert result["dispatched"] is False
+        assert "no merge-queue entry" in result["detail"]
+        log = query_audit_log(
+            event_type="conflict_fix_dispatch_refused", repo="api", issue=8,
+        )
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
+
+    def test_an_entry_that_no_longer_reads_conflict_is_refused(self, monkeypatch) -> None:
+        # The live queue state is re-read at action time, so a row whose
+        # conflict has since cleared (or never was one) cannot spend a
+        # mechanical conflict-fix on a rebase nothing is asking for.
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import sweep_dispatch_conflict_fix
+
+        self._queue_one(mq.PENDING, 9)
+        self._must_not_dispatch(monkeypatch)
+
+        result = sweep_dispatch_conflict_fix("api", 9, Board(), _fixit_config(_fixit_repo()))
+
+        assert result["dispatched"] is False
+        assert "no longer reads CONFLICT" in result["detail"]
+        assert f"state={mq.PENDING}" in result["detail"]
+        log = query_audit_log(
+            event_type="conflict_fix_dispatch_refused", repo="api", issue=9,
+        )
+        assert len(log["entries"]) == 1
+
+    def test_refused_with_no_capable_machine_audits_the_refusal(self) -> None:
+        # End to end through the REAL `dispatch_conflict_fix` against a
+        # config with no machine that can take the leg: the action reports
+        # a refusal rather than a dispatch it never made.
+        from coord import merge_queue as mq
+        from coord.board_doctor_permissions import sweep_dispatch_conflict_fix
+
+        self._queue_one(mq.CONFLICT, 10)
+        config = Config(repos=[_fixit_repo()], machines=[])
+
+        result = sweep_dispatch_conflict_fix("api", 10, Board(), config)
+
+        assert result["dispatched"] is False
+        assert "could not be dispatched" in result["detail"]
+        assert state.build_board().active == []
+        log = query_audit_log(
+            event_type="conflict_fix_dispatch_refused", repo="api", issue=10,
+        )
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["actor"] == "sweep"
+
+
 class TestDispatchInvestigatorActionThinClientGuard:
     """#3881 acceptance: runs only on the daemon host — a thin client
     refuses via `coord.state._thin_client_local_board_guard`, mirroring

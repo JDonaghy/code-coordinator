@@ -175,7 +175,7 @@ def gh_world(monkeypatch):
     world: dict[str, Any] = {
         "pr_state": "OPEN",
         "pr": {"number": 77},
-        "mergeable": False,
+        "mergeable": True,
         "checks": [_Check("test", "success")],
         "gates": [_Gate("merge", True)],
         "branch": "issue-branch",
@@ -212,6 +212,25 @@ def _stall(issue: int, reason: str, block_log_path: Path) -> None:
         }],
         path=block_log_path,
     )
+
+
+#: A stated block reason in the CI family, so the row's own `block_log`
+#: entry and the live diagnosis below agree on what is wrong with it.
+_CI_RED_REASON = "blocked: CI red, 2/2 attempts"
+
+
+def _ci_red(world: dict) -> None:
+    """Make the live probe read a failing required check on a PR GitHub
+    still calls mergeable — i.e. a `queue_diagnose.CAUSE_CI_RED`
+    diagnosis, which is one of `INVESTIGATE_CAUSES`.
+
+    Deliberately not a merge-conflict world: that cause routes to the
+    mechanical `conflict_fix_dispatch` allow-list action and never reaches
+    `coord.board_doctor_policy._investigate` at all, so it cannot exercise
+    the per-repo investigate opt-in this file is about.
+    """
+    world["checks"] = [_Check("test", "failure")]
+    world["mergeable"] = True
 
 
 def _sweep_json(output: str) -> dict:
@@ -268,9 +287,9 @@ def test_a_blocked_row_in_an_opted_in_repo_gets_a_real_fixit_leg(
     seed(issues={101: "open", 102: "open"})
     cli("add", REPO, "101")
     cli("add", REPO, "102")
-    _stall(101, "merge blocked: stale test verdict (2/2 attempts)", block_log)
-    _stall(102, "merge blocked: stale test verdict (2/2 attempts)", block_log)
-    gh_world["mergeable"] = False
+    _stall(101, _CI_RED_REASON, block_log)
+    _stall(102, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
 
     result = cli("sweep", "--json")
     assert result.exit_code == 0, result.output
@@ -322,8 +341,8 @@ def test_blocked_row_in_a_non_opted_in_repo_falls_back_to_alert(
     _write_config(config_path, repo_investigate=False, max_parallel=2)
     seed(issues={201: "open"})
     cli("add", REPO, "201")
-    _stall(201, "merge blocked: stale test verdict (2/2 attempts)", block_log)
-    gh_world["mergeable"] = False
+    _stall(201, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
 
     result = cli("sweep", "--json")
     assert result.exit_code == 0, result.output
@@ -344,8 +363,8 @@ def test_opting_in_takes_effect_on_the_very_next_sweep_with_no_restart(
     _write_config(config_path, repo_investigate=False, max_parallel=2)
     seed(issues={301: "open"})
     cli("add", REPO, "301")
-    _stall(301, "merge blocked: stale test verdict (2/2 attempts)", block_log)
-    gh_world["mergeable"] = False
+    _stall(301, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
 
     first = cli("sweep", "--json")
     assert first.exit_code == 0, first.output
@@ -370,8 +389,8 @@ def test_no_investigate_flag_disarms_the_tier_fleet_wide(
     _write_config(config_path, repo_investigate=True, max_parallel=2)
     seed(issues={401: "open"})
     cli("add", REPO, "401")
-    _stall(401, "merge blocked: stale test verdict (2/2 attempts)", block_log)
-    gh_world["mergeable"] = False
+    _stall(401, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
 
     result = cli("sweep", "--no-investigate", "--json")
     assert result.exit_code == 0, result.output
