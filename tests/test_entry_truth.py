@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import pytest
 
+from coord import merge_queue as mq
 from coord.ci_store import CheckRun
-from coord.config import Config
+from coord.config import Config, PipelineConfig
 from coord.entry_truth import (
     NEXT_ACTION_CONFLICT_FIX,
     NEXT_ACTION_DISPATCH_CI_FIX,
@@ -92,6 +93,7 @@ class FakeGh:
         pr_merged: bool = False,
         mergeable_override: bool | None = None,
         raise_on_branch_sha: bool = False,
+        pr_state_for_branch: str | None = None,
     ):
         self.branch_sha = branch_sha
         self.base_sha = base_sha
@@ -101,6 +103,10 @@ class FakeGh:
         self.pr_merged = pr_merged
         self.mergeable_override = mergeable_override
         self.raise_on_branch_sha = raise_on_branch_sha
+        # `None` means "this stand-in doesn't implement the optional
+        # `get_pr_state_for_branch` capability at all" — distinct from the
+        # method existing and itself returning `None` (no PR/read failure).
+        self.pr_state_for_branch = pr_state_for_branch
 
     def get_branch_sha(self, repo: str, branch: str) -> str | None:
         if self.raise_on_branch_sha:
@@ -123,12 +129,25 @@ class FakeGh:
         return self.mergeable_override
 
 
+class FakeGhWithPrState(FakeGh):
+    """`FakeGh` plus the optional `get_pr_state_for_branch` capability, so a
+    genuinely CONFIRMED closed-without-merging PR can be exercised
+    distinctly from the ordinary (and far more common) "no PR yet" case."""
+
+    def get_pr_state_for_branch(self, repo: str, branch: str) -> str | None:
+        return self.pr_state_for_branch
+
+
 class FakeCi:
-    def __init__(self, checks: list[CheckRun] | None = None):
+    def __init__(self, checks: list[CheckRun] | None = None, *, expects_checks: bool = True):
         self.checks = checks or []
+        self._expects_checks = expects_checks
 
     def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
         return self.checks
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        return self._expects_checks
 
 
 def _check(name: str, status: str, conclusion: str | None) -> CheckRun:
@@ -242,14 +261,170 @@ class TestNextAction:
         assert truth.ci_state == "green"
         assert truth.next_action == NEXT_ACTION_MERGE
 
-    def test_merge_queue_error_string_never_drives_next_action(self, config: Config) -> None:
-        """Rule 1: a persisted `merge_queue` row's `error` is NOT one of the
-        live facts `reconcile_entry` reads at all — this test documents that
-        by asserting a clean merge-ready entry stays `merge` regardless of
-        what any out-of-band merge_queue row might say, since no merge_queue
-        read happens in `reconcile_entry` in the first place."""
+    def test_merge_queue_error_string_never_drives_next_action(
+        self, config: Config, coord_db,
+    ) -> None:
+        """Rule 1: a persisted `merge_queue` row's raw `error` TEXT never
+        drives `next_action` on its own — only a genuine operator latch
+        (HUMAN_REQUIRED/SKIPPED, see `test_human_required_merge_queue_entry_
+        escalates_rather_than_merging` below) does. A PENDING row carrying
+        an `error` string (e.g. a transient failure note from an earlier
+        attempt) must not, by itself, block a now-clean entry."""
         board = Board(active=[], completed=[_work(), _review("w1")])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.PENDING,
+                error="transient failure from an earlier attempt",
+            )
+        ])
         gh = FakeGh(pr={"number": 7, "mergeable": True})
         ci = FakeCi([_check("build", "completed", "success")])
         truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, ci_store=ci)
         assert truth.next_action == NEXT_ACTION_MERGE
+
+    def test_human_required_merge_queue_entry_escalates_rather_than_merging(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#3445: a latched HUMAN_REQUIRED `merge_queue` row is the one fact
+        nothing else `reconcile_entry` derives can see — every review/test/
+        CI/PR live fact can read clear while a human has already parked
+        this entry, and `coord merge` genuinely refuses it without
+        `--override-human-required`. `next_action` must say so, not `merge`."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.HUMAN_REQUIRED,
+                error="stale-rebase worker refused to push",
+                last_attempt=1_700_000_000.0,
+            )
+        ])
+        gh = FakeGh(pr={"number": 7, "mergeable": True})
+        ci = FakeCi([_check("build", "completed", "success")])
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, ci_store=ci)
+        assert truth.next_action == NEXT_ACTION_ESCALATE
+        assert "HUMAN_REQUIRED" in truth.next_action_reason
+
+    def test_in_flight_worker_leg_waits_rather_than_redispatching(self, config: Config) -> None:
+        """A still-running work leg has no verdicts yet — that must read
+        `wait`, not `dispatch_review`/`dispatch_test`, which would race it."""
+        board = Board(active=[_work(status="active", test_state=None)], completed=[])
+        gh = FakeGh()
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.next_action == NEXT_ACTION_WAIT
+        assert "w1" in truth.next_action_reason
+
+    def test_test_unmet_outranks_review_unmet_when_test_precedes_review(
+        self, config: Config,
+    ) -> None:
+        """CLAUDE.md: Work → Test → Review. Default `pipeline.default_gates`
+        orders `test` ahead of `review`, matching `coord.review.
+        dispatch_pending_reviews`'s own gate — when BOTH are unmet, this
+        must name `dispatch_test`, never `dispatch_review`."""
+        board = Board(active=[], completed=[_work(test_state=None, review_state=None)])
+        gh = FakeGh()
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.test is not None and not truth.test.ok
+        assert truth.review is not None and not truth.review.ok
+        assert truth.next_action == NEXT_ACTION_DISPATCH_TEST
+
+    def test_review_unmet_outranks_test_unmet_when_review_precedes_test(self) -> None:
+        """The mirror of the test above, for a repo whose `default_gates`
+        orders `review` ahead of `test` — `next_action` must flip to match,
+        never hardcode review-first (or test-first) regardless of config."""
+        config = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+            pipeline=PipelineConfig(default_gates=["review", "test", "merge"]),
+        )
+        board = Board(active=[], completed=[_work(test_state=None, review_state=None)])
+        gh = FakeGh()
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.test is not None and not truth.test.ok
+        assert truth.review is not None and not truth.review.ok
+        assert truth.next_action == NEXT_ACTION_DISPATCH_REVIEW
+
+    def test_pr_mergeable_unknown_waits_never_merges(self, config: Config) -> None:
+        """#2704/`check_pr_mergeable`'s own contract: an inconclusive
+        mergeability read (`None` — still computing, or the `gh` call
+        itself failed) must be treated the same as `False` for deciding
+        whether to merge — never a green light."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh(pr={"number": 7, "mergeable": "UNKNOWN"}, mergeable_override=None)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.pr_mergeable is None
+        assert truth.next_action == NEXT_ACTION_WAIT
+
+    def test_pr_mergeable_string_shape_matches_production(self, config: Config) -> None:
+        """`github_ops.find_pr_for_branch` reports GitHub's `mergeable`
+        field as a STRING (`"MERGEABLE"`/`"CONFLICTING"`/`"UNKNOWN"`), never
+        a `bool` — the shape every real `gh_ops` call returns, not just the
+        bool shape a stub is free to use instead."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh(pr={"number": 7, "mergeable": "CONFLICTING"})
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.pr_mergeable is False
+        assert truth.next_action == NEXT_ACTION_CONFLICT_FIX
+
+    def test_checks_absent_but_expected_dispatches_ci_fix_not_merge(
+        self, config: Config,
+    ) -> None:
+        """#1904: an empty check list on a repo that DOES declare CI must
+        fail closed — never read the same as "no CI gate wired here"."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh(pr={"number": 7, "mergeable": True})
+        ci = FakeCi([], expects_checks=True)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, ci_store=ci)
+        assert truth.ci_state == "checks_absent"
+        assert truth.next_action == NEXT_ACTION_DISPATCH_CI_FIX
+
+    def test_checks_absent_and_not_expected_reads_none_and_merges(
+        self, config: Config,
+    ) -> None:
+        """The legitimate "no CI gate wired for this repo" case must stay
+        unaffected by the #1904 `checks_absent` fail-closed handling."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh(pr={"number": 7, "mergeable": True})
+        ci = FakeCi([], expects_checks=False)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, ci_store=ci)
+        assert truth.ci_state == "none"
+        assert truth.next_action == NEXT_ACTION_MERGE
+
+    def test_ci_probe_failure_waits_rather_than_merging(self, config: Config) -> None:
+        """A `ci_store` that raises on the live read is a genuine probe
+        failure (`ci_probed=True`) — fail closed to `wait`, never `merge`."""
+
+        class RaisingCi:
+            def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+                raise RuntimeError("ci backend unreachable")
+
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh(pr={"number": 7, "mergeable": True})
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, ci_store=RaisingCi())
+        assert truth.ci_state == "unknown"
+        assert truth.ci_probed is True
+        assert truth.next_action == NEXT_ACTION_WAIT
+
+    def test_no_pr_yet_is_benign_and_still_merges(self, config: Config) -> None:
+        """"Approved + tested, PR not yet created" is a normal pipeline
+        state (`merge_queue.process()` is what opens the PR) — it must
+        never read the same as a confirmed "closed without merging"."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh(pr=None, pr_merged=False)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.pr_state == "none"
+        assert truth.next_action == NEXT_ACTION_MERGE
+
+    def test_confirmed_closed_pr_escalates(self, config: Config) -> None:
+        """A LIVE, CONFIRMED "closed without merging" read (distinct from
+        merely "no open PR found") still escalates — this is the one case
+        `get_pr_state_for_branch` exists to confirm."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGhWithPrState(pr=None, pr_merged=False, pr_state_for_branch="CLOSED")
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.pr_state == "closed"
+        assert truth.next_action == NEXT_ACTION_ESCALATE
+        assert "closed" in truth.next_action_reason.lower()

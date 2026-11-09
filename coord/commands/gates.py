@@ -87,15 +87,19 @@ def gates(repo: str, issue: int, as_json: bool, config_path: Path) -> None:
     cfg = _load_config(config_path)
     board = build_board()
     report = build_gate_report(board, cfg, repo, issue, gh_ops=gh_ops)
-    # #3922: the SAME live facts this command already gathered via
-    # `build_gate_report`, plus the merge-side (PR lifecycle/CI) and
-    # issue-state facts that report doesn't itself compute, reconciled into
-    # one next_action — so what this prints is what the merge gate actually
-    # enforces, not a narrower "review/test/registry gates only" reading
-    # that can say READY while `coord merge` still refuses (see
-    # `coord.gates.build_gate_report`'s own "merge READY reflects ... only"
-    # note on its `merge` GateDecision).
-    truth = reconcile_entry(board, cfg, repo, issue, gh_ops=gh_ops, ci_store=GitHubCi())
+    # #3922: the SAME `report` snapshot this command already built, plus the
+    # merge-side (PR lifecycle/CI) and issue-state facts that report doesn't
+    # itself compute, reconciled into one next_action — so what this prints
+    # is what the merge gate actually enforces, not a narrower "review/test/
+    # registry gates only" reading that can say READY while `coord merge`
+    # still refuses (see `coord.gates.build_gate_report`'s own "merge READY
+    # reflects ... only" note on its `merge` GateDecision). Passing `report`
+    # through (rather than letting `reconcile_entry` build its own) means
+    # the printed report and the printed `next_action` can never describe
+    # two different live snapshots.
+    truth = reconcile_entry(
+        board, cfg, repo, issue, gh_ops=gh_ops, ci_store=GitHubCi(), report=report,
+    )
 
     if as_json:
         payload = report_to_dict(report)
