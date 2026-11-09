@@ -480,7 +480,15 @@ def format_api_error_reason(
 #   work — nothing about the issue's CONTENT is wrong.
 # * PREMISE (#3164) — the worker investigated and found the issue's stated
 #   premise false, or its stated prerequisite unmet. No prohibition is
-#   involved; there is simply nothing correct to build yet.
+#   involved; there is simply nothing correct to build yet. #3923 folds in
+#   the sibling shape where the premise refuted is the issue's own IMPLICIT
+#   one ("this needs building") — the worker greps and finds the requested
+#   behaviour already shipped, so there is nothing left TO build, not merely
+#   nothing CORRECT to build. Both read the same way downstream: parked
+#   without spending a fix-round attempt (#2972's budget is for driving the
+#   issue to a state change, not for re-confirming an unchanged finding),
+#   needing an operator's `coord drive-queue clear-refusal` before another
+#   leg re-investigates.
 #
 # Both kinds of message routinely cite CLAUDE.md or a numbered repo rule — a
 # PREMISE report often quotes the exact rule it is showing does NOT apply, or
@@ -529,6 +537,23 @@ _PREMISE_REFUSAL_MARKERS = (
     "prerequisite is unmet",
     "wrong on count",
     "wrong on scope",
+    # #3923: "the deliverable already exists, there is nothing to build" is
+    # the SAME premise-false shape as the markers above, not a weaker
+    # cousin of it — a worker that greps for the requested symbol/behaviour
+    # and finds it already shipped has refuted the issue's implicit premise
+    # ("this needs building") exactly as the quadraui#812 worker refuted an
+    # explicit one. Each marker here requires "merged"/"shipped"/"landed"
+    # alongside "already" so this never fires on the standing worker
+    # instructions template itself (CLAUDE.md's own "verify ... isn't
+    # already implemented" / "if it already exists, report back" — neither
+    # contains any of those words), only on a worker's own affirmative
+    # finding that the work is done.
+    "already fully implemented and merged",
+    "already implemented and merged",
+    "fully implemented and already merged",
+    "already merged into",
+    "already shipped in",
+    "already landed on",
 )
 
 
@@ -552,7 +577,10 @@ def looks_like_policy_refusal(text: str | None) -> bool:
 def looks_like_premise_refusal(text: str | None) -> bool:
     """#3164: does *text* read as a worker reporting an investigated,
     refuted issue premise (a false or unmet prerequisite), rather than a
-    standing-rule refusal or a stuck session?
+    standing-rule refusal or a stuck session? #3923: also true for the
+    "already implemented" shape — the worker's own finding that the
+    requested behaviour already exists (and is already merged/shipped),
+    so there is nothing left to build.
     """
     if not text:
         return False

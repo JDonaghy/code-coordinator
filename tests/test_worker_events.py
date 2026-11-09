@@ -1578,6 +1578,38 @@ class TestLooksLikePremiseRefusal:
     def test_does_not_match_non_premise_text(self, text) -> None:
         assert looks_like_premise_refusal(text) is False
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The quadraui#2256 incident shape (#3923): three independent
+            # work legs each reported this, each burning a fix round before
+            # the row hit the #2972 ceiling and blocked a downstream row
+            # behind it.
+            "RowAlign and FormSpacing::padding are already fully "
+            "implemented and merged into `develop` — tests pass. Writing "
+            "nothing further.",
+            "Confirmed via grep: this primitive is already implemented "
+            "and merged into main.",
+            "The requested helper is already shipped in v2.4 — nothing to "
+            "add.",
+        ],
+    )
+    def test_matches_the_already_implemented_shape(self, text: str) -> None:
+        assert looks_like_premise_refusal(text) is True
+
+    def test_does_not_match_the_bare_worker_instructions_echo(self) -> None:
+        """#3923: the standing worker-instructions template itself says
+        'verify ... isn't already implemented' / 'if it already exists,
+        report back' — a worker that merely echoes that instruction back
+        (e.g. while narrating its own process) must not false-positive as
+        an actual "already implemented" finding. Only a marker that ALSO
+        names where the work landed (merged/shipped/landed) counts."""
+        text = (
+            "Before writing any code I verified the feature isn't already "
+            "implemented — it is not, so I built it and pushed the branch."
+        )
+        assert looks_like_premise_refusal(text) is False
+
 
 class TestClassifyZeroCommitRefusal:
     """#3164 acceptance criteria 1, 2, 5."""
@@ -1592,6 +1624,24 @@ class TestClassifyZeroCommitRefusal:
         """AC5: quadraui#812's reconstructed final message — an
         investigated, refuted premise, no prohibition involved."""
         assert classify_zero_commit_refusal(_QUADRAUI_812_FINAL_MESSAGE) == "premise"
+
+    def test_the_quadraui_2256_already_implemented_shape_classifies_as_premise(
+        self,
+    ) -> None:
+        """#3923: the quadraui#2256 incident — three independent work legs
+        each reported the requested primitives already fully implemented
+        and merged, and each one burned a fix round rediscovering the same
+        finding before the row hit the #2972 ceiling and blocked a
+        downstream row behind it. Classifying this as "premise" (same as
+        quadraui#812's explicit-premise shape) routes it to REFUSED_PREMISE
+        — parked without spending an attempt — instead of looping through
+        the full fix-round budget on an unchanging finding."""
+        text = (
+            "RowAlign and FormSpacing::padding are already fully "
+            "implemented and merged into `develop` — tests pass. Writing "
+            "nothing further."
+        )
+        assert classify_zero_commit_refusal(text) == "premise"
 
     def test_a_message_citing_both_shapes_resolves_to_premise(self) -> None:
         """The overlap #3164 exists to fix: a premise report that ALSO

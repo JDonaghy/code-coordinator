@@ -146,6 +146,21 @@ REFUSED_POLICY = "refused_policy"
 # exactly: terminal, no-attempt-spent park, no auto-retry — see
 # `coord.models.PREMISE_REFUSAL_MARKER`/`is_premise_refusal_reason` and
 # `coord/drive_queue.py`'s park branch for the messaging difference.
+#
+# #3923: also the landing spot for "already implemented" — the worker's own
+# finding that the requested behaviour already exists (and is already
+# merged/shipped), refuting the issue's IMPLICIT premise ("this needs
+# building") the same way quadraui#812 refuted an explicit one. Before this,
+# that finding had no distinct status: it fell through to the bare #448
+# ADVISORY default, which the comment on that constant already named as the
+# exact failure mode ("auto_reassign would loop forever on 'already
+# implemented' reports") — three independent relaunches of quadraui#2256
+# each re-spent a fix round rediscovering the identical finding before the
+# row hit the #2972 ceiling and blocked, with a downstream row stuck behind
+# it reading "will never satisfy". Parking here instead costs zero fix
+# rounds and waits for an operator's one-line confirmation
+# (`coord drive-queue clear-refusal`) rather than a third independent
+# relaunch re-proving what the first one already found.
 REFUSED_PREMISE = "refused_premise"
 
 # #448: spec types that are expected to push commits, so a clean exit with
