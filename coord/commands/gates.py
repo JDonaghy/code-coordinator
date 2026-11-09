@@ -79,14 +79,29 @@ def gates(repo: str, issue: int, as_json: bool, config_path: Path) -> None:
     import json as _json  # noqa: PLC0415
 
     from coord import github_ops as gh_ops  # noqa: PLC0415
+    from coord.ci_github import GitHubCi  # noqa: PLC0415
+    from coord.entry_truth import reconcile_entry  # noqa: PLC0415
     from coord.gates import build_gate_report, format_gate_report, report_to_dict  # noqa: PLC0415
     from coord.state import build_board  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     board = build_board()
     report = build_gate_report(board, cfg, repo, issue, gh_ops=gh_ops)
+    # #3922: the SAME live facts this command already gathered via
+    # `build_gate_report`, plus the merge-side (PR lifecycle/CI) and
+    # issue-state facts that report doesn't itself compute, reconciled into
+    # one next_action — so what this prints is what the merge gate actually
+    # enforces, not a narrower "review/test/registry gates only" reading
+    # that can say READY while `coord merge` still refuses (see
+    # `coord.gates.build_gate_report`'s own "merge READY reflects ... only"
+    # note on its `merge` GateDecision).
+    truth = reconcile_entry(board, cfg, repo, issue, gh_ops=gh_ops, ci_store=GitHubCi())
 
     if as_json:
-        click.echo(_json.dumps(report_to_dict(report), indent=2))
+        payload = report_to_dict(report)
+        payload["next_action"] = truth.next_action
+        payload["next_action_reason"] = truth.next_action_reason
+        click.echo(_json.dumps(payload, indent=2))
     else:
         click.echo(format_gate_report(report))
+        click.echo(f"next_action: {truth.next_action}  ({truth.next_action_reason})")
