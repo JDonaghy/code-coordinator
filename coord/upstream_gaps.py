@@ -718,7 +718,10 @@ def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str)
                             **_enqueue_kwargs(entry, new_after))
         return True, f"queue row now after {upstream_key}"
 
-    removal = dequeue_drive_queue(entry.repo, entry.issue)
+    # #3944: `operator=False` — this remove is immediately followed by a
+    # re-add below (same row, `after` extended), an automated self-heal, not
+    # a human `drive-queue remove`.
+    removal = dequeue_drive_queue(entry.repo, entry.issue, operator=False)
     if not removal.get("removed"):
         return False, (
             f"queue row ({entry.state}) vanished before it could be held "

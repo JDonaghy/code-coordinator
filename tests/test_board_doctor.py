@@ -4158,45 +4158,64 @@ class TestStrandedPrereqGuard:
     def test_operator_removed_is_refused_without_even_reading_github(
         self, monkeypatch
     ) -> None:
-        from coord.block_log import operator_resolution_event, record
-        from coord.drive_queue import QueueEntry as _QE
-
+        # The real production write: `coord drive-queue remove` (CLI's own
+        # `operator=True` default) against a `waiting` row — the exact
+        # shape `block_log`'s `STALL_STATES` gate could never record, since
+        # `waiting` isn't `blocked`/`parked`. Reads back through the shared
+        # `audit_log`, not the per-host `block_log`.
         def _boom(*a, **k):
             raise AssertionError("must not read GitHub once operator-removed is confirmed")
 
         monkeypatch.setattr("coord.github_ops.get_issue", _boom)
-        entry = _QE(repo="quadraui", issue=2172, state="waiting")
-        record([operator_resolution_event(entry, resolution="operator_removed")])
+        state.enqueue_drive_queue("quadraui", 2172)
+        state.dequeue_drive_queue("quadraui", 2172)
 
         guard = stranded_prereq_guard("quadraui#2172", self._config())
         assert guard.may_queue is False
         assert "operator" in guard.reason
 
-    def test_a_later_non_operator_record_does_not_shadow_the_removal(
+    def test_a_later_automated_removal_does_not_inherit_the_operator_flag(
         self, monkeypatch
     ) -> None:
-        # The MOST RECENT record decides — an operator removal followed by
-        # a later tick-driven `enter` record (the only shape a key that is
-        # back in the queue could produce) must not still read as
-        # removed-on-purpose: `_dep_last_operator_removed` only matches a
-        # RESOLVE record whose own `resolution` is exactly
-        # "operator_removed", and the latest record here is an `enter`.
-        from coord.block_log import enter_event, operator_resolution_event, record
-        from coord.drive_queue import QueueEntry as _QE
-
-        entry = _QE(repo="quadraui", issue=2172, state="blocked", last_reason="ci red")
-        record([operator_resolution_event(entry, resolution="operator_removed", now=100.0)])
-        record([enter_event(entry, state="blocked", reason="ci red", now=200.0)])
+        # The MOST RECENT removal decides: an operator's `remove`, followed
+        # by the row getting re-added and later removed again by an
+        # AUTOMATED path (`operator=False` — e.g. `board_doctor_
+        # permissions`'s own gated dequeue, or `upstream_gaps`'s remove-
+        # then-re-add), must not still read as a standing human veto.
+        state.enqueue_drive_queue("quadraui", 2172)
+        state.dequeue_drive_queue("quadraui", 2172)
+        state.enqueue_drive_queue("quadraui", 2172)
+        state.dequeue_drive_queue("quadraui", 2172, operator=False)
 
         monkeypatch.setattr("coord.github_ops.get_issue", lambda *a, **k: {"labels": []})
         guard = stranded_prereq_guard("quadraui#2172", self._config())
         assert guard.may_queue is True
+
+    def test_no_removal_history_is_not_treated_as_removed(self) -> None:
+        # Absence of a record is not evidence of a human decision — a key
+        # that was simply never queued, or queued and left alone, must not
+        # refuse on this check alone.
+        from coord.board_doctor import _dep_last_operator_removed
+
+        assert _dep_last_operator_removed("quadraui", 2172) is False
 
     def test_gh_read_failure_is_refused_not_assumed_safe(self, monkeypatch) -> None:
         def _boom(*a, **k):
             raise RuntimeError("gh: rate limited")
 
         monkeypatch.setattr("coord.github_ops.get_issue", _boom)
+        guard = stranded_prereq_guard("quadraui#2172", self._config())
+        assert guard.may_queue is False
+        assert "could not read" in guard.reason
+
+    def test_empty_label_read_is_refused_not_assumed_safe(self, monkeypatch) -> None:
+        # `github_ops.get_issue` fails OPEN to `{}` on an exit-0 `gh` that
+        # emitted empty/malformed stdout — distinct from the raising case
+        # above, and from a genuinely label-less issue (`{"labels": []}`,
+        # which `test_open_plain_issue_may_be_queued` already covers as
+        # auto-queueable). Both must refuse, never fall through to "no
+        # labels, so no epic/opt-out" by default.
+        monkeypatch.setattr("coord.github_ops.get_issue", lambda *a, **k: {})
         guard = stranded_prereq_guard("quadraui#2172", self._config())
         assert guard.may_queue is False
         assert "could not read" in guard.reason

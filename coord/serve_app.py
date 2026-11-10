@@ -9657,7 +9657,12 @@ def build_app(
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":
                 deleted = state._dequeue_drive_queue_local(
-                    body["repo_name"], body["issue_number"]
+                    body["repo_name"],
+                    body["issue_number"],
+                    # #3944: absent key (a client predating this feature)
+                    # means "operator", same as the Python-level default —
+                    # every pre-existing caller is in fact a human removal.
+                    operator=bool(body.get("operator", True)),
                 )
                 # #3282: this daemon process runs ON the daemon host — the
                 # only machine `coord drive-queue tick` (and every `coord

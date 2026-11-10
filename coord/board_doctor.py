@@ -321,30 +321,43 @@ class StrandedPrereqGuard:
     reason: str = ""
 
 
-def _dep_last_operator_removed(dep: str) -> bool:
-    """True when *dep*'s most recent `block_log` record is an operator
-    `drive-queue remove` (#3944's "removed on purpose" guard).
+def _dep_last_operator_removed(dep_repo: str, dep_issue: int) -> bool:
+    """True when *dep_repo*/*dep_issue*'s most recent drive-queue removal
+    was a human's, not the sweep's own (#3944's "removed on purpose" guard).
 
-    `coord.commands.drive_queue._record_operator_release`/`_record_operator_
-    release_entry` are the ONLY writers of `resolution="operator_removed"`
-    (:func:`coord.block_log.operator_resolution_event`) anywhere in this
-    tree — every tick-driven resolution instead records `"landed"`,
-    `"auto_merged"`, `"auto_resumed"` or a bare `"moved"`
-    (:func:`coord.block_log._resolve_record`) — so the latest record for a
-    key reading this resolution is specifically a human's `remove`, never a
-    self-heal. See the memory note "removing a queue row strands its green
-    PR": a removal can be deliberate, and this sweep must not second-guess
-    one by re-adding the row right back.
+    Reads the shared `audit_log` `drive_queue_removed` event
+    `coord.state._dequeue_drive_queue_local` writes on every successful
+    removal, tagged with the `operator` bit the caller passed in. That
+    choke point is reached by EVERY removal path regardless of topology —
+    a thin client's `coord drive-queue remove` routes through the daemon's
+    own `/drive-queue` handler, which calls the exact same local function —
+    so, unlike `block_log` (per-host, one-generation-rotated), a removal
+    typed on any machine at any time in the past is visible from here.
 
-    A key with no record at all (never queued, or queued and simply left
-    alone) reads ``False`` — nothing here says "removed on purpose".
+    A key currently sitting unqueued (the only state this guard is ever
+    asked about — see :func:`stranded_prereq_guard`) can have at most one
+    "most recent" removal: re-adding it would put a queue row back and take
+    this shape out of :func:`stranded_prereq_rows`'s classification
+    entirely, so there is never a later addition to reconcile against.
+
+    A key with no removal record at all (never queued, or the removal
+    predates this event existing) reads ``False`` — absence of a record is
+    not evidence of a human decision.
     """
-    from coord import block_log  # noqa: PLC0415
+    from coord.state import list_audit_log  # noqa: PLC0415
 
-    matching = [e for e in block_log.read_events() if e.get("key") == dep]
-    if not matching:
+    result = list_audit_log(
+        category="drive_queue",
+        event_type="drive_queue_removed",
+        repo=dep_repo,
+        issue=dep_issue,
+        limit=1,
+    )
+    entries = result.get("entries") or []
+    if not entries:
         return False
-    return matching[-1].get("resolution") == "operator_removed"
+    details = entries[0].get("details") or {}
+    return bool(details.get("operator"))
 
 
 def stranded_prereq_guard(dep: str, config: Any) -> StrandedPrereqGuard:
@@ -379,7 +392,7 @@ def stranded_prereq_guard(dep: str, config: Any) -> StrandedPrereqGuard:
             False, f"{dep_repo!r} is not a repo in coordinator.yml"
         )
 
-    if _dep_last_operator_removed(dep):
+    if _dep_last_operator_removed(dep_repo, dep_issue):
         return StrandedPrereqGuard(
             False,
             f"{dep}'s last drive-queue history is an operator `drive-queue "
@@ -395,6 +408,16 @@ def stranded_prereq_guard(dep: str, config: Any) -> StrandedPrereqGuard:
     except Exception as exc:  # noqa: BLE001 — fail CLOSED, see docstring
         return StrandedPrereqGuard(
             False, f"could not read {dep}'s labels to check epic/opt-out: {exc}"
+        )
+    # `github_ops.get_issue` fails OPEN to `{}` on an exit-0 `gh` that
+    # emitted empty/malformed stdout (see its own docstring) — so a missing
+    # `"labels"` key means "could not actually read the labels", never "read
+    # them, there are none". Treat the two differently: refuse instead of
+    # falling through to the permissive "no labels" branch, or an unreadable
+    # dep would default to auto-queueable.
+    if not issue_data or "labels" not in issue_data:
+        return StrandedPrereqGuard(
+            False, f"could not read {dep}'s labels to check epic/opt-out"
         )
     labels = {lbl.get("name", "") for lbl in (issue_data.get("labels") or [])}
     if TRACKING_ISSUE_LABEL in labels:

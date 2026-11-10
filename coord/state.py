@@ -11011,7 +11011,9 @@ def _enqueue_drive_queue_local(
     return entry_id
 
 
-def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
+def dequeue_drive_queue(
+    repo_name: str, issue_number: int, *, operator: bool = True
+) -> dict:
     """Remove an issue from the drive queue, renumbering what's left — and,
     #3282, own the live driver session that removal orphans.
 
@@ -11025,6 +11027,15 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
     (non-daemon) write always executes on that same machine. Neither branch
     probes for a driver when nothing was removed (an issue never in the
     queue has nothing to orphan).
+
+    ``operator`` (#3944) records, in the shared `audit_log` (not the
+    per-host, one-generation `block_log`), whether this removal is a human
+    decision — the default — or part of an automated sweep's own self-heal.
+    `coord.board_doctor`'s stranded-prereq guard reads this record to decide
+    whether re-adding a dep an operator deliberately took out would second-
+    guess that decision; an automated caller (`board_doctor_permissions`'s
+    own dequeue action, `upstream_gaps`'s stale-upstream cleanup) passes
+    ``operator=False`` so its own removals never read back as a human veto.
 
     Returns ``{"removed": bool, "driver_ok": bool, "driver_session":
     str | None, "driver_detail": str | None}``. ``driver_session`` is
@@ -11043,6 +11054,7 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
             "action": "dequeue",
             "repo_name": repo_name,
             "issue_number": issue_number,
+            "operator": bool(operator),
         },
     )
     if resp is not None:
@@ -11053,7 +11065,7 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
             "driver_detail": resp.get("driver_detail"),
         }
 
-    removed = _dequeue_drive_queue_local(repo_name, issue_number)
+    removed = _dequeue_drive_queue_local(repo_name, issue_number, operator=operator)
     driver_ok, driver_session, driver_detail = True, None, None
     if removed:
         from coord.drive import stop_live_driver_session  # noqa: PLC0415
@@ -11069,7 +11081,9 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
     }
 
 
-def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:
+def _dequeue_drive_queue_local(
+    repo_name: str, issue_number: int, *, operator: bool = True
+) -> bool:
     # #2846: wrapped in retry_on_locked like every other write in this
     # module (DELETE-by-natural-key is idempotent, so extending the retry
     # budget here is pure upside — a transient lock from a concurrent writer
@@ -11086,7 +11100,25 @@ def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:
         conn.commit()
         return removed
 
-    return retry_on_locked(_write)
+    removed = retry_on_locked(_write)
+    if removed:
+        # #3944: business tier — shared across hosts (unlike `block_log`,
+        # which is per-host) and never swept by retention, so this stays
+        # readable no matter which machine the removal was typed on or how
+        # long ago it happened. `operator=False` is the one bit that tells
+        # `coord.board_doctor`'s stranded-prereq guard this wasn't a human
+        # decision to leave the row out.
+        _record_audit(
+            tier="business",
+            category="drive_queue",
+            event_type="drive_queue_removed",
+            actor="operator" if operator else "system",
+            summary=f"Removed {repo_name}#{issue_number} from the drive queue",
+            repo=repo_name,
+            issue=issue_number,
+            details={"operator": bool(operator)},
+        )
+    return removed
 
 
 def update_drive_queue_entry(repo_name: str, issue_number: int, **fields) -> bool:

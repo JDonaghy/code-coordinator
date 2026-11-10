@@ -765,7 +765,12 @@ def _dequeue_and_log(repo_name: str, issue_number: int) -> DriveQueueRemoval:
     """
     from coord.state import dequeue_drive_queue  # noqa: PLC0415
 
-    result = dequeue_drive_queue(repo_name, issue_number)
+    # #3944: `operator=False` — this is the sweep's OWN gated action, not a
+    # human running `coord drive-queue remove`. `coord.board_doctor`'s
+    # stranded-prereq guard reads the `operator` bit back to tell "a human
+    # took this row out on purpose" apart from "the sweep's own policy took
+    # it out" — the latter must never read back as a standing human veto.
+    result = dequeue_drive_queue(repo_name, issue_number, operator=False)
     if result.get("removed") and not result.get("driver_ok", True):
         log.warning(
             "board-doctor sweep: drive-queue remove for %s#%s orphaned a "
