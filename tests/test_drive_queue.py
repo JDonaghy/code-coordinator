@@ -6767,6 +6767,38 @@ def test_summarize_drive_queue_eligible_count_follows_live_truth_not_dep_state()
     assert with_truth.eligible == 1
 
 
+def test_prereq_truth_never_shadows_the_already_done_board_signal():
+    """#3931's `already_done` ("premise-refused on the specific 'already
+    implemented' finding") is a board-level signal `EntryTruth` does not
+    yet have its own equivalent of — `_derive_next_action` reads ANY
+    `refused_premise` worker outcome as `escalate`, generic or
+    already-done alike. A live truth reading `escalate` for such a dep
+    must NOT override `facts.already_done`'s own, more-informed
+    "satisfied" verdict — `facts` is consulted first, exactly as it was
+    before #3934."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        entry(2256, position=0, state=STATE_PARKED, attempts=0,
+              last_reason=f"already implemented — {PREMISE_REFUSAL_MARKER}"),
+        entry(2140, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(already_done=(2256,)), capacity=2,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO,
+                issue_number=2256,
+                next_action=NEXT_ACTION_ESCALATE,
+                next_action_reason=(
+                    "latest worker leg exited 'refused_premise' — needs "
+                    "operator recovery, not another dispatch"
+                ),
+            ),
+        },
+    )
+    assert plan.launch is not None and plan.launch.issue == 2140
+
+
 # ── #2602 recovery half: a live re-check resumes the "unknown pre-req" ────
 # blocked shape too, not just "queued but blocked/failed" (#2362's original
 # scope). Before this, `pre-req is not queued, not merged and not open on

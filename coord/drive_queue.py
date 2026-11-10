@@ -3759,14 +3759,19 @@ def _resolve_prereqs(
     :class:`~coord.entry_truth.EntryTruth`, when the caller has one — see
     :func:`_prereq_truth_verdict` for exactly what it decides and the
     vimcode#2140 incident it replays. Checked AFTER *held_gates* (a fired
-    deploy gate always wins, live truth or not — see that check's own
-    comment) but BEFORE `facts`/`dep_state`: once present for a key, it is
-    the ONLY thing that decides this edge — the dep's own `facts.landed`/
-    `dep_state`/`live_prereq_terminal`/`dep_reasons` reading below is never
-    reached for that key. A key ABSENT from *prereq_truth* (no caller-side
-    live truth for that dep this tick), or present with
-    :data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN`, falls straight through
-    to that unchanged pre-#3934 reasoning — the production default today,
+    deploy gate always wins, live truth or not) AND AFTER `facts.landed`/
+    `facts.already_done` (board-level signals this module already trusted
+    pre-#3934, `already_done` included — EntryTruth does not yet have its
+    own equivalent of the #3931 "already implemented" reading, so a dep's
+    facts are consulted first rather than letting a less-informed live
+    ESCALATE shadow them) but BEFORE `dep_state`: once present for a key
+    AND `facts` had nothing conclusive to say, it is what decides this
+    edge instead — the dep's own `dep_state`/`live_prereq_terminal`/
+    `dep_reasons` reading below is never reached for that key. A key
+    ABSENT from *prereq_truth* (no caller-side live truth for that dep
+    this tick), or present with :data:`~coord.entry_truth.
+    NEXT_ACTION_UNKNOWN`, falls straight through to that unchanged
+    pre-#3934 reasoning — the production default today,
     since nothing yet wires a live `reconcile_entry` call into the shell
     that builds this mapping.
     """
@@ -3777,13 +3782,6 @@ def _resolve_prereqs(
         hold = (held_gates or {}).get(dep)
         if hold is not None:
             return _Verdict(False, False, _gate_defer_reason(dep, hold))
-        dep_truth = (prereq_truth or {}).get(dep)
-        if dep_truth is not None:
-            truth_verdict = _prereq_truth_verdict(dep, dep_truth)
-            if truth_verdict is not None:
-                if truth_verdict.satisfied:
-                    continue
-                return truth_verdict
         facts = board.facts(dep)
         if facts.landed or (facts.already_done and not facts.reopened):
             # #3931: `already_done` — *dep* parked `refused_premise` on the
@@ -3806,6 +3804,13 @@ def _resolve_prereqs(
             # edge from releasing, the same claude-coordinator#3380 shape
             # `landed` already guards against.
             continue
+        dep_truth = (prereq_truth or {}).get(dep)
+        if dep_truth is not None:
+            truth_verdict = _prereq_truth_verdict(dep, dep_truth)
+            if truth_verdict is not None:
+                if truth_verdict.satisfied:
+                    continue
+                return truth_verdict
         dep_state = states.get(dep)
         if dep_state is not None:
             if dep_state in STATE_DONE_LIKE:
