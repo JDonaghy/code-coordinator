@@ -478,7 +478,7 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
 # distinction has to be verified per-dispatcher, not assumed; see the
 # issue's suggested structural alternative (branch never had commits, ever)
 # for a fix that wouldn't require keeping this list exhaustive by hand.
-_OBSERVER_LEG_TAGS = ("review", "scoped-review", "smoke", "gate-b")
+_OBSERVER_LEG_TAGS = ("review", "scoped-review", "smoke", "gate-b", "size-triage")
 
 
 def _is_observer_leg_branch(branch: str, issue_number: int) -> bool:

@@ -22,6 +22,16 @@ history has actually been rewritten). `TestHistoryRewriteLegSafetyNetPush`
 below covers the `--force-with-lease` push this file's `_HISTORY_REWRITE_
 TYPES` leg now uses instead, and the promotion of a non-fast-forward/
 stale-lease rejection to the same FAILED outcome as an auth break.
+
+#3975: a size-triage leg (`coord.decomposition_chat.dispatch_size_triage_
+review`) is read-only by its own system prompt and its branch is cut fresh
+from the default branch's tip, so this reap-time safety-net push has
+nothing of the leg's own to push in the first place — and pushing the
+empty branch anyway hands #3376's `any_matching_branch_merged` fallback a
+zero-commit `issue-N-size-triage-*` branch to mis-read as "already
+merged", refusing the Work dispatch the triage verdict just unblocked
+(quadraui#2304). `test_size_triage_leg_reap_skips_the_push` below pins
+down that this reap-time push is never even attempted for that leg shape.
 """
 
 from __future__ import annotations
@@ -505,6 +515,52 @@ def test_successful_push_leaves_push_failure_reason_none(
 
     assert final.status == DONE
     assert final.push_failure_reason is None
+    server.shutdown()
+
+
+def test_size_triage_leg_reap_skips_the_push(
+    tmp_path: Path, repo_with_rejecting_remote: tuple[Path, Path]
+) -> None:
+    """#3975: a size-triage leg's reap must never attempt the
+    belt-and-suspenders push at all — not even one that would otherwise
+    fail loudly. The rejecting remote proves the point: if reap attempted
+    the push, this leg would come back FAILED with an auth-shaped
+    `push_failure_reason`; since the leg is read-only, it must instead come
+    back DONE with no push attempted and no branch created on origin."""
+    clone, origin = repo_with_rejecting_remote
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "true"],  # read-only, no commits
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(clone),
+        issue_number=2304,
+        issue_title="[size-triage] shared app layer 2a widgetid",
+        briefing="b",
+        branch="main",
+        type="review",
+        review_target="size-triage-2304",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE
+    assert final.push_failure_reason is None
+    log_text = Path(final.log_path).read_text()
+    assert "# reap: push starting" not in log_text
+    assert "# reap: push completed" not in log_text
+    # The branch the agent would have minted (`issue-2304-size-triage-...`)
+    # must never reach origin — the whole bug was that empty branch landing
+    # there and being misread as "this issue's work already merged".
+    refs = subprocess.run(
+        ["git", "ls-remote", "--heads", str(origin)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "size-triage" not in refs
     server.shutdown()
 
 
