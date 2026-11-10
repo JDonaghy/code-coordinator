@@ -223,6 +223,41 @@ def test_a_content_identical_rebase_reads_fresh_not_stale(monkeypatch):
     assert review_stale is False
 
 
+def test_a_sha_unchanged_approval_with_a_drifted_patch_id_reads_review_stale(
+    monkeypatch,
+):
+    """#3936/#3948, quadraui#2173's exact shape: the branch head has NOT
+    moved since the approval (`scan_approved_reviews`'s own #1475 SHA-match
+    fast path reads this as a plain, unconditionally-fresh APPROVED — the
+    persisted conclusion this test contradicts), but the BASE moved under
+    it, so the live patch-id no longer matches what the review actually
+    looked at. Before #3936, `_staleness` read `scan.approved` alone and
+    returned `review_stale=False` unconditionally here — exactly the bug
+    quadraui#2173 hit (`coord gates`: "every required gate reads clear").
+    `_staleness` must now defer to `EntryTruth.review_stale` (#3948) for
+    this case and read `True`."""
+    _patch_gh_ops(monkeypatch, branch_sha="old-sha", patch_id="patch-new")
+    work = _work()
+    review = _review(work.assignment_id, head_sha="old-sha", patch_id="patch-old")
+    board = Board(completed=[work, review])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    errors: list[str] = []
+
+    # Pin the contradiction this test guards against: the branch head is
+    # confirmed UNCHANGED, so the merge gate's own cached-style verdict
+    # reads approved-and-current on its own.
+    from coord import github_ops
+    from coord import merge_queue as mq
+
+    mq_entry = mq.live_gate_entry(work, "acme/api", "main", github_ops)
+    assert mq.scan_approved_reviews(mq_entry, board, github_ops, config=_config()).approved is True
+
+    review_stale, _test_stale = probe._staleness(entry(77), errors)  # noqa: SLF001
+
+    assert review_stale is True
+    assert not errors
+
+
 def test_no_prior_review_at_all_reads_false_not_stale(monkeypatch):
     """Nothing to go stale: a branch that was simply never reviewed must
     read `review_stale=False` (confirmed, nothing stale to report), never

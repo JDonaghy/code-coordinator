@@ -1458,6 +1458,7 @@ def _no_progress_shape(
     local_host: str | None,
     now: float = 0.0,
     stall_nudge_of: Callable[[str, int], Mapping[str, Any] | None] = lambda repo, issue: None,
+    prereq_truth_of: Callable[[str], Any | None] = lambda dep: None,
 ) -> str | None:
     """Which of the #3888/#3918 no-progress shapes *entry* matches, or
     ``None``.
@@ -1513,13 +1514,21 @@ def _no_progress_shape(
     grace window (applied by the caller) is what keeps a merely-just-blocked
     row out, not this predicate.
 
-    ``waiting``: every ``after=`` pre-req reads ``landed`` off the SAME
-    :attr:`coord.drive_queue.IssueFacts.landed` property `_resolve_prereqs`
-    itself consults (#2096 again) — OR, like `_resolve_prereqs` itself
-    (#2715), the dep's OWN drive-queue row already reading
-    :data:`coord.drive_queue.STATE_DONE_LIKE` in *dep_states*, since the
-    ``issues`` cache backing ``landed`` can run minutes behind a merge the
-    queue performed itself — AND the repo has room under its own ceiling
+    ``waiting``: every ``after=`` pre-req is landed, decided per-dep by
+    :func:`_dep_landed` (#3936) — a live :class:`~coord.entry_truth.
+    EntryTruth` from *prereq_truth_of*, when one is supplied and decisive,
+    exactly as :func:`coord.drive_queue._prereq_truth_verdict` already
+    decides the SAME question for the real tick's own ``after=``
+    resolution (#2096: one question, one answer — never a dep's own
+    drive-queue row ``state``, a latched conclusion that can go stale the
+    moment a different actor changes the dep's reality without rewriting
+    it). Falling back, when no live truth is supplied or it has nothing
+    decisive to say, to :attr:`coord.drive_queue.IssueFacts.landed` — OR,
+    like `_resolve_prereqs` itself (#2715), the dep's OWN drive-queue row
+    already reading :data:`coord.drive_queue.STATE_DONE_LIKE` in
+    *dep_states*, since the ``issues`` cache backing ``landed`` can run
+    minutes behind a merge the queue performed itself — AND the repo has
+    room under its own ceiling
     right now, per *running_counts* (the scheduler's own occupancy
     verdict) — AND the FLEET has room too, per *fleet_occupied* against
     *fleet_ceiling*. Both capacity answers come from the same
@@ -1566,10 +1575,18 @@ def _no_progress_shape(
     if entry.state in (STATE_BLOCKED, STATE_PARKED):
         return _NO_PROGRESS_BLOCKED
     if entry.state == STATE_WAITING:
-        if not all(
-            facts_of(dep).landed or dep_states.get(dep) in STATE_DONE_LIKE
-            for dep in entry.after
-        ):
+        from coord.entry_truth import (  # noqa: PLC0415
+            NEXT_ACTION_MARK_DONE,
+            NEXT_ACTION_UNKNOWN,
+        )
+
+        def _dep_landed(dep: str) -> bool:
+            truth = prereq_truth_of(dep)
+            if truth is not None and truth.next_action != NEXT_ACTION_UNKNOWN:
+                return truth.next_action == NEXT_ACTION_MARK_DONE
+            return facts_of(dep).landed or dep_states.get(dep) in STATE_DONE_LIKE
+
+        if not all(_dep_landed(dep) for dep in entry.after):
             return None
         ceiling = repo_ceiling(entry.repo)
         if ceiling > 0 and running_counts.get(entry.repo, 0) >= ceiling:
@@ -1660,8 +1677,17 @@ def no_progress_rows(
     now: float | None = None,
     local_host: str | None = None,
     systemd_flags: Mapping[str, int] | None = None,
+    prereq_truth: Mapping[str, Any] | None = None,
 ) -> list[StuckRow]:
     """Classify every drive-queue row #3888 says the episode walk misses.
+
+    *prereq_truth* (#3936) is ``{dep_key: EntryTruth}`` for whichever
+    ``after=`` pre-reqs the caller already reconciled LIVE this sweep —
+    threaded straight to :func:`_no_progress_shape`'s own ``waiting`` dep
+    check, exactly as :func:`coord.drive_queue._resolve_prereqs` consults
+    the same mapping for the real tick (#2096). ``None`` (the default)
+    reproduces today's behaviour exactly: every dep falls through to the
+    board/queue-state reasoning `_no_progress_shape` already had.
 
     :func:`collect_rows`'s episode-based walk only ever looks at keys
     `block_log` opened an episode for — exclusively `blocked`/`parked`
@@ -1775,6 +1801,7 @@ def no_progress_rows(
             local_host=local_host,
             now=stamp,
             stall_nudge_of=stall_nudge_of,
+            prereq_truth_of=(lambda dep: (prereq_truth or {}).get(dep)),
         )
         if shape is None:
             continue

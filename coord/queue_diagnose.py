@@ -158,24 +158,23 @@ CAUSE_AGENT_UNREACHABLE = "agent-unreachable"
 #: budget recorded as `unknown` stays `unknown` — `needs_diagnosis` refuses
 #: to re-probe it — so only new or unspent episodes reach this cause.
 CAUSE_NEVER_DISPATCHED = "never-dispatched"
-#: #3929 (#3918 gap 3): the merge gate's OWN freshness check
-#: (:func:`coord.merge_queue.find_scoped_review_candidate`, built on the
-#: same :func:`~coord.merge_queue.scan_approved_reviews` ``has_approved_
-#: review`` relies on) confirms an approve verdict exists for this branch's
-#: work chain but no longer covers it — the branch head/patch-id moved past
-#: what that review actually looked at, and none of the rebase-equivalence
-#: escape hatches (#1475 content-identical patch-id, #3707 ancillary-only,
-#: #3749 context-only) apply. ``coord gates`` itself calls the SAME
-#: underlying scan (see ``build_gate_report``'s own "review" decision), so
-#: a live, DIRECT call here is never a second implementation of the
-#: freshness math — it is the one place in this module that refuses to
-#: trust `coord gates`'s cached decision and re-derives the answer itself
+#: #3929 (#3918 gap 3): a live :class:`~coord.entry_truth.EntryTruth`
+#: (#3936) confirms an approve verdict exists for this branch's work chain
+#: but no longer covers it, via one of two routes, never `coord gates`'s
+#: own cached decision: (1) :attr:`~coord.entry_truth.EntryTruth.
+#: review_stale` — the gate itself still reads APPROVED, but the #3948
+#: patch-id check confirms the base moved under an unchanged branch head
 #: (quadraui#2173: `coord gates` read "every required gate reads clear"
 #: while the approving review's own `review_patch_id` no longer matched the
 #: branch — a cause that reached :data:`CAUSE_UNKNOWN` and dispatched a
-#: blind fix-it work leg instead of a fresh review). The fix here is a
-#: review, never a worker leg — see :mod:`coord.board_doctor_policy`'s
-#: ``restage`` wiring for this cause.
+#: blind fix-it work leg instead of a fresh review); or (2) the gate reads
+#: NOT approved and :func:`coord.merge_queue.find_scoped_review_candidate`
+#: — built on the same :func:`~coord.merge_queue.scan_approved_reviews`
+#: ``has_approved_review`` relies on — finds a genuinely voided PRIOR
+#: approval, with none of the rebase-equivalence escape hatches (#1475
+#: content-identical patch-id, #3707 ancillary-only, #3749 context-only)
+#: applying. The fix either way is a review, never a worker leg — see
+#: :mod:`coord.board_doctor_policy`'s ``restage`` wiring for this cause.
 CAUSE_REVIEW_STALE = "review-stale"
 #: #3929 (#3918 gap 3), the Test-gate twin of :data:`CAUSE_REVIEW_STALE`:
 #: :func:`coord.merge_queue.evaluate_smoke_verdict`'s own ``kind`` reads
@@ -1110,122 +1109,155 @@ class GhLiveProbe:
             branch_test_state, review_stale, test_stale,
         )
 
-    # -- #3929: the merge gate's OWN freshness functions, called DIRECTLY --
+    # -- #3936: review/test staleness decided from a live EntryTruth -------
     def _staleness(
         self, entry: QueueEntry, errors: list[str]
     ) -> tuple[bool | None, bool | None]:
-        """Re-derive review/test staleness straight from
-        :mod:`coord.merge_queue` — never from ``coord gates``'s own cached
-        decision (see :data:`CAUSE_REVIEW_STALE`'s docstring for why that
-        distinction is the whole point of #3929).
+        """Review/test staleness for *entry*, read off a live
+        :class:`~coord.entry_truth.EntryTruth` (:func:`coord.entry_truth.
+        reconcile_entry`) rather than this module re-deriving the freshness
+        math a second time (#3929's original sin, #2096).
 
-        Builds the SAME synthetic, never-persisted
-        :class:`~coord.merge_queue.QueuedMerge` :func:`coord.gates.
-        build_gate_report` builds internally
-        (:func:`coord.merge_queue.live_gate_entry`), off the SAME winning
-        work-like assignment :func:`coord.gates._select_winning_work_
-        assignment` would pick — read-only diagnosis of a row that may
-        still be in flight, exactly like that helper's own docstring
-        describes, which is why this reuses it rather than growing a THIRD
-        copy of the tie-break (#2096).
+        **Test side** is fully answered by :attr:`EntryTruth.test` — the
+        SAME ``coord.merge_queue.evaluate_smoke_verdict`` call
+        :func:`coord.gates.build_gate_report` already makes to build it.
+        Its ``anchor`` is populated ONLY for a STALE (never a MISSING)
+        verdict (see :class:`~coord.gates.GateDecision`'s own field
+        docstring) — exactly the stale-vs-missing split this needs, with no
+        second ``evaluate_smoke_verdict`` call anywhere in this method.
 
-        **Blocking review finding:** :func:`~coord.merge_queue.
-        find_scoped_review_candidate` is NOT a freshness oracle on its own
-        — every other caller
-        (:func:`coord.commands.review.reaffirm`, :func:`coord.review.
-        dispatch_scoped_reviews_for_queue`,
-        :func:`coord.review.maybe_scoped_review_for_completed_fix`) gates it
-        behind :func:`~coord.merge_queue.scan_approved_reviews`/
-        :func:`~coord.merge_queue.has_approved_review` first, because the
-        two can disagree: ``scan_approved_reviews`` returns ``approved=
-        True`` on the FIRST approve review matching the live head, while
-        ``find_scoped_review_candidate`` walks newest-first, skips the
-        SHA/patch-id match, and keeps walking to an OLDER approve whose
-        SHA/patch-id moved. On a branch carrying two approve verdicts at
-        different SHAs (any #1476 scoped re-review, or a conflict-fix/ci-fix
-        leg that was itself approved), asking ``find_scoped_review_
-        candidate`` alone reports stale when the gate itself reads
-        approved-and-current. So this asks the gate's own verdict FIRST:
-        only when ``scan_approved_reviews`` confirms there is no fresh
-        approval does it fall through to ``find_scoped_review_candidate``
-        to tell "genuinely stale" apart from "never approved at all" (see
-        :attr:`LiveState.review_stale`'s docstring for that distinction).
+        **Review side**: once the gate itself reports APPROVED
+        (``truth.review.ok``), :attr:`EntryTruth.review_stale` is the
+        #3948 patch-id-drift check this module used to have no way to see
+        at all — the OLD code read ``scan.approved`` alone as unconditionally
+        fresh, which is quadraui#2173's exact shape: ``coord gates`` read
+        "every required gate reads clear" while the approving review's own
+        ``review_patch_id`` no longer matched the branch. When the gate
+        reports NOT approved (and the branch head was confirmable),
+        :class:`EntryTruth` has nothing further to say — distinguishing
+        "genuinely never reviewed" from "a prior approval voided by a real
+        content change" is additive work it does not yet do (see its own
+        module docstring, rule 2) — so :meth:`_review_stale_fallback` asks
+        :func:`coord.merge_queue.find_scoped_review_candidate` directly,
+        gated behind the gate's own "not approved" reading exactly as
+        #3929's blocking review required (that function disagrees with
+        ``scan_approved_reviews`` on its own, on a branch carrying two
+        approvals at different SHAs — see its own docstring).
 
-        ``(None, None)`` whenever there is nothing to anchor the check to
-        (no work-like assignment, no repo config) or a live call raises —
-        "could not tell", never "confirmed not stale". The review side also
-        reads ``None`` when the live branch head itself could not be
-        confirmed (``ApprovalScan.unknown_head`` — e.g. a `gh` read
-        failure), rather than folding that into "fresh" the way the
-        "never approved at all" case does.
+        ``(None, None)`` whenever there is nothing to anchor the check to —
+        :func:`~coord.entry_truth.reconcile_entry`'s own ``None``/"unknown"
+        fail-closed posture (#2704): a live probe that was never asked, or
+        one that was asked and failed, both read "could not tell", never
+        "confirmed fresh".
+        """
+        from coord import github_ops  # noqa: PLC0415
+        from coord.entry_truth import reconcile_entry  # noqa: PLC0415
+        from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON  # noqa: PLC0415
+
+        try:
+            truth = reconcile_entry(
+                self.board, self.config, entry.repo, entry.issue, gh_ops=github_ops,
+            )
+        except Exception as exc:  # noqa: BLE001 — a probe, never a decision
+            errors.append(f"merge-gate freshness recheck: {type(exc).__name__}: {exc}")
+            return None, None
+
+        review_stale: bool | None
+        if truth.review is None:
+            review_stale = None
+        elif not truth.review.required:
+            review_stale = False
+        elif truth.review.ok:
+            review_stale = truth.review_stale
+        elif (truth.review.reason or "").startswith(UNKNOWN_BRANCH_HEAD_REASON):
+            # Refused purely because the live branch head could not be
+            # confirmed right now — "could not tell", not "confirmed fresh"
+            # and not "confirmed stale" either.
+            review_stale = None
+        else:
+            review_stale = self._review_stale_fallback(entry, truth, errors)
+
+        test_stale: bool | None
+        if truth.test is None:
+            test_stale = None
+        elif not truth.test.required:
+            test_stale = False
+        elif truth.test.ok:
+            test_stale = False
+        elif (truth.test.reason or "").startswith(UNKNOWN_BRANCH_HEAD_REASON):
+            # The live SHA needed to judge staleness could not even be
+            # read — "could not tell", never "confirmed fresh".
+            test_stale = None
+        else:
+            test_stale = truth.test.anchor is not None
+
+        return review_stale, test_stale
+
+    def _review_stale_fallback(
+        self, entry: QueueEntry, truth: Any, errors: list[str],
+    ) -> bool | None:
+        """#3929's remaining gap :class:`~coord.entry_truth.EntryTruth`
+        does not cover: the review gate reads NOT approved (not merely
+        "branch head unconfirmed"), and the open question is whether that
+        is a genuinely voided PRIOR approval (needs a fresh review,
+        :data:`CAUSE_REVIEW_STALE`) or a branch that was simply never
+        reviewed at all (an ordinary pending review).
+
+        :attr:`EntryTruth.review_stale` is scoped to the OPPOSITE case — an
+        approval that still reads ``ok`` (see its own docstring) — so this
+        asking :func:`coord.merge_queue.find_scoped_review_candidate` is
+        additive, never a second implementation of what `EntryTruth`
+        already decides for the approved case.
+
+        ``None`` ("could not tell") when there is nothing to anchor the
+        check to (no work-like assignment, no branch, no repo config) or a
+        live call raises — never "confirmed not stale".
         """
         try:
             from coord import github_ops  # noqa: PLC0415
             from coord import merge_queue as mq  # noqa: PLC0415
-            from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
             from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
             from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
 
-            if self.board is None or self.config is None:
-                return None, None
+            if self.board is None or self.config is None or not truth.branch:
+                return None
             repo_cfg = self.config.repo(entry.repo)
             if repo_cfg is None:
-                return None, None
+                return None
             work_like = [
                 a
                 for a in assignments_for_issue(self.board, entry.repo, entry.issue)
                 if a.type in WORK_LIKE_TYPES
             ]
             if not work_like:
-                return None, None
+                return None
             winner = _select_winning_work_assignment(work_like)
             if not winner.branch:
-                return None, None
-            target_branch = resolve_base_branch_for_issue_number(
-                repo_cfg, repo_cfg.github, entry.issue,
+                return None
+            # The SAME head/patch-id `reconcile_entry` already probed LIVE
+            # a moment ago — carried straight through rather than paying
+            # for (and risking a second, independently-timed disagreement
+            # with) another `gh_ops` round trip for the identical branch.
+            mq_entry = mq.QueuedMerge(
+                assignment_id=winner.assignment_id or "",
+                repo_name=winner.repo_name,
+                repo_github=repo_cfg.github,
+                branch=winner.branch,
+                target_branch=truth.target_branch or repo_cfg.default_branch,
+                issue_number=getattr(winner, "issue_number", 0) or 0,
+                issue_title=getattr(winner, "issue_title", None) or "",
+                assignment_type=getattr(winner, "type", None) or "work",
+                required_gates=list(getattr(winner, "required_gates", None) or []),
+                branch_head_sha=truth.head_sha,
+                branch_patch_id=truth.patch_id,
             )
-            mq_entry = mq.live_gate_entry(
-                winner, repo_cfg.github, target_branch, github_ops,
+            candidate = mq.find_scoped_review_candidate(
+                mq_entry, self.board, github_ops, config=self.config,
             )
-
-            review_stale: bool | None = None
-            if mq.requires_review(mq_entry, self.config):
-                scan = mq.scan_approved_reviews(
-                    mq_entry, self.board, github_ops, config=self.config,
-                )
-                if scan.approved:
-                    # The gate's own verdict is approved-and-current — never
-                    # relabel that `review-stale` off a second surface that
-                    # can (and does) disagree with it.
-                    review_stale = False
-                elif scan.unknown_head:
-                    # Refused purely because the live branch head could not
-                    # be confirmed right now — "could not tell", not
-                    # "confirmed fresh" and not "confirmed stale" either.
-                    review_stale = None
-                else:
-                    candidate = mq.find_scoped_review_candidate(
-                        mq_entry, self.board, github_ops, config=self.config,
-                    )
-                    review_stale = candidate is not None
-            else:
-                review_stale = False
-
-            test_stale: bool | None = None
-            if mq.requires_smoke(mq_entry, self.config):
-                smoke = mq.evaluate_smoke_verdict(mq_entry, self.board, github_ops)
-                if smoke.kind == mq.SMOKE_UNKNOWN:
-                    # The live SHA needed to judge staleness could not even
-                    # be read — "could not tell", never "confirmed fresh".
-                    test_stale = None
-                else:
-                    test_stale = smoke.kind == mq.SMOKE_STALE
-            else:
-                test_stale = False
+            return candidate is not None
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"merge-gate freshness recheck: {type(exc).__name__}: {exc}")
-            return None, None
-        return review_stale, test_stale
+            return None
 
     # -- `gh pr view` / `gh pr checks` ------------------------------------
     def _github(
