@@ -65,9 +65,16 @@ from coord.drive_queue import (
     plan_tick,
     remaining_fix_rounds,
     render_plan,
+    summarize_drive_queue,
     total_fix_round_budget,
     unreachable_wait_alert,
     validate_enqueue,
+)
+from coord.entry_truth import (
+    NEXT_ACTION_ESCALATE,
+    NEXT_ACTION_MARK_DONE,
+    NEXT_ACTION_UNKNOWN,
+    EntryTruth,
 )
 from coord.models import (
     EPIC_DECOMPOSE_TYPE,
@@ -6601,6 +6608,163 @@ def test_a_permanently_blocked_entry_is_not_resumed_even_once_its_after_lands():
     plan = plan_tick(entries, board(merged=(1650,)), capacity=1)
     assert plan.reconciles == ()
     assert plan.launch is None
+
+
+# ── #3934: a pre-req's live EntryTruth decides the after= edge, never its ──
+# own queue-row `state` — a stored conclusion that stays put even after a
+# DIFFERENT actor changes the pre-req's reality without rewriting that row.
+# Replays vimcode#2140: pre-req quadraui#2256 sat `blocked`, so
+# `_resolve_prereqs` called the dependent's edge "will never satisfy" — but
+# the feature it named had already shipped upstream, and #2140 itself merged
+# outside the queue while quadraui#2256's row still showed `blocked`.
+
+
+def test_vimcode_2140_blocked_prereq_with_live_truth_mark_done_releases_the_dependent():
+    """A pre-req sitting `blocked` in the queue (matching #2140's incident
+    shape) must release its dependent the instant a live `EntryTruth` for
+    that pre-req reads `mark_done` — whatever the pre-req's OWN row still
+    claims. Mirrors `test_a_dependent_is_released_when_its_prereq_is_
+    blocked_but_live_landed` (#2850's `live_prereq_terminal`), but for the
+    richer EntryTruth read #3934 wires in instead."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        entry(2140, position=0, after=(dep_key,)),
+        entry(2256, position=1, state=STATE_BLOCKED, attempts=2),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO,
+                issue_number=2256,
+                next_action=NEXT_ACTION_MARK_DONE,
+                next_action_reason="PR merged; issue should close",
+            ),
+        },
+    )
+    assert plan.launch is not None
+    assert plan.launch.issue == 2140
+
+
+def test_a_blocked_dependent_resumes_once_its_prereqs_live_truth_says_mark_done():
+    """The #2362 self-heal (`_reconcile_blocked_after`) must ALSO consult a
+    live `EntryTruth`, not just `_resolve_prereqs`'s own launch-walk call —
+    a dependent already `blocked` on the frozen "it will never satisfy"
+    verdict resumes the moment a fresh live truth for the named pre-req
+    reads `mark_done`."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        entry(2256, position=0, state=STATE_BLOCKED, last_reason="blocked: red CI"),
+        entry(
+            2140,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO, issue_number=2256, next_action=NEXT_ACTION_MARK_DONE,
+            ),
+        },
+    )
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 2140))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert "it will never satisfy" not in reconcile.reason
+
+
+def test_prereq_truth_escalate_blocks_the_dependent_even_though_its_queue_row_reads_waiting():
+    """A pre-req's own queue row can read `waiting` (merely "still queued",
+    an ordinary deferral by `dep_state` alone) while its LIVE truth already
+    knows better — a probe confirmed it is genuinely stuck needing an
+    operator. Once a truth is supplied, it is the ONLY thing that decides
+    the edge; the dep's row `state` is display-only (#3934's rule), so this
+    reads unsatisfiable even though `dep_state` alone would merely defer."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        # The dependent sits at position 0 so the main launch walk reaches
+        # IT first, before the pre-req (position 1, itself launchable) can
+        # steal this tick's one launch slot — see `test_a_dependent_is_
+        # released_when_its_queued_but_not_done_prereq_has_live_landed`'s
+        # own comment for why position order matters here.
+        entry(2140, position=0, after=(dep_key,)),
+        entry(2256, position=1, state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO,
+                issue_number=2256,
+                next_action=NEXT_ACTION_ESCALATE,
+                next_action_reason="branch head could not be read live",
+            ),
+        },
+    )
+    assert plan.launch is None or plan.launch.issue != 2140
+    blocked = next(b for b in plan.blocked if b.key == entry_key(REPO, 2140))
+    assert "it will never satisfy without operator action" in blocked.reason
+    assert "branch head could not be read live" in blocked.reason
+
+
+def test_prereq_truth_unknown_falls_back_to_the_pre_3934_dep_state_reasoning():
+    """`NEXT_ACTION_UNKNOWN` means no live access was even gathered for the
+    dep this tick — the same "nothing to go on" as the dep being absent from
+    `prereq_truth` at all. The #3368 unconfirmed-probe-failure carve-out
+    (which `EntryTruth` has no equivalent vocabulary for) must still apply
+    unchanged in that case."""
+    dep_key = entry_key(REPO, 1059)
+    dep_reason = (
+        f"{dep_key}'s merge gate could not be read this tick (no PR number "
+        "yet) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    entries = [
+        entry(1059, position=0, state=STATE_BLOCKED, last_reason=dep_reason),
+        entry(1060, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO, issue_number=1059, next_action=NEXT_ACTION_UNKNOWN,
+            ),
+        },
+    )
+    assert plan.blocked == ()
+    deferral = next(d for d in plan.deferrals if d.key == entry_key(REPO, 1060))
+    assert "it will never satisfy" not in deferral.reason
+    assert "retrying" in deferral.reason
+
+
+def test_summarize_drive_queue_eligible_count_follows_live_truth_not_dep_state():
+    """`summarize_drive_queue`'s `eligible` count (via `_after_satisfied`)
+    must agree with a live tick's own verdict: a `waiting` dependent whose
+    pre-req row still reads `blocked` is NOT eligible by `dep_state` alone,
+    but IS once a live truth for that pre-req reads `mark_done`."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        entry(2256, position=0, state=STATE_BLOCKED),
+        entry(2140, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    without_truth = summarize_drive_queue(entries)
+    assert without_truth.eligible == 0
+    with_truth = summarize_drive_queue(
+        entries,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO, issue_number=2256, next_action=NEXT_ACTION_MARK_DONE,
+            ),
+        },
+    )
+    assert with_truth.eligible == 1
 
 
 # ── #2602 recovery half: a live re-check resumes the "unknown pre-req" ────

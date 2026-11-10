@@ -89,9 +89,14 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
+from coord.entry_truth import (
+    NEXT_ACTION_ESCALATE,
+    NEXT_ACTION_MARK_DONE,
+    NEXT_ACTION_UNKNOWN,
+)
 from coord.gate_a import is_gate_a_refusal_reason
 from coord.github_ops import is_throttle_skip_reason, parse_throttle_skip_until
 from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
@@ -119,6 +124,9 @@ from coord.models import (
     parse_issue_resolution,
 )
 from coord.worker_events import classify_zero_commit_outcome
+
+if TYPE_CHECKING:  # avoid a hard import cycle at module load (#3934)
+    from coord.entry_truth import EntryTruth
 
 # ── dispatch type selection (#3132) ─────────────────────────────────────────
 #
@@ -1994,18 +2002,40 @@ def _entry_stops_fleet(entry: QueueEntry) -> bool:
     return _entry_is_holding(entry) and entry.hold_scope == HOLD_SCOPE_FLEET
 
 
-def _after_satisfied(entry: QueueEntry, all_entries: Sequence[QueueEntry]) -> bool:
+def _after_satisfied(
+    entry: QueueEntry,
+    all_entries: Sequence[QueueEntry],
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+) -> bool:
     """Is *entry*'s `after=` list satisfied by the queue it sits in?
 
     Same conservative, local read as the Rust original: a pre-req not
     present in *all_entries* at all is treated as satisfied (it may have
     landed long ago); a pre-req whose OWN gate has fired is unsatisfied even
     though its row has by then reconciled to `done`.
+
+    *prereq_truth* (#3934) maps a pre-req key to its LIVE, just-reconciled
+    :class:`~coord.entry_truth.EntryTruth`, when the caller has one. Once
+    present for a key, it decides that edge outright — the pre-req's own
+    queue-row `state` (a latched conclusion that can go stale the moment a
+    different actor changes the pre-req's reality without rewriting that
+    row, e.g. vimcode#2140: pre-req quadraui#2256 sat `blocked` while the
+    feature it named had already shipped upstream) is never consulted for
+    a key a live truth already answers — `other.state` only decides a key
+    `prereq_truth` has nothing decisive to say about (absent entirely, or
+    :data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN` — no live access was
+    even gathered this tick for that key, same as it being absent).
     """
     for key in entry.after:
+        if any(other.key == key and _entry_is_holding(other) for other in all_entries):
+            return False
+        truth = (prereq_truth or {}).get(key)
+        if truth is not None and truth.next_action != NEXT_ACTION_UNKNOWN:
+            if truth.next_action != NEXT_ACTION_MARK_DONE:
+                return False
+            continue
         unsatisfied = any(
-            other.key == key
-            and (other.state not in STATE_DONE_LIKE or _entry_is_holding(other))
+            other.key == key and other.state not in STATE_DONE_LIKE
             for other in all_entries
         )
         if unsatisfied:
@@ -2042,8 +2072,15 @@ class DriveQueueSummary:
     fleet_held: int = 0
 
 
-def summarize_drive_queue(entries: Sequence[QueueEntry]) -> DriveQueueSummary:
-    """Summarise *entries* — pure, no clock, no DB. See :class:`DriveQueueSummary`."""
+def summarize_drive_queue(
+    entries: Sequence[QueueEntry],
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+) -> DriveQueueSummary:
+    """Summarise *entries* — pure, no clock, no DB. See :class:`DriveQueueSummary`.
+
+    *prereq_truth* (#3934) is passed straight through to :func:`_after_satisfied`
+    — see its own docstring.
+    """
     pending = sum(1 for e in entries if _entry_is_pending(e))
     held = sum(1 for e in entries if _entry_is_holding(e))
     fleet_held = sum(1 for e in entries if _entry_stops_fleet(e))
@@ -2057,7 +2094,7 @@ def summarize_drive_queue(entries: Sequence[QueueEntry]) -> DriveQueueSummary:
             blocked += 1
         elif e.state == STATE_WAITING:
             waiting += 1
-            if _after_satisfied(e, entries):
+            if _after_satisfied(e, entries, prereq_truth):
                 eligible += 1
         # An unrecognised state from a newer daemon: counted in `pending`
         # above (it is not `done`) but never as waiting/eligible/running/
@@ -3594,6 +3631,59 @@ class _Verdict:
     reason: str = ""
 
 
+def _prereq_truth_verdict(dep: str, truth: "EntryTruth") -> "_Verdict | None":
+    """The after= verdict *dep*'s live :class:`~coord.entry_truth.EntryTruth`
+    decides outright (#3934) — never *dep*'s own queue-row ``state``, a
+    latched conclusion that can go stale the moment a different actor
+    changes *dep*'s reality without rewriting that row. The incident this
+    replaces: vimcode#2140's pre-req quadraui#2256 sat `blocked`, so
+    `_resolve_prereqs` called the edge "will never satisfy" — but the
+    feature it named had already shipped upstream, and #2140 itself merged
+    outside the queue while quadraui#2256's row still showed `blocked`.
+
+    Returns ``None`` when *truth* has nothing decisive to say —
+    :data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN` (no live access was even
+    gathered for *dep* this tick) — so the caller falls through to the
+    board/queue-row reasoning exactly as if *dep* had no truth supplied at
+    all, the same fail-closed posture every other live read in this module
+    takes (#2704).
+
+    Otherwise:
+
+    * :data:`~coord.entry_truth.NEXT_ACTION_MARK_DONE` (merged, or
+      premise-refused on the #3931 "already implemented" finding — the
+      live equivalent of this module's own ``facts.landed``/
+      ``facts.already_done`` checks) satisfies the edge.
+    * :data:`~coord.entry_truth.NEXT_ACTION_ESCALATE` (a live probe failed,
+      or *dep*'s own pipeline is stuck needing an operator) is this
+      vocabulary's analogue of "it will never satisfy without operator
+      action" — the same disposition ``_resolve_prereqs``'s pre-#3934
+      `blocked`/`failed`-row branch already gave an unsatisfiable dep.
+    * anything else (`wait`, `dispatch_review`, `dispatch_test`,
+      `dispatch_ci_fix`, `conflict_fix`, `merge`) means *dep* is
+      demonstrably still in flight — an ordinary, plausibly-temporary
+      deferral, never a permanent block.
+    """
+    if truth.next_action == NEXT_ACTION_UNKNOWN:
+        return None
+    if truth.next_action == NEXT_ACTION_MARK_DONE:
+        return _Verdict(True)
+    if truth.next_action == NEXT_ACTION_ESCALATE:
+        return _Verdict(
+            False,
+            True,
+            f"pre-req {dep}'s live status is escalate "
+            f"({truth.next_action_reason}) — it will never satisfy without "
+            "operator action",
+        )
+    return _Verdict(
+        False,
+        False,
+        f"waiting on {dep} (live status: {truth.next_action} — "
+        f"{truth.next_action_reason})",
+    )
+
+
 def _resolve_prereqs(
     entry: QueueEntry,
     board: BoardView,
@@ -3602,6 +3692,7 @@ def _resolve_prereqs(
     held_gates: Mapping[str, Hold] | None = None,
     live_prereq_terminal: Mapping[str, bool] | None = None,
     dep_reasons: Mapping[str, str] | None = None,
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
 ) -> _Verdict:
     """Decide whether *entry* may launch now.
 
@@ -3663,6 +3754,21 @@ def _resolve_prereqs(
     tick — exactly like waiting on any other still-in-flight dep. A dep
     ABSENT here, or `blocked`/`failed` for any OTHER reason, keeps the
     pre-#3368 "it will never satisfy" verdict unchanged.
+
+    *prereq_truth* (#3934) maps a dep key to its LIVE, just-reconciled
+    :class:`~coord.entry_truth.EntryTruth`, when the caller has one — see
+    :func:`_prereq_truth_verdict` for exactly what it decides and the
+    vimcode#2140 incident it replays. Checked AFTER *held_gates* (a fired
+    deploy gate always wins, live truth or not — see that check's own
+    comment) but BEFORE `facts`/`dep_state`: once present for a key, it is
+    the ONLY thing that decides this edge — the dep's own `facts.landed`/
+    `dep_state`/`live_prereq_terminal`/`dep_reasons` reading below is never
+    reached for that key. A key ABSENT from *prereq_truth* (no caller-side
+    live truth for that dep this tick), or present with
+    :data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN`, falls straight through
+    to that unchanged pre-#3934 reasoning — the production default today,
+    since nothing yet wires a live `reconcile_entry` call into the shell
+    that builds this mapping.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -3671,6 +3777,13 @@ def _resolve_prereqs(
         hold = (held_gates or {}).get(dep)
         if hold is not None:
             return _Verdict(False, False, _gate_defer_reason(dep, hold))
+        dep_truth = (prereq_truth or {}).get(dep)
+        if dep_truth is not None:
+            truth_verdict = _prereq_truth_verdict(dep, dep_truth)
+            if truth_verdict is not None:
+                if truth_verdict.satisfied:
+                    continue
+                return truth_verdict
         facts = board.facts(dep)
         if facts.landed or (facts.already_done and not facts.reopened):
             # #3931: `already_done` — *dep* parked `refused_premise` on the
@@ -3817,6 +3930,7 @@ def diagnose_blocked_after(
     cycle_keys: Mapping[str, str],
     live_prereq_terminal: Mapping[str, bool] | None = None,
     dep_reasons: Mapping[str, str] | None = None,
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
 ) -> BlockedAfterDiagnosis:
     """Re-check a `blocked`/`failed` row's `after=` graph against the CURRENT
     board, fresh on every render (#2183).
@@ -3871,13 +3985,29 @@ def diagnose_blocked_after(
     probe failure rather than a confirmed-still-shut gate, and what lets
     `coord drive-queue list`/`status` (#2183's rendering) compute the exact
     same verdict a live tick would.
+
+    *prereq_truth* (#3934) is passed straight through to
+    :func:`_resolve_prereqs` — see its own docstring. A dep whose live truth
+    reads :data:`~coord.entry_truth.NEXT_ACTION_MARK_DONE` also drops out of
+    ``unsatisfied`` below, the same way *live_prereq_terminal* already does
+    for its own narrower "closed or merged" reading — this render must never
+    show a dep as still-pending once a live truth says otherwise, the exact
+    #2096 "one question, one answer" this issue exists to enforce against
+    the dep's own possibly-stale queue-row ``state``.
     """
     live_terminal = live_prereq_terminal or {}
+    truth_map = prereq_truth or {}
+
+    def _dep_truth_done(dep: str) -> bool:
+        truth = truth_map.get(dep)
+        return truth is not None and truth.next_action == NEXT_ACTION_MARK_DONE
+
     unsatisfied = tuple(
         dep for dep in entry.after
         if not board.facts(dep).landed
         and not (board.facts(dep).already_done and not board.facts(dep).reopened)
         and not live_terminal.get(dep)
+        and not _dep_truth_done(dep)
         and states.get(dep) not in STATE_DONE_LIKE
     )
     if not entry.after:
@@ -3886,6 +4016,7 @@ def diagnose_blocked_after(
         entry, board, states, cycle_keys, held_gates={},
         live_prereq_terminal=live_prereq_terminal,
         dep_reasons=dep_reasons,
+        prereq_truth=prereq_truth,
     )
     return BlockedAfterDiagnosis(
         unsatisfied,
@@ -4244,6 +4375,7 @@ def _reconcile_blocked_after(
     cycle_keys: Mapping[str, str],
     live_prereq_terminal: Mapping[str, bool] | None = None,
     dep_reasons: Mapping[str, str] | None = None,
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
 ) -> Reconcile | None:
     """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
     `after=` pre-req, once every named pre-req has since landed. #2756:
@@ -4308,6 +4440,12 @@ def _reconcile_blocked_after(
     that never CACHE-resolves needs an operator `remove` + `add`, same as
     always.
 
+    *prereq_truth* (#3934) is threaded straight through to
+    :func:`diagnose_blocked_after` / :func:`_resolve_prereqs` the same way —
+    a dep's live `mark_done` truth resumes this row exactly like
+    *live_prereq_terminal* already does, without waiting on the dep's own
+    queue row to repaint itself.
+
     On resume: `state` flips to `waiting`, `attempts` resets to 0 (a fresh
     start, exactly like #2230's gate-cleared resume — nothing about being
     blocked on a now-landed pre-req should cost this entry its launch
@@ -4324,7 +4462,8 @@ def _reconcile_blocked_after(
     if not _is_unsatisfiable_prereq_reason(entry.last_reason):
         return None
     diagnosis = diagnose_blocked_after(
-        entry, board, states, cycle_keys, live_prereq_terminal, dep_reasons
+        entry, board, states, cycle_keys, live_prereq_terminal, dep_reasons,
+        prereq_truth,
     )
     if diagnosis.unsatisfiable:
         return None
@@ -7453,6 +7592,7 @@ def plan_tick(
     live_running_merge_gate_reason: Mapping[str, str] | None = None,
     live_test_routing_clear: Mapping[str, bool] | None = None,
     live_test_routing_reason: Mapping[str, str] | None = None,
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -7786,6 +7926,14 @@ def plan_tick(
     2026-08-22). A dep ABSENT here (the shell's bounded live check never ran
     for it, or ran and came back inconclusive) leaves both call sites to
     their pre-#2602 behaviour — never a false "satisfied".
+
+    *prereq_truth* (#3934) maps a dep key to its LIVE, just-reconciled
+    :class:`~coord.entry_truth.EntryTruth` — passed straight through to the
+    same two call sites *live_prereq_terminal* is, where it is what
+    actually decides (:func:`_prereq_truth_verdict`) rather than the dep's
+    own queue-row ``state``. A key ABSENT here (no caller-side wiring has
+    computed a live truth for that dep this tick — true of every production
+    caller today) leaves both call sites to their pre-#3934 behaviour.
 
     *fix_round_config_default* (#2972) is ``pipeline.max_fix_rounds`` — the
     SAME value the shell also hands ``_launch_argv`` to compute the actual
@@ -8141,6 +8289,7 @@ def plan_tick(
                 cycle_keys,
                 live_prereq_terminal,
                 effective_last_reason,
+                prereq_truth,
             )
             if blocked_reconcile is None:
                 # #3695: re-check a Test-stage routing dead end (no
@@ -8776,6 +8925,7 @@ def plan_tick(
                 held_gates,
                 live_prereq_terminal,
                 effective_last_reason,
+                prereq_truth,
             )
             updates = _refresh_only(verdict.reason, entry.last_reason)
             if not updates:
@@ -8998,6 +9148,7 @@ def plan_tick(
                 held_gates,
                 live_prereq_terminal,
                 effective_last_reason,
+                prereq_truth,
             )
             if not verdict.satisfied:
                 deferrals.append(
@@ -9117,6 +9268,7 @@ def plan_tick(
             held_gates,
             live_prereq_terminal,
             effective_last_reason,
+            prereq_truth,
         )
         if verdict.unsatisfiable:
             blocked.append(
