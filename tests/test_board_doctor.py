@@ -38,6 +38,7 @@ from coord.board_doctor import (
     _reclassify_merge_never_attempted,
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
+    dispatch_plan_leg,
     drive_queue_rows,
     merged_partial_rows,
     no_progress_rows,
@@ -4904,3 +4905,103 @@ class TestDriveQueueSweepCliFollowthroughOutput:
 
         assert result.exit_code == 0, result.output
         assert "filed: #300, #301" in result.output
+
+
+class TestDispatchPlanLeg:
+    """:func:`dispatch_plan_leg` — the real `plan_leg` seam: dispatches a
+    headless `type="plan"` leg through the agent, polls `/status` until
+    terminal, and reads the raw transcript back."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="box", host="box.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/src/quadraui"},
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _partial() -> ft.PartialMerge:
+        return ft.PartialMerge(
+            repo_name="quadraui", issue_number=2180, title="T", body="B",
+        )
+
+    def test_happy_path_polls_until_done_and_returns_the_transcript(self, monkeypatch) -> None:
+        from coord.network import StatusResult
+
+        # The first call is `select_fix_machine`'s own pre-dispatch
+        # reachability probe (discarded — it predates the assignment even
+        # existing); the real poll loop starts from the second.
+        statuses = iter(["running", "running", "done"])
+        sleeps: list[float] = []
+
+        def fake_dispatch(proposal, config):
+            assert proposal.type == "plan"
+            assert proposal.system_prompt == "PROMPT"
+            assert proposal.repo_name == "quadraui"
+            return {"id": "assign-1"}
+
+        def fake_status_fetcher(machine):
+            return StatusResult(
+                data={"active": [{"id": "assign-1", "status": next(statuses)}], "completed": []},
+            )
+
+        monkeypatch.setattr("coord.dispatch.dispatch", fake_dispatch)
+
+        result = dispatch_plan_leg(
+            "PROMPT",
+            partial=self._partial(),
+            config=self._config(),
+            status_fetcher=fake_status_fetcher,
+            text_fetcher=lambda host, aid: "the plan text",
+            sleep=sleeps.append,
+            now=iter([0.0, 1.0, 2.0, 3.0]).__next__,
+        )
+
+        assert result.assignment_id == "assign-1"
+        assert result.output == "the plan text"
+        assert len(sleeps) == 1  # one non-terminal poll before "done"
+
+    def test_no_reachable_machine_raises(self, monkeypatch) -> None:
+        from coord.network import StatusResult
+
+        monkeypatch.setattr(
+            "coord.dispatch.dispatch",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+        )
+
+        with pytest.raises(RuntimeError, match="no machine reachable"):
+            dispatch_plan_leg(
+                "PROMPT",
+                partial=self._partial(),
+                config=Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[]),
+                status_fetcher=lambda m: StatusResult(error="unreachable"),
+            )
+
+    def test_timeout_raises_with_the_last_observed_status(self, monkeypatch) -> None:
+        from coord.network import StatusResult
+
+        monkeypatch.setattr(
+            "coord.dispatch.dispatch", lambda proposal, config: {"id": "assign-1"},
+        )
+        clock = iter([0.0, 5.0, 25.0])
+
+        def fake_status_fetcher(machine):
+            return StatusResult(
+                data={"active": [{"id": "assign-1", "status": "running"}], "completed": []},
+            )
+
+        with pytest.raises(RuntimeError, match="did not reach a terminal state"):
+            dispatch_plan_leg(
+                "PROMPT",
+                partial=self._partial(),
+                config=self._config(),
+                status_fetcher=fake_status_fetcher,
+                sleep=lambda s: None,
+                now=clock.__next__,
+                timeout_seconds=20.0,
+            )
