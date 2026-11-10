@@ -2960,6 +2960,79 @@ class TestNoProgressRows:
 
         assert {row.key for row in rows} == {entry.key}
 
+    def test_waiting_follows_a_live_prereq_truth_over_a_stale_blocked_dep_row(
+        self,
+    ) -> None:
+        """#3936, vimcode#2140's shape replayed for the no-progress sweep:
+        the dep's own drive-queue row still reads `blocked` (a latched
+        conclusion — the OLD check here, `dep_states.get(dep) in
+        STATE_DONE_LIKE`, would read this dep as unsatisfied forever) and
+        the board's own issue cache has not caught up either (`facts.landed`
+        is also `False`) — but a LIVE `EntryTruth` supplied for this dep via
+        `prereq_truth` says `next_action=mark_done` (the dep's feature
+        shipped upstream even though its row never got rewritten). The
+        actor must follow the live truth, not either persisted/stale
+        reading, and classify the row `waiting-ready-not-launched`."""
+        from coord.entry_truth import EntryTruth, NEXT_ACTION_MARK_DONE
+
+        dep = QueueEntry(repo="acme/widgets", issue=2000, state="blocked")
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2047,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({"acme/widgets#2047": LiveState()})
+        dep_truth = EntryTruth(
+            repo_name="acme/widgets",
+            issue_number=2000,
+            next_action=NEXT_ACTION_MARK_DONE,
+            next_action_reason="PR merged; issue should close",
+        )
+
+        rows = no_progress_rows(
+            [dep, entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+            prereq_truth={"acme/widgets#2000": dep_truth},
+        )
+
+        [row] = [r for r in rows if r.key == entry.key]
+        assert "waiting-ready-not-launched" in row.evidence[-1]
+
+    def test_waiting_still_reads_a_stale_blocked_dep_as_unsatisfied_with_no_truth_supplied(
+        self,
+    ) -> None:
+        """Same stale-`blocked` dep row as above, but with no `prereq_truth`
+        supplied at all (today's default) — the pre-#3936 board/queue-state
+        reasoning must still apply unchanged, so the row is NOT classified."""
+        dep = QueueEntry(repo="acme/widgets", issue=2000, state="blocked")
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2047,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({"acme/widgets#2047": LiveState()})
+
+        rows = no_progress_rows(
+            [dep, entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+        )
+
+        assert entry.key not in {r.key for r in rows}
+
     def test_all_three_2026_11_05_shapes_reach_one_sweep_output(self) -> None:
         # Three different repos — each shape's own fixture is independently
         # the ONLY row that could occupy its own repo's capacity, so a
