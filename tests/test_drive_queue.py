@@ -6682,10 +6682,12 @@ def test_a_blocked_dependent_resumes_once_its_prereqs_live_truth_says_mark_done(
 def test_prereq_truth_escalate_blocks_the_dependent_even_though_its_queue_row_reads_waiting():
     """A pre-req's own queue row can read `waiting` (merely "still queued",
     an ordinary deferral by `dep_state` alone) while its LIVE truth already
-    knows better — a probe confirmed it is genuinely stuck needing an
-    operator. Once a truth is supplied, it is the ONLY thing that decides
-    the edge; the dep's row `state` is display-only (#3934's rule), so this
-    reads unsatisfiable even though `dep_state` alone would merely defer."""
+    knows better — a CONFIRMED fact (here: the pre-req's PR closed without
+    merging, `escalate_probe_failure=False`) says it is genuinely stuck
+    needing an operator. Once a truth is supplied, it is the ONLY thing
+    that decides the edge; the dep's row `state` is display-only (#3934's
+    rule), so this reads unsatisfiable even though `dep_state` alone would
+    merely defer."""
     dep_key = entry_key(REPO, 2256)
     entries = [
         # The dependent sits at position 0 so the main launch walk reaches
@@ -6703,14 +6705,48 @@ def test_prereq_truth_escalate_blocks_the_dependent_even_though_its_queue_row_re
                 repo_name=REPO,
                 issue_number=2256,
                 next_action=NEXT_ACTION_ESCALATE,
-                next_action_reason="branch head could not be read live",
+                next_action_reason="PR closed without merging",
+                escalate_probe_failure=False,
             ),
         },
     )
-    assert plan.launch is None or plan.launch.issue != 2140
+    # `plan.launch`, if any, is pre-req 2256 itself (launchable on its own
+    # merits) — never dependent 2140, which the `blocked` assertions below
+    # already carry the test for.
+    assert plan.launch is None or plan.launch.issue == 2256
     blocked = next(b for b in plan.blocked if b.key == entry_key(REPO, 2140))
     assert "it will never satisfy without operator action" in blocked.reason
-    assert "branch head could not be read live" in blocked.reason
+    assert "PR closed without merging" in blocked.reason
+
+
+def test_prereq_truth_escalate_probe_failure_is_an_ordinary_deferral_not_a_block():
+    """An ESCALATE caused by a FAILED live probe (`escalate_probe_failure`)
+    — the branch head or PR state could not be confirmed — is inconclusive,
+    never a confirmed block: unlike a confirmed escalate (the test above),
+    this must fall through to the dep's own `dep_state` reasoning exactly
+    like `NEXT_ACTION_UNKNOWN` does, so the dependent merely defers and
+    retries next tick instead of latching `blocked` on a transient `gh`
+    read failure."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        entry(2140, position=0, after=(dep_key,)),
+        entry(2256, position=1, state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO,
+                issue_number=2256,
+                next_action=NEXT_ACTION_ESCALATE,
+                next_action_reason="branch head could not be read live",
+                escalate_probe_failure=True,
+            ),
+        },
+    )
+    assert plan.blocked == ()
+    deferral = next(d for d in plan.deferrals if d.key == entry_key(REPO, 2140))
+    assert "it will never satisfy" not in deferral.reason
 
 
 def test_prereq_truth_unknown_falls_back_to_the_pre_3934_dep_state_reasoning():
@@ -6793,6 +6829,56 @@ def test_prereq_truth_never_shadows_the_already_done_board_signal():
                     "latest worker leg exited 'refused_premise' — needs "
                     "operator recovery, not another dispatch"
                 ),
+            ),
+        },
+    )
+    assert plan.launch is not None and plan.launch.issue == 2140
+
+
+def test_after_satisfied_fired_gate_outranks_a_mark_done_truth():
+    """`_after_satisfied`'s `_entry_is_holding` check is consulted BEFORE
+    *prereq_truth* — a pre-req's own `--hold-after` gate having FIRED is a
+    later, stronger fact than a live `mark_done` truth read before that
+    gate fired, and must still hold the dependent regardless of what the
+    truth says."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        held(2256),
+        entry(2140, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    summary = summarize_drive_queue(
+        entries,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO, issue_number=2256, next_action=NEXT_ACTION_MARK_DONE,
+            ),
+        },
+    )
+    assert summary.eligible == 0
+
+
+def test_prereq_truth_never_shadows_a_dep_state_already_done_row():
+    """A pre-req the QUEUE ITSELF confirmed `done` this tick (`dep_state in
+    STATE_DONE_LIKE`) is at least as trustworthy a positive signal as
+    `facts.landed`/`already_done` (see the test above) — it must not be
+    shadowed by a live truth whose own probe happens to fail against that
+    same pre-req. Without this ordering a confirmed merge would
+    permanently block its dependent on nothing more than a flaky `gh`
+    read."""
+    dep_key = entry_key(REPO, 2256)
+    entries = [
+        entry(2256, position=0, state=STATE_DONE),
+        entry(2140, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=2,
+        prereq_truth={
+            dep_key: EntryTruth(
+                repo_name=REPO,
+                issue_number=2256,
+                next_action=NEXT_ACTION_ESCALATE,
+                next_action_reason="PR closed without merging",
+                escalate_probe_failure=False,
             ),
         },
     )
