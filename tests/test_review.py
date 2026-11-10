@@ -4597,6 +4597,81 @@ def test_scoped_briefing_request_changes_without_findings_says_so_plainly() -> N
     assert "(prior findings text unavailable)" in briefing
 
 
+def test_scoped_briefing_fix_round_carries_forward_prior_partial() -> None:
+    """#3966: a fix round's only blocking finding was a code bug, but the
+    prior review ALSO recorded a separate `ISSUE_RESOLUTION: partial` that
+    lives outside `## Blocking findings` — "check each blocking finding"
+    alone never re-checks it, so the re-review briefing must surface it
+    explicitly and tell the reviewer to re-check it against the delta."""
+    from coord.models import IssueResolution
+
+    briefing = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+        prior_verdict="request-changes",
+        prior_findings_body=(
+            "## Blocking findings\n- the render-frame slot was non-nullable\n"
+            "## Non-blocking concerns\nNone.\n## Nits\nNone.\n"
+        ),
+        prior_issue_resolution=IssueResolution(
+            "partial", "28 of 29 additive primitives still Any/unknown"
+        ),
+    )
+    assert "ISSUE_RESOLUTION: partial" in briefing
+    assert "28 of 29 additive primitives still Any/unknown" in briefing
+    assert "still outstanding" in briefing
+    assert "re-check it against the delta" in briefing
+    # The reviewer must be told to state their OWN line either way.
+    assert "ALWAYS include your own `ISSUE_RESOLUTION:` line" in briefing
+    assert "carrying the PRIOR review's own" in briefing
+
+
+def test_scoped_briefing_resolved_prior_adds_nothing_new() -> None:
+    """Control: when the prior review's resolution was `resolved` (today's
+    default), the briefing gets no extra "still outstanding" section —
+    only the generic always-present ISSUE_RESOLUTION instructions."""
+    from coord.models import IssueResolution
+
+    briefing_without = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+        prior_verdict="request-changes",
+        prior_findings_body="## Blocking findings\n- a bug\n",
+        prior_issue_resolution=None,
+    )
+    briefing_with_resolved = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+        prior_verdict="request-changes",
+        prior_findings_body="## Blocking findings\n- a bug\n",
+        prior_issue_resolution=IssueResolution("resolved", ""),
+    )
+    for briefing in (briefing_without, briefing_with_resolved):
+        assert "still outstanding" not in briefing
+        assert "Prior ISSUE_RESOLUTION judgment" not in briefing
+
+
 def _scoped_entry(**overrides) -> QueuedMerge:
     defaults = dict(
         assignment_id="w1",
@@ -4713,6 +4788,49 @@ def test_dispatch_scoped_review_request_changes_prior_embeds_findings(
     assert "was **not** an approval" in payload["briefing"]
     assert "fix the off-by-one" in payload["briefing"]
     assert "**already approved**" not in payload["briefing"]
+
+
+def test_dispatch_scoped_review_carries_forward_prior_partial(
+    two_machine_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3966: the prior round's `ISSUE_RESOLUTION:` judgment lives in the
+    recovered findings BODY, not a separate structured field — this must be
+    re-parsed from that body and threaded into the dispatched briefing, even
+    when `_load_review_findings` hit the DB-cache fast path (which never
+    parses `issue_resolution` onto the `ReviewFindings` it returns)."""
+    import coord.auto_loop as auto_loop_mod
+
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review(review_verdict="request-changes")
+    client = _FakeHTTPClient({"id": "scoped-3"})
+
+    def _fake_load_findings(review, log_path, machine_host, repo_github=None):
+        # Mirrors the DB-cache path's `ReviewFindings(verdict=..., body=...)`
+        # construction — `issue_resolution` deliberately left at its default.
+        return ReviewFindings(
+            verdict="request-changes",
+            body=(
+                "## Blocking findings\n- non-nullable render-frame slots\n\n"
+                "ISSUE_RESOLUTION: partial — 28 of 29 additive primitives "
+                "still Any/unknown"
+            ),
+        )
+
+    monkeypatch.setattr(
+        auto_loop_mod, "_load_review_findings", _fake_load_findings,
+    )
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, now=999.0, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    assert "ISSUE_RESOLUTION: partial" in payload["briefing"]
+    assert "28 of 29 additive primitives still Any/unknown" in payload["briefing"]
+    assert "still outstanding" in payload["briefing"]
 
 
 def test_dispatch_scoped_review_skips_candidate_with_dead_claude_credential(

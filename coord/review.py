@@ -5933,6 +5933,7 @@ def build_scoped_review_briefing(
     prior_verdict: str = "approve",
     prior_findings_body: str | None = None,
     is_base_move: bool = False,
+    prior_issue_resolution: "IssueResolution | None" = None,
 ) -> str:
     """Assemble a SCOPED re-review briefing (#1476, widened by #3161).
     Pure function — testable.
@@ -5954,6 +5955,20 @@ def build_scoped_review_briefing(
       handed the prior review's findings (*prior_findings_body*) alongside
       the delta, and is asked to confirm each blocking finding was actually
       addressed rather than told to avoid re-litigating anything.
+
+    *prior_issue_resolution* (#3966): the prior review's own separate
+    `ISSUE_RESOLUTION:` judgment (:func:`coord.models.parse_issue_resolution`
+    applied to *prior_findings_body* — not a `## Blocking findings` entry,
+    so a reviewer told only to "check each blocking finding" never re-checks
+    it). When it is `partial`/`investigation`, this briefing echoes it
+    verbatim next to the prior findings and instructs the reviewer to
+    re-check it against the delta explicitly, and to state their own
+    `ISSUE_RESOLUTION:` line either way — never just drop it. A `None` or
+    `resolved` prior resolution adds nothing here; this function always asks
+    for the reviewer's own `ISSUE_RESOLUTION:` line regardless, since
+    :func:`coord.merge_queue._issue_resolution_for_entry` carries the prior
+    round's value forward when a re-review's own line is missing, and a
+    missing line must never silently read as "resolved".
     """
     is_fix_round = prior_verdict != "approve"
     lines: list[str] = []
@@ -5985,6 +6000,45 @@ def build_scoped_review_briefing(
             (prior_findings_body or "(prior findings text unavailable)").strip()
         )
         lines.append("")
+        if (
+            prior_issue_resolution is not None
+            and prior_issue_resolution.value != "resolved"
+        ):
+            # #3966: the prior review's `ISSUE_RESOLUTION:` judgment is a
+            # SEPARATE line from `## Blocking findings` above, so "check
+            # each blocking finding" alone never re-checks it — call it out
+            # explicitly as its own outstanding finding.
+            lines.append("## Prior ISSUE_RESOLUTION judgment (still outstanding)")
+            lines.append("")
+            reason_suffix = (
+                f" — {prior_issue_resolution.reason}"
+                if prior_issue_resolution.reason
+                else ""
+            )
+            lines.append(
+                f"`ISSUE_RESOLUTION: {prior_issue_resolution.value}{reason_suffix}`"
+            )
+            lines.append("")
+            lines.append(
+                "The prior review also recorded this SEPARATE judgment: "
+                "merging the PR as it stood did NOT fully resolve the "
+                "issue (code quality and 'does this actually fix the "
+                "reported bug' are different questions — see the "
+                "`ISSUE_RESOLUTION:` instructions below). Treat this "
+                "exactly like a blocking finding: re-check it against the "
+                "delta. If the fix round actually completed what was "
+                "missing, say so and record your own `ISSUE_RESOLUTION: "
+                "resolved`. If it is still not fully resolved — including "
+                "when this repo's own CLAUDE.md only allows specific "
+                "narrow partials (e.g. a declared tranche, a one-backend "
+                "leftover, an upstream blocker) and this one doesn't "
+                "qualify — restate it explicitly with your own "
+                "`ISSUE_RESOLUTION: partial` or `investigation` line and "
+                "`request-changes`, naming what's still missing. Do NOT "
+                "just omit the line: a missing line is read as carrying "
+                "this judgment forward UNCHANGED, not as 'resolved'."
+            )
+            lines.append("")
     elif is_base_move:
         # #3917/#3935/#3948: the branch itself never moved — only the base
         # it merges against did — so there is no delta *of diffs* to show
@@ -6125,6 +6179,7 @@ def build_scoped_review_briefing(
     lines.append("```")
     lines.append("REVIEW_VERDICT: approve")
     lines.append("REVIEW_BODY:")
+    lines.append("ISSUE_RESOLUTION: resolved")
     lines.append("<your full review text in markdown>")
     lines.append("END_REVIEW")
     lines.append("```")
@@ -6132,6 +6187,21 @@ def build_scoped_review_briefing(
     lines.append(
         "Use `REVIEW_VERDICT: request-changes` if the resolution introduced "
         "a real bug."
+    )
+    lines.append("")
+    lines.append(
+        "ALWAYS include your own `ISSUE_RESOLUTION:` line inside "
+        "`REVIEW_BODY:` (shown above), one of `resolved` | `partial` | "
+        "`investigation` — exactly the same judgment a normal review "
+        "states, and separate from `REVIEW_VERDICT:` (code quality and "
+        "'does this actually fix the reported bug' are different "
+        "questions). State it even when you have nothing new to add: a "
+        "missing line is read as carrying the PRIOR review's own "
+        "`ISSUE_RESOLUTION:` judgment forward UNCHANGED (#3966), never as "
+        "`resolved` by default — so omitting it does not clear a prior "
+        "`partial`/`investigation`, it only leaves the coordinator "
+        "guessing. If the prior review's judgment was already `resolved` "
+        "(or absent), `resolved` is the right default here too."
     )
     lines.append(
         "BODY STRUCTURE — same three headings as a normal review, always "
@@ -6423,6 +6493,18 @@ def dispatch_scoped_review(
         if _prior_findings is not None:
             prior_findings_body = _prior_findings.body
 
+    # #3966: re-parsed from the recovered body text rather than trusting
+    # `_prior_findings.issue_resolution` — `_load_review_findings`'s DB-cache
+    # fast path (the common case: `notify`/`report-result` already cached
+    # verdict+body for this exact row) constructs its `ReviewFindings`
+    # without ever parsing one, so that attribute silently defaults to
+    # "resolved" regardless of what the body actually says. Re-parsing the
+    # body text here is the one parse both paths (DB-cache and log/agent
+    # fallback) can rely on alike.
+    prior_issue_resolution = (
+        parse_issue_resolution(prior_findings_body) if prior_findings_body else None
+    )
+
     # #1476 fix: rank candidates against the machine that authored the code
     # under review — the WORK assignment behind *entry* — not the prior
     # reviewer's machine. ``QueuedMerge`` doesn't carry the worker's machine
@@ -6607,6 +6689,7 @@ def dispatch_scoped_review(
                 prior_verdict=prior_review_verdict,
                 prior_findings_body=prior_findings_body,
                 is_base_move=is_base_move,
+                prior_issue_resolution=prior_issue_resolution,
             )
 
             payload = {

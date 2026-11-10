@@ -1298,6 +1298,129 @@ class TestProcess:
         assert gh.pr_bodies[100] == "Closes #1\n\nAutomated merge."
         assert not [e for e in events if e.kind == "pr_body_downgraded"]
 
+    def test_scoped_rereview_with_no_own_marker_carries_forward_prior_partial(
+        self,
+    ) -> None:
+        # #3966: a first review round requests changes and ALSO records a
+        # separate `ISSUE_RESOLUTION: partial` (outside its blocking
+        # findings). A fix round addresses the blocking finding, and the
+        # scoped re-review approves it — but states no `ISSUE_RESOLUTION:`
+        # line of its own. The effective resolution must stay `partial`,
+        # not silently default to `resolved` just because the round that
+        # happened to approve said nothing.
+        from coord.merge_queue import _issue_resolution_for_entry
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.review import ReviewFindings
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            completion_summary="Fixed it outright.",
+        )
+        review_1 = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="request-changes",
+            dispatched_at=100.0,
+        )
+        # A scoped re-review carries the SAME review_of_assignment_id as the
+        # round it supersedes (coord.review.dispatch_scoped_review) — only
+        # dispatched_at distinguishes it as the later round.
+        review_2 = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-2", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            dispatched_at=200.0,
+        )
+        board = Board(active=[], completed=[work, review_1, review_2])
+        entry = _q("a", assignment_type="work")
+
+        findings_by_id = {
+            "rev-1": ReviewFindings(
+                verdict="request-changes",
+                body=(
+                    "## Blocking findings\n- non-nullable render-frame slots\n\n"
+                    "ISSUE_RESOLUTION: partial — reviewer caught it"
+                ),
+                issue_resolution=IssueResolution("partial", "reviewer caught it"),
+            ),
+            # The approving round states NO ISSUE_RESOLUTION line of its
+            # own — parses to the indistinguishable-from-absent default.
+            "rev-2": ReviewFindings(
+                verdict="approve",
+                body="## Blocking findings\nNone.\n",
+                issue_resolution=IssueResolution(),
+            ),
+        }
+
+        def _fake_fetch(repo_github, issue_number, assignment_id):
+            return findings_by_id.get(assignment_id)
+
+        with patch(
+            "coord.review.fetch_review_findings_from_github",
+            side_effect=_fake_fetch,
+        ):
+            result = _issue_resolution_for_entry(entry, board)
+
+        assert result.value == "partial"
+        assert result.reason == "reviewer caught it"
+
+    def test_scoped_rereview_restating_resolved_still_carries_forward(
+        self,
+    ) -> None:
+        # Companion to the test above: an explicit `ISSUE_RESOLUTION:
+        # resolved` from the approving round is — by design —
+        # indistinguishable from a missing line, so it must ALSO never
+        # downgrade a prior round's `partial` ("never the reverse", the
+        # same rule that already protects a worker's own claim).
+        from coord.merge_queue import _issue_resolution_for_entry
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.review import ReviewFindings
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            completion_summary="Fixed it outright.",
+        )
+        review_1 = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="request-changes",
+            dispatched_at=100.0,
+        )
+        review_2 = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-2", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            dispatched_at=200.0,
+        )
+        board = Board(active=[], completed=[work, review_1, review_2])
+        entry = _q("a", assignment_type="work")
+
+        findings_by_id = {
+            "rev-1": ReviewFindings(
+                verdict="request-changes",
+                body="ISSUE_RESOLUTION: partial — reviewer caught it",
+                issue_resolution=IssueResolution("partial", "reviewer caught it"),
+            ),
+            "rev-2": ReviewFindings(
+                verdict="approve",
+                body="ISSUE_RESOLUTION: resolved",
+                issue_resolution=IssueResolution("resolved", ""),
+            ),
+        }
+
+        def _fake_fetch(repo_github, issue_number, assignment_id):
+            return findings_by_id.get(assignment_id)
+
+        with patch(
+            "coord.review.fetch_review_findings_from_github",
+            side_effect=_fake_fetch,
+        ):
+            result = _issue_resolution_for_entry(entry, board)
+
+        assert result.value == "partial"
+
     def test_commit_message_closing_keyword_blocks_merge_when_partial(self) -> None:
         # #3502 review (non-blocking concern): a commit SUBJECT using a
         # closing keyword (this repo's own `Fix #N: ...` convention) also
