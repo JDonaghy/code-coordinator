@@ -3537,6 +3537,133 @@ def test_a_size_triage_pending_refusal_parks_and_resumes_on_verdict(
     assert entry["attempts"] == 0
 
 
+def _size_triage_parked_entry(issue: int):
+    """A `parked`-on-size-triage-pending queue entry, for the shell-half
+    tests below."""
+    from coord.decomposition_chat import SIZE_TRIAGE_PENDING_MARKER
+    from coord.drive_queue import STATE_PARKED, QueueEntry
+
+    return QueueEntry(
+        repo=REPO, issue=issue, position=1, state=STATE_PARKED,
+        last_reason=(
+            f"issue #{issue} flagged by the preflight size scorer — retry "
+            f"once it posts its verdict. {SIZE_TRIAGE_PENDING_MARKER}"
+        ),
+    )
+
+
+def _triage_row(issue: int, status: str, *, repo: str = REPO) -> dict:
+    from coord.decomposition_chat import size_triage_review_target_for
+
+    return {
+        "assignment_id": f"triage-{issue}",
+        "repo_name": repo,
+        "issue_number": issue,
+        "type": "review",
+        "status": status,
+        "review_target": size_triage_review_target_for(issue),
+    }
+
+
+def test_fetch_size_triage_pending_reads_the_routed_board_not_the_local_db(
+    monkeypatch,
+):
+    """#3971 shell half, #615: the triage leg's status must come from the
+    board payload `_fetch_board_payload` resolves — the daemon's `GET
+    /board` on a thin client, the local DB only when no `board_service` is
+    configured — never from a direct `coord.state.build_board`, which
+    silently reads an empty board on a thin client. `build_board` is
+    booby-trapped here, so a regression back to the local read fails this
+    test rather than quietly answering "nothing in flight"."""
+    import coord.commands.drive_queue as dq
+    import coord.state as state_mod
+
+    def exploding_build_board():
+        raise AssertionError("build_board must not be called — read is routed")
+
+    monkeypatch.setattr(state_mod, "build_board", exploding_build_board)
+    monkeypatch.setattr(
+        dq, "_fetch_board_payload",
+        lambda: {"assignments": [_triage_row(2304, "running")]},
+    )
+
+    entry = _size_triage_parked_entry(2304)
+    assert dq._fetch_size_triage_pending([entry]) == {entry.key: True}
+
+
+def test_fetch_size_triage_pending_clears_once_the_triage_leg_is_terminal(
+    monkeypatch,
+):
+    import coord.commands.drive_queue as dq
+
+    monkeypatch.setattr(
+        dq, "_fetch_board_payload",
+        lambda: {"assignments": [_triage_row(2304, "done")]},
+    )
+
+    entry = _size_triage_parked_entry(2304)
+    assert dq._fetch_size_triage_pending([entry]) == {entry.key: False}
+
+
+def test_fetch_size_triage_pending_ignores_a_same_target_row_in_another_repo(
+    monkeypatch,
+):
+    """`review_target` is only unique within a repo — a still-running
+    `size-triage-2304` in a DIFFERENT repo must not keep this entry
+    parked, and must not be mistaken for this one's verdict either."""
+    import coord.commands.drive_queue as dq
+
+    monkeypatch.setattr(
+        dq, "_fetch_board_payload",
+        lambda: {
+            "assignments": [
+                _triage_row(2304, "running", repo="other-repo"),
+                _triage_row(2304, "done"),
+            ]
+        },
+    )
+
+    entry = _size_triage_parked_entry(2304)
+    assert dq._fetch_size_triage_pending([entry]) == {entry.key: False}
+
+
+def test_fetch_size_triage_pending_fails_closed_on_an_unreadable_board(
+    monkeypatch,
+):
+    """An unreadable board is not evidence that the triage finished: the
+    entry stays parked rather than resuming Work dispatch against an issue
+    a paid triage session may still be about to split."""
+    import coord.commands.drive_queue as dq
+
+    def boom():
+        raise RuntimeError("daemon unreachable")
+
+    monkeypatch.setattr(dq, "_fetch_board_payload", boom)
+
+    entry = _size_triage_parked_entry(2304)
+    assert dq._fetch_size_triage_pending([entry]) == {entry.key: True}
+
+
+def test_fetch_size_triage_pending_ignores_other_parks_and_reads_no_board(
+    monkeypatch,
+):
+    """No board read at all on a tick where nothing is parked this way —
+    the common case."""
+    import coord.commands.drive_queue as dq
+    from coord.drive_queue import STATE_PARKED, QueueEntry
+
+    def boom():
+        raise AssertionError("no board read when nothing is parked on triage")
+
+    monkeypatch.setattr(dq, "_fetch_board_payload", boom)
+
+    entry = QueueEntry(
+        repo=REPO, issue=2304, position=1, state=STATE_PARKED,
+        last_reason="CI running: checks pending",
+    )
+    assert dq._fetch_size_triage_pending([entry]) == {}
+
+
 def test_a_permanent_dispatch_refusal_blocks_on_the_first_tick_no_attempt_spent(
     cli, seed, launches,
 ):
