@@ -1863,6 +1863,8 @@ class MergeVerifier(Protocol):
 
     def github_backoff_active(self) -> bool: ...
 
+    def entry_truth(self, state: IssueState) -> "EntryTruth | None": ...
+
 
 def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
     """Loosely compare a ``git remote get-url origin`` URL against the
@@ -1894,10 +1896,15 @@ class GitMergeVerifier:
 
     ``repo_path`` is the local checkout used for fetches; defaults to
     ``~/src/<repo>``.
+
+    ``config`` (#3933) is threaded through from :attr:`Driver.config` solely
+    for :meth:`entry_truth` — every other method here answers a narrower,
+    repo-agnostic git/gh question that never needed it.
     """
 
     repo_path: str = ""
     warn: Callable[[str], None] = lambda msg: None
+    config: Any = None
     # #2437: memoizes which (base, reason) pairs have already been warned
     # about, so a checkout that stays broken across many drive-loop polls
     # gets exactly one loud warning instead of one per poll. Keyed on the
@@ -2155,6 +2162,44 @@ class GitMergeVerifier:
         return EpicChecklistSnapshot(
             children=tuple(children), queued_keys=queued_keys, epic_after=epic_after,
         )
+
+    def entry_truth(self, state: IssueState) -> "EntryTruth | None":
+        """Live :class:`~coord.entry_truth.EntryTruth` for ``(state.repo,
+        state.issue)`` (#3933).
+
+        ``None`` means "could not be computed" (no local board, a config
+        that failed to resolve, or any exception from the live reads
+        :func:`~coord.entry_truth.reconcile_entry` itself performs) — never
+        a stand-in for a verdict. Callers must treat that exactly like "no
+        live truth available", falling back to whatever this module's own
+        board-snapshot classification already does, never to a default
+        outcome the issue hasn't actually observed.
+
+        Mirrors the one existing production call site
+        (``coord.commands.gates.gates``) almost exactly: same ``gh_ops``
+        (the :mod:`coord.github_ops` module itself, duck-typed to the
+        ``GhOps`` Protocol), same :class:`~coord.ci_github.GitHubCi`. The one
+        difference is *board*: that command's daemon-reroute guarantees a
+        local, authoritative board; this runs on whatever host happens to be
+        driving, so :func:`~coord.state.build_board` is wrapped in the same
+        try/except as every other live read below rather than assumed to
+        succeed.
+        """
+        if self.config is None:
+            return None
+        from coord.ci_github import GitHubCi  # noqa: PLC0415
+        from coord import github_ops  # noqa: PLC0415
+        from coord.entry_truth import reconcile_entry  # noqa: PLC0415
+        from coord.state import build_board  # noqa: PLC0415
+
+        try:
+            board = build_board()
+            return reconcile_entry(
+                board, self.config, state.repo, state.issue,
+                gh_ops=github_ops, ci_store=GitHubCi(),
+            )
+        except Exception:  # noqa: BLE001 — fail closed: no truth, not a guess
+            return None
 
 
 # ── preflight (pure) ─────────────────────────────────────────────────────────
@@ -4946,6 +4991,56 @@ def _decide_merge(
             )
         )
     divergence = _merge_gate_divergence(state, reason=gate_reason)
+    # #3933 (quadraui#2173): *gate_reason* is a string this driver only
+    # CLASSIFIES — "smoke" or "review" — from whatever word the merge gate
+    # happened to persist on an earlier attempt. quadraui#2173's incident was
+    # exactly that classification going stale: the persisted reason named
+    # the smoke gate, `state.work_test_state` read "passed" (true at the
+    # time), so `divergence == "smoke"` and this function kept dispatching a
+    # Test re-run — but the LIVE problem by then was a review voided by a
+    # patch-id change after that reason was written; the test was never the
+    # issue. No amount of re-testing was ever going to touch that.
+    #
+    # `coord.entry_truth.reconcile_entry` (#3922) answers the SAME question
+    # — "review or test, which gate is actually unmet right now" — from a
+    # live `coord.gates.build_gate_report` read, not a persisted word on the
+    # board. When it is available and confirms the persisted "smoke"
+    # classification is itself stale (test genuinely fine; review is the
+    # live gate still open), dispatch a real review instead of taking any of
+    # the smoke-specific arms below — this is the literal "Expected:
+    # dispatch_review" outcome the incident calls for. `entry_truth()`
+    # returning `None` (no config, a board/gh read failure) changes nothing:
+    # every arm below still runs exactly as it did before this existed, so a
+    # verifier that can't produce a live truth is never worse off than the
+    # persisted-string classification already was.
+    #
+    # Only called once `divergence == "smoke"` already holds — this issues
+    # several extra live `gh` reads of its own (`reconcile_entry` fetches the
+    # branch head, patch-id, issue state, PR lifecycle and CI summary), so it
+    # must not run on every merge-stage poll, only the one case it exists to
+    # double-check.
+    truth = verifier.entry_truth(state) if divergence == "smoke" else None
+    if (
+        divergence == "smoke"
+        and truth is not None
+        and truth.test is not None
+        and truth.test.ok
+        and truth.review is not None
+        and truth.review.required
+        and not truth.review.ok
+    ):
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: merge_reason names the smoke gate, but a live "
+                "reconcile_entry (#3933) shows test is fine and review is "
+                f"the gate actually unmet (quadraui#2173): "
+                f"{truth.review.reason or 'review required but not approved'}"
+            ),
+            command=("review", state.work_aid),
+            on_error="warn",
+            error_message=f"coord review failed to dispatch for {state.work_aid}",
+        )
     if (
         divergence == "smoke"
         and _is_stale_smoke_reason(gate_reason)
@@ -5981,7 +6076,7 @@ class Driver:
         self.err = self.err or sys.stderr
         if self.verifier is None:
             self.verifier = GitMergeVerifier(
-                repo_path=self.opts.repo_path, warn=self.warn
+                repo_path=self.opts.repo_path, warn=self.warn, config=self.config
             )
         if self.oracle_gate is None:
             self.oracle_gate = GitHubAcceptanceGateChecker(config=self.config)
@@ -6058,6 +6153,15 @@ class Driver:
             self._config_reload_broken = False
         self._log_config_change(self.config, new_config)
         self.config = new_config
+        # #3933: keep GitMergeVerifier.entry_truth()'s own `config` in step
+        # with a reload — it only reads *self.config* once, at
+        # `__post_init__` construction time, so without this a reloaded
+        # pipeline/review-gate edit would never reach its live truth reads
+        # for the rest of this run. `hasattr` rather than an isinstance
+        # check: any `MergeVerifier` double that doesn't carry a `config`
+        # attribute at all (most test doubles) is untouched.
+        if hasattr(self.verifier, "config"):
+            self.verifier.config = new_config
 
     def _log_config_change(self, old: Any, new: Any) -> None:
         """Narrate a reload that changes a decision this loop actually makes
