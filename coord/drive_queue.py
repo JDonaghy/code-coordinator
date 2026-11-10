@@ -91,6 +91,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from coord.decomposition_chat import is_size_triage_pending_reason
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.entry_truth import (
     EntryTruth,
@@ -5804,6 +5805,45 @@ def _reconcile_running(
             None,
         )
 
+    # #3971 rides the SAME "pending verdict, not a standing refusal" shape
+    # as #2063's Gate-A park immediately above: `coord.dispatch.
+    # enforce_preflight_guard`'s "a size-triage review is running — retry
+    # once it posts its verdict" refusal is TEMPORARY — the condition that
+    # refused it (a non-terminal triage leg) clears on its own the moment
+    # that leg finishes, no operator action needed — yet it reached here as
+    # a PLAIN `EXIT_DISPATCH_REFUSED` (#1844's exit code for every
+    # `DispatchRefused`, permanent or not) and would otherwise fall straight
+    # into the `exit_refused` → `blocked` branch below and stay blocked
+    # forever even after the verdict posts PROCEED (quadraui#2304, 2026-11-10
+    # UTC: every dependent behind the row cascaded to `blocked` three minutes
+    # before the triage leg itself returned `proceed`). Checked purely off
+    # `own_reason`'s marker — independent of `exit_refused` — the same
+    # "recognise this refusal by its own text, not by the exit code every
+    # `DispatchRefused` shares" posture #2063/#2234 already established.
+    # Parks rather than blocks; `plan_tick`'s pre-pass below un-parks it the
+    # tick after the matching `review_target` assignment goes terminal, same
+    # "no queue surgery needed" contract Gate-A's park gives.
+    if own_reason and is_size_triage_pending_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt; the queue "
+            "resumes it automatically once the size-triage review posts its "
+            "verdict, no queue surgery needed (#3971)"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
     # #2234 rides the SAME evidence as `refused` below (the drive's own
     # `drive_exited` reason) but, like #2063 above, reaches the OPPOSITE
     # conclusion from a PLAIN `EXIT_TERMINAL_FAILURE` — `coord.drive.
@@ -7602,6 +7642,7 @@ def plan_tick(
     exit_refused: Mapping[str, bool] | None = None,
     exit_dead_end: Mapping[str, bool] | None = None,
     gate_a_pending: Mapping[str, bool] | None = None,
+    size_triage_pending: Mapping[str, bool] | None = None,
     cordons: Mapping[str, str] | None = None,
     no_eligible_host: Mapping[str, str] | None = None,
     live_ci_gate: Mapping[str, bool] | None = None,
@@ -8655,6 +8696,41 @@ def plan_tick(
             )
             states[entry.key] = STATE_WAITING
             effective_attempts[entry.key] = 0  # #2273: see #2182 branch above
+            continue
+        # #3971: the SAME "external verdict, re-check every tick" shape as
+        # the Gate-A branch just above, for `enforce_preflight_guard`'s
+        # size-triage-pending park. The shell resolves `size_triage_pending`
+        # by re-reading the matching `review_target` assignment's own
+        # `status` column — a local board read, no `gh` call per entry; an
+        # entry it can't resolve stays parked, same fail-closed posture as
+        # Gate-A's. Resuming does NOT itself decide proceed/split — it only
+        # lets the next real `enforce_preflight_guard` call run again, which
+        # is what actually consumes the verdict (falls through for PROCEED/
+        # unparseable, raises a fresh — unmarked, permanent — refusal that
+        # supersedes the original for SPLIT).
+        if is_size_triage_pending_reason(entry.last_reason):
+            if (size_triage_pending or {}).get(entry.key, True):
+                continue
+            reason = (
+                f"the size-triage review for {entry.key} has posted its "
+                "verdict — resuming from parked without spending an "
+                "attempt (#3971)"
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "resumed",
+                    reason,
+                    occupies=False,
+                    updates={
+                        "state": STATE_WAITING,
+                        "attempts": 0,
+                        "last_reason": reason,
+                    },
+                )
+            )
+            states[entry.key] = STATE_WAITING
+            effective_attempts[entry.key] = 0
             continue
         # #2234: a policy-refusal park has NO external verdict to poll for —
         # the rule it names is standing, not pending — so unlike the Gate-A

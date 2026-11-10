@@ -41,7 +41,12 @@ from coord.dispatch import (
     route_work_by_capability,
     route_work_by_liveness,
 )
-from coord.decomposition_chat import SizeTriageError, size_triage_review_target_for
+from coord.decomposition_chat import (
+    SIZE_TRIAGE_PENDING_MARKER,
+    SizeTriageError,
+    is_size_triage_pending_reason,
+    size_triage_review_target_for,
+)
 from coord.milestone_order import WorkOrder, WorkOrderNode
 from coord.models import (
     EPIC_DECOMPOSE_TYPE,
@@ -1690,7 +1695,7 @@ class TestPreflightGuard:
             "title": "A giant issue", "body": "", "labels": [{"name": "epic"}],
         }
 
-        with pytest.raises(DispatchRefused, match="flagged by the preflight size"):
+        with pytest.raises(DispatchRefused, match="flagged by the preflight size") as exc:
             enforce_preflight_guard(
                 proposal_type="work", repo=repo, config=cfg, issue_number=99,
                 machine=machine, board=board,
@@ -1698,6 +1703,11 @@ class TestPreflightGuard:
         mock_dispatch_triage.assert_called_once()
         assert mock_dispatch_triage.call_args.kwargs["issue_number"] == 99
         assert mock_dispatch_triage.call_args.kwargs["board"] is board
+        # #3971: carries the TEMPORARY-refusal marker — `coord.drive_queue.
+        # _reconcile_running` parks on this, rather than falling into the
+        # generic `exit_refused` → `blocked` branch every other
+        # `DispatchRefused` (a genuinely permanent guard) reaches.
+        assert is_size_triage_pending_reason(str(exc.value))
 
     @patch(
         "coord.decomposition_chat.dispatch_size_triage_review",
@@ -1746,12 +1756,16 @@ class TestPreflightGuard:
         ))
         mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
 
-        with pytest.raises(DispatchRefused, match="already running"):
+        with pytest.raises(DispatchRefused, match="already running") as exc:
             enforce_preflight_guard(
                 proposal_type="work", repo=repo, config=cfg, issue_number=99,
                 machine=machine, board=board,
             )
         mock_dispatch_triage.assert_not_called()
+        # #3971: the "already in flight" wording carries the same marker as
+        # the first-dispatch refusal above — both are the same TEMPORARY
+        # wait, just at different points in the triage leg's lifetime.
+        assert SIZE_TRIAGE_PENDING_MARKER in str(exc.value)
 
     @patch(
         "coord.decomposition_chat.dispatch_size_triage_review",
@@ -1898,7 +1912,7 @@ class TestPreflightGuard:
         mock_verify.return_value = verification
         mock_file_and_queue.return_value = 555
 
-        with pytest.raises(DispatchRefused, match="split"):
+        with pytest.raises(DispatchRefused, match="split") as exc:
             enforce_preflight_guard(
                 proposal_type="work", repo=repo, config=cfg, issue_number=99,
                 machine=machine, board=board,
@@ -1910,6 +1924,14 @@ class TestPreflightGuard:
         assert kwargs["proposal"] is proposal
         assert kwargs["verification"] is verification
         assert kwargs["repo"] is repo
+        # #3971: a verified SPLIT already superseded the original (the epic
+        # + children are filed and the original closed) — this refusal is
+        # genuinely permanent, unlike the "still waiting" one, so it must
+        # NOT carry the pending marker and must fall into the ordinary
+        # `exit_refused` → `blocked` classification (caught, in practice,
+        # by the #2850 live-prereq-terminal re-check instead, once the
+        # close lands).
+        assert not is_size_triage_pending_reason(str(exc.value))
 
     @patch("coord.decomposition_chat.file_and_queue_split_proposal")
     @patch("coord.preflight_size.verify_split_proposal")

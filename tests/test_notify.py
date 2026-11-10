@@ -1168,6 +1168,40 @@ class TestReviewNotify:
         assert "could not be extracted" in body
         assert "REVIEW_VERDICT" in body
 
+    def test_size_triage_completion_posts_no_review_comment(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """#3971: `coord.decomposition_chat.dispatch_size_triage_review`
+        dispatches a size-triage leg as `type="review"` only to reuse
+        `coord.agent`'s read-only deny-list for that type — it is never a
+        real code review and emits `SIZE_TRIAGE_VERDICT:`, not
+        `REVIEW_VERDICT:`. Before this, that mismatch fell into the generic
+        review-completion branch and posted a "Review assignment completed
+        but findings could not be extracted" comment to the issue
+        (quadraui#2304) — this pins that NEITHER `post_pr_review` nor a
+        fallback `post_issue_comment` fires for a `review_target` this
+        module recognises as a size-triage sentinel."""
+        _record_review_assignment(
+            "triage1", review_target="size-triage-99", issue_number=99,
+        )
+        log = tmp_path / "triage.log"
+        log.write_text(
+            "SIZE_TRIAGE_VERDICT: proceed\nEND_SIZE_TRIAGE\n", encoding="utf-8",
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("triage1", "done", log_path=str(log))],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck, _attn, _stalled, _liveness, _phantom, _stuck_test = notify_mod.run(config)
+
+        assert len(posted) == 1
+        mock_review.assert_not_called()
+        mock_post.assert_not_called()
+        assert "triage1" in state_mod.load_notified()
+
     def test_review_fallback_end_review_without_verdict_is_not_silent(
         self, coord_dir: Path, config: Config, tmp_path: Path, caplog
     ) -> None:

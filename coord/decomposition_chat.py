@@ -1024,14 +1024,48 @@ def size_triage_review_target_for(issue_number: int) -> str:
 
     Mirrors `coord.gate_b.review_target_for`: keeping it non-int-parseable
     means `coord.notify._try_parse_and_post_review`'s `int(review_target)`
-    sniff falls through to "post as a plain issue comment" rather than
-    mistaking this for a per-issue code review of a real PR — and this
-    entry posts no comment at all (see `dispatch_size_triage_review`), so in
-    practice nothing ever reads this string back out of `coord.notify`; it
-    exists so `latest`-style lookups (if one is ever needed) can find this
-    assignment unambiguously among a repo's other `type="review"` rows.
+    sniff falls through rather than mistaking this for a per-issue code
+    review of a real PR. It also exists so `latest`-style lookups (if one
+    is ever needed) can find this assignment unambiguously among a repo's
+    other `type="review"` rows, and so `coord.notify.notify`'s own
+    completion handler (#3971) can recognise this ONE `type="review"`
+    shape and skip review-findings extraction / the "Review assignment
+    completed" comment for it — a leg this dispatch-time sentinel marks is
+    a read-only size triage, never a real code review, whatever its
+    board-row `type` says.
     """
     return f"size-triage-{issue_number}"
+
+
+def is_size_triage_review_target(review_target: str | None) -> bool:
+    """Whether *review_target* identifies a size-triage dispatch rather than
+    a real code review (#3971) — the inverse of
+    :func:`size_triage_review_target_for`, for a caller holding only the
+    string back out of an `Assignment` row.
+    """
+    return bool(review_target) and str(review_target).startswith("size-triage-")
+
+
+# #3971: a TEMPORARY wait, not a permanent pre-dispatch guard refusal
+# (#1844) — unlike `enforce_oracle_readiness`/`enforce_epic_dispatch_guard`'s
+# refusals, `enforce_preflight_guard`'s "a size-triage review is running —
+# retry once it posts its verdict" refusal clears on its own the moment that
+# leg reaches a terminal status, no operator action needed. Embedded in that
+# refusal's text so `coord.drive_queue._reconcile_running` can recognise it
+# BEFORE the generic `exit_refused` → `blocked` branch (#1844) every other
+# `DispatchRefused` falls into, and park instead — the same precedent
+# `coord.gate_a.is_gate_a_refusal_reason`'s own marker set for a refusal with
+# a self-clearing condition. Lives here, not in `coord.dispatch`, because
+# this module already owns every other size-triage-shaped sentinel
+# (`size_triage_review_target_for`, `is_size_triage_review_target`) and
+# `coord.dispatch`/`coord.drive_queue` both already import from it.
+SIZE_TRIAGE_PENDING_MARKER = "[size-triage-pending]"
+
+
+def is_size_triage_pending_reason(text: str | None) -> bool:
+    """Whether *text* is `enforce_preflight_guard`'s triage-in-flight
+    refusal (#3971) — see :data:`SIZE_TRIAGE_PENDING_MARKER`."""
+    return bool(text) and SIZE_TRIAGE_PENDING_MARKER in text
 
 
 SIZE_TRIAGE_SYSTEM_PROMPT = """You are an independent triage agent dispatched by the coordinator to \
