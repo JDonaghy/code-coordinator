@@ -3033,6 +3033,88 @@ class TestNoProgressRows:
 
         assert entry.key not in {r.key for r in rows}
 
+    def test_waiting_probe_failure_escalate_truth_falls_through_to_board_facts(
+        self,
+    ) -> None:
+        """Review fix (#3936): a dep's live `EntryTruth` reading `escalate`
+        with `escalate_probe_failure=True` (a transient `gh` read failure,
+        `coord.entry_truth._derive_next_action`) is INCONCLUSIVE, exactly
+        like :func:`coord.drive_queue._prereq_truth_verdict` treats it — not
+        a confirmed "not landed". The dep's own board facts already read
+        `merged`, so the edge must still release."""
+        from coord.entry_truth import EntryTruth, NEXT_ACTION_ESCALATE
+
+        dep = QueueEntry(repo="acme/widgets", issue=2000, state="running")
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2047,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({"acme/widgets#2047": LiveState()})
+        dep_truth = EntryTruth(
+            repo_name="acme/widgets",
+            issue_number=2000,
+            next_action=NEXT_ACTION_ESCALATE,
+            next_action_reason="could not confirm branch head",
+            escalate_probe_failure=True,
+        )
+
+        rows = no_progress_rows(
+            [dep, entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(issues={"acme/widgets#2000": IssueFacts(merged=True)}),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+            prereq_truth={"acme/widgets#2000": dep_truth},
+        )
+
+        [row] = [r for r in rows if r.key == entry.key]
+        assert "waiting-ready-not-launched" in row.evidence[-1]
+
+    def test_waiting_done_dep_row_outranks_a_non_mark_done_live_truth(self) -> None:
+        """Review fix (#3936): a dep whose OWN drive-queue row already
+        reads `done` this tick must not be shadowed by a live truth whose
+        verdict is anything other than `mark_done` (e.g. `merge`, read off a
+        slightly-behind PR state) — the same ordering
+        :func:`coord.drive_queue._resolve_prereqs` enforces (#2715 before
+        #3934's own truth check)."""
+        from coord.drive_queue import STATE_DONE
+        from coord.entry_truth import EntryTruth, NEXT_ACTION_MERGE
+
+        dep = QueueEntry(repo="acme/widgets", issue=2000, state=STATE_DONE)
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2047,
+            state="waiting",
+            after=("acme/widgets#2000",),
+            reason_at=0.0,
+        )
+        probe = _FakeProbe({"acme/widgets#2047": LiveState()})
+        dep_truth = EntryTruth(
+            repo_name="acme/widgets",
+            issue_number=2000,
+            next_action=NEXT_ACTION_MERGE,
+            next_action_reason="PR is mergeable, not yet merged",
+        )
+
+        rows = no_progress_rows(
+            [dep, entry],
+            covered_keys=frozenset(),
+            live_sessions=frozenset(),
+            board_view=BoardView(),
+            probe=probe,
+            config=self._config(),
+            now=100_000.0,
+            prereq_truth={"acme/widgets#2000": dep_truth},
+        )
+
+        [row] = [r for r in rows if r.key == entry.key]
+        assert "waiting-ready-not-launched" in row.evidence[-1]
+
     def test_all_three_2026_11_05_shapes_reach_one_sweep_output(self) -> None:
         # Three different repos — each shape's own fixture is independently
         # the ONLY row that could occupy its own repo's capacity, so a
