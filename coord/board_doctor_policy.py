@@ -1345,7 +1345,7 @@ def _queue_stranded_prereq(row: StuckRow) -> bool:
             state.comment_on_issue(
                 repo_name, issue_number,
                 f"Queued {dep} because {entry_key(repo_name, issue_number)} "
-                f"was waiting on it (open, not queued) {since_text} (#3944).",
+                f"was waiting on it (open, not queued) {since_text}.",
                 repo_github=next(
                     (r.github for r in (config.repos or []) if r.name == repo_name), None,
                 ),
