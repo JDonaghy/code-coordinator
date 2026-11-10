@@ -2923,6 +2923,57 @@ def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple
     return ("", "coord status")
 
 
+def write_drive_escalation(
+    repo_name: str,
+    issue_number: int,
+    *,
+    stage: str,
+    reason: str,
+    gate_readings: str,
+    proposed_command: str,
+) -> bool | str:
+    """The ONE `drive_escalations` write path every board-doctor alert/page
+    sink shares — `escalation_alert_dispatcher` below and
+    `coord.board_doctor._followthrough_notify` both route through this
+    rather than keeping independent copies that can disagree (#2085, #3945).
+
+    Skips the write when a more specific, non-*stage* escalation already
+    covers this issue — `drive_escalations` holds one row per issue, so an
+    unconditional write here would clobber a live e.g. `plan.blocked`
+    escalation's `reason`/`gate_readings`/`created_at` with a generic one.
+    That case returns :data:`ALERT_SKIPPED`. Otherwise records (or renews)
+    the row and returns only once the write is confirmed by reading it
+    back — a clean `record_drive_escalation` return proves the request was
+    issued, not that it landed. Never raises: a failed/unconfirmed write
+    returns `False` rather than taking its caller down with it.
+    """
+    import click  # noqa: PLC0415
+
+    from coord.state import get_drive_escalation, record_drive_escalation  # noqa: PLC0415
+
+    try:
+        existing = get_drive_escalation(repo_name, issue_number)
+        if existing is not None and existing.get("stage") != stage:
+            return ALERT_SKIPPED
+        record_drive_escalation(
+            repo_name,
+            issue_number,
+            stage=stage,
+            reason=reason,
+            gate_readings=gate_readings,
+            proposed_command=proposed_command,
+        )
+        confirmed = get_drive_escalation(repo_name, issue_number)
+        return bool(
+            confirmed is not None
+            and confirmed.get("stage") == stage
+            and confirmed.get("reason") == reason
+        )
+    except Exception as exc:  # noqa: BLE001 — never crash the caller
+        click.echo(f"warning: could not record escalation for {repo_name}#{issue_number}: {exc}", err=True)
+        return False
+
+
 def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
     """#3745's C4: surface an alert-tier row via `drive_escalations`.
 
@@ -2950,8 +3001,6 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
     """
     import click  # noqa: PLC0415
 
-    from coord.state import get_drive_escalation, record_drive_escalation  # noqa: PLC0415
-
     parsed = _parse_row_key(row.key)
     if parsed is None:
         click.echo(
@@ -2977,13 +3026,6 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
         config = None
 
     try:
-        existing = get_drive_escalation(repo_name, issue_number)
-        if existing is not None and existing.get("stage") != stage:
-            # A more specific escalation (e.g. plan.blocked) already covers
-            # this issue — don't overwrite its reason/created_at with our
-            # generic "coord status" pointer.
-            return ALERT_SKIPPED
-
         sealed_lines = (
             _sealed_confined_lines(row, repo_name, issue_number, config)
             if config is not None else None
@@ -3020,24 +3062,18 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
             f"{attempted_suffix}{resolution_suffix}{options_suffix}"
         )
         gate_readings = f"queue={row.queue} | cause={row.cause} | evidence={' | '.join(row.evidence)}"
-        record_drive_escalation(
-            repo_name,
-            issue_number,
-            stage=stage,
-            reason=reason,
-            gate_readings=gate_readings,
-            proposed_command=proposed_command,
-        )
-
-        confirmed = get_drive_escalation(repo_name, issue_number)
-        return bool(
-            confirmed is not None
-            and confirmed.get("stage") == stage
-            and confirmed.get("reason") == reason
-        )
     except Exception as exc:  # noqa: BLE001 — see docstring: never crash the sweep
         click.echo(f"warning: could not record board-doctor escalation: {exc}", err=True)
         return False
+
+    return write_drive_escalation(
+        repo_name,
+        issue_number,
+        stage=stage,
+        reason=reason,
+        gate_readings=gate_readings,
+        proposed_command=proposed_command,
+    )
 
 
 def dismiss_resolved_escalation(queue: str, key: str) -> None:

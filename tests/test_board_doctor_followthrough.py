@@ -187,6 +187,61 @@ def test_cross_backend_plan_alerts_and_writes_nothing() -> None:
     assert len(sinks.alerts) == 1
 
 
+def test_after_declared_in_work_order_but_not_sub_issues_rejects_before_any_write() -> None:
+    """#3945 review: `_splice_epic_checklists` would later splice the SAME
+    `after` edge into `## Sub-issues` too, and `parse_sub_issues` requires
+    it declared WITHIN that section — rejecting here, before any follow-up
+    issue is created, beats hard-failing mid-write and orphaning one."""
+    body = (
+        "## Sub-issues\n"
+        "- #100\n\n"
+        "## Work order\n"
+        "- #100\n"
+        "- #101  {after: #100}\n"
+    )
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "New piece", "body": "Do it.", "after": ["#101"]},
+        ],
+    }
+    disp, writer, sinks = _run(_partial(epic_body=body), plan, writer=FakeWriter(body))
+
+    assert disp.action == ft.ACTION_REJECTED
+    assert any(
+        "not its ## Sub-issues section" in r for r in disp.reasons
+    ), disp.reasons
+    # Nothing was created/linked/closed — rejected before any write, not
+    # mid-write after orphaning a follow-up (`wrote_anything` isn't used
+    # here: it compares against the module-level `EPIC_BODY` fixture,
+    # which this test's custom *body* deliberately is not).
+    assert writer.created == [] and writer.children == [] and writer.closed == []
+    assert len(sinks.alerts) == 1
+
+
+def test_after_declared_in_both_sections_is_accepted() -> None:
+    body = (
+        "## Sub-issues\n"
+        "- #100\n\n"
+        "## Work order\n"
+        "- #100\n"
+    )
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "New piece", "body": "Do it.", "after": ["#100"]},
+        ],
+    }
+    disp, writer, _ = _run(_partial(epic_body=body), plan, writer=FakeWriter(body))
+
+    assert disp.action == ft.ACTION_FILED
+    from coord.milestone_order import parse_sub_issues
+
+    new_body = writer.bodies[50]
+    assert parse_sub_issues(new_body).issue_numbers == (100, 200)
+    assert parse_work_order(new_body).issue_numbers == (100, 200)
+
+
 def test_cross_backend_check_inert_without_backend_rule() -> None:
     plan = {
         "items": [{"item": "B", "verified_still_missing": True}],
@@ -513,6 +568,31 @@ def test_splice_preserves_existing_row_prose_in_work_order() -> None:
     assert wo.node(201).after == (200,)
 
 
+def test_splice_preserves_existing_checkbox_row_prose_in_work_order() -> None:
+    """Same as the checkbox-free variant above, but for the `- [ ] #N —
+    prose` shape `coord milestone add-child` actually writes today
+    (#1061's checkbox is optional, not retired) — the splice must not
+    require the epic to already be in the checkbox-free grammar."""
+    body = (
+        "Epic body.\n\n"
+        "## Work order\n"
+        "- [ ] #100 — tranche 1 of #99: do the first half\n"
+        "- [x] #101  {after: #100} — tranche 2: do the rest\n\n"
+        "## Notes\nkeep me\n"
+    )
+    disp, writer, _ = _run(_partial(epic_body=body), HAPPY_PLAN, writer=FakeWriter(body))
+
+    assert disp.action == ft.ACTION_FILED
+    new_body = writer.bodies[50]
+    # Every pre-existing line survives byte-for-byte.
+    assert "- [ ] #100 — tranche 1 of #99: do the first half" in new_body
+    assert "- [x] #101  {after: #100} — tranche 2: do the rest" in new_body
+    assert "keep me" in new_body
+    wo = parse_work_order(new_body)
+    assert wo.issue_numbers == (100, 101, 200, 201)
+    assert wo.node(201).after == (200,)
+
+
 def test_splice_preserves_prose_in_both_work_order_and_sub_issues() -> None:
     body = (
         "## Sub-issues\n"
@@ -559,6 +639,22 @@ def test_splice_appends_fresh_work_order_when_epic_has_neither_section() -> None
     assert wo.issue_numbers == (200,)
 
 
+def test_splice_preserves_trailing_newline() -> None:
+    """`body.splitlines()` drops whether *body* ended in `\\n` — the splice
+    must restore it rather than silently trimming a trailing newline on
+    every write (#3945 review)."""
+    from coord.board_doctor_followthrough import _splice_epic_checklists
+    from coord.milestone_order import WorkOrderNode
+
+    with_trailing = "## Work order\n- #100\n"
+    result = _splice_epic_checklists(with_trailing, [WorkOrderNode(issue_number=200)])
+    assert result.endswith("\n")
+
+    without_trailing = "## Work order\n- #100"
+    result = _splice_epic_checklists(without_trailing, [WorkOrderNode(issue_number=200)])
+    assert not result.endswith("\n")
+
+
 def test_splice_raises_on_a_cycle_introduced_by_the_new_rows() -> None:
     from coord.board_doctor_followthrough import _splice_epic_checklists
     from coord.milestone_order import WorkOrderError, WorkOrderNode
@@ -586,8 +682,10 @@ class _FakeGithubOps:
     def __init__(self) -> None:
         self.created: list[dict] = []
         self.sub_issues: list[tuple[str, int, int]] = []
+        self.parents: dict[int, int] = {}
         self.bodies: dict[int, str] = {}
         self.closed: list[tuple[int, str]] = []
+        self.states: dict[int, str] = {}
         self.next_number = 500
 
     def create_issue(self, repo, title, body, labels=None, milestone=None):
@@ -597,19 +695,29 @@ class _FakeGithubOps:
             repo=repo, number=number, title=title, body=body, milestone=milestone,
         ))
         self.bodies[number] = body
+        self.states[number] = "open"
         return {"number": number, "url": f"https://x/{number}"}
 
     def add_sub_issue(self, repo, parent_number, child_number):
         self.sub_issues.append((repo, parent_number, child_number))
+        self.parents[child_number] = parent_number
 
     def get_issue(self, repo, number):
         return {"number": number, "body": self.bodies.get(number, "")}
+
+    def get_issue_parent(self, repo, number):
+        parent = self.parents.get(number)
+        return {"number": parent} if parent is not None else None
+
+    def get_issue_state(self, repo, number):
+        return self.states.get(number, "open")
 
     def update_issue_body(self, repo, number, body):
         self.bodies[number] = body
 
     def close_issue(self, repo, number, comment=None, force=False):
         self.closed.append((number, comment))
+        self.states[number] = "closed"
 
 
 def test_github_writer_routes_every_method_through_github_ops(monkeypatch) -> None:
@@ -617,6 +725,8 @@ def test_github_writer_routes_every_method_through_github_ops(monkeypatch) -> No
     monkeypatch.setattr("coord.github_ops.create_issue", fake.create_issue)
     monkeypatch.setattr("coord.github_ops.add_sub_issue", fake.add_sub_issue)
     monkeypatch.setattr("coord.github_ops.get_issue", fake.get_issue)
+    monkeypatch.setattr("coord.github_ops.get_issue_parent", fake.get_issue_parent)
+    monkeypatch.setattr("coord.github_ops.get_issue_state", fake.get_issue_state)
     monkeypatch.setattr("coord.github_ops.update_issue_body", fake.update_issue_body)
     monkeypatch.setattr("coord.github_ops.close_issue", fake.close_issue)
 
@@ -638,3 +748,63 @@ def test_github_writer_routes_every_method_through_github_ops(monkeypatch) -> No
 
     writer.close_issue("acme/api", 101, comment="done")
     assert fake.closed == [(101, "done")]
+
+
+class TestGitHubFollowThroughWriterReadBack:
+    """Every write on :class:`ft.GitHubFollowThroughWriter` confirms its own
+    result by reading it back and raises when the read disagrees — a clean
+    `gh`/REST return only proves the request was issued, not that it
+    landed (#3945 review)."""
+
+    @staticmethod
+    def _writer_and_fake(monkeypatch) -> tuple["ft.GitHubFollowThroughWriter", _FakeGithubOps]:
+        fake = _FakeGithubOps()
+        monkeypatch.setattr("coord.github_ops.add_sub_issue", fake.add_sub_issue)
+        monkeypatch.setattr("coord.github_ops.get_issue", fake.get_issue)
+        monkeypatch.setattr("coord.github_ops.get_issue_parent", fake.get_issue_parent)
+        monkeypatch.setattr("coord.github_ops.get_issue_state", fake.get_issue_state)
+        monkeypatch.setattr("coord.github_ops.update_issue_body", fake.update_issue_body)
+        monkeypatch.setattr("coord.github_ops.close_issue", fake.close_issue)
+        return ft.GitHubFollowThroughWriter(), fake
+
+    def test_add_child_confirmed_does_not_raise(self, monkeypatch) -> None:
+        writer, fake = self._writer_and_fake(monkeypatch)
+        writer.add_child("acme/api", epic=50, child=500, after=())
+        assert fake.parents[500] == 50
+
+    def test_add_child_unconfirmed_raises(self, monkeypatch) -> None:
+        writer, fake = self._writer_and_fake(monkeypatch)
+        # `add_sub_issue` "succeeds" but the parent never actually took.
+        monkeypatch.setattr(
+            "coord.github_ops.add_sub_issue", lambda repo, parent_number, child_number: None,
+        )
+        with pytest.raises(RuntimeError, match="not 50"):
+            writer.add_child("acme/api", epic=50, child=500, after=())
+
+    def test_set_issue_body_confirmed_does_not_raise(self, monkeypatch) -> None:
+        writer, fake = self._writer_and_fake(monkeypatch)
+        writer.set_issue_body("acme/api", 50, "new body")
+        assert fake.bodies[50] == "new body"
+
+    def test_set_issue_body_unconfirmed_raises(self, monkeypatch) -> None:
+        writer, fake = self._writer_and_fake(monkeypatch)
+        # `update_issue_body` "succeeds" but never actually writes.
+        monkeypatch.setattr(
+            "coord.github_ops.update_issue_body", lambda repo, number, body: None,
+        )
+        with pytest.raises(RuntimeError, match="does not match"):
+            writer.set_issue_body("acme/api", 50, "new body")
+
+    def test_close_issue_confirmed_does_not_raise(self, monkeypatch) -> None:
+        writer, fake = self._writer_and_fake(monkeypatch)
+        writer.close_issue("acme/api", 101, comment="done")
+        assert fake.closed == [(101, "done")]
+
+    def test_close_issue_unconfirmed_raises(self, monkeypatch) -> None:
+        writer, fake = self._writer_and_fake(monkeypatch)
+        # `close_issue` "succeeds" but the issue still reads open.
+        monkeypatch.setattr(
+            "coord.github_ops.close_issue", lambda repo, number, comment=None, force=False: None,
+        )
+        with pytest.raises(RuntimeError, match="not confirmed closed"):
+            writer.close_issue("acme/api", 101, comment="done")

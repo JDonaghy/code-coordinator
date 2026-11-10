@@ -3187,7 +3187,15 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
     "--dry-run",
     is_flag=True,
     default=False,
-    help="Classify and print, but dispatch nothing and persist no convergence state.",
+    help=(
+        "Classify and print; dispatch no auto-action/mechanical fix and "
+        "persist/write/alert nothing. EXCEPTION (#3945): a `merged-partial` "
+        "row still dispatches its own read-only `claude -p` plan leg (up to "
+        "PLAN_LEG_TIMEOUT_SECONDS=20min) to render what it would propose — "
+        "that leg edits nothing in the target repo, but it IS a real "
+        "dispatch occupying a machine slot, unlike every other `--dry-run` "
+        "path in this command."
+    ),
 )
 @click.option(
     "--no-investigate",
@@ -3200,9 +3208,23 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
         "(C2/C3 allowlist) and alert (C4) tiers are unaffected."
     ),
 )
+@click.option(
+    "--no-followthrough",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disarm `merged-partial` follow-through fleet-wide for this "
+        "sweep, regardless of any repo's own opt-in (#3945) — same kind "
+        "of invocation-scoped kill switch `--no-investigate` is for the "
+        "C1 tier. Every other row/tier is unaffected. Same effect as "
+        "setting COORD_BOARD_DOCTOR_NO_FOLLOWTHROUGH for just this "
+        "invocation."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_sweep(
-    output_json: bool, dry_run: bool, no_investigate: bool, config_path: Path,
+    output_json: bool, dry_run: bool, no_investigate: bool, no_followthrough: bool,
+    config_path: Path,
 ) -> None:
     """Board-doctor sweep: classify every stuck row, dispatch, record (#3758).
 
@@ -3250,8 +3272,14 @@ def drive_queue_sweep(
     (`coord.state.BOARD_DOCTOR_BACKOFF_INITIAL_HOURS` doubling each firing
     up to `BOARD_DOCTOR_BACKOFF_CAP_HOURS`) rather than alerting once and
     then being ignored forever. `--dry-run` classifies and prints but
-    mutates no convergence counter and dispatches nothing — a sweep run
-    right after a dry run sees exactly what the dry run saw.
+    mutates no convergence counter and dispatches no auto-action/mechanical
+    fix — a sweep run right after a dry run sees exactly what the dry run
+    saw for those rows. The one exception (#3945): a `merged-partial` row
+    still dispatches its own read-only plan leg under `--dry-run` (it edits
+    nothing in the target repo, but it IS a real `claude -p` leg occupying
+    a machine slot for up to 20 minutes) so the rendered plan can be
+    printed; writing the follow-ups/closing the issue is what `--dry-run`
+    actually suppresses for that row.
 
     Meant to run on a schedule (`coord/deploy/coord-board-doctor.timer`,
     shipped disabled by default) as well as by hand; same `is_remote()`
@@ -3267,6 +3295,13 @@ def drive_queue_sweep(
     setting `board_doctor.investigate: false` at the top of
     `coordinator.yml` would for every future sweep — the mechanical and
     alert tiers keep running either way.
+
+    `merged-partial` rows are resolved by a separate pass alongside the
+    tier loop above, never through it (see `run_sweep`'s docstring).
+    `--no-followthrough` disarms that pass fleet-wide for this invocation
+    regardless of any repo's own `repos[].board_doctor.followthrough`
+    opt-in — the same kind of kill switch `--no-investigate` is for the
+    C1 tier.
 
     There is no `--no-finish` here: the finisher tier (Trigger A,
     #3835/#3837) fires off `coord.auto_loop.process_review_completion` at
@@ -3303,6 +3338,7 @@ def drive_queue_sweep(
             alert_dispatcher=board_doctor_policy.escalation_alert_dispatcher,
             dry_run=dry_run,
             escalation_resolver=board_doctor_policy.dismiss_resolved_escalation,
+            followthrough=not no_followthrough,
         )
     finally:
         # Restore rather than blindly delete: a caller already running with
@@ -3384,7 +3420,15 @@ def drive_queue_sweep(
         for reason in f.reasons:
             click.echo(f"  reason: {reason}")
     if dry_run:
-        click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
+        if report.followthrough:
+            click.echo(
+                "--dry-run: no auto-action/mechanical fix was dispatched and no "
+                "convergence state was persisted; the merged-partial row(s) above "
+                "still dispatched a real, read-only plan leg to render their plan "
+                "— nothing was written to GitHub"
+            )
+        else:
+            click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
     else:
         click.echo(
             f"{report.rows_observed} row(s) observed and decided — read the log later with "

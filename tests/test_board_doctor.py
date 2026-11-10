@@ -49,7 +49,14 @@ from coord.board_doctor import (
     stranded_prereq_rows,
     sweep,
 )
-from coord.config import BoardDoctorConfig, Config, ConfigError, _parse_board_doctor
+from coord.config import (
+    BoardDoctorConfig,
+    Config,
+    ConfigError,
+    PreflightGuardConfig,
+    PreflightGuardRepoConfig,
+    _parse_board_doctor,
+)
 from coord.drive_queue import BoardView, IssueFacts, QueueEntry, STATE_MERGED_PARTIAL, STATE_WAITING
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
 from coord.queue_diagnose import LiveState
@@ -4775,6 +4782,181 @@ class TestRunFollowthroughSweep:
         )
         assert dispositions == []
 
+    def test_max_rows_bounds_dispatches_per_sweep(self, monkeypatch) -> None:
+        """#3945 review: without a ceiling, N eligible rows in one sweep
+        means N serialized 20-minute plan legs. A row past *max_rows* is
+        simply left for the next sweep — no disposition, no alert."""
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+        rows = [self._row(2180), self._row(2181), self._row(2182)]
+
+        dispositions = run_followthrough_sweep(
+            rows, config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(self.ALL_LANDED_PLAN),
+            writer=writer, issue_open=lambda repo, number: True,
+            max_rows=2,
+        )
+
+        assert len(dispositions) == 2
+        assert {d.issue_number for d in dispositions} == {2180, 2181}
+
+    # ── #3945 review: the #3864 acceptance cases through the WIRED path,
+    # exercising `run_followthrough_sweep`'s own `cap`/`backends`/
+    # `epic_exists`/`milestone_exists` arguments rather than only
+    # `validate_plan`/`run_followthrough` directly — this is exactly where
+    # the `epic_exists` arity bug hid (a plan setting `fu.epic` never ran
+    # through this function before).
+
+    def test_over_cap_plan_rejects_through_the_wired_path(self, monkeypatch) -> None:
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+        config = replace(
+            self._config(), board_doctor=BoardDoctorConfig(followthrough_cap=1),
+        )
+        plan = {
+            "items": [{"item": "B", "verified_still_missing": True}],
+            "follow_ups": [
+                {"key": "a", "title": "t1", "body": ""},
+                {"key": "b", "title": "t2", "body": ""},
+            ],
+        }
+
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=config,
+            plan_leg_dispatcher=self._fake_plan_leg(plan),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_REJECTED
+        assert any("over the per-issue cap of 1" in r for r in dispositions[0].reasons)
+        assert writer.closed == []
+
+    def test_cross_backend_plan_rejects_through_the_wired_path(self, monkeypatch) -> None:
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+        config = replace(
+            self._config(),
+            preflight_guard=PreflightGuardConfig(
+                repos={
+                    "quadraui": PreflightGuardRepoConfig(backends=("gtk", "tui", "cocoa")),
+                },
+            ),
+        )
+        plan = {
+            "items": [{"item": "B", "verified_still_missing": True}],
+            "follow_ups": [{"key": "x", "title": "Port B to gtk and tui", "body": "both"}],
+        }
+
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=config,
+            plan_leg_dispatcher=self._fake_plan_leg(plan),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_REJECTED
+        assert any("crosses backends (gtk, tui)" in r for r in dispositions[0].reasons)
+        assert writer.closed == []
+
+    def test_epic_missing_rejects_through_the_wired_path(self, monkeypatch) -> None:
+        """#3945 review: `epic_exists` is wired with the fixed arity
+        (`epic_exists(fu.epic)`, one arg) and addressed by the repo's
+        GitHub slug, never the local repo name."""
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+        seen_repos: list[str] = []
+
+        def fake_get_issue(repo_name, issue_number):
+            seen_repos.append(repo_name)
+            return {} if issue_number == 999 else {"number": issue_number}
+
+        monkeypatch.setattr("coord.github_ops.get_issue", fake_get_issue)
+        plan = {
+            "items": [{"item": "B", "verified_still_missing": True}],
+            "follow_ups": [
+                {"key": "a", "title": "t1", "body": "", "epic": 999},
+            ],
+        }
+
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(plan),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_REJECTED
+        assert any("epic #999 does not exist" in r for r in dispositions[0].reasons)
+        assert writer.closed == []
+        # Addressed GitHub by the SLUG (`acme/quadraui`), never the local
+        # `coordinator.yml` name (`quadraui`).
+        assert seen_repos and all(r == "acme/quadraui" for r in seen_repos)
+
+    def test_milestone_missing_rejects_through_the_wired_path(self, monkeypatch) -> None:
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+        seen_repos: list[str] = []
+
+        def fake_get_repo_milestones(repo_name, state="open"):
+            seen_repos.append(repo_name)
+            return [{"title": "M1"}]
+
+        monkeypatch.setattr("coord.github_ops.get_repo_milestones", fake_get_repo_milestones)
+        plan = {
+            "items": [{"item": "B", "verified_still_missing": True}],
+            "follow_ups": [
+                {"key": "a", "title": "t1", "body": "", "milestone": "nope"},
+            ],
+        }
+
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(plan),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_REJECTED
+        assert any("milestone 'nope' does not exist" in r for r in dispositions[0].reasons)
+        assert writer.closed == []
+        assert seen_repos and all(r == "acme/quadraui" for r in seen_repos)
+
+    def test_depth_limit_pages_through_the_wired_path(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.board_doctor.build_partial_merge",
+            lambda repo_name, issue_number, *, config, board: ft.PartialMerge(
+                repo_name=repo_name, issue_number=issue_number, title="T",
+                body=f"B\n{ft.FOLLOWTHROUGH_MARKER.format(issue=1)}",
+            ),
+        )
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+        paged: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "coord.board_doctor._followthrough_notify",
+            lambda repo, number, stage, subject, body: paged.append((stage, subject)),
+        )
+
+        def boom_plan_leg(prompt, *, partial, config):
+            raise AssertionError("must not dispatch a plan leg for a depth-limited row")
+
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=boom_plan_leg,
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_DEPTH_PAGED
+        assert writer.closed == []
+        assert len(paged) == 1 and "followthrough-page" in paged[0][0]
+
 
 class TestRunSweepFollowthroughWiring:
     """:func:`run_sweep`'s own split: `merged-partial` rows never reach
@@ -4791,12 +4973,17 @@ class TestRunSweepFollowthroughWiring:
                 cause=CAUSE_MERGED_PARTIAL, confidence="high",
             ),
         ]
-        monkeypatch.setattr(board_doctor_mod, "collect_rows", lambda *, config: rows)
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config: (rows, Board()),
+        )
 
         captured_followthrough_rows: list = []
+        captured_board = []
 
-        def _fake_followthrough_sweep(ft_rows, *, config, dry_run):
+        def _fake_followthrough_sweep(ft_rows, *, config, board, dry_run):
             captured_followthrough_rows.extend(ft_rows)
+            captured_board.append(board)
             return ["sentinel-disposition"]
 
         config = Config(repos=[], machines=[])
@@ -4814,6 +5001,9 @@ class TestRunSweepFollowthroughWiring:
         assert report.followthrough == ["sentinel-disposition"]
         # Still counted for the "nothing stuck" honesty check (#3758).
         assert report.rows_observed == 2
+        # The SAME Board `_collect_rows_with_board` already built is handed
+        # to the followthrough pass — never a second `build_board` read.
+        assert len(captured_board) == 1 and isinstance(captured_board[0], Board)
 
     def test_followthrough_false_disarms_the_pass(self, monkeypatch) -> None:
         import coord.board_doctor as board_doctor_mod
@@ -4822,7 +5012,10 @@ class TestRunSweepFollowthroughWiring:
             queue="drive-queue", key="quadraui#2180", state=STATE_MERGED_PARTIAL,
             cause=CAUSE_MERGED_PARTIAL, confidence="high",
         )
-        monkeypatch.setattr(board_doctor_mod, "collect_rows", lambda *, config: [row])
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config: ([row], Board()),
+        )
         called = []
 
         report = board_doctor_mod.run_sweep(
@@ -4860,6 +5053,35 @@ class TestDriveQueueSweepCliFollowthroughOutput:
         args = ["--dry-run"] if dry_run else []
         return runner.invoke(drive_queue_sweep, args)
 
+    def test_no_followthrough_flag_reaches_run_sweep(self, monkeypatch) -> None:
+        """#3945 review: `run_sweep`'s own `followthrough` kwarg must be
+        reachable from the CLI, not just the env var."""
+        from click.testing import CliRunner
+
+        from coord.commands.drive_queue import drive_queue_sweep
+
+        captured_kwargs: dict = {}
+
+        monkeypatch.setattr("coord.board_service.is_remote", lambda: False)
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path, **k: Config(repos=[], machines=[]),
+        )
+
+        def fake_run_sweep(**kwargs):
+            captured_kwargs.update(kwargs)
+            import coord.board_doctor as board_doctor_mod
+
+            return board_doctor_mod.SweepReport(sweep_id="s1", rows_observed=0)
+
+        monkeypatch.setattr("coord.board_doctor.run_sweep", fake_run_sweep)
+
+        runner = CliRunner()
+        result = runner.invoke(drive_queue_sweep, ["--no-followthrough"])
+
+        assert result.exit_code == 0, result.output
+        assert captured_kwargs["followthrough"] is False
+
     def test_dry_run_prints_the_rendered_plan_and_writes_nothing(self, monkeypatch) -> None:
         import coord.board_doctor as board_doctor_mod
 
@@ -4882,7 +5104,11 @@ class TestDriveQueueSweepCliFollowthroughOutput:
         assert "quadraui#2180 merged-partial follow-through" in result.output
         assert "[still missing] B" in result.output
         assert "Implement B core" in result.output
-        assert "--dry-run: nothing was dispatched" in result.output
+        # The printed promise must not claim nothing was dispatched — a
+        # merged-partial row's own read-only plan leg IS a real dispatch
+        # even under --dry-run (#3945 review).
+        assert "nothing was dispatched" not in result.output
+        assert "still dispatched a real, read-only plan leg" in result.output
         # Dry-run action is still ACTION_FILED (what WOULD be filed) but no
         # issue numbers were actually created, so the "filed:" line (which
         # only fires for a real, non-dry-run file) must not appear.
@@ -4928,6 +5154,7 @@ class TestDispatchPlanLeg:
     def _partial() -> ft.PartialMerge:
         return ft.PartialMerge(
             repo_name="quadraui", issue_number=2180, title="T", body="B",
+            github_repo="acme/quadraui",
         )
 
     def test_happy_path_polls_until_done_and_returns_the_transcript(self, monkeypatch) -> None:
@@ -4939,7 +5166,7 @@ class TestDispatchPlanLeg:
         statuses = iter(["running", "running", "done"])
         sleeps: list[float] = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             assert proposal.type == "plan"
             assert proposal.system_prompt == "PROMPT"
             assert proposal.repo_name == "quadraui"
@@ -4951,6 +5178,11 @@ class TestDispatchPlanLeg:
             )
 
         monkeypatch.setattr("coord.dispatch.dispatch", fake_dispatch)
+        recorded = []
+        monkeypatch.setattr(
+            "coord.state.record_dispatched_assignment",
+            lambda *, assignment, repo_github: recorded.append((assignment, repo_github)),
+        )
 
         result = dispatch_plan_leg(
             "PROMPT",
@@ -4965,6 +5197,15 @@ class TestDispatchPlanLeg:
         assert result.assignment_id == "assign-1"
         assert result.output == "the plan text"
         assert len(sleeps) == 1  # one non-terminal poll before "done"
+        # #3945 review: the leg must be visible to `coord status`/cost
+        # attribution for the up-to-20-minutes it occupies a slot, same as
+        # every other non-CLI dispatcher's `dispatch* -> record_dispatched_
+        # assignment` pattern.
+        assert len(recorded) == 1
+        assignment, repo_github = recorded[0]
+        assert assignment.assignment_id == "assign-1"
+        assert assignment.machine_name == "box"
+        assert repo_github == "acme/quadraui"
 
     def test_no_reachable_machine_raises(self, monkeypatch) -> None:
         from coord.network import StatusResult
@@ -4986,7 +5227,7 @@ class TestDispatchPlanLeg:
         from coord.network import StatusResult
 
         monkeypatch.setattr(
-            "coord.dispatch.dispatch", lambda proposal, config: {"id": "assign-1"},
+            "coord.dispatch.dispatch", lambda proposal, config, **kwargs: {"id": "assign-1"},
         )
         clock = iter([0.0, 5.0, 25.0])
 
