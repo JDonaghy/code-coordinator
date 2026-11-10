@@ -32,6 +32,7 @@ from coord.review import (
     dispatch_review,
     dispatch_scoped_review,
     dispatch_scoped_reviews_for_queue,
+    fetch_review_findings_from_github_many,
     maybe_scoped_review_for_completed_fix,
     parse_review_from_log,
     pick_reviewer_machine,
@@ -4672,6 +4673,35 @@ def test_scoped_briefing_resolved_prior_adds_nothing_new() -> None:
         assert "Prior ISSUE_RESOLUTION judgment" not in briefing
 
 
+def test_scoped_briefing_base_move_also_carries_forward_prior_partial() -> None:
+    """#3966 non-blocking: a prior APPROVING review can carry its own
+    `ISSUE_RESOLUTION: partial` (#3502) — the already-approved/base-move
+    path must surface it too, not just the fix-round path."""
+    from coord.models import IssueResolution
+
+    briefing = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+        prior_verdict="approve",
+        is_base_move=True,
+        prior_issue_resolution=IssueResolution(
+            "partial", "root cause is a quadraui gap", explicit=True
+        ),
+    )
+    assert "already approved" in briefing
+    assert "ISSUE_RESOLUTION: partial" in briefing
+    assert "root cause is a quadraui gap" in briefing
+    assert "still outstanding" in briefing
+    assert "re-check it against the current branch" in briefing
+
+
 def _scoped_entry(**overrides) -> QueuedMerge:
     defaults = dict(
         assignment_id="w1",
@@ -7644,6 +7674,56 @@ END_REVIEW
         result = parse_review_from_log(log)
         assert result is not None
         assert result.issue_resolution.value == "resolved"
+
+
+class TestFetchReviewFindingsFromGithubMany:
+    """#3966: the batched form of `fetch_review_findings_from_github` —
+    one `get_issue_comments` fetch covering every requested assignment id,
+    instead of one fetch per id (the cost a multi-round review-chain fold
+    would otherwise pay on every merge-queue tick)."""
+
+    def test_single_fetch_covers_every_requested_assignment(self) -> None:
+        from unittest.mock import patch
+
+        from coord.comments import format_findings_block
+
+        comments = [
+            {"body": format_findings_block("rev-1", "request-changes", "First round.")},
+            {"body": format_findings_block("rev-2", "approve", "Second round.")},
+        ]
+        with patch(
+            "coord.github_ops.get_issue_comments", return_value=comments
+        ) as mock_fetch:
+            result = fetch_review_findings_from_github_many(
+                "acme/api", 42, ["rev-1", "rev-2", "rev-missing"]
+            )
+
+        mock_fetch.assert_called_once_with("acme/api", 42)
+        assert set(result) == {"rev-1", "rev-2"}
+        assert result["rev-1"].verdict == "request-changes"
+        assert result["rev-1"].body == "First round."
+        assert result["rev-2"].verdict == "approve"
+        assert result["rev-2"].body == "Second round."
+
+    def test_empty_assignment_ids_skips_the_fetch(self) -> None:
+        from unittest.mock import patch
+
+        with patch("coord.github_ops.get_issue_comments") as mock_fetch:
+            result = fetch_review_findings_from_github_many("acme/api", 42, [])
+        mock_fetch.assert_not_called()
+        assert result == {}
+
+    def test_fetch_failure_returns_empty_dict(self) -> None:
+        from unittest.mock import patch
+
+        with patch(
+            "coord.github_ops.get_issue_comments",
+            side_effect=RuntimeError("gh timed out"),
+        ):
+            result = fetch_review_findings_from_github_many(
+                "acme/api", 42, ["rev-1"]
+            )
+        assert result == {}
 
 
 class TestParseReviewFromAgent:

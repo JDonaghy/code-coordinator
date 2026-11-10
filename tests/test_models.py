@@ -417,7 +417,9 @@ def test_parse_issue_resolution_real_marker_wins_over_later_quoted_one() -> None
         "Reviewer note: `ISSUE_RESOLUTION: partial`. This matches exactly "
         "what review expected."
     )
-    assert parse_issue_resolution(text) == IssueResolution("resolved", "")
+    assert parse_issue_resolution(text) == IssueResolution(
+        "resolved", "", explicit=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -429,7 +431,9 @@ def test_parse_issue_resolution_list_and_heading_prefixes(prefix: str) -> None:
     parse exactly like a `*` bullet already did — not fail open to the
     "resolved" default."""
     text = f"{prefix} ISSUE_RESOLUTION: partial — X"
-    assert parse_issue_resolution(text) == IssueResolution("partial", "X")
+    assert parse_issue_resolution(text) == IssueResolution(
+        "partial", "X", explicit=True
+    )
 
 
 def test_parse_issue_resolution_3916_review_text_regression() -> None:

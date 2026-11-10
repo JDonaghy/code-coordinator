@@ -714,10 +714,27 @@ class IssueResolution:
     remainder after the value (e.g. "the quadraui issue was only drafted,
     not filed"), empty when the marker carried none or wasn't present at
     all.
+
+    ``explicit`` (#3966) is the presence bit: ``True`` only when
+    :func:`parse_issue_resolution` actually matched a real marker in the
+    source text, ``False`` for the default it returns when none was found
+    (or the text was empty/``None``). Without this bit, a round that
+    states nothing and a round that explicitly writes
+    ``ISSUE_RESOLUTION: resolved`` are the same value and indistinguishable
+    — which is exactly what let a multi-round fold (#3966's
+    `coord.merge_queue._issue_resolution_for_entry`) never clear a prior
+    `partial`/`investigation`, even when a later, independent reviewer
+    deliberately restated `resolved`. Callers that fold multiple rounds
+    together use this bit to tell "silent" (carry the prior value forward)
+    apart from "stated" (let it win the tie); callers combining a single
+    worker/reviewer pair (:func:`effective_issue_resolution`) do not need
+    it — "never the reverse" there is unconditional regardless of how the
+    reviewer's value was produced.
     """
 
     value: str = DEFAULT_ISSUE_RESOLUTION
     reason: str = ""
+    explicit: bool = False
 
 
 # Mirrors `SMOKE_TESTS:`/`REVIEW_VERDICT:`'s tolerance for trailing
@@ -794,6 +811,12 @@ def parse_issue_resolution(text: str | None) -> IssueResolution:
     quotations of the marker text, not claims. A real, unquoted marker
     earlier in the text still wins once every later quoted mention has
     been skipped, rather than falling all the way back to the default.
+
+    The returned :class:`IssueResolution`'s ``explicit`` bit (#3966) is
+    ``True`` only on the "found a real marker" return below — the
+    absent/malformed default always comes back with ``explicit=False``,
+    so a caller folding several of these together can tell a genuine
+    `ISSUE_RESOLUTION: resolved` apart from a line that was never written.
     """
     if not text:
         return IssueResolution()
@@ -808,7 +831,7 @@ def parse_issue_resolution(text: str | None) -> IssueResolution:
         ).strip()
         if is_blank_issue_resolution_reason(reason):
             reason = ""
-        return IssueResolution(value=value, reason=reason)
+        return IssueResolution(value=value, reason=reason, explicit=True)
     return IssueResolution()
 
 
