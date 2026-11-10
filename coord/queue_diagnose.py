@@ -57,9 +57,12 @@ import logging
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from coord.drive_queue import QueueEntry, is_unreachable_wait_shape
+
+if TYPE_CHECKING:
+    from coord.gates import GateReport
 
 _log = logging.getLogger(__name__)
 
@@ -176,10 +179,14 @@ CAUSE_NEVER_DISPATCHED = "never-dispatched"
 #: applying. The fix either way is a review, never a worker leg — see
 #: :mod:`coord.board_doctor_policy`'s ``restage`` wiring for this cause.
 CAUSE_REVIEW_STALE = "review-stale"
-#: #3929 (#3918 gap 3), the Test-gate twin of :data:`CAUSE_REVIEW_STALE`:
-#: :func:`coord.merge_queue.evaluate_smoke_verdict`'s own ``kind`` reads
-#: :data:`coord.merge_queue.SMOKE_STALE` — a ``passed``/``skipped`` verdict
-#: recorded against a branch/base SHA pair that has since moved. Never
+#: #3929 (#3918 gap 3), the Test-gate twin of :data:`CAUSE_REVIEW_STALE`: a
+#: live :class:`~coord.entry_truth.EntryTruth` (#3936) whose ``test``
+#: decision's ``anchor`` is populated — set ONLY for a ``passed``/
+#: ``skipped`` verdict recorded against a branch/base SHA pair that has
+#: since moved (:func:`coord.merge_queue.evaluate_smoke_verdict`'s own
+#: ``kind`` reading :data:`coord.merge_queue.SMOKE_STALE`, which
+#: :func:`coord.gates.build_gate_report` already calls to build the
+#: decision — never a second, independent call here). Never
 #: ``SMOKE_MISSING`` (nothing was ever recorded — that is a plain gate
 #: refusal, not staleness) or ``SMOKE_UNKNOWN`` (the live SHA needed to
 #: judge staleness could not even be read — abstain, don't guess). The fix
@@ -309,25 +316,37 @@ class LiveState:
     #: that assignment has no branch recorded yet (dispatched, just not
     #: pushed). Only a confirmed ``True`` may ever upgrade a verdict.
     no_assignment_ever: bool | None = None
-    #: #3929: ``True`` only when the merge gate's OWN freshness check
-    #: (:func:`coord.merge_queue.find_scoped_review_candidate`) confirms a
+    #: #3929/#3936: ``True`` only when a live :class:`~coord.entry_truth.
+    #: EntryTruth` (:func:`coord.entry_truth.reconcile_entry`) confirms a
     #: prior approve verdict exists for this branch but no longer covers
-    #: its current head/patch-id. ``False`` when review isn't required at
-    #: all, or the requirement reads fresh (approved-and-current, or never
+    #: its current head/patch-id — either :attr:`~coord.entry_truth.
+    #: EntryTruth.review_stale` (the gate itself still reads APPROVED, the
+    #: #3948 patch-id-drift case) or, when the gate reads NOT approved, a
+    #: direct :func:`coord.merge_queue.find_scoped_review_candidate` call
+    #: (:meth:`GhLiveProbe._review_stale_fallback` — additive work
+    #: `EntryTruth` does not yet do on its own, see its own module
+    #: docstring rule 2). ``False`` when review isn't required at all, or
+    #: the requirement reads fresh (approved-and-current, or never
     #: approved in the first place — there is nothing stale to report
-    #: either way). ``None`` — "could not tell" — when the check was never
-    #: attempted (no board/config, no work-like assignment to anchor it
-    #: to) or raised. Never derived from ``coord gates``'s own cached
-    #: decision (see :data:`CAUSE_REVIEW_STALE`): a direct call, every
-    #: time, is the whole point.
+    #: either way). ``None`` — "could not tell" — when the live
+    #: reconciliation was never attempted (no board/config, no work-like
+    #: assignment to anchor it to) or raised, or when the live branch head
+    #: itself could not be confirmed. Never derived from ``coord gates``'s
+    #: own cached decision (see :data:`CAUSE_REVIEW_STALE`): a live read,
+    #: every time, is the whole point.
     review_stale: bool | None = None
-    #: #3929, the Test-gate twin of `review_stale`: ``True`` only when
-    #: :func:`coord.merge_queue.evaluate_smoke_verdict`'s own ``kind``
-    #: reads :data:`coord.merge_queue.SMOKE_STALE`. ``False`` when Test
-    #: isn't required, or the verdict reads fresh/missing/unknown — a
-    #: verdict that was simply never recorded is a plain gate refusal, not
-    #: staleness, and an unreadable live SHA is "could not tell", not
-    #: "confirmed not stale". ``None`` when the check was never attempted.
+    #: #3929/#3936, the Test-gate twin of `review_stale`: ``True`` only
+    #: when the live :class:`~coord.entry_truth.EntryTruth`'s ``test``
+    #: decision carries a populated ``anchor`` — set ONLY for a STALE
+    #: verdict (:func:`coord.merge_queue.evaluate_smoke_verdict`'s own
+    #: ``kind`` reading :data:`coord.merge_queue.SMOKE_STALE`, folded into
+    #: that decision by :func:`coord.gates.build_gate_report`, never a
+    #: second independent call here). ``False`` when Test isn't required,
+    #: or the verdict reads fresh/missing — a verdict that was simply
+    #: never recorded is a plain gate refusal, not staleness. ``None``
+    #: when the check was never attempted, raised, or the live SHA needed
+    #: to judge staleness could not be read — "could not tell", not
+    #: "confirmed not stale".
     test_stale: bool | None = None
 
     @property
@@ -1028,14 +1047,18 @@ class GhLiveProbe:
     def _gates(
         self, entry: QueueEntry, errors: list[str]
     ) -> tuple[str, bool | None, list[str], bool | None, str | None, bool | None, bool | None]:
-        # #3929 review: run BEFORE `build_gate_report`, and independently of
-        # whether it raises — the whole point of this recheck is that it
-        # does not trust `coord gates`'s cached decision, so it must not be
-        # coupled to that decision having succeeded in the first place. A
-        # raising `build_gate_report` still leaves `review_stale`/
-        # `test_stale` as the one reading this pass got to confirm.
-        review_stale, test_stale = self._staleness(entry, errors)
+        # #3936 review: `_staleness` now reads off the SAME `GateReport`
+        # this builds (via `reconcile_entry`'s own `report=` passthrough)
+        # rather than paying for — and risking disagreeing with — a SECOND
+        # live `build_gate_report` call for the identical `(repo, issue)` a
+        # moment later. `self.board`/`self.config` being absent is handled
+        # entirely inside `_staleness` (its own short-circuit), never by
+        # attempting a build here first and letting it fail. A build that
+        # DOES raise is recorded ONCE, right here — `_staleness` is never
+        # asked to retry the identical call and log the identical failure a
+        # second time; it simply has no report to read a verdict from.
         if self.board is None or self.config is None:
+            review_stale, test_stale = self._staleness(entry, errors, report=None)
             return "", None, [], None, None, review_stale, test_stale
         try:
             from coord import github_ops  # noqa: PLC0415
@@ -1046,7 +1069,8 @@ class GhLiveProbe:
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"coord gates: {type(exc).__name__}: {exc}")
-            return "", None, [], None, None, review_stale, test_stale
+            return "", None, [], None, None, None, None
+        review_stale, test_stale = self._staleness(entry, errors, report=report)
         # `build_gate_report` returns early, with `report.rows` empty, ONLY
         # when `assignments_for_issue` found nothing on the board for this
         # issue at all (coord/gates.py) — never for an assignment that
@@ -1111,7 +1135,7 @@ class GhLiveProbe:
 
     # -- #3936: review/test staleness decided from a live EntryTruth -------
     def _staleness(
-        self, entry: QueueEntry, errors: list[str]
+        self, entry: QueueEntry, errors: list[str], *, report: "GateReport | None" = None,
     ) -> tuple[bool | None, bool | None]:
         """Review/test staleness for *entry*, read off a live
         :class:`~coord.entry_truth.EntryTruth` (:func:`coord.entry_truth.
@@ -1144,12 +1168,36 @@ class GhLiveProbe:
         ``scan_approved_reviews`` on its own, on a branch carrying two
         approvals at different SHAs — see its own docstring).
 
+        *report* (#3936 review) is the caller's already-built
+        :class:`~coord.gates.GateReport` for this SAME ``(repo, issue)``,
+        threaded straight into :func:`~coord.entry_truth.reconcile_entry`'s
+        own ``report=`` parameter so this never pays for — or risks
+        disagreeing with — a second live ``build_gate_report`` call.
+        ``None`` (the default) leaves the build to ``reconcile_entry``
+        itself, exactly as if no report had ever been threaded through —
+        the right default for a caller (or a direct test) that has no
+        report of its own to hand over.
+
+        ``self.board``/``self.config`` are checked FIRST, before anything
+        live is attempted: :func:`_gates` already special-cases both
+        "absent" (nothing to probe — never reaches here with a real
+        attempt either) and "the one live build it tried already raised"
+        (that failure is recorded by `_gates` itself; retrying the
+        identical call here would only log the identical failure a second
+        time) by short-circuiting to ``(None, None)`` before calling this
+        at all. This guard exists for every OTHER caller of ``_staleness``
+        (this module's own tests included) that does not go through
+        `_gates` first.
+
         ``(None, None)`` whenever there is nothing to anchor the check to —
         :func:`~coord.entry_truth.reconcile_entry`'s own ``None``/"unknown"
         fail-closed posture (#2704): a live probe that was never asked, or
         one that was asked and failed, both read "could not tell", never
         "confirmed fresh".
         """
+        if self.board is None or self.config is None:
+            return None, None
+
         from coord import github_ops  # noqa: PLC0415
         from coord.entry_truth import reconcile_entry  # noqa: PLC0415
         from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON  # noqa: PLC0415
@@ -1157,6 +1205,7 @@ class GhLiveProbe:
         try:
             truth = reconcile_entry(
                 self.board, self.config, entry.repo, entry.issue, gh_ops=github_ops,
+                report=report,
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"merge-gate freshness recheck: {type(exc).__name__}: {exc}")
@@ -1234,23 +1283,21 @@ class GhLiveProbe:
             winner = _select_winning_work_assignment(work_like)
             if not winner.branch:
                 return None
-            # The SAME head/patch-id `reconcile_entry` already probed LIVE
-            # a moment ago — carried straight through rather than paying
-            # for (and risking a second, independently-timed disagreement
-            # with) another `gh_ops` round trip for the identical branch.
-            mq_entry = mq.QueuedMerge(
-                assignment_id=winner.assignment_id or "",
-                repo_name=winner.repo_name,
-                repo_github=repo_cfg.github,
-                branch=winner.branch,
-                target_branch=truth.target_branch or repo_cfg.default_branch,
-                issue_number=getattr(winner, "issue_number", 0) or 0,
-                issue_title=getattr(winner, "issue_title", None) or "",
-                assignment_type=getattr(winner, "type", None) or "work",
-                required_gates=list(getattr(winner, "required_gates", None) or []),
-                branch_head_sha=truth.head_sha,
-                branch_patch_id=truth.patch_id,
+            # #3936 review: `mq.live_gate_entry` is the ONE place this
+            # construction happens (its own docstring, #2096) — never a
+            # second hand-rolled `QueuedMerge`, which would silently drift
+            # the moment that one grows a field this copy forgets (#2085's
+            # exact shape). `gh_ops=None` skips its OWN live lookup since
+            # the SAME head/patch-id `reconcile_entry` already probed LIVE
+            # a moment ago is carried straight through instead — never
+            # paying for (or risking a second, independently-timed
+            # disagreement with) another `gh_ops` round trip for the
+            # identical branch.
+            mq_entry = mq.live_gate_entry(
+                winner, repo_cfg.github, truth.target_branch or repo_cfg.default_branch, None,
             )
+            mq_entry.branch_head_sha = truth.head_sha
+            mq_entry.branch_patch_id = truth.patch_id
             candidate = mq.find_scoped_review_candidate(
                 mq_entry, self.board, github_ops, config=self.config,
             )

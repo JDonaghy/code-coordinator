@@ -59,10 +59,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
 from coord import queue_diagnose
 from coord.models import Board
+
+if TYPE_CHECKING:
+    from coord.entry_truth import EntryTruth
 
 _log = logging.getLogger(__name__)
 
@@ -1458,7 +1461,7 @@ def _no_progress_shape(
     local_host: str | None,
     now: float = 0.0,
     stall_nudge_of: Callable[[str, int], Mapping[str, Any] | None] = lambda repo, issue: None,
-    prereq_truth_of: Callable[[str], Any | None] = lambda dep: None,
+    prereq_truth_of: Callable[[str], "EntryTruth | None"] = lambda dep: None,
 ) -> str | None:
     """Which of the #3888/#3918 no-progress shapes *entry* matches, or
     ``None``.
@@ -1515,23 +1518,30 @@ def _no_progress_shape(
     row out, not this predicate.
 
     ``waiting``: every ``after=`` pre-req is landed, decided per-dep by
-    :func:`_dep_landed` (#3936) — a live :class:`~coord.entry_truth.
-    EntryTruth` from *prereq_truth_of*, when one is supplied and decisive,
-    exactly as :func:`coord.drive_queue._prereq_truth_verdict` already
-    decides the SAME question for the real tick's own ``after=``
-    resolution (#2096: one question, one answer — never a dep's own
-    drive-queue row ``state``, a latched conclusion that can go stale the
-    moment a different actor changes the dep's reality without rewriting
-    it). Falling back, when no live truth is supplied or it has nothing
-    decisive to say, to :attr:`coord.drive_queue.IssueFacts.landed` — OR,
-    like `_resolve_prereqs` itself (#2715), the dep's OWN drive-queue row
-    already reading :data:`coord.drive_queue.STATE_DONE_LIKE` in
-    *dep_states*, since the ``issues`` cache backing ``landed`` can run
-    minutes behind a merge the queue performed itself — AND the repo has
-    room under its own ceiling
-    right now, per *running_counts* (the scheduler's own occupancy
-    verdict) — AND the FLEET has room too, per *fleet_occupied* against
-    *fleet_ceiling*. Both capacity answers come from the same
+    :func:`_dep_landed` (#3936) with the SAME ordering and the SAME two
+    functions :func:`coord.drive_queue._resolve_prereqs` uses for the real
+    tick's own ``after=`` resolution (#2096: one question, one answer) —
+    every board-level positive signal checked FIRST (:attr:`coord.
+    drive_queue.IssueFacts.landed`, OR ``already_done and not reopened``
+    (#3931), OR the dep's OWN drive-queue row already reading
+    :data:`coord.drive_queue.STATE_DONE_LIKE` in *dep_states* — like
+    `_resolve_prereqs` itself (#2715), since the ``issues`` cache backing
+    ``landed`` can run minutes behind a merge the queue performed itself),
+    and only once none of those fire does a live :class:`~coord.
+    entry_truth.EntryTruth` from *prereq_truth_of* get a say, via
+    :func:`coord.drive_queue._truth_is_done` — so a pre-req the queue
+    itself already confirmed `done` this tick, or whose cached `landed`
+    fact already reads `True`, is never shadowed by a live truth read
+    whose OWN probe happens to fail against that same pre-req. A dep with
+    no live truth supplied, or whose truth has nothing decisive to say
+    (:data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN`, or an inconclusive
+    probe-failure :data:`~coord.entry_truth.NEXT_ACTION_ESCALATE` — see
+    :attr:`~coord.entry_truth.EntryTruth.escalate_probe_failure` and
+    :func:`coord.drive_queue._truth_is_done`'s own docstring), simply
+    reads as not landed by this check — AND the repo has room under its
+    own ceiling right now, per *running_counts* (the scheduler's own
+    occupancy verdict) — AND the FLEET has room too, per *fleet_occupied*
+    against *fleet_ceiling*. Both capacity answers come from the same
     ``ConcurrencyReport`` :func:`_resolve_no_progress_concurrency` resolves,
     the one the real tick's own ``plan_tick`` enforces at both levels: a
     `waiting` row at `repo` capacity and one at the FLEET's own
@@ -1575,16 +1585,15 @@ def _no_progress_shape(
     if entry.state in (STATE_BLOCKED, STATE_PARKED):
         return _NO_PROGRESS_BLOCKED
     if entry.state == STATE_WAITING:
-        from coord.entry_truth import (  # noqa: PLC0415
-            NEXT_ACTION_MARK_DONE,
-            NEXT_ACTION_UNKNOWN,
-        )
+        from coord.drive_queue import _truth_is_done  # noqa: PLC0415
 
         def _dep_landed(dep: str) -> bool:
-            truth = prereq_truth_of(dep)
-            if truth is not None and truth.next_action != NEXT_ACTION_UNKNOWN:
-                return truth.next_action == NEXT_ACTION_MARK_DONE
-            return facts_of(dep).landed or dep_states.get(dep) in STATE_DONE_LIKE
+            facts = facts_of(dep)
+            if facts.landed or (facts.already_done and not facts.reopened):
+                return True
+            if dep_states.get(dep) in STATE_DONE_LIKE:
+                return True
+            return _truth_is_done(prereq_truth_of(dep))
 
         if not all(_dep_landed(dep) for dep in entry.after):
             return None
@@ -1677,7 +1686,7 @@ def no_progress_rows(
     now: float | None = None,
     local_host: str | None = None,
     systemd_flags: Mapping[str, int] | None = None,
-    prereq_truth: Mapping[str, Any] | None = None,
+    prereq_truth: Mapping[str, "EntryTruth"] | None = None,
 ) -> list[StuckRow]:
     """Classify every drive-queue row #3888 says the episode walk misses.
 
