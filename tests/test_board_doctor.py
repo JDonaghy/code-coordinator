@@ -17,12 +17,14 @@ from dataclasses import replace
 import pytest
 
 from coord import queue_diagnose, state
+from coord import board_doctor_followthrough as ft
 from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CHECKS_STALE_RACE,
     CAUSE_MERGE_NEVER_ATTEMPTED,
+    CAUSE_MERGED_PARTIAL,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
     CAUSE_STRANDED_PREREQ_BLOCKED,
@@ -37,7 +39,9 @@ from coord.board_doctor import (
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
     drive_queue_rows,
+    merged_partial_rows,
     no_progress_rows,
+    run_followthrough_sweep,
     smoke_no_verdict_rows,
     stranded_prereq_dep,
     stranded_prereq_guard,
@@ -45,7 +49,7 @@ from coord.board_doctor import (
     sweep,
 )
 from coord.config import BoardDoctorConfig, Config, ConfigError, _parse_board_doctor
-from coord.drive_queue import BoardView, IssueFacts, QueueEntry
+from coord.drive_queue import BoardView, IssueFacts, QueueEntry, STATE_MERGED_PARTIAL, STATE_WAITING
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
 from coord.queue_diagnose import LiveState
 from coord.smoke import (
@@ -2504,11 +2508,12 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
         from coord.config import BoardDoctorConfig, Config
 
         captured: dict = {}
+        sentinel_report = board_doctor_mod.SweepReport(sweep_id="sentinel-report")
 
         def _fake_sweep(rows, **kwargs):
             captured.update(kwargs)
             captured["rows"] = rows
-            return "sentinel-report"
+            return sentinel_report
 
         monkeypatch.setattr(board_doctor_mod, "collect_rows", lambda *, config: [])
         monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
@@ -2527,7 +2532,14 @@ class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
 
         result = board_doctor_mod.run_sweep(config=cfg, capacity_check=None)
 
-        assert result == "sentinel-report"
+        # #3945: `run_sweep` now returns the SAME report object `sweep()`
+        # built, only stamping `rows_observed` onto it (no merged-partial
+        # rows here, so `followthrough` stays empty) — no longer a bare
+        # passthrough, hence identity rather than equality to a sentinel
+        # string.
+        assert result is sentinel_report
+        assert result.rows_observed == 0
+        assert result.followthrough == []
         assert captured["log_retention_days"] == 7
         assert captured["backoff_initial_hours"] == 6.0
         assert captured["backoff_cap_hours"] == 12.0
@@ -4482,3 +4494,413 @@ class TestQueueStrandedPrereqDispatcher:
         assert decision.cause == CAUSE_STRANDED_PREREQ_BLOCKED
         assert decision.tier == TIER_ALERT
         assert self.comments == []
+
+
+# ── Merged-partial follow-through wiring (#3945) ────────────────────────────
+
+
+class TestMergedPartialRows:
+    """:func:`merged_partial_rows` — the `StuckRow` source that feeds
+    :func:`run_followthrough_sweep`."""
+
+    def test_a_merged_partial_entry_is_flagged(self) -> None:
+        entry = QueueEntry(
+            repo="quadraui", issue=2180, state=STATE_MERGED_PARTIAL,
+            last_reason="merged, ISSUE_RESOLUTION: partial",
+        )
+        [row] = merged_partial_rows([entry])
+        assert row.key == "quadraui#2180"
+        assert row.queue == "drive-queue"
+        assert row.cause == CAUSE_MERGED_PARTIAL
+        assert row.fresh is True
+        assert "last_reason=merged, ISSUE_RESOLUTION: partial" in row.evidence
+
+    def test_a_done_or_waiting_entry_is_not_flagged(self) -> None:
+        done = QueueEntry(repo="quadraui", issue=1, state="done")
+        waiting = QueueEntry(repo="quadraui", issue=2, state=STATE_WAITING)
+        assert merged_partial_rows([done, waiting]) == []
+
+    def test_collect_rows_feeds_merged_partial_rows(self, monkeypatch) -> None:
+        """#3945: a `merged-partial` row carries no `block_log` episode and
+        no merge-queue entry, so without this wiring it is invisible to
+        :func:`coord.board_doctor.collect_rows` entirely."""
+        import coord.board_doctor as board_doctor_mod
+
+        entry = QueueEntry(repo="quadraui", issue=2180, state=STATE_MERGED_PARTIAL)
+        monkeypatch.setattr(board_doctor_mod, "merge_queue_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "merged_partial_rows", lambda entries: (
+            merged_partial_rows(entries)
+        ))
+        monkeypatch.setattr(board_doctor_mod, "no_progress_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "smoke_no_verdict_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "stranded_prereq_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod.queue_diagnose, "run_pass", lambda *a, **k: [])
+        monkeypatch.setattr(
+            board_doctor_mod, "_refresh_ceiling_blocked_settled_rows",
+            lambda *a, **k: ([], []),
+        )
+        monkeypatch.setattr("coord.block_log.episodes", lambda *a, **k: [])
+        monkeypatch.setattr("coord.block_log.read_events", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "coord.commands.drive_queue._fetch_board_view_with_retry",
+            lambda: (_ for _ in ()).throw(RuntimeError("no board view in this test")),
+        )
+        monkeypatch.setattr("coord.commands.drive_queue._local_host_id", lambda: "host")
+        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda: [])
+        monkeypatch.setattr(
+            "coord.health.aggregate.local_fleet_health_block", lambda *a, **k: {},
+        )
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: [])
+        monkeypatch.setattr("coord.state.baseline_red_merge_blocked", lambda *a, **k: False)
+        monkeypatch.setattr("coord.state.baseline_red_streaks", lambda: {})
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        monkeypatch.setattr("coord.state.list_drive_queue", lambda: [entry.__dict__])
+        monkeypatch.setattr(
+            "coord.drive_queue.entries_from_rows", lambda rows: [entry],
+        )
+        monkeypatch.setattr(
+            "coord.drive_queue.read_systemd_max_parallel_flags", lambda: {},
+        )
+
+        config = Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[])
+        rows = board_doctor_mod.collect_rows(config=config)
+
+        assert any(r.key == "quadraui#2180" and r.cause == CAUSE_MERGED_PARTIAL for r in rows)
+
+
+class TestBuildPartialMerge:
+    """:func:`build_partial_merge` — the real (best-effort)
+    :class:`~coord.board_doctor_followthrough.PartialMerge` builder."""
+
+    def test_pulls_issue_epic_and_resolution_text(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        def fake_get_issue(repo, number):
+            if number == 101:
+                return {
+                    "number": 101, "title": "Do A and B", "body": "Do A. Do B.",
+                    "milestone": {"title": "M1"},
+                }
+            if number == 50:
+                return {"number": 50, "title": "Epic", "body": "## Work order\n- #101\n"}
+            raise AssertionError(f"unexpected issue number {number}")
+
+        monkeypatch.setattr("coord.github_ops.get_issue", fake_get_issue)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_parent", lambda repo, number: {"number": 50},
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_repo_file", lambda repo, path, branch="develop": "rules",
+        )
+
+        board = Board(completed=[
+            Assignment(
+                machine_name="m", repo_name="quadraui", issue_number=101,
+                issue_title="Do A and B", type="work", status="done",
+                completion_summary="ISSUE_RESOLUTION: partial — B remains",
+            ),
+        ])
+
+        partial = board_doctor_mod.build_partial_merge(
+            "quadraui", 101, config=Config(repos=[], machines=[]), board=board,
+        )
+
+        assert partial.repo_name == "quadraui" and partial.issue_number == 101
+        assert partial.title == "Do A and B"
+        assert partial.epic_number == 50
+        assert "## Work order" in partial.epic_body
+        assert partial.resolution_text == "ISSUE_RESOLUTION: partial — B remains"
+        assert partial.milestone == "M1"
+        assert partial.claude_md == "rules"
+
+    def test_degrades_gracefully_without_epic_or_claude_md(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda repo, number: {"number": number, "title": "T", "body": "B"},
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_parent", lambda repo, number: None,
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_repo_file",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no CLAUDE.md")),
+        )
+
+        partial = board_doctor_mod.build_partial_merge(
+            "quadraui", 42, config=Config(repos=[], machines=[]), board=Board(),
+        )
+
+        assert partial.epic_number is None and partial.epic_body == ""
+        assert partial.claude_md == "" and partial.resolution_text == ""
+
+
+class _FakeFollowThroughWriter:
+    def __init__(self) -> None:
+        self.closed: list[int] = []
+
+    def create_issue(self, repo_name, *, title, body, milestone):
+        return 999
+
+    def add_child(self, repo_name, *, epic, child, after):
+        pass
+
+    def get_issue_body(self, repo_name, number):
+        return ""
+
+    def set_issue_body(self, repo_name, number, body):
+        pass
+
+    def close_issue(self, repo_name, number, *, comment):
+        self.closed.append(number)
+
+
+class TestRunFollowthroughSweep:
+    """:func:`run_followthrough_sweep` — the production wiring between a
+    `merged-partial` :class:`StuckRow` and
+    :func:`coord.board_doctor_followthrough.run_followthrough`."""
+
+    @staticmethod
+    def _config(*, opted_in: bool = True) -> Config:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(followthrough=opted_in),
+        )
+        return Config(repos=[repo], machines=[])
+
+    @staticmethod
+    def _fake_plan_leg(plan: dict):
+        import json as _json
+
+        def leg(prompt, *, partial, config):
+            return ft.PlanLegResult(
+                assignment_id="plan-1",
+                output="```json\n" + _json.dumps(plan) + "\n```",
+            )
+        return leg
+
+    ALL_LANDED_PLAN = {
+        "items": [{"item": "A", "verified_still_missing": False, "evidence": "a.py:1"}],
+        "follow_ups": [],
+    }
+
+    def _row(self, issue: int = 2180) -> StuckRow:
+        return StuckRow(
+            queue="drive-queue", key=f"quadraui#{issue}", state=STATE_MERGED_PARTIAL,
+            cause=CAUSE_MERGED_PARTIAL, confidence="high",
+        )
+
+    def _stub_build_partial_merge(self, monkeypatch, *, epic_body: str = "") -> None:
+        monkeypatch.setattr(
+            "coord.board_doctor.build_partial_merge",
+            lambda repo_name, issue_number, *, config, board: ft.PartialMerge(
+                repo_name=repo_name, issue_number=issue_number, title="T", body="B",
+                epic_body=epic_body,
+            ),
+        )
+
+    def test_eligible_row_runs_followthrough_and_closes(self, monkeypatch) -> None:
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+
+        dispositions = run_followthrough_sweep(
+            [self._row()],
+            config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(self.ALL_LANDED_PLAN),
+            writer=writer,
+            issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_ALL_LANDED
+        assert writer.closed == [2180]
+
+    def test_dry_run_writes_nothing(self, monkeypatch) -> None:
+        self._stub_build_partial_merge(monkeypatch)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        writer = _FakeFollowThroughWriter()
+
+        dispositions = run_followthrough_sweep(
+            [self._row()],
+            config=self._config(),
+            dry_run=True,
+            plan_leg_dispatcher=self._fake_plan_leg(self.ALL_LANDED_PLAN),
+            writer=writer,
+            issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].dry_run is True
+        assert writer.closed == []
+
+    def test_a_row_not_cause_merged_partial_is_skipped(self, monkeypatch) -> None:
+        other_row = StuckRow(
+            queue="drive-queue", key="quadraui#9", state="blocked",
+            cause="merge-conflict", confidence="high",
+        )
+        dispositions = run_followthrough_sweep(
+            [other_row], config=self._config(), issue_open=lambda r, n: True,
+        )
+        assert dispositions == []
+
+    def test_a_suppressed_row_is_skipped(self, monkeypatch) -> None:
+        row = replace(self._row(), suppressed=True)
+        dispositions = run_followthrough_sweep(
+            [row], config=self._config(), issue_open=lambda r, n: True,
+        )
+        assert dispositions == []
+
+    def test_a_repo_without_opt_in_is_skipped(self, monkeypatch) -> None:
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=self._config(opted_in=False),
+            issue_open=lambda r, n: True,
+        )
+        assert dispositions == []
+
+    def test_an_already_closed_issue_is_skipped(self, monkeypatch) -> None:
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=self._config(), issue_open=lambda r, n: False,
+        )
+        assert dispositions == []
+
+    def test_a_flaky_open_check_does_not_sink_the_sweep(self, monkeypatch) -> None:
+        def boom(repo, number):
+            raise RuntimeError("gh timeout")
+
+        dispositions = run_followthrough_sweep(
+            [self._row()], config=self._config(), issue_open=boom,
+        )
+        assert dispositions == []
+
+
+class TestRunSweepFollowthroughWiring:
+    """:func:`run_sweep`'s own split: `merged-partial` rows never reach
+    :func:`sweep`'s tier loop — they're resolved by *followthrough_sweep*
+    instead and reported separately."""
+
+    def test_merged_partial_rows_bypass_the_tier_loop(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        rows = [
+            _row("quadraui#1", "merge-conflict"),
+            self_row := StuckRow(
+                queue="drive-queue", key="quadraui#2180", state=STATE_MERGED_PARTIAL,
+                cause=CAUSE_MERGED_PARTIAL, confidence="high",
+            ),
+        ]
+        monkeypatch.setattr(board_doctor_mod, "collect_rows", lambda *, config: rows)
+
+        captured_followthrough_rows: list = []
+
+        def _fake_followthrough_sweep(ft_rows, *, config, dry_run):
+            captured_followthrough_rows.extend(ft_rows)
+            return ["sentinel-disposition"]
+
+        config = Config(repos=[], machines=[])
+        report = board_doctor_mod.run_sweep(
+            config=config,
+            tier_of=lambda cause: TIER_ALERT,
+            alert_dispatcher=lambda row: True,
+            followthrough_sweep=_fake_followthrough_sweep,
+        )
+
+        # Only the non-merged-partial row went through the tier loop.
+        assert [d.key for d in report.decisions] == ["quadraui#1"]
+        # The merged-partial row was handed to the dedicated pass instead.
+        assert captured_followthrough_rows == [self_row]
+        assert report.followthrough == ["sentinel-disposition"]
+        # Still counted for the "nothing stuck" honesty check (#3758).
+        assert report.rows_observed == 2
+
+    def test_followthrough_false_disarms_the_pass(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        row = StuckRow(
+            queue="drive-queue", key="quadraui#2180", state=STATE_MERGED_PARTIAL,
+            cause=CAUSE_MERGED_PARTIAL, confidence="high",
+        )
+        monkeypatch.setattr(board_doctor_mod, "collect_rows", lambda *, config: [row])
+        called = []
+
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            followthrough=False,
+            followthrough_sweep=lambda *a, **k: called.append(1) or [],
+        )
+
+        assert called == []
+        assert report.followthrough == []
+
+
+class TestDriveQueueSweepCliFollowthroughOutput:
+    """CLI-level black-box coverage (#3864's open AC item, closed by
+    #3945): ``coord drive-queue sweep --dry-run`` prints
+    :func:`~coord.board_doctor_followthrough.render_plan`'s rendering of a
+    `merged-partial` follow-through and writes nothing."""
+
+    @staticmethod
+    def _invoke(monkeypatch, *, dry_run: bool, followthrough_report):
+        from click.testing import CliRunner
+
+        from coord.commands.drive_queue import drive_queue_sweep
+
+        monkeypatch.setattr("coord.board_service.is_remote", lambda: False)
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path, **k: Config(repos=[], machines=[]),
+        )
+        monkeypatch.setattr(
+            "coord.board_doctor.run_sweep", lambda **k: followthrough_report,
+        )
+
+        runner = CliRunner()
+        args = ["--dry-run"] if dry_run else []
+        return runner.invoke(drive_queue_sweep, args)
+
+    def test_dry_run_prints_the_rendered_plan_and_writes_nothing(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        disposition = ft.Disposition(
+            repo_name="quadraui", issue_number=2180, action=ft.ACTION_FILED,
+            dry_run=True, follow_ups=[],
+            rendered_plan=(
+                "Remaining items:\n  - [still missing] B\n"
+                "Proposed follow-ups:\n  - [a] Implement B core"
+            ),
+        )
+        report = board_doctor_mod.SweepReport(
+            sweep_id="s1", dry_run=True, decisions=[], rows_observed=1,
+            followthrough=[disposition],
+        )
+
+        result = self._invoke(monkeypatch, dry_run=True, followthrough_report=report)
+
+        assert result.exit_code == 0, result.output
+        assert "quadraui#2180 merged-partial follow-through" in result.output
+        assert "[still missing] B" in result.output
+        assert "Implement B core" in result.output
+        assert "--dry-run: nothing was dispatched" in result.output
+        # Dry-run action is still ACTION_FILED (what WOULD be filed) but no
+        # issue numbers were actually created, so the "filed:" line (which
+        # only fires for a real, non-dry-run file) must not appear.
+        assert "filed:" not in result.output
+
+    def test_real_run_reports_what_was_filed(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        disposition = ft.Disposition(
+            repo_name="quadraui", issue_number=2180, action=ft.ACTION_FILED,
+            dry_run=False, follow_ups=[300, 301],
+            rendered_plan="Remaining items:\n  - [still missing] B",
+        )
+        report = board_doctor_mod.SweepReport(
+            sweep_id="s1", dry_run=False, decisions=[], rows_observed=1,
+            followthrough=[disposition],
+        )
+
+        result = self._invoke(monkeypatch, dry_run=False, followthrough_report=report)
+
+        assert result.exit_code == 0, result.output
+        assert "filed: #300, #301" in result.output

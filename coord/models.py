@@ -1724,6 +1724,14 @@ class Proposal:
     # `coord/dispatch_workers.py`, ...) gets this for free without each call
     # site threading it through by hand.
     dispatched_by_assignment_id: str | None = None
+    # #3945: overrides the `type="plan"` dispatch's default system prompt
+    # (`coord.agent.WORKER_PLAN_PROMPT`'s own FILES_READ/FILES_MODIFY/
+    # APPROACH/RISKS/ESTIMATE schema) — set by the board-doctor merged-
+    # partial follow-through's plan leg, whose contract is a different
+    # fixed JSON shape (`coord.board_doctor_followthrough.build_plan_leg_
+    # prompt`). `None` for every other caller, which keeps today's
+    # `WORKER_PLAN_PROMPT` behaviour exactly.
+    system_prompt: str | None = None
 
 
 @dataclass

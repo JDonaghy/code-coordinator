@@ -48,6 +48,7 @@ from coord.milestone_order import (
     WorkOrder,
     WorkOrderError,
     WorkOrderNode,
+    parse_sub_issues,
     parse_work_order,
     render_work_order,
     replace_work_order_section,
@@ -190,6 +191,48 @@ class FollowThroughWriter(Protocol):
     def set_issue_body(self, repo_name: str, number: int, body: str) -> None: ...
 
     def close_issue(self, repo_name: str, number: int, *, comment: str) -> None: ...
+
+
+@dataclass
+class GitHubFollowThroughWriter:
+    """Real :class:`FollowThroughWriter` over the GitHub-backed
+    issue-tracker seam (:mod:`coord.github_ops`) — never `gh` directly
+    (#3945). ``add_child`` links the live GitHub sub-issues relationship
+    (:func:`coord.github_ops.add_sub_issue`); the ``after`` ordering itself
+    is recorded separately, in the epic body's own checklist
+    (:func:`_write_follow_ups`/:func:`_splice_epic_checklists`), since the
+    sub-issues API has no concept of inter-child ordering.
+    """
+
+    def create_issue(
+        self, repo_name: str, *, title: str, body: str, milestone: str | None,
+    ) -> int:
+        from coord import github_ops  # noqa: PLC0415
+
+        result = github_ops.create_issue(repo_name, title, body, milestone=milestone)
+        return int(result["number"])
+
+    def add_child(
+        self, repo_name: str, *, epic: int, child: int, after: Sequence[int],
+    ) -> None:
+        from coord import github_ops  # noqa: PLC0415
+
+        github_ops.add_sub_issue(repo_name, parent_number=epic, child_number=child)
+
+    def get_issue_body(self, repo_name: str, number: int) -> str:
+        from coord import github_ops  # noqa: PLC0415
+
+        return github_ops.get_issue(repo_name, number).get("body") or ""
+
+    def set_issue_body(self, repo_name: str, number: int, body: str) -> None:
+        from coord import github_ops  # noqa: PLC0415
+
+        github_ops.update_issue_body(repo_name, number, body)
+
+    def close_issue(self, repo_name: str, number: int, *, comment: str) -> None:
+        from coord import github_ops  # noqa: PLC0415
+
+        github_ops.close_issue(repo_name, number, comment=comment)
 
 
 # ── Gating ───────────────────────────────────────────────────────────────────
@@ -772,15 +815,91 @@ def _write_follow_ups(
             )
     for epic, nodes in new_nodes.items():
         body = writer.get_issue_body(partial.repo_name, epic)
-        # Raises on a malformed block so a write failure alerts rather than
-        # overwriting rows this module could not read.
-        existing = parse_work_order(body or "")
-        known = set(existing.issue_numbers)
-        merged = WorkOrder(nodes=existing.nodes + tuple(
-            n for n in nodes if n.issue_number not in known
-        ))
-        writer.set_issue_body(
-            partial.repo_name, epic,
-            replace_work_order_section(body, render_work_order(merged, checkbox=False)),
-        )
+        updated = _splice_epic_checklists(body or "", nodes)
+        writer.set_issue_body(partial.repo_name, epic, updated)
     return successors
+
+
+def _find_checklist_bounds(
+    lines: Sequence[str], heading_re: re.Pattern[str],
+) -> tuple[int, int] | None:
+    """``(start, end)`` line-index bounds of the checklist section
+    *heading_re* matches in *lines* — the line right after the heading
+    through the line right before the next markdown heading (or EOF).
+    ``None`` when *heading_re* matches no line. Mirrors
+    ``coord.milestone_order``'s own (private) section-boundary rule
+    exactly, duplicated here rather than imported since that module
+    exposes the splice only as "replace the whole section"
+    (:func:`~coord.milestone_order.replace_work_order_section`), which is
+    lossy for a hand-written row's prose suffix — see
+    :func:`_splice_epic_checklists`.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if heading_re.match(line.strip()):
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].strip().startswith("#"):
+            end = i
+            break
+    return start, end
+
+
+_WORK_ORDER_HEADING_RE = re.compile(r"^#{1,6}\s*Work order\s*$", re.IGNORECASE)
+_SUB_ISSUES_HEADING_RE = re.compile(r"^#{1,6}\s*Sub-issues\s*$", re.IGNORECASE)
+
+
+def _splice_epic_checklists(body: str, nodes: Sequence[WorkOrderNode]) -> str:
+    """Append *nodes* to the epic's ``## Work order`` and/or
+    ``## Sub-issues`` checklist(s), preserving every existing line
+    byte-for-byte (#3945).
+
+    ``coord milestone add-child`` rewrites the WHOLE checklist from its
+    parsed :class:`WorkOrder` — and :class:`WorkOrderNode` carries no
+    free-text field, so a hand-written `` - [ ] #N — tranche 2 of #101``
+    row comes back as bare `` - [ ] #N``, silently dropping the prose.
+    This splices the NEW rows in at the end of each section that already
+    exists in *body* instead, leaving every byte of the existing section
+    untouched, and appends a fresh ``## Work order`` section (the
+    pre-#3945 fallback, lossless since there was nothing to preserve) only
+    when *body* has neither section at all.
+
+    Skips a node already declared in a given section (idempotent re-run).
+    Validates each spliced section with the matching parser before
+    returning — a cycle, a duplicate, or an ``after`` edge to something
+    undeclared raises :class:`WorkOrderError` rather than landing a
+    corrupted checklist.
+    """
+    lines = body.splitlines()
+    spliced_any = False
+    for heading_re, parser in (
+        (_WORK_ORDER_HEADING_RE, parse_work_order),
+        (_SUB_ISSUES_HEADING_RE, parse_sub_issues),
+    ):
+        bounds = _find_checklist_bounds(lines, heading_re)
+        if bounds is None:
+            continue
+        spliced_any = True
+        start, end = bounds
+        existing = parser("\n".join(lines))
+        known = set(existing.issue_numbers)
+        to_add = [n for n in nodes if n.issue_number not in known]
+        if not to_add:
+            continue
+        new_lines = render_work_order(WorkOrder(nodes=tuple(to_add))).splitlines()
+        section_end = end
+        while section_end > start and not lines[section_end - 1].strip():
+            section_end -= 1
+        lines = lines[:section_end] + new_lines + lines[section_end:end] + lines[end:]
+        parser("\n".join(lines))  # raises WorkOrderError on a corrupted splice
+    if spliced_any:
+        return "\n".join(lines)
+    existing = parse_work_order(body)
+    merged = WorkOrder(nodes=existing.nodes + tuple(
+        n for n in nodes if n.issue_number not in set(existing.issue_numbers)
+    ))
+    return replace_work_order_section(body, render_work_order(merged, checkbox=False))

@@ -1672,6 +1672,14 @@ def dispatch(
         effective_provider_name, config,
     ):
         payload["provider"] = effective_provider_name
+    # #3945: a custom system prompt — only ever set by the board-doctor
+    # follow-through's plan leg, whose JSON-plan contract differs from
+    # `type="plan"`'s default `WORKER_PLAN_PROMPT` schema (see
+    # `Proposal.system_prompt`'s docstring). Same "only send when set"
+    # discipline as every other optional field above — an agent predating
+    # `AssignmentSpec.system_prompt` 400s on an unrecognized kwarg.
+    if proposal.system_prompt:
+        payload["system_prompt"] = proposal.system_prompt
 
     resp = httpx.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
     if (

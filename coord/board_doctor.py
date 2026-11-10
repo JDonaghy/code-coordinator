@@ -58,11 +58,12 @@ from __future__ import annotations
 
 import logging
 import re
+import time as _time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
-from coord import queue_diagnose
+from coord import board_doctor_followthrough, queue_diagnose
 from coord.models import Board
 
 if TYPE_CHECKING:
@@ -499,6 +500,398 @@ def stranded_prereq_rows(entries: Sequence[Any], *, config: Any) -> list[StuckRo
     return rows
 
 
+# ── Merged-partial follow-through (#3945) ───────────────────────────────────
+#
+# The disposition itself — plan-leg prompt/parse/validate, write/record
+# orchestration — is :mod:`coord.board_doctor_followthrough` (#3879). What
+# was missing: nobody called it. This section is the production wiring —
+# a THIRD `StuckRow` source alongside :func:`drive_queue_rows`/
+# :func:`merge_queue_rows`, and the impure seams (a real plan leg dispatched
+# through the agent, a real GitHub-backed writer) that feed
+# :func:`coord.board_doctor_followthrough.run_followthrough`.
+#
+# Deliberately NOT routed through :func:`sweep`'s own tier/auto_dispatchers/
+# convergence loop: that machinery exists to retry a cause across sweeps
+# with backoff, which is the wrong shape for "file the follow-ups and close
+# the issue, once" — :func:`run_followthrough_sweep` is a separate pass
+# :func:`run_sweep` runs alongside it, not a cause registered in
+# :mod:`coord.board_doctor_policy`'s allowlist.
+
+#: The one cause :func:`merged_partial_rows` ever mints — mirrors
+#: :data:`coord.drive_queue.STATE_MERGED_PARTIAL` (the drive-queue STATE,
+#: not a `queue_diagnose` cause: no block_log episode or merge-queue entry
+#: is involved, so there is nothing for that classifier to diagnose).
+CAUSE_MERGED_PARTIAL = "merged-partial"
+
+#: How long :func:`dispatch_plan_leg` waits for the follow-through's
+#: read-only plan leg to finish before giving up. A `claude -p` session
+#: grepping one repo, not a build — generous but still bounded, so a hung
+#: leg frees this sweep instead of blocking it indefinitely.
+PLAN_LEG_TIMEOUT_SECONDS = 20 * 60.0
+PLAN_LEG_POLL_INTERVAL_SECONDS = 15.0
+
+#: `/status` values :func:`dispatch_plan_leg` treats as "the leg is done
+#: trying" — mirrors `coord.models.Assignment.status`'s own terminal set
+#: for a non-work assignment (no review/smoke/merge stages apply to a plan
+#: leg, so "running"/"pending" are the only non-terminal values).
+_PLAN_LEG_TERMINAL_STATUSES = frozenset(
+    {"done", "failed", "advisory", "refused_policy", "refused_premise"}
+)
+
+
+def merged_partial_rows(entries: Sequence[Any]) -> list[StuckRow]:
+    """One :class:`StuckRow` per drive-queue row in
+    :data:`coord.drive_queue.STATE_MERGED_PARTIAL` (#3945) — the feed
+    :func:`run_followthrough_sweep` resolves.
+
+    Pure, like every other row source in this module: whether the issue is
+    STILL open (a human, or an earlier follow-through pass, may already
+    have closed it) is checked live, right before a plan leg would be
+    dispatched (:func:`run_followthrough_sweep`), not here — mirrors
+    :func:`merge_queue_rows`'s own split between "which rows" (cheap,
+    already-fetched evidence) and "what to do about them" (impure).
+    """
+    from coord.drive_queue import STATE_MERGED_PARTIAL  # noqa: PLC0415
+
+    rows: list[StuckRow] = []
+    for entry in entries:
+        if entry.state != STATE_MERGED_PARTIAL:
+            continue
+        evidence = (f"drive_queue.state={entry.state}",)
+        if entry.last_reason:
+            evidence += (f"last_reason={entry.last_reason}",)
+        rows.append(
+            StuckRow(
+                queue="drive-queue",
+                key=entry.key,
+                state=entry.state,
+                cause=CAUSE_MERGED_PARTIAL,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=evidence,
+                fresh=True,
+            )
+        )
+    return rows
+
+
+def _followthrough_notify(
+    repo_name: str, issue_number: int, stage: str, subject: str, body: str,
+) -> None:
+    """Real alert/page sink for :func:`coord.board_doctor_followthrough.
+    run_followthrough` (#3945): the SAME ``drive_escalations`` surface
+    every other board-doctor alert/page writes to
+    (:func:`coord.board_doctor_policy.escalation_alert_dispatcher`) — one
+    question ("does this issue need a human"), one answer, rather than a
+    second notification channel just for follow-through.
+    """
+    import click  # noqa: PLC0415
+
+    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+    try:
+        record_drive_escalation(
+            repo_name, issue_number, stage=stage, reason=subject,
+            gate_readings=body, proposed_command="coord drive-queue sweep",
+        )
+    except Exception as exc:  # noqa: BLE001 — an alert write failing must not sink the sweep
+        click.echo(
+            f"warning: board-doctor follow-through alert failed for "
+            f"{repo_name}#{issue_number}: {exc}",
+            err=True,
+        )
+
+
+def build_partial_merge(
+    repo_name: str, issue_number: int, *, config: Any, board: Board,
+) -> board_doctor_followthrough.PartialMerge:
+    """Real :class:`~coord.board_doctor_followthrough.PartialMerge` builder
+    for a live ``merged-partial`` row (#3945).
+
+    Best-effort on everything the plan leg's prompt treats as optional
+    context (epic body, CLAUDE.md) — the plan leg itself has Read/Bash on
+    the actual checkout and re-derives the truth from the live code
+    regardless; this only has to get it ENOUGH context to know what to
+    look for. ``resolution_text`` comes off the board — the originating
+    ``work`` assignment's own ``completion_summary`` (the #874 durable
+    copy of the worker's final message, the same column
+    :mod:`coord.drive_queue`'s own ``merge_resolution`` reads) — never a
+    second `gh` round trip for text already on disk. The most recently
+    completed matching assignment wins, in case the issue went through
+    more than one work leg.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    issue = github_ops.get_issue(repo_name, issue_number)
+    milestone = issue.get("milestone") or {}
+    parent = github_ops.get_issue_parent(repo_name, issue_number)
+    epic_number = parent.get("number") if parent else None
+    epic_body = ""
+    if epic_number is not None:
+        try:
+            epic_body = github_ops.get_issue(repo_name, epic_number).get("body") or ""
+        except Exception:  # noqa: BLE001 — epic body is advisory context only
+            epic_body = ""
+
+    resolution_text = ""
+    for a in reversed(list(board.completed)):
+        if (
+            a.repo_name == repo_name and a.issue_number == issue_number
+            and a.type == "work" and a.completion_summary
+        ):
+            resolution_text = a.completion_summary
+            break
+
+    claude_md = ""
+    try:
+        claude_md = github_ops.get_repo_file(repo_name, "CLAUDE.md")
+    except Exception:  # noqa: BLE001 — advisory context only
+        claude_md = ""
+
+    return board_doctor_followthrough.PartialMerge(
+        repo_name=repo_name,
+        issue_number=issue_number,
+        title=issue.get("title") or "",
+        body=issue.get("body") or "",
+        resolution_text=resolution_text,
+        epic_number=epic_number,
+        epic_body=epic_body,
+        milestone=milestone.get("title"),
+        claude_md=claude_md,
+    )
+
+
+def dispatch_plan_leg(
+    prompt: str,
+    *,
+    partial: board_doctor_followthrough.PartialMerge,
+    config: Any,
+    status_fetcher: Callable[..., Any] | None = None,
+    text_fetcher: Callable[[str, str], str | None] | None = None,
+    sleep: Callable[[float], None] = _time.sleep,
+    now: Callable[[], float] = _time.time,
+    timeout_seconds: float = PLAN_LEG_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = PLAN_LEG_POLL_INTERVAL_SECONDS,
+) -> board_doctor_followthrough.PlanLegResult:
+    """Real ``plan_leg`` seam for :func:`coord.board_doctor_followthrough.
+    run_followthrough` (#3945).
+
+    Dispatches an ordinary ``type="plan"`` headless leg through the agent
+    (:func:`coord.dispatch.dispatch`, never an in-process call) with a
+    custom system prompt carrying the follow-through's own JSON-plan
+    contract (``Proposal.system_prompt`` — the worker never sees
+    ``type="plan"``'s default ``WORKER_PLAN_PROMPT``/FILES_READ/.../
+    ESTIMATE schema once this is set), then blocks polling ``/status``
+    until the assignment reaches a terminal state or *timeout_seconds*
+    elapses, and returns its raw transcript
+    (:func:`coord.plan_parser.fetch_raw_text_from_agent` — the extraction
+    half shared with the generic plan-worker parser, regardless of which
+    schema the transcript actually follows).
+
+    Routes machine selection through :func:`coord.dispatch.select_fix_machine`
+    (the SAME "which machine" answer a same-branch fix dispatch gets,
+    #2096) rather than a second, independently-drifting picker — this is a
+    fresh dispatch, not a same-branch fix, so there is no "original
+    machine" to prefer; the first configured machine is named as that
+    (inert) preference and every capable, reachable one is an equally good
+    candidate.
+
+    Raises :class:`RuntimeError` when no machine is reachable/capable, the
+    dispatch itself fails, or the leg never reaches a terminal state before
+    the timeout — :func:`run_followthrough` has no recovery path for a plan
+    leg that produced no output, so surfacing the failure loudly (rather
+    than returning an empty result :func:`parse_plan` would merely read as
+    "unreadable") is deliberate.
+    """
+    from coord.dispatch import dispatch as dispatch_proposal  # noqa: PLC0415
+    from coord.dispatch import select_fix_machine  # noqa: PLC0415
+    from coord.models import Proposal  # noqa: PLC0415
+    from coord.network import fetch_status  # noqa: PLC0415
+    from coord.plan_parser import fetch_raw_text_from_agent  # noqa: PLC0415
+
+    fetch = status_fetcher or fetch_status
+    fetch_text = text_fetcher or fetch_raw_text_from_agent
+
+    preferred = config.machines[0].name if config.machines else ""
+    selection = select_fix_machine(
+        original_machine_name=preferred,
+        repo_name=partial.repo_name,
+        machines=list(config.machines),
+        status_fetcher=fetch,
+    )
+    if selection.machine is None:
+        raise RuntimeError(
+            f"no machine reachable to run the follow-through plan leg for "
+            f"{partial.repo_name}#{partial.issue_number}: {selection.tried}"
+        )
+
+    proposal = Proposal(
+        id=0,
+        machine_name=selection.machine.name,
+        repo_name=partial.repo_name,
+        issue_number=partial.issue_number,
+        issue_title=partial.title,
+        rationale="board-doctor merged-partial follow-through plan leg",
+        briefing="Begin.",
+        type="plan",
+        system_prompt=prompt,
+    )
+    result = dispatch_proposal(proposal, config)
+    assignment_id = str(result.get("id") or result.get("assignment_id") or "")
+    if not assignment_id:
+        raise RuntimeError(
+            f"follow-through plan leg dispatch for "
+            f"{partial.repo_name}#{partial.issue_number} returned no "
+            f"assignment id: {result!r}"
+        )
+
+    deadline = now() + timeout_seconds
+    status: str | None = None
+    while now() < deadline:
+        probe = fetch(selection.machine)
+        if probe.ok:
+            data = probe.data or {}
+            candidates = list(data.get("active") or []) + list(data.get("completed") or [])
+            match = next(
+                (d for d in candidates if str(d.get("id")) == assignment_id), None,
+            )
+            if match is not None:
+                status = match.get("status")
+                if status in _PLAN_LEG_TERMINAL_STATUSES:
+                    break
+        sleep(poll_interval_seconds)
+
+    if status not in _PLAN_LEG_TERMINAL_STATUSES:
+        raise RuntimeError(
+            f"follow-through plan leg {assignment_id} for "
+            f"{partial.repo_name}#{partial.issue_number} did not reach a "
+            f"terminal state within {timeout_seconds:.0f}s "
+            f"(last observed status: {status!r})"
+        )
+
+    output = fetch_text(selection.machine.host, assignment_id)
+    return board_doctor_followthrough.PlanLegResult(
+        assignment_id=assignment_id, output=output or "",
+    )
+
+
+def _issue_exists(repo_name: str, issue_number: int) -> bool:
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        issue = github_ops.get_issue(repo_name, issue_number)
+    except Exception:  # noqa: BLE001 — unreachable/unknown reads as "doesn't exist"
+        return False
+    return bool(issue.get("number"))
+
+
+def _milestone_exists(repo_name: str, title: str) -> bool:
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        milestones = github_ops.get_repo_milestones(repo_name, state="all")
+    except Exception:  # noqa: BLE001 — unreachable reads as "doesn't exist"
+        return False
+    return any(m.get("title") == title for m in milestones)
+
+
+def run_followthrough_sweep(
+    rows: Sequence[StuckRow],
+    *,
+    config: Any,
+    board: Board | None = None,
+    dry_run: bool = False,
+    plan_leg_dispatcher: Callable[..., board_doctor_followthrough.PlanLegResult] = (
+        dispatch_plan_leg
+    ),
+    writer: board_doctor_followthrough.FollowThroughWriter | None = None,
+    issue_open: Callable[[str, int], bool] | None = None,
+) -> list[board_doctor_followthrough.Disposition]:
+    """Resolve every eligible ``merged-partial`` row in *rows* (#3945).
+
+    Eligible: ``row.cause == CAUSE_MERGED_PARTIAL``, not ``row.suppressed``
+    (a #3761-suppressed row defers to its repo's baseline-red row instead),
+    the repo has opted in
+    (:func:`coord.board_doctor_followthrough.followthrough_enabled`), and
+    the issue is STILL open (*issue_open*, defaulting to a live
+    ``github_ops.issue_is_closed`` check — the one place this is checked,
+    see :func:`merged_partial_rows`'s docstring for why it isn't checked
+    there).
+
+    *board*, when ``None`` (the default), is read once here via
+    :func:`coord.state.build_board` — a caller that already has one from
+    the same sweep (:func:`collect_rows`) should pass it through rather
+    than paying for a second read. *writer* defaults to a real
+    :class:`~coord.board_doctor_followthrough.GitHubFollowThroughWriter`.
+    """
+    from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+
+    if board is None:
+        from coord.state import build_board  # noqa: PLC0415
+
+        board = build_board()
+
+    def _default_issue_open(repo_name: str, issue_number: int) -> bool:
+        from coord import github_ops  # noqa: PLC0415
+
+        return not github_ops.issue_is_closed(repo_name, issue_number)
+
+    is_open = issue_open or _default_issue_open
+    row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
+    cap = getattr(
+        getattr(config, "board_doctor", None), "followthrough_cap",
+        board_doctor_followthrough.DEFAULT_FOLLOWUP_CAP,
+    )
+
+    dispositions: list[board_doctor_followthrough.Disposition] = []
+    for row in rows:
+        if row.cause != CAUSE_MERGED_PARTIAL or row.suppressed:
+            continue
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            continue
+        repo_name, issue_number = parsed
+        if not board_doctor_followthrough.followthrough_enabled(repo_name, config):
+            continue
+        try:
+            if not is_open(repo_name, issue_number):
+                continue
+        except Exception:  # noqa: BLE001 — a flaky open-check must not sink the sweep
+            continue
+
+        partial = build_partial_merge(
+            repo_name, issue_number, config=config, board=board,
+        )
+        backends = (
+            config.preflight_guard.for_repo(repo_name).backends
+            if getattr(config, "preflight_guard", None) is not None
+            else ()
+        )
+        auto_queue = board_doctor_followthrough.build_auto_queue_context(
+            repo_name, config,
+        )
+        disposition = board_doctor_followthrough.run_followthrough(
+            partial,
+            plan_leg=lambda prompt, _partial=partial: plan_leg_dispatcher(
+                prompt, partial=_partial, config=config,
+            ),
+            writer=row_writer,
+            alert=lambda subject, body, _r=repo_name, _n=issue_number: _followthrough_notify(
+                _r, _n, "board-doctor:followthrough-alert", subject, body,
+            ),
+            page=lambda subject, body, _r=repo_name, _n=issue_number: _followthrough_notify(
+                _r, _n, "board-doctor:followthrough-page", subject, body,
+            ),
+            cap=cap,
+            backends=backends,
+            epic_exists=_issue_exists,
+            milestone_exists=lambda title, _r=repo_name: _milestone_exists(_r, title),
+            dry_run=dry_run,
+            auto_queue=auto_queue,
+        )
+        dispositions.append(disposition)
+    return dispositions
+
+
 def default_tier_of(cause: str) -> str:
     """Default `tier_of`: delegates to the real C2 policy.
 
@@ -614,6 +1007,14 @@ class SweepReport:
     #: instead of asserting nothing is stuck when rows were simply
     #: filtered out upstream of :func:`sweep` (#3758).
     rows_observed: int = 0
+    #: #3945: one :class:`~coord.board_doctor_followthrough.Disposition`
+    #: per ``merged-partial`` row :func:`run_followthrough_sweep` acted on
+    #: this round — separate from *decisions* because the follow-through
+    #: disposition isn't a tier/auto_dispatchers/convergence decision (see
+    #: the "Merged-partial follow-through" section's module comment).
+    followthrough: list[board_doctor_followthrough.Disposition] = field(
+        default_factory=list,
+    )
 
 
 def merge_queue_rows(entries: Sequence[Any], *, now: float | None = None) -> list[StuckRow]:
@@ -2277,6 +2678,18 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     merge_entries = load_merge_queue()
     rows.extend(merge_queue_rows(merge_entries))
 
+    # #3945: a `merged-partial` row carries no open `block_log` episode (it
+    # is terminal/done-like, never `blocked`/`parked`) and no merge-queue
+    # entry, so neither walk above ever sees it — same "otherwise invisible
+    # to this sweep" gap `stranded_prereq_rows` closes for its own shape.
+    # `covered_keys` guards the same way every other additive pass here
+    # does, though in practice a merged-partial row never collides with an
+    # episode/merge-queue cause.
+    covered_keys = frozenset(row.key for row in rows)
+    rows.extend(
+        row for row in merged_partial_rows(entries) if row.key not in covered_keys
+    )
+
     # #3888: the episode/merge-queue walk above only ever covers a
     # `blocked`/`parked` transition or a merge-queue row — this is the
     # three-shape sweep over the whole queue that catches everything else.
@@ -3118,6 +3531,10 @@ def run_sweep(
     capacity_check: Callable[[StuckRow], bool] | _CapacityCheckUnset | None = (
         _CAPACITY_CHECK_UNSET
     ),
+    followthrough: bool = True,
+    followthrough_sweep: Callable[..., list[board_doctor_followthrough.Disposition]] = (
+        run_followthrough_sweep
+    ),
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -3141,16 +3558,32 @@ def run_sweep(
     the very next sweep with no daemon restart, same posture as every
     other `coord.board_doctor_policy` knob this module already reads live
     from *config*.
+
+    #3945: ``merged-partial`` rows are pulled OUT of *rows* before they
+    ever reach :func:`sweep` — that function's tier/auto_dispatchers/
+    convergence loop exists to retry a cause across sweeps with backoff,
+    the wrong shape for "file the follow-ups and close the issue, once".
+    They're resolved by *followthrough_sweep* (default
+    :func:`run_followthrough_sweep`) instead and reported on
+    :attr:`SweepReport.followthrough`, while still counting toward
+    :attr:`SweepReport.rows_observed` so "nothing stuck" stays honest.
+    *followthrough* is the same kind of fleet-wide kill switch
+    ``--no-investigate`` is for the C1 tier — ``False`` disarms this pass
+    for this invocation regardless of any repo's own opt-in
+    (:func:`coord.board_doctor_followthrough.followthrough_enabled` is
+    still consulted per-row on top of this).
     """
     rows = collect_rows(config=config)
+    followthrough_rows = [r for r in rows if r.cause == CAUSE_MERGED_PARTIAL]
+    other_rows = [r for r in rows if r.cause != CAUSE_MERGED_PARTIAL]
     resolved_capacity_check = (
         default_investigate_capacity(config)
         if capacity_check is _CAPACITY_CHECK_UNSET
         else capacity_check
     )
     board_doctor_cfg = getattr(config, "board_doctor", None)
-    return sweep(
-        rows,
+    report = sweep(
+        other_rows,
         tier_of=tier_of,
         auto_dispatchers=auto_dispatchers,
         alert_dispatcher=alert_dispatcher,
@@ -3163,6 +3596,12 @@ def run_sweep(
         backoff_cap_hours=getattr(board_doctor_cfg, "backoff_cap_hours", None),
         outcome_grace_hours=getattr(board_doctor_cfg, "outcome_grace_hours", None),
     )
+    report.rows_observed = len(rows)
+    if followthrough and followthrough_rows:
+        report.followthrough = followthrough_sweep(
+            followthrough_rows, config=config, dry_run=dry_run,
+        )
+    return report
 
 
 def _utcnow() -> datetime:
