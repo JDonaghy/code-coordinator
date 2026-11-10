@@ -3322,37 +3322,67 @@ def decide(
     # The merge queue's OWN gate (`merge_queue.has_approved_review`, matched
     # by branch / the `review_of_assignment_id` chain rather than this
     # driver's own exact-work-id match — see that function's #292 docstring)
-    # can report READY even when `drive_state.project`'s narrower match finds
-    # no review row for the CURRENT round at all: a scoped re-review's
-    # verdict can land on an older round of the same chain. Narrowed to
-    # exactly that shape — a bare WAIT with no verdict and no review
-    # assignment on this round — so it can never swallow a genuine WAIT that
-    # already has a review row to explain itself, such as the #1584
-    # usage-limit wait or the request-changes fix-dispatched latch; both of
-    # those must still wait even if some other queue entry happens to read
-    # READY.
+    # can confirm an approval even when `drive_state.project`'s narrower
+    # match finds no review row for the CURRENT round at all: a scoped
+    # re-review's verdict can land on an older round of the same chain.
+    # Narrowed to exactly that shape — a bare WAIT with no verdict and no
+    # review assignment on this round — so it can never swallow a genuine
+    # WAIT that already has a review row to explain itself, such as the
+    # #1584 usage-limit wait or the request-changes fix-dispatched latch;
+    # both of those must still wait regardless of what the queue reports.
+    #
+    # #3938: the live confirmation that the queue's review gate passed is
+    # NOT "merge_status == READY" — that was quadraui#2226's bug. The queue
+    # entry's own gates are evaluated in a fixed order every real attempt
+    # follows (review -> smoke -> uat -> CI -> merge mechanics; see
+    # `merge_queue._entry_gate_status`'s docstring, which `process()` mirrors
+    # byte-for-byte), and EVERY branch short-circuits: `entry.error`/
+    # `merge_reason` is only ever written past the review check once that
+    # check has already passed. So a PENDING entry whose recorded reason
+    # names anything OTHER than the review gate itself — a CI failure, a
+    # #2252/#3809 flake re-check, a #1892 CI-infra reason, a #3886
+    # merge-gate reservation, a stale/missing smoke verdict, a UAT verdict,
+    # or a real merge-mechanics CONFLICT — could only have been recorded
+    # AFTER the review gate passed, exactly like READY itself. Only an empty
+    # reason (never evaluated past "is this entry even enqueued yet") or one
+    # the review gate itself produced ("review not approved"/"review
+    # required…") leaves the review question genuinely unanswered; the
+    # ambiguous `unknown_head` reason (which review's OWN scan, or a LATER
+    # gate's, can equally produce — see `_merge_gate_kind`'s docstring) is
+    # treated the same way, out of caution.
+    _queue_reason_kind = _merge_gate_kind(state.merge_reason)
+    queue_review_gate_passed = (
+        (state.merge_status or "").upper() == "READY"
+        or (
+            bool((state.merge_reason or "").strip())
+            and _queue_reason_kind not in ("review", "unknown_head")
+        )
+    )
     review_gate_overridden_by_queue = (
         review is not None
         and review.kind == WAIT
         and state.review_verdict == ""
         and not state.review_aid
         and state.active_count == 0
-        and (state.merge_status or "").upper() == "READY"
+        and queue_review_gate_passed
     )
     if review is not None and not review_gate_overridden_by_queue:
         return replace(review, warnings=warnings + review.warnings)
     if review_gate_overridden_by_queue:
         warnings = warnings + review.warnings + (
-            "review gate found no review on this round, but the merge queue "
-            "already reports READY — proceeding to the merge arm instead of "
-            "waiting indefinitely (#3891)",
+            "review gate found no review on this round, but the merge "
+            "queue's own gate already passed review "
+            f"(status={state.merge_status or '(none)'}, "
+            f"reason={state.merge_reason or '(none)'}) — proceeding to the "
+            "merge arm instead of waiting indefinitely (#3891/#3938)",
         )
 
     if not opts.do_merge:
         return replace(
             _succeed(
                 (
-                    "✓ merge queue reports READY — stopping here (--no-merge)\n"
+                    "✓ merge queue's own review gate already passed — "
+                    "stopping here (--no-merge)\n"
                     f"  merge with: coord merge --only {state.work_aid}"
                 )
                 if review_gate_overridden_by_queue
