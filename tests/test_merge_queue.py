@@ -1214,10 +1214,13 @@ class TestProcess:
         findings = ReviewFindings(
             verdict="approve",
             body="ISSUE_RESOLUTION: partial — reviewer caught it",
-            issue_resolution=IssueResolution("partial", "reviewer caught it"),
+            issue_resolution=IssueResolution(
+                "partial", "reviewer caught it", explicit=True
+            ),
         )
         with patch(
-            "coord.review.fetch_review_findings_from_github", return_value=findings,
+            "coord.review.fetch_review_findings_from_github_many",
+            return_value={"rev-a": findings},
         ):
             events = process(items, gh := FakeGh(), board=board)
 
@@ -1257,10 +1260,13 @@ class TestProcess:
         findings = ReviewFindings(
             verdict="approve",
             body="ISSUE_RESOLUTION: partial — reviewer caught it",
-            issue_resolution=IssueResolution("partial", "reviewer caught it"),
+            issue_resolution=IssueResolution(
+                "partial", "reviewer caught it", explicit=True
+            ),
         )
         with patch(
-            "coord.review.fetch_review_findings_from_github", return_value=findings,
+            "coord.review.fetch_review_findings_from_github_many",
+            return_value={"rev-a": findings},
         ):
             events = process(items, gh, board=board)
 
@@ -1342,7 +1348,9 @@ class TestProcess:
                     "## Blocking findings\n- non-nullable render-frame slots\n\n"
                     "ISSUE_RESOLUTION: partial — reviewer caught it"
                 ),
-                issue_resolution=IssueResolution("partial", "reviewer caught it"),
+                issue_resolution=IssueResolution(
+                    "partial", "reviewer caught it", explicit=True
+                ),
             ),
             # The approving round states NO ISSUE_RESOLUTION line of its
             # own — parses to the indistinguishable-from-absent default.
@@ -1353,26 +1361,33 @@ class TestProcess:
             ),
         }
 
-        def _fake_fetch(repo_github, issue_number, assignment_id):
-            return findings_by_id.get(assignment_id)
+        def _fake_fetch_many(repo_github, issue_number, assignment_ids):
+            return {
+                aid: findings_by_id[aid]
+                for aid in assignment_ids
+                if aid in findings_by_id
+            }
 
         with patch(
-            "coord.review.fetch_review_findings_from_github",
-            side_effect=_fake_fetch,
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=_fake_fetch_many,
         ):
             result = _issue_resolution_for_entry(entry, board)
 
         assert result.value == "partial"
         assert result.reason == "reviewer caught it"
 
-    def test_scoped_rereview_restating_resolved_still_carries_forward(
+    def test_scoped_rereview_explicit_resolved_clears_prior_review_partial(
         self,
     ) -> None:
-        # Companion to the test above: an explicit `ISSUE_RESOLUTION:
-        # resolved` from the approving round is — by design —
-        # indistinguishable from a missing line, so it must ALSO never
-        # downgrade a prior round's `partial` ("never the reverse", the
-        # same rule that already protects a worker's own claim).
+        # Companion to the test above: unlike a MISSING line (indistinguish-
+        # able from "resolved" by design), a re-review that EXPLICITLY
+        # writes its own `ISSUE_RESOLUTION: resolved` has a presence bit
+        # proving the reviewer actually re-checked and made a deliberate
+        # call — that later, independent judgment clears an earlier REVIEW
+        # ROUND's `partial` (#3966). This is distinct from the worker's own
+        # claim, which "never the reverse" (#3502) still protects — see the
+        # next test.
         from coord.merge_queue import _issue_resolution_for_entry
         from coord.models import Assignment, Board, IssueResolution
         from coord.review import ReviewFindings
@@ -1401,25 +1416,197 @@ class TestProcess:
             "rev-1": ReviewFindings(
                 verdict="request-changes",
                 body="ISSUE_RESOLUTION: partial — reviewer caught it",
-                issue_resolution=IssueResolution("partial", "reviewer caught it"),
+                issue_resolution=IssueResolution(
+                    "partial", "reviewer caught it", explicit=True
+                ),
             ),
             "rev-2": ReviewFindings(
                 verdict="approve",
                 body="ISSUE_RESOLUTION: resolved",
-                issue_resolution=IssueResolution("resolved", ""),
+                issue_resolution=IssueResolution("resolved", "", explicit=True),
             ),
         }
 
-        def _fake_fetch(repo_github, issue_number, assignment_id):
-            return findings_by_id.get(assignment_id)
+        def _fake_fetch_many(repo_github, issue_number, assignment_ids):
+            return {
+                aid: findings_by_id[aid]
+                for aid in assignment_ids
+                if aid in findings_by_id
+            }
 
         with patch(
-            "coord.review.fetch_review_findings_from_github",
-            side_effect=_fake_fetch,
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=_fake_fetch_many,
+        ):
+            result = _issue_resolution_for_entry(entry, board)
+
+        assert result.value == "resolved"
+
+    def test_scoped_rereview_explicit_resolved_never_overrides_workers_own_partial(
+        self,
+    ) -> None:
+        # "Never the reverse" (#3502) still protects the WORKER's own
+        # `partial`/`investigation` admission from being undone — even by
+        # every review round unanimously, explicitly agreeing "resolved".
+        # The #3966 escape hatch only lets a later review round override an
+        # EARLIER review round's judgment, not the worker's own.
+        from coord.merge_queue import _issue_resolution_for_entry
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.review import ReviewFindings
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            completion_summary=(
+                "ISSUE_RESOLUTION: partial — root cause lives upstream"
+            ),
+        )
+        review = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            dispatched_at=100.0,
+        )
+        board = Board(active=[], completed=[work, review])
+        entry = _q("a", assignment_type="work")
+
+        findings_by_id = {
+            "rev-1": ReviewFindings(
+                verdict="approve",
+                body="ISSUE_RESOLUTION: resolved",
+                issue_resolution=IssueResolution("resolved", "", explicit=True),
+            ),
+        }
+
+        def _fake_fetch_many(repo_github, issue_number, assignment_ids):
+            return {
+                aid: findings_by_id[aid]
+                for aid in assignment_ids
+                if aid in findings_by_id
+            }
+
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=_fake_fetch_many,
         ):
             result = _issue_resolution_for_entry(entry, board)
 
         assert result.value == "partial"
+        assert result.reason == "root cause lives upstream"
+
+    def test_scoped_rereview_all_resolved_chain_stays_resolved(self) -> None:
+        # Nit: the permissive outcome through the new chain fold was only
+        # covered indirectly via `process()` — a multi-round chain where
+        # every round (worker + both reviews) says "resolved" must stay
+        # "resolved".
+        from coord.merge_queue import _issue_resolution_for_entry
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.review import ReviewFindings
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            completion_summary="Fixed it outright.",
+        )
+        review_1 = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="request-changes",
+            dispatched_at=100.0,
+        )
+        review_2 = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-2", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            dispatched_at=200.0,
+        )
+        board = Board(active=[], completed=[work, review_1, review_2])
+        entry = _q("a", assignment_type="work")
+
+        findings_by_id = {
+            "rev-1": ReviewFindings(
+                verdict="request-changes",
+                body="## Blocking findings\n- a nit\n",
+                issue_resolution=IssueResolution("resolved", "", explicit=True),
+            ),
+            "rev-2": ReviewFindings(
+                verdict="approve",
+                body="ISSUE_RESOLUTION: resolved",
+                issue_resolution=IssueResolution("resolved", "", explicit=True),
+            ),
+        }
+
+        def _fake_fetch_many(repo_github, issue_number, assignment_ids):
+            return {
+                aid: findings_by_id[aid]
+                for aid in assignment_ids
+                if aid in findings_by_id
+            }
+
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=_fake_fetch_many,
+        ):
+            result = _issue_resolution_for_entry(entry, board)
+
+        assert result.value == "resolved"
+
+    def test_scoped_rereview_carries_forward_prior_investigation(self) -> None:
+        # Nit: `investigation` (the higher of the two non-"resolved" ranks)
+        # must also survive the fold, not just `partial`.
+        from coord.merge_queue import _issue_resolution_for_entry
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.review import ReviewFindings
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            completion_summary="Fixed it outright.",
+        )
+        review_1 = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="request-changes",
+            dispatched_at=100.0,
+        )
+        review_2 = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-2", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            dispatched_at=200.0,
+        )
+        board = Board(active=[], completed=[work, review_1, review_2])
+        entry = _q("a", assignment_type="work")
+
+        findings_by_id = {
+            "rev-1": ReviewFindings(
+                verdict="request-changes",
+                body="ISSUE_RESOLUTION: investigation — nothing fixed yet",
+                issue_resolution=IssueResolution(
+                    "investigation", "nothing fixed yet", explicit=True
+                ),
+            ),
+            "rev-2": ReviewFindings(
+                verdict="approve",
+                body="## Blocking findings\nNone.\n",
+                issue_resolution=IssueResolution(),
+            ),
+        }
+
+        def _fake_fetch_many(repo_github, issue_number, assignment_ids):
+            return {
+                aid: findings_by_id[aid]
+                for aid in assignment_ids
+                if aid in findings_by_id
+            }
+
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=_fake_fetch_many,
+        ):
+            result = _issue_resolution_for_entry(entry, board)
+
+        assert result.value == "investigation"
 
     def test_commit_message_closing_keyword_blocks_merge_when_partial(self) -> None:
         # #3502 review (non-blocking concern): a commit SUBJECT using a
