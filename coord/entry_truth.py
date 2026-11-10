@@ -332,6 +332,41 @@ def _live_pr_facts(
     return "none", None, None
 
 
+def _review_unmet_action(review: GateDecision) -> tuple[str, str]:
+    """The action for an unmet "review" `GateDecision` — split out because
+    "review required but not ok" is not always "go dispatch a review".
+
+    Two defect shapes `coord.gates.build_gate_report` folds into the SAME
+    ``ok=False`` `GateDecision` need a DIFFERENT remedy than an ordinary
+    pending review, and both must be caught here so every caller of
+    :func:`_derive_next_action` sees them — not just `coord.drive`'s own
+    `_decide_merge` arm that first needed this split:
+
+    - `review.reason` carrying :data:`coord.merge_queue.
+      UNKNOWN_BRANCH_HEAD_REASON` (#2704, possibly suffixed by #2809's
+      request-id/retry-after detail — matched with `startswith`) means the
+      branch head could not be confirmed live at all; this is NEVER "not
+      approved", which asserts a refusal this scan never actually
+      confirmed. `coord.drive._merge_gate_kind` already treats the same
+      string as its own gate kind the auto-loop WAITS on rather than
+      escalating or re-dispatching — mirrored here as `wait`.
+    - `review.verdict_unparseable` (#1956) means a linked review row
+      finished with NO parseable verdict — a defect, not a pending/failed
+      review. The remedy is OPERATOR RECOVERY (`review.reason` carries the
+      exact `coord report-result --verdict-source recovered` command), not
+      another dispatched review, which would just re-derive a conclusion
+      that already exists in the log.
+    """
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON  # noqa: PLC0415
+
+    reason = review.reason or "review required but not approved"
+    if reason.startswith(UNKNOWN_BRANCH_HEAD_REASON):
+        return NEXT_ACTION_WAIT, reason
+    if review.verdict_unparseable:
+        return NEXT_ACTION_ESCALATE, reason
+    return NEXT_ACTION_DISPATCH_REVIEW, reason
+
+
 def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tuple[str, str]:
     """Rule 1: branches ONLY on the live facts already gathered onto
     *truth* — never on a persisted string like `merge_queue.error`.
@@ -387,10 +422,10 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         if test_unmet:
             return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
         if review_unmet:
-            return NEXT_ACTION_DISPATCH_REVIEW, truth.review.reason or "review required"  # type: ignore[union-attr]
+            return _review_unmet_action(truth.review)  # type: ignore[arg-type]
     else:
         if review_unmet:
-            return NEXT_ACTION_DISPATCH_REVIEW, truth.review.reason or "review required"  # type: ignore[union-attr]
+            return _review_unmet_action(truth.review)  # type: ignore[arg-type]
         if test_unmet:
             return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
 

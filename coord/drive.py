@@ -105,8 +105,9 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Protocol, Sequence
 
+from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
 from coord.filelock import FileLock, LockBusy, notify_lock_path
 from coord.drive_state import (
     BoardFetcher,
@@ -175,6 +176,9 @@ from coord.merge_queue import (
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
     stale_smoke_anchor as _mq_stale_smoke_anchor,
 )
+
+if TYPE_CHECKING:  # avoid a hard import cycle / heavy load-time import
+    from coord.entry_truth import EntryTruth
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
 
@@ -1865,6 +1869,8 @@ class MergeVerifier(Protocol):
 
     def entry_truth(self, state: IssueState) -> "EntryTruth | None": ...
 
+    def set_config(self, config: Any) -> None: ...
+
 
 def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
     """Loosely compare a ``git remote get-url origin`` URL against the
@@ -2200,6 +2206,16 @@ class GitMergeVerifier:
             )
         except Exception:  # noqa: BLE001 — fail closed: no truth, not a guess
             return None
+
+    def set_config(self, config: Any) -> None:
+        """Replace the config :meth:`entry_truth` reads (#3933).
+
+        Called by :meth:`Driver._reload_config` on every successful
+        ``coordinator.yml`` reload, so a mid-run pipeline/review-gate edit
+        reaches this verifier's live truth reads for the rest of the run —
+        `__post_init__` only sets ``self.config`` once, at construction.
+        """
+        self.config = config
 
 
 # ── preflight (pure) ─────────────────────────────────────────────────────────
@@ -4991,56 +5007,6 @@ def _decide_merge(
             )
         )
     divergence = _merge_gate_divergence(state, reason=gate_reason)
-    # #3933 (quadraui#2173): *gate_reason* is a string this driver only
-    # CLASSIFIES — "smoke" or "review" — from whatever word the merge gate
-    # happened to persist on an earlier attempt. quadraui#2173's incident was
-    # exactly that classification going stale: the persisted reason named
-    # the smoke gate, `state.work_test_state` read "passed" (true at the
-    # time), so `divergence == "smoke"` and this function kept dispatching a
-    # Test re-run — but the LIVE problem by then was a review voided by a
-    # patch-id change after that reason was written; the test was never the
-    # issue. No amount of re-testing was ever going to touch that.
-    #
-    # `coord.entry_truth.reconcile_entry` (#3922) answers the SAME question
-    # — "review or test, which gate is actually unmet right now" — from a
-    # live `coord.gates.build_gate_report` read, not a persisted word on the
-    # board. When it is available and confirms the persisted "smoke"
-    # classification is itself stale (test genuinely fine; review is the
-    # live gate still open), dispatch a real review instead of taking any of
-    # the smoke-specific arms below — this is the literal "Expected:
-    # dispatch_review" outcome the incident calls for. `entry_truth()`
-    # returning `None` (no config, a board/gh read failure) changes nothing:
-    # every arm below still runs exactly as it did before this existed, so a
-    # verifier that can't produce a live truth is never worse off than the
-    # persisted-string classification already was.
-    #
-    # Only called once `divergence == "smoke"` already holds — this issues
-    # several extra live `gh` reads of its own (`reconcile_entry` fetches the
-    # branch head, patch-id, issue state, PR lifecycle and CI summary), so it
-    # must not run on every merge-stage poll, only the one case it exists to
-    # double-check.
-    truth = verifier.entry_truth(state) if divergence == "smoke" else None
-    if (
-        divergence == "smoke"
-        and truth is not None
-        and truth.test is not None
-        and truth.test.ok
-        and truth.review is not None
-        and truth.review.required
-        and not truth.review.ok
-    ):
-        return Action(
-            kind=RUN,
-            label=(
-                "MERGE: merge_reason names the smoke gate, but a live "
-                "reconcile_entry (#3933) shows test is fine and review is "
-                f"the gate actually unmet (quadraui#2173): "
-                f"{truth.review.reason or 'review required but not approved'}"
-            ),
-            command=("review", state.work_aid),
-            on_error="warn",
-            error_message=f"coord review failed to dispatch for {state.work_aid}",
-        )
     if (
         divergence == "smoke"
         and _is_stale_smoke_reason(gate_reason)
@@ -5108,6 +5074,38 @@ def _decide_merge(
         # real merge attempt) applies identically regardless of which of
         # `_effective_merge_gate_reason`'s two sources produced the text.
         divergence = None
+    if divergence == "smoke" and not verifier.github_backoff_active():
+        # #3933 (quadraui#2173): *gate_reason* is a string this driver only
+        # CLASSIFIES ("smoke"/"review") from whatever word a PAST merge
+        # attempt happened to persist — and that classification itself can
+        # go stale while `state.work_test_state` still reads passed/
+        # skipped, keeping this function re-testing a suite that was never
+        # the real problem. A live `EntryTruth` (#3922) answers the same
+        # "which gate is actually unmet right now" question from fresh
+        # `gh`/board reads, not a persisted word — so it is consulted here,
+        # the one point a stale-smoke self-service action (re-test, or the
+        # escalation right below) is actually about to be taken, past the
+        # #3861 fresh-head fast path and the #3917 one-attempt latch above.
+        # A verifier that can't produce one (no config, a read failure, or
+        # a GitHub backoff window in force) changes nothing below.
+        truth = verifier.entry_truth(state)
+        if truth is not None and truth.next_action == NEXT_ACTION_DISPATCH_REVIEW:
+            # The live read disagrees with the persisted "smoke"
+            # classification: test is genuinely fine, review is the gate
+            # actually unmet. `coord review` itself would hard-refuse here
+            # whenever this work row already carries a recorded verdict
+            # (#3670, one review per leg) — exactly the voided-approval
+            # shape quadraui#2173 replays — so this escalates through the
+            # SAME path the "review" divergence case below already uses,
+            # which proposes the real remedy (a scoped `coord
+            # review-reaffirm`, or a full `coord review` otherwise) to a
+            # human instead of attempting a dispatch that cannot succeed.
+            return _escalate_merge(
+                state,
+                state.merge_status,
+                gate_kind="review",
+                gate_reason=truth.next_action_reason,
+            )
     if divergence == "smoke" and _is_stale_smoke_reason(gate_reason):
         # #1738: a STALE (not missing) smoke verdict has a safe, bounded
         # self-service fix this driver can take without a human — re-run the
@@ -6153,15 +6151,16 @@ class Driver:
             self._config_reload_broken = False
         self._log_config_change(self.config, new_config)
         self.config = new_config
-        # #3933: keep GitMergeVerifier.entry_truth()'s own `config` in step
+        # #3933: keep GitMergeVerifier.entry_truth()'s own config in step
         # with a reload — it only reads *self.config* once, at
         # `__post_init__` construction time, so without this a reloaded
         # pipeline/review-gate edit would never reach its live truth reads
-        # for the rest of this run. `hasattr` rather than an isinstance
-        # check: any `MergeVerifier` double that doesn't carry a `config`
-        # attribute at all (most test doubles) is untouched.
-        if hasattr(self.verifier, "config"):
-            self.verifier.config = new_config
+        # for the rest of this run. `set_config` (declared on the
+        # `MergeVerifier` Protocol itself, defaulting to a no-op) rather
+        # than a generic `hasattr(self.verifier, "config")` — that would
+        # silently clobber an unrelated same-named attribute on some future
+        # double that isn't `GitMergeVerifier` and never meant it this way.
+        self.verifier.set_config(new_config)
 
     def _log_config_change(self, old: Any, new: Any) -> None:
         """Narrate a reload that changes a decision this loop actually makes

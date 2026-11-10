@@ -161,6 +161,8 @@ class FakeVerifier:
         self.epic_snapshot_calls = 0
         self.github_backoff_calls = 0
         self.entry_truth_calls = 0
+        self.config = None
+        self.set_config_calls = 0
 
     def branch_has_commits(self, s: IssueState) -> bool | None:
         self.commits_calls += 1
@@ -185,6 +187,10 @@ class FakeVerifier:
     def entry_truth(self, s: IssueState) -> "EntryTruth | None":
         self.entry_truth_calls += 1
         return self._entry_truth
+
+    def set_config(self, config) -> None:
+        self.set_config_calls += 1
+        self.config = config
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -5901,8 +5907,12 @@ def test_entry_truth_review_unmet_overrides_a_stale_smoke_classification():
     confirms test is genuinely fine and the gate ACTUALLY still unmet is
     review (voided by a patch-id change after `merge_reason` was captured).
 
-    Expected: dispatch_review — never the smoke re-test arm, and never an
-    escalation naming the wrong gate.
+    Expected: escalate naming the REVIEW gate, not the smoke re-test arm —
+    never a direct `coord review` dispatch, which `dispatch_review` would
+    hard-refuse outright (#3670, one review per leg) for exactly this
+    voided-approval shape (`approved_work()` already carries a recorded
+    `review_verdict="approve"`), so a bare command-argv assertion here would
+    prove the request was issued without proving it could ever succeed.
     """
     counters = DriveCounters()
     truth = EntryTruth(
@@ -5925,10 +5935,10 @@ def test_entry_truth_review_unmet_overrides_a_stale_smoke_classification():
         counters=counters,
         verifier=verifier,
     )
-    assert action.kind == RUN
-    assert not action.is_exit
-    assert action.command == ("review", "w1")
-    assert "review" in action.label.lower()
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert "review voided by patch-id change" in action.message
+    assert "review-reaffirm" in action.message
     assert counters.merge_attempts == 0
     assert counters.fix_rounds == 0  # no Test re-run was ever dispatched
     assert verifier.entry_truth_calls == 1
@@ -5945,6 +5955,7 @@ def test_entry_truth_review_unmet_overrides_the_stale_smoke_redispatch_arm_too()
         test=GateDecision(gate="test", required=True, ok=True),
         review=GateDecision(gate="review", required=True, ok=False),
         next_action="dispatch_review",
+        next_action_reason="review required but not approved",
     )
     action = step(
         approved_work(
@@ -5957,7 +5968,9 @@ def test_entry_truth_review_unmet_overrides_the_stale_smoke_redispatch_arm_too()
         ),
         verifier=FakeVerifier(entry_truth=truth),
     )
-    assert action.command == ("review", "w1")
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert "review" in action.message.lower()
 
 
 def test_entry_truth_unavailable_preserves_the_pre_3933_escalate_behaviour():
@@ -5985,6 +5998,31 @@ def test_entry_truth_not_consulted_when_there_is_no_smoke_divergence():
     step(approved_work())  # no divergence at all: plain merge retry
     step(approved_work(), verifier=verifier)
     assert verifier.entry_truth_calls == 0
+
+
+def test_entry_truth_not_consulted_during_a_github_backoff_window():
+    """#2809/#3479: no probe (real or otherwise) is issued while a GitHub
+    backoff window is in force — `entry_truth()` issues several of its own
+    live `gh` reads, so it must respect the SAME guard every other live
+    read in this function already does, rather than hammering GitHub while
+    it's backing off."""
+    verifier = FakeVerifier(
+        github_backoff=True,
+        entry_truth=EntryTruth(
+            repo_name=REPO, issue_number=ISSUE, next_action="dispatch_review",
+        ),
+    )
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+        verifier=verifier,
+    )
+    assert verifier.entry_truth_calls == 0
+    # Unaffected: falls through to the pre-#3933 escalate behaviour.
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
 
 
 def test_entry_truth_review_ok_does_not_override_a_genuine_smoke_divergence():
