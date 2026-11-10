@@ -140,7 +140,9 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-r
   session on a *different* machine reviews your diff against this file, with **zero shared
   context with you** — so your diff and final message must stand on their own. Put the
   *why* of a fix in the commit message and final message, not in code comments: comments
-  describe the code as it is, with no issue numbers or "used to" history.
+  describe the code as it is, with no issue numbers or "used to" history. **An unplanned
+  `ISSUE_RESOLUTION: partial` is a blocking finding** (scope you cut yourself, or a call
+  site left unwired); only an upstream blocker or a tranche the issue defines is allowed.
 
 ## Rules for workers
 
