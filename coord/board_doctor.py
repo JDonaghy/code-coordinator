@@ -618,6 +618,16 @@ def build_partial_merge(
     second `gh` round trip for text already on disk. The most recently
     completed matching assignment wins, in case the issue went through
     more than one work leg.
+
+    ``review_findings``/``merged_diff``/``pr_number`` are deliberately
+    left unset: resolving the merging PR (and, if approved, its review
+    findings) needs the merge-queue's own heavier machinery
+    (:func:`coord.merge_queue._issue_resolution_for_entry`'s scan), which
+    this production entry point does not have cheaply in hand. The plan
+    leg's own Read/Bash access to the live checkout makes this
+    non-load-bearing — the prompt already tells it to verify everything
+    against the code, not trust supplied context — so the degradation is
+    "a slightly thinner prompt", not "an unreliable plan".
     """
     from coord import github_ops  # noqa: PLC0415
 
