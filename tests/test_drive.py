@@ -3570,6 +3570,84 @@ def test_a_review_that_finished_with_no_verdict_is_terminal():
     assert "NO verdict" in action.message
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# #3938: quadraui#2226 held a queue slot for 6+ hours with an approving
+# review, a passing test and a mergeable PR, because the #3891 override
+# above only fired on `merge_status == "READY"`. The merge queue had
+# already ATTEMPTED the merge and recorded `PENDING` with a CI-failure
+# reason — which, per `merge_queue._entry_gate_status`'s fixed gate order
+# (review -> smoke -> uat -> CI -> merge mechanics), could only have been
+# recorded after the review gate itself already passed. The override must
+# fire on that shape too, not just on a bare READY.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_missing_review_falls_through_to_merge_on_a_confirmed_ci_failure():
+    """A PENDING entry whose recorded reason is a confirmed CI failure could
+    only have been written AFTER the review gate passed (#3938) — the
+    override must fire, routing to the merge arm (which runs the #2252
+    flake re-check / `_dispatch_ci_fixes`), not wait forever."""
+    action = step(
+        work_tested(
+            merge_status="PENDING",
+            merge_reason="checks failed: gtk (build, test, clippy) (failure)",
+            merge_aid="w1",
+        )
+    )
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "CI running: gtk (build, test, clippy)",
+        "CI infra: gtk (build, test, clippy) — no verdict about the code",
+        "CI re-checking: gtk (build, test, clippy) — failing checks shifted",
+        "merge gate reserved for coord-drive-quadraui-9999 until 2026-11-10",
+    ],
+)
+def test_missing_review_falls_through_to_merge_on_other_ci_stage_reasons(reason):
+    """Flake re-checks, CI-infra reasons and the #3886 per-repo merge-gate
+    reservation are all evaluated strictly after the review gate — same
+    override, same reasoning as the confirmed-failure case above."""
+    action = step(
+        work_tested(merge_status="PENDING", merge_reason=reason, merge_aid="w1")
+    )
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+
+
+def test_missing_review_still_waits_when_the_queues_own_reason_names_review():
+    """The queue's own PENDING reason names the review gate itself ("review
+    not approved") — the queue has NOT confirmed an approval here, so the
+    override must not fire even though `merge_status` is nominally
+    retryable."""
+    action = step(
+        work_tested(
+            merge_status="PENDING", merge_reason="review not approved",
+            merge_aid="w1",
+        )
+    )
+    assert action.kind == WAIT
+    assert action.command == ()
+
+
+def test_missing_review_still_waits_on_an_unknown_branch_head():
+    """`unknown_head` is ambiguous — review's own scan, or a later gate's,
+    can equally produce it (see `_merge_gate_kind`'s docstring) — so it must
+    not be read as "review confirmed" either."""
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    action = step(
+        work_tested(
+            merge_status="PENDING",
+            merge_reason=UNKNOWN_BRANCH_HEAD_REASON,
+            merge_aid="w1",
+        )
+    )
+    assert action.kind == WAIT
+    assert action.command == ()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # the dead-end predicate (#2019)
 #
@@ -4092,8 +4170,8 @@ def test_no_merge_stops_after_the_review_approves():
 
 def test_no_merge_stops_on_a_ready_gate_with_no_review_row():
     """No review was actually observed here — the message must say the
-    merge queue reports READY, not claim a review approval this driver
-    never read."""
+    merge queue's own gate already passed review, not claim a review
+    approval this driver never read."""
     action = step(
         work_tested(merge_status="READY", merge_aid="w1"),
         DriveOptions(machine="precision", do_merge=False),
@@ -4101,7 +4179,7 @@ def test_no_merge_stops_on_a_ready_gate_with_no_review_row():
     assert action.is_exit
     assert action.exit_code == EXIT_OK
     assert "coord merge --only w1" in action.message
-    assert "merge queue reports READY" in action.message
+    assert "merge queue's own review gate already passed" in action.message
     assert "review approved" not in action.message
 
 
