@@ -81,6 +81,7 @@ __all__ = [
     "gap_key",
     "parse_upstream_markers",
     "process_upstream_gaps",
+    "queue_prereq",
 ]
 
 UPSTREAM_GAP_MARKER = "BLOCKED_ON_UPSTREAM"
@@ -543,24 +544,30 @@ def _enqueue_kwargs(entry, after: list[str]) -> dict:
     )
 
 
-def _queue_upstream(
-    upstream_repo: str,
+def queue_prereq(
+    repo: str,
     number: int,
     *,
-    upstream_github: str | None = None,
+    position: int,
+    github: str | None = None,
     assume_open: bool = False,
 ) -> tuple[bool, str]:
-    """Enqueue the auto-filed upstream issue as a fresh drive-queue root.
+    """Enqueue *repo*#*number* as a fresh drive-queue root, idempotently.
 
-    Without this the upstream issue is filed but never worked, so the
-    downstream row :func:`_block_queue_row` holds ``after=`` it defers forever
-    "waiting on <upstream> (open, not queued)" — the gap #2056/#1771 hit. The
-    upstream is a root: nothing blocks it, so it enqueues with no ``after``.
+    Shared by two callers that both hit the identical "a dependent's
+    ``after=`` names an issue nothing ever enqueues" shape: :func:`_queue_upstream`
+    (#2056/#1771, an auto-filed ``BLOCKED_ON_UPSTREAM`` gap) and
+    :func:`coord.board_doctor_policy._queue_stranded_prereq` (#3944, the
+    board-doctor sweep generalizing the same fix to any stranded pre-req,
+    not just an auto-filed one). Without this the pre-req is never worked,
+    so whatever row holds ``after=`` it defers forever "waiting on <dep>
+    (open, not queued)". The pre-req is enqueued as a ROOT: nothing blocks
+    it, so it enqueues with no ``after`` of its own.
 
-    It is inserted at ``position=0`` (front of its repo's queue), not the tail:
-    this is a blocker — a downstream row is ``after=`` it and cannot launch
-    until it lands — so sinking it below an existing backlog would de-prioritize
-    the very issue holding the chain up. Returns ``(enqueued_now, note)``.
+    *position* is the caller's call — #3944's own dependent-position-or-
+    front-of-repo rule lives in the caller, not here, so this stays a pure
+    "add the row" primitive one question away from the ordering policy
+    above it. Returns ``(enqueued_now, note)``.
 
     Idempotency / guards (membership alone is NOT enough — the row's live state
     and the issue's resolution matter):
@@ -572,15 +579,15 @@ def _queue_upstream(
       is satisfied, re-driving would burn a slot the tick reconciles back.
     * Already queued but terminally stuck (``blocked``/``failed``) — NOT
       silently reported as healthy, and deliberately NOT auto-re-driven (that
-      would loop a fix-round-ceiling failure on every gap pass). Surfaced via
+      would loop a fix-round-ceiling failure on every pass). Surfaced via
       the note so an operator — or the board-doctor — can intervene; the
-      downstream already reads this dep as "will never satisfy" (not a silent
+      dependent already reads this dep as "will never satisfy" (not a silent
       hang).
-    * Not queued at all, but the issue is already closed — NOT enqueued (the
-      ``#1771``-heal replay must not re-drive an upstream resolved out-of-band,
-      e.g. closed by hand or its ``done`` row removed). ``assume_open`` skips
-      this check on the just-filed path, where the issue was created moments
-      ago and the extra ``gh`` round-trip is pure cost.
+    * Not queued at all, but the issue is already closed — NOT enqueued (a
+      self-heal replay must not re-drive a pre-req resolved out-of-band, e.g.
+      closed by hand or its ``done`` row removed). ``assume_open`` skips this
+      check on a just-filed path, where the issue was created moments ago and
+      the extra ``gh`` round-trip is pure cost.
     """
     from coord.drive_queue import (  # noqa: PLC0415
         STATE_BLOCKED,
@@ -593,31 +600,53 @@ def _queue_upstream(
     existing = next(
         (
             e
-            for e in (QueueEntry.from_row(r) for r in list_drive_queue(upstream_repo))
+            for e in (QueueEntry.from_row(r) for r in list_drive_queue(repo))
             if e.issue == number
         ),
         None,
     )
     if existing is not None:
         if existing.state in STATE_DONE_LIKE:
-            return False, f"upstream already landed ({existing.state}) — not re-queued"
+            return False, f"pre-req already landed ({existing.state}) — not re-queued"
         if existing.state in (STATE_BLOCKED, STATE_FAILED):
             return False, (
-                f"upstream queue row is {existing.state} — needs attention, "
-                "not auto-re-driven (would loop); downstream stays blocked on it"
+                f"pre-req queue row is {existing.state} — needs attention, "
+                "not auto-re-driven (would loop); dependent stays blocked on it"
             )
-        return False, f"upstream already in the drive queue ({existing.state}) — left as-is"
+        return False, f"pre-req already in the drive queue ({existing.state}) — left as-is"
 
     if not assume_open:
         from coord.github_ops import issue_is_closed  # noqa: PLC0415
 
         # Fail-open: a transient gh error returns False, so we still enqueue
-        # rather than silently drop a legitimate upstream.
-        if issue_is_closed(upstream_github or upstream_repo, number):
-            return False, "upstream already closed — not re-queued"
+        # rather than silently drop a legitimate pre-req.
+        if issue_is_closed(github or repo, number):
+            return False, "pre-req already closed — not re-queued"
 
-    enqueue_drive_queue(upstream_repo, number, position=0)
-    return True, "upstream enqueued for drive (fresh root, front of queue)"
+    enqueue_drive_queue(repo, number, position=position)
+    where = "front of queue" if position == 0 else f"position {position}"
+    return True, f"pre-req enqueued for drive (fresh root, {where})"
+
+
+def _queue_upstream(
+    upstream_repo: str,
+    number: int,
+    *,
+    upstream_github: str | None = None,
+    assume_open: bool = False,
+) -> tuple[bool, str]:
+    """Enqueue the auto-filed upstream issue as a fresh drive-queue root.
+
+    Thin wrapper over :func:`queue_prereq`, pinned at ``position=0`` (front
+    of its repo's queue), not the tail: this is a blocker — a downstream row
+    is ``after=`` it and cannot launch until it lands — so sinking it below
+    an existing backlog would de-prioritize the very issue holding the
+    chain up. See :func:`queue_prereq` for the shared idempotency guards.
+    """
+    return queue_prereq(
+        upstream_repo, number, position=0,
+        github=upstream_github, assume_open=assume_open,
+    )
 
 
 def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str) -> tuple[bool, str]:

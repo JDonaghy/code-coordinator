@@ -223,10 +223,13 @@ from coord.board_doctor import (
     CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_MERGE_PENDING_STUCK,
     CAUSE_SMOKE_NO_VERDICT,
+    CAUSE_STRANDED_PREREQ,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
     after_prereqs_landed_for_entry,
+    stranded_prereq_dep,
+    stranded_prereq_guard,
 )
 from coord.board_doctor_permissions import (
     SAFE_TIER_ACTIONS,
@@ -1198,6 +1201,172 @@ _register_auto_action(
     CAUSE_MERGE_NEVER_ATTEMPTED,
     "merge",
     _merge_pending_stuck_row,
+)
+
+
+def _queue_stranded_prereq(row: StuckRow) -> bool:
+    """#3944: enqueue the pre-req a `waiting` row is stranded on.
+
+    `CAUSE_STRANDED_PREREQ` only ever names a row `coord.board_doctor.
+    stranded_prereq_rows` already confirmed, for THIS sweep, both (a)
+    stuck on exactly the "open, not queued" `after=` shape and (b) cleared
+    by `coord.board_doctor.stranded_prereq_guard` to auto-queue — so this
+    dispatcher's own job is narrower than re-deriving either: settle,
+    re-confirm the shape is still live, enqueue, audit.
+
+    Settle (the issue's own requirement): only acts once `coord.
+    board_doctor.sweep`'s OWN convergence counter (`coord.state.
+    board_doctor_row_state`) shows this row observed on at least two
+    consecutive sweeps with this cause — i.e. the stranded shape has
+    survived one full sweep interval — so an operator mid-way through
+    queuing the pre-req by hand is never raced by this sweep doing it
+    first. The very first sighting (``count == 1``) always returns
+    ``False`` here, which `sweep` records as ``"auto-dispatch-noop"``, not
+    a failure — the row is simply not ready yet.
+
+    Re-confirms live, immediately before acting, the same posture every
+    other #3887/#3901 mechanical dispatcher in this module takes: reads
+    the dependent's CURRENT drive-queue row (not the frozen *row* snapshot
+    `collect_rows` built this sweep) and re-derives the pre-req key and the
+    guard verdict from it. A row that resolved, moved on to a different
+    `after=` dep, or whose guard verdict flipped since classification (a
+    label added, a hand `remove`) is left alone — the alert tier (via
+    `CAUSE_STRANDED_PREREQ_BLOCKED`, or simply this cause persisting) picks
+    it up on the very next sweep.
+
+    Enqueues through `coord.upstream_gaps.queue_prereq` — #3944's own
+    generalisation of `_queue_upstream`'s idempotency guards (already-
+    queued/landed/stuck/closed), never a second, independently-maintained
+    copy of them (#2096). *position* is the dependent's OWN current queue
+    position for a same-repo pre-req (the dependent's place in line is the
+    operator's stated priority for the whole chain), or the front of the
+    pre-req's own repo queue for a cross-repo one — the same "front, not
+    the tail" rule `_queue_upstream` already applies to a blocker.
+
+    Returns ``True`` only once `queue_prereq` confirms the enqueue — the
+    SAME "a dispatcher returns truthy only once its action is CONFIRMED"
+    contract every other :data:`AUTO_DISPATCHERS` entry keeps. Every
+    decline (not yet settled, row moved on, guard now says no, a
+    config/queue read failure, `queue_prereq` itself reporting a no-op)
+    returns ``False`` — `sweep` logs ``"auto-dispatch-noop"`` and, once
+    this row's OWN convergence counter reaches `CONVERGENCE_LIMIT`, falls
+    back to the alert tier on its own; this dispatcher never alerts
+    directly.
+    """
+
+    def _body() -> bool:
+        from coord import state  # noqa: PLC0415
+        from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
+        from coord.drive_queue import (  # noqa: PLC0415
+            STATE_WAITING,
+            QueueEntry,
+            entry_key,
+            parse_key,
+        )
+        from coord.state import get_drive_queue_entry  # noqa: PLC0415
+        from coord.upstream_gaps import queue_prereq  # noqa: PLC0415
+
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
+
+        prior = state.board_doctor_row_state(row.queue, row.key)
+        if int(prior.get("count", 0)) < 2:
+            return False
+
+        live_row = get_drive_queue_entry(repo_name, issue_number)
+        if live_row is None:
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                "row no longer in the drive queue",
+            )
+        entry = QueueEntry.from_row(live_row)
+        if entry.state != STATE_WAITING:
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                f"row moved on to {entry.state} — no longer stranded",
+            )
+        dep = stranded_prereq_dep(entry.last_reason)
+        if dep is None:
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                "row's reason no longer names a stranded pre-req",
+            )
+
+        try:
+            config = resolve_and_load_config(None)
+        except ConfigError as exc:
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                f"could not load config to re-check {dep}: {exc}",
+            )
+
+        guard = stranded_prereq_guard(dep, config)
+        if not guard.may_queue:
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                f"declined to auto-queue {dep}: {guard.reason}",
+            )
+
+        dep_parsed = parse_key(dep)
+        if dep_parsed is None:  # pragma: no cover — the guard above already validated this
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                f"unparseable pre-req key {dep!r}",
+            )
+        dep_repo, dep_issue = dep_parsed
+        dep_repo_cfg = next((r for r in (config.repos or []) if r.name == dep_repo), None)
+        position = entry.position if dep_repo == repo_name else 0
+
+        enqueued, note = queue_prereq(
+            dep_repo, dep_issue, position=position,
+            github=dep_repo_cfg.github if dep_repo_cfg is not None else None,
+        )
+        if not enqueued:
+            return _warn_noop("drive_queue_add", repo_name, issue_number, f"{dep}: {note}")
+
+        # #2096 ("unconfirmed success is a defect"): `queue_prereq` reports
+        # ``enqueued=True`` off `enqueue_drive_queue`'s own return, not a
+        # re-read — every OTHER write this module makes through the sweep
+        # is confirmed by reading the row back
+        # (`coord.board_doctor_permissions._confirm_write`'s own contract),
+        # so this dispatcher holds itself to the same bar rather than
+        # trusting the primitive's say-so.
+        if get_drive_queue_entry(dep_repo, dep_issue) is None:
+            return _warn_noop(
+                "drive_queue_add", repo_name, issue_number,
+                f"{dep}: queue_prereq reported enqueued, but a re-read found "
+                "no row — not confirmed, retrying next sweep",
+            )
+
+        since_text = _stuck_since_text(row.queue, row.key)
+        try:
+            state.comment_on_issue(
+                repo_name, issue_number,
+                f"Queued {dep} because {entry_key(repo_name, issue_number)} "
+                f"was waiting on it (open, not queued) {since_text} (#3944).",
+                repo_github=next(
+                    (r.github for r in (config.repos or []) if r.name == repo_name), None,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — the enqueue itself already succeeded
+            import click  # noqa: PLC0415
+
+            click.echo(
+                f"warning: board-doctor could not comment on {repo_name}#"
+                f"{issue_number} about auto-queueing {dep}: {exc}",
+                err=True,
+            )
+        return True
+
+    return _run_mechanical_action("drive_queue_add", row, _body)
+
+
+_register_auto_action(
+    CAUSE_STRANDED_PREREQ,
+    "drive_queue_add",
+    _queue_stranded_prereq,
 )
 
 
