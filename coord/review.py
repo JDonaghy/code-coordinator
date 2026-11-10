@@ -5848,6 +5848,45 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
 # nothing downstream needs to know the review was scoped.
 
 
+def _live_review_stale(
+    board: Board, config: Config, repo_name: str, issue_number: int,
+    *, gh_ops=None,
+) -> tuple[bool, str | None]:
+    """Whether a live :func:`coord.entry_truth.reconcile_entry` (#3922/#3948)
+    finds the approval already recorded for ``(repo_name, issue_number)``
+    #3948-stale — the branch head SHA hasn't moved, but the patch-id it
+    covers no longer matches the live one because the BASE moved under it.
+
+    ``mq.scan_approved_reviews``'s own #1475 SHA-match fast path (what both
+    ``has_approved_review`` and ``find_scoped_review_candidate`` rely on —
+    see their own docstrings) accepts that approval outright without ever
+    comparing patch-ids, so neither can see this on its own. A caller that
+    needs this answer asks :class:`~coord.entry_truth.EntryTruth` instead of
+    re-deriving the same freshness math a second time (#2096: one question,
+    one answer — the incident this closes, #3917, is exactly a second,
+    disagreeing implementation of "is this approval still fresh").
+
+    *gh_ops* (defaults to :mod:`coord.github_ops`) is the live backend
+    ``reconcile_entry`` reads through; inject a stub in tests.
+
+    ``(False, None)`` on anything that prevents a confirmed live answer (a
+    ``reconcile_entry`` exception — malformed config, an unreadable board or
+    `gh` probe) rather than guessing stale — this only ever NARROWS the
+    #1475 fast path's own "still covers it" when it's wrong, never widens
+    which rows this module dispatches a review for.
+    """
+    from coord.entry_truth import reconcile_entry  # noqa: PLC0415
+
+    try:
+        truth = reconcile_entry(
+            board, config, repo_name, issue_number,
+            gh_ops=gh_ops if gh_ops is not None else github_ops,
+        )
+    except Exception:  # noqa: BLE001 — fail closed: no confirmed staleness
+        return False, None
+    return truth.review_stale, truth.review_stale_reason
+
+
 def compute_resolution_delta(old_diff_text: str | None, new_diff_text: str | None) -> str | None:
     """Return a unified diff *between* two full unified diffs (#1476).
 
@@ -5893,6 +5932,7 @@ def build_scoped_review_briefing(
     default_branch: str = "main",
     prior_verdict: str = "approve",
     prior_findings_body: str | None = None,
+    is_base_move: bool = False,
 ) -> str:
     """Assemble a SCOPED re-review briefing (#1476, widened by #3161).
     Pure function — testable.
@@ -5945,6 +5985,32 @@ def build_scoped_review_briefing(
             (prior_findings_body or "(prior findings text unavailable)").strip()
         )
         lines.append("")
+    elif is_base_move:
+        # #3917/#3935/#3948: the branch itself never moved — only the base
+        # it merges against did — so there is no delta *of diffs* to show
+        # (the diff-of-diffs mechanism the other two branches use needs a
+        # new commit on the branch to diff against; this case has none).
+        # The reviewer gets the branch's FULL current diff against the new
+        # base instead, with the premise stated plainly.
+        lines.append(
+            f"You are re-reviewing issue #{issue_number}: {issue_title}. This PR "
+            "was **already approved** by a previous review, and the branch "
+            "itself has not changed since — but its TARGET BRANCH has moved "
+            "forward, so the approval's own recorded content-fingerprint "
+            "(`review_patch_id`, computed against the base at review time) "
+            "no longer matches the diff against the CURRENT base, and the "
+            "approval was voided (#3948)."
+        )
+        lines.append("")
+        lines.append(
+            "**This is the full current diff against the new base** (below), "
+            "not a delta — there is no new commit to scope a smaller delta "
+            "around. Confirm the diff still reads the same way it did when "
+            "it was approved; `request-changes` only if the base's own "
+            "movement changed what this diff now does (e.g. a conflicting "
+            "change the base introduced that this PR silently overrides)."
+        )
+        lines.append("")
     else:
         lines.append(
             f"You are re-reviewing issue #{issue_number}: {issue_title}. This PR "
@@ -5970,7 +6036,11 @@ def build_scoped_review_briefing(
     if pr_url:
         lines.append(f"- PR URL: {pr_url}")
     lines.append("")
-    lines.append("## Resolution delta (review THIS)")
+    lines.append(
+        "## Full current diff against the new base (review THIS)"
+        if is_base_move
+        else "## Resolution delta (review THIS)"
+    )
     lines.append("")
     if is_fix_round:
         lines.append(
@@ -5981,6 +6051,12 @@ def build_scoped_review_briefing(
             "the previously-reviewed diff and is gone now; a line starting "
             "with `+` is new since that review. This is exactly what the "
             "fix round changed — nothing else in the PR did."
+        )
+    elif is_base_move:
+        lines.append(
+            "This is NOT a diff of diffs — it's the branch's full current "
+            "diff against its (moved) base, since there is no new commit on "
+            "the branch to scope a smaller delta around."
         )
     else:
         lines.append(
@@ -6014,6 +6090,14 @@ def build_scoped_review_briefing(
             "addressed, or the fix introduced a new genuine bug. Do NOT "
             "re-raise non-blocking concerns or nits from the prior review as "
             "new blocking findings — they were already non-blocking."
+        )
+    elif is_base_move:
+        lines.append(
+            "2. `approve` unless the diff, read against the new base, now "
+            "does something it didn't before (a conflict the base's own "
+            "move papers over, a silently-dropped change). Do NOT re-litigate "
+            "anything the prior approval already covered — the branch itself "
+            "is byte-for-byte what it was when that approval was given."
         )
     else:
         lines.append(
@@ -6081,10 +6165,20 @@ def dispatch_scoped_review(
     check_test_coverage: bool = False,
     parent_claim_held: bool = False,
     credential_fetcher=None,
+    is_base_move: bool = False,
 ) -> Assignment | None:
     """Dispatch a SCOPED re-review (#1476, widened by #3161) for a merge
     entry whose approval was voided ONLY by a content-changing conflict-fix
-    rebase, CI-triggered fix, or review-bounce fix round.
+    rebase, CI-triggered fix, or review-bounce fix round — or, when
+    *is_base_move* is set (#3917/#3935/#3948), by neither: the branch itself
+    never moved, but the BASE did, voiding ``review_patch_id`` without any
+    new commit to scope a diff-of-diffs delta around. In that case the
+    "resolution delta" shown to the reviewer is the branch's full current
+    diff against the (moved) base instead of a delta — see
+    :func:`build_scoped_review_briefing`'s own ``is_base_move`` branch —
+    computed directly from *entry*'s own current diff rather than the
+    old/new diff-of-diffs below, which would always come back empty here
+    (both sides resolve to the SAME compare: the branch hasn't moved).
 
     Caller contract: only call this after
     :func:`coord.merge_queue.find_scoped_review_candidate` (its result is
@@ -6249,23 +6343,39 @@ def dispatch_scoped_review(
 
     _diff = diff_fetcher or github_ops.get_compare_diff
     try:
-        old_diff = _diff(repo.github, base_branch, prior_review.review_head_sha)
-    except Exception:  # noqa: BLE001 — fail-safe: unfetchable old diff → no scope
-        old_diff = None
-    try:
         new_diff = _diff(repo.github, base_branch, entry.branch)
     except Exception:  # noqa: BLE001
         new_diff = None
 
-    delta = compute_resolution_delta(old_diff, new_diff)
-    if delta is None:
-        log.warning(
-            "[review] scoped review for merge entry %s: could not compute a "
-            "resolution delta (old/new diff unavailable or identical) — "
-            "caller should fall back to a full review",
-            entry.assignment_id,
-        )
-        return None
+    if is_base_move:
+        # #3917/#3935/#3948: no new commit landed on the branch, so there is
+        # no delta *of diffs* to compute — the branch's own current diff
+        # against the (moved) base IS the thing to show, in full.
+        delta = new_diff if new_diff and new_diff.strip() else None
+        if delta is None:
+            log.warning(
+                "[review] scoped review for merge entry %s: base-move "
+                "staleness confirmed, but the current diff against the new "
+                "base could not be fetched — caller should fall back to a "
+                "full review",
+                entry.assignment_id,
+            )
+            return None
+    else:
+        try:
+            old_diff = _diff(repo.github, base_branch, prior_review.review_head_sha)
+        except Exception:  # noqa: BLE001 — fail-safe: unfetchable old diff → no scope
+            old_diff = None
+
+        delta = compute_resolution_delta(old_diff, new_diff)
+        if delta is None:
+            log.warning(
+                "[review] scoped review for merge entry %s: could not compute a "
+                "resolution delta (old/new diff unavailable or identical) — "
+                "caller should fall back to a full review",
+                entry.assignment_id,
+            )
+            return None
 
     # #3161: same free, log-only #2192 nudge `dispatch_review` runs — see
     # `check_test_coverage`'s docstring for why this only fires for a
@@ -6496,6 +6606,7 @@ def dispatch_scoped_review(
                 default_branch=base_branch,
                 prior_verdict=prior_review_verdict,
                 prior_findings_body=prior_findings_body,
+                is_base_move=is_base_move,
             )
 
             payload = {
@@ -6616,6 +6727,7 @@ def dispatch_scoped_reviews_for_queue(
     branch_sha_fetcher=None,
     branch_patch_id_fetcher=None,
     patch_id_computer=None,
+    gh_ops=None,
 ) -> list[Assignment]:
     """Scan the merge queue for entries eligible for a #1476 SCOPED
     re-review (widened by #3161 to also cover ci-fix/fix-round legs, not
@@ -6651,6 +6763,17 @@ def dispatch_scoped_reviews_for_queue(
     completed, so a slow reconcile loop can't fire two scoped reviews for
     the same voided approval.
 
+    #3917/#3935: even when ``has_approved_review``'s own #1475 SHA-match
+    fast path says "approved" (the branch itself hasn't moved), a LIVE
+    :class:`~coord.entry_truth.EntryTruth` read (via :func:`_live_review_stale`)
+    may still find it #3948-stale — the BASE moved under the unmoving branch,
+    so the approval no longer covers the diff against the current base.
+    That case dispatches a scoped review too, around the approving review
+    itself, bypassing ``only_bounded_fix_since_review`` (inapplicable: no new
+    commit landed on the branch to attribute the delta to). *gh_ops*
+    (defaults to :mod:`coord.github_ops`) is the live backend this check
+    reads through; inject a stub in tests.
+
     #3161: for each dispatched entry, runs the #2192 test-coverage nudge
     (via :func:`dispatch_scoped_review`'s ``check_test_coverage``) exactly
     when :func:`coord.merge_queue.intervening_work_since_review` found a
@@ -6670,8 +6793,9 @@ def dispatch_scoped_reviews_for_queue(
     items = queue_items if queue_items is not None else mq.load_queue()
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
     _get_branch_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
+    _entry_truth_gh_ops = gh_ops if gh_ops is not None else github_ops
 
-    eligible: list[tuple] = []  # (entry, prior_review, run_test_coverage_nudge)
+    eligible: list[tuple] = []  # (entry, prior_review, run_test_coverage_nudge, is_base_move)
     mutated = False
     for entry in items:
         if entry.state != mq.PENDING:
@@ -6697,26 +6821,59 @@ def dispatch_scoped_reviews_for_queue(
         repo_cfg = config.repo(entry.repo_name)
         ancillary_files = repo_cfg.ancillary_files if repo_cfg else None
 
-        if mq.has_approved_review(
+        approval_scan = mq.scan_approved_reviews(
             entry,
             board,
             ancillary_files=ancillary_files,
             ancillary_gh_ops=github_ops,
-        ):
-            continue  # not stale, or a content-identical/ancillary-only/context-only rebase covers it (#1475/#3707/#3749)
-
-        prior_review = mq.find_scoped_review_candidate(
-            entry,
-            board,
-            ancillary_files=ancillary_files,
-            ancillary_gh_ops=github_ops,
-            verdicts=("approve", "request-changes"),
         )
-        if prior_review is None:
-            continue  # no scoped candidate — needs a full review, not this path
+        if approval_scan.approved:
+            # #3917/#3935: the #1475 SHA-match fast path above accepted this
+            # approval outright, without ever comparing patch-ids. Ask
+            # EntryTruth whether it's #3948-stale (the base moved under an
+            # unmoving branch) before trusting that at face value — a live
+            # answer, not a second, independently-derived freshness check.
+            review_stale, review_stale_reason = _live_review_stale(
+                board, config, entry.repo_name, entry.issue_number,
+                gh_ops=_entry_truth_gh_ops,
+            )
+            if not review_stale:
+                continue  # not stale, or a content-identical/ancillary-only/context-only rebase covers it (#1475/#3707/#3749)
+            prior_review = approval_scan.review_assignment
+            if prior_review is None:
+                continue
+            # The branch itself carries no new commit — only the base moved
+            # under it — so `only_bounded_fix_since_review` (which answers
+            # "is the delta explained by a bounded leg") does not apply here
+            # and nothing intervened for the #2192 nudge to key off of.
+            run_test_coverage_nudge = False
+            is_base_move = True
+            log.info(
+                "[review] scoped re-review (#3917): %s (%s #%s) — %s",
+                prior_review.assignment_id, entry.repo_name,
+                entry.issue_number, review_stale_reason,
+            )
+        else:
+            prior_review = mq.find_scoped_review_candidate(
+                entry,
+                board,
+                ancillary_files=ancillary_files,
+                ancillary_gh_ops=github_ops,
+                verdicts=("approve", "request-changes"),
+            )
+            if prior_review is None:
+                continue  # no scoped candidate — needs a full review, not this path
 
-        if not mq.only_bounded_fix_since_review(entry, board, prior_review):
-            continue  # guardrail: another commit intervened — full review required
+            if not mq.only_bounded_fix_since_review(entry, board, prior_review):
+                continue  # guardrail: another commit intervened — full review required
+
+            # #3161: run the #2192 nudge only when a ci-fix/fix-round leg
+            # (not just a conflict-fix) contributed to this delta — see
+            # `dispatch_scoped_review`'s `check_test_coverage` docstring.
+            run_test_coverage_nudge = bool(
+                mq.intervening_work_since_review(entry, board, prior_review)
+            )
+            is_base_move = False
 
         pool = list(board.active) + list(board.completed)
         already_handled = any(
@@ -6729,14 +6886,7 @@ def dispatch_scoped_reviews_for_queue(
         if already_handled:
             continue
 
-        # #3161: run the #2192 nudge only when a ci-fix/fix-round leg (not
-        # just a conflict-fix) contributed to this delta — see
-        # `dispatch_scoped_review`'s `check_test_coverage` docstring.
-        run_test_coverage_nudge = bool(
-            mq.intervening_work_since_review(entry, board, prior_review)
-        )
-
-        eligible.append((entry, prior_review, run_test_coverage_nudge))
+        eligible.append((entry, prior_review, run_test_coverage_nudge, is_base_move))
 
     def _persist() -> None:
         if mutated and queue_items is None:
@@ -6773,7 +6923,7 @@ def dispatch_scoped_reviews_for_queue(
     # one gh lookup per issue, not one per entry revisited.
     terminal_cache: dict = {}
     dispatched: list[Assignment] = []
-    for entry, prior_review, run_test_coverage_nudge in eligible:
+    for entry, prior_review, run_test_coverage_nudge, is_base_move in eligible:
         if cap and len(dispatched) >= cap:
             break
         review = dispatch_scoped_review(
@@ -6785,6 +6935,7 @@ def dispatch_scoped_reviews_for_queue(
             patch_id_computer=patch_id_computer,
             terminal_cache=terminal_cache,
             check_test_coverage=run_test_coverage_nudge,
+            is_base_move=is_base_move,
         )
         if review is not None:
             dispatched.append(review)

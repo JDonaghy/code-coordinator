@@ -5120,6 +5120,109 @@ def test_dispatch_scoped_reviews_for_queue_skips_when_already_approved(
     assert dispatched == []
 
 
+class _FakeEntryTruthGh:
+    """Minimal gh_ops double for ``coord.entry_truth.reconcile_entry`` —
+    only the live probes that function itself calls (#3917/#3935). Not the
+    *branch_sha_fetcher*/*branch_patch_id_fetcher* narrow callables
+    `dispatch_scoped_reviews_for_queue` already accepts for its OWN
+    anchor backfill — this is the separate, full ``gh_ops``-shaped object
+    EntryTruth reads through."""
+
+    def __init__(self, *, branch_sha: str, patch_id: str, issue_state: str = "open"):
+        self.branch_sha = branch_sha
+        self.patch_id = patch_id
+        self.issue_state = issue_state
+
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        return self.branch_sha
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        return self.patch_id
+
+    def get_issue_state(self, repo: str, issue_number: int) -> str | None:
+        return self.issue_state
+
+    def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
+        return None
+
+    def pr_is_merged(self, repo: str, branch: str) -> bool:
+        return False
+
+
+def test_dispatch_scoped_reviews_for_queue_dispatches_when_review_stale_base_moved(
+    two_machine_config: Config,
+) -> None:
+    """#3917/#3935/#3948: the branch itself never moved (its SHA still
+    matches the approving review's own ``review_head_sha``), so
+    ``has_approved_review``'s #1475 SHA-match fast path accepts the
+    approval at face value — but the recorded ``review_patch_id`` no
+    longer matches the live one because the TARGET BRANCH moved under it.
+    A live ``EntryTruth`` read (#3922/#3948) is the only thing that can see
+    this; a merge-queue row's own cached freshness anchors agree with the
+    stale approval and would never catch it on their own. This replays
+    #3917: a persisted "still approved" conclusion must not win over the
+    live read, and the result is exactly one fresh (scoped, base-move)
+    review dispatch."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review(
+        review_head_sha="unmovedsha", review_patch_id="patchid-old",
+    )
+    board = Board(completed=[work, prior])
+    entry = _scoped_entry(state=mq.PENDING)
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-basemove"}),
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "unmovedsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+        gh_ops=_FakeEntryTruthGh(branch_sha="unmovedsha", patch_id="patchid-new"),
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+    assert dispatched[0].review_of_assignment_id == "w1"
+    assert "Full current diff against the new base" in dispatched[0].briefing
+    assert "TARGET BRANCH has moved forward" in dispatched[0].briefing
+
+
+def test_dispatch_scoped_reviews_for_queue_leaves_pending_when_not_review_stale(
+    two_machine_config: Config,
+) -> None:
+    """The SHA-match fast path's own approval stands when a live EntryTruth
+    read agrees nothing moved — no dispatch, no false positive from the new
+    #3917 check."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review(
+        review_head_sha="unmovedsha", review_patch_id="samepatchid",
+    )
+    board = Board(completed=[work, prior])
+    entry = _scoped_entry(state=mq.PENDING)
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-notstale"}),
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "unmovedsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "samepatchid",
+        gh_ops=_FakeEntryTruthGh(branch_sha="unmovedsha", patch_id="samepatchid"),
+    )
+
+    assert dispatched == []
+
+
 def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_ancillary_only(
     two_machine_config: Config, monkeypatch,
 ) -> None:
