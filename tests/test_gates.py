@@ -1898,3 +1898,47 @@ class TestStaleApproveNextAction:
         )
         assert truth.next_action == NEXT_ACTION_MERGE
         assert "all gates clear" in output
+
+    def test_ancillary_only_rebase_carried_forward_reports_all_clear(self) -> None:
+        """#3948 review: the approving review's `review_head_sha` does NOT
+        match the live branch head (a rebase moved the commit), so this
+        does not take the #1475 SHA-match fast path `review_stale` is
+        scoped to. `scan_approved_reviews`'s #3707 ancillary-only exemption
+        carries the approval forward anyway — same as `coord.gates.
+        build_gate_report`'s own `review`/`merge` gate decisions in
+        `test_ancillary_only_rebase_delta_reports_merge_ready` above.
+        `review_stale` must stay `False` and the combined output must still
+        read "all gates clear", not name a stale review."""
+        from coord.entry_truth import NEXT_ACTION_MERGE, reconcile_entry
+
+        repo_cfg = Repo(
+            name="api", github="acme/api", default_branch="main",
+            ancillary_files=["CHANGELOG.md", "README.md"],
+        )
+        config = Config(
+            repos=[repo_cfg],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+        )
+        work = _work(test_state="passed")
+        review = _review(
+            "w1", verdict="approve",
+            review_head_sha="oldsha", review_patch_id="patchid-old",
+        )
+        board = Board(active=[], completed=[work, review])
+        gh_ops = FakeGh(
+            branch_sha="newsha", patch_id="patchid-new",
+            compare_files=["CHANGELOG.md"],
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh_ops)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh_ops, report=report)
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is True  # carried forward via #3707
+
+        output = (
+            format_gate_report(report)
+            + f"\nnext_action: {truth.next_action}  ({truth.next_action_reason})\n"
+        )
+        assert truth.review_stale is False
+        assert truth.next_action == NEXT_ACTION_MERGE
+        assert "all gates clear" in output

@@ -361,6 +361,8 @@ def _stale_approval_review(
     winner: "Assignment | None",
     repo_github: str | None,
     target_branch: str | None,
+    head_sha: str | None,
+    patch_id: str | None,
 ) -> tuple["Assignment | None", str | None]:
     """Return ``(review_assignment, review_patch_id)`` for the approving
     review `coord.merge_queue.scan_approved_reviews` itself found for
@@ -369,11 +371,31 @@ def _stale_approval_review(
     which review covers a (possibly bounced) branch chain a second time
     (#2096: one function answers "which review approved this", not two).
 
+    *head_sha*/*patch_id* are `reconcile_entry`'s OWN already-live
+    `truth.head_sha`/`truth.patch_id` (the same probe `build_gate_report`
+    already triggered a few lines earlier) — passed straight through rather
+    than re-derived here via a second `gh_ops.get_branch_sha`/
+    `get_branch_patch_id` round trip (and a second, independently-timed
+    snapshot that could legitimately disagree with the first on a branch
+    that moved between the two calls). The synthetic `QueuedMerge` built
+    below carries them directly instead of going through
+    `coord.merge_queue.live_gate_entry` (which would re-probe both).
+
     ``(None, None)`` when there is nothing to compare: no *winner*/branch/
-    *gh_ops*/*target_branch*, the scan did not actually approve, or the
-    approving review has no `review_patch_id` of its own to compare (a
+    *gh_ops*/*target_branch*/*head_sha*, the scan did not actually approve,
+    the approving review has no `review_patch_id` of its own to compare (a
     pre-#1475 row, or one that approved via the SHA-match path with no
-    patch-id ever recorded).
+    patch-id ever recorded), or — #3948 — the approval was carried forward
+    via one of `scan_approved_reviews`'s own exemptions
+    (`_review_delta_is_ancillary_only` #3707, `_review_delta_is_context_only`
+    #3749) rather than its #1475 "branch head literally unchanged" fast
+    path. Those two exemptions are reached only once `review_head_sha !=
+    head_sha` is already confirmed, and they deliberately accept the
+    resulting patch-id mismatch — `EntryTruth.review_stale` is scoped
+    (see its own field comment) to the fast-path case where the head SHA
+    has NOT moved, so re-flagging those exempted approvals here would
+    answer the same "is this approval still fresh" question the merge gate
+    already answered, differently (#2085/#2096: one question, one answer).
     """
     if (
         winner is None
@@ -381,15 +403,32 @@ def _stale_approval_review(
         or gh_ops is None
         or not repo_github
         or not target_branch
+        or head_sha is None
     ):
         return None, None
     from coord import merge_queue as mq  # noqa: PLC0415
 
-    entry = mq.live_gate_entry(winner, repo_github, target_branch, gh_ops)
+    entry = mq.QueuedMerge(
+        assignment_id=winner.assignment_id or "",
+        repo_name=winner.repo_name,
+        repo_github=repo_github,
+        branch=winner.branch or "",
+        target_branch=target_branch,
+        issue_number=getattr(winner, "issue_number", 0) or 0,
+        issue_title=getattr(winner, "issue_title", None) or "",
+        assignment_type=getattr(winner, "type", None) or "work",
+        required_gates=list(getattr(winner, "required_gates", None) or []),
+        branch_head_sha=head_sha,
+        branch_patch_id=patch_id,
+    )
     scan = mq.scan_approved_reviews(entry, board, gh_ops, config=config)
     if not scan.approved or scan.review_assignment is None:
         return None, None
-    review_patch_id = getattr(scan.review_assignment, "review_patch_id", None)
+    if scan.review_assignment.review_head_sha != head_sha:
+        # Carried forward via #3707/#3749 (or the legacy no-SHA-to-compare
+        # path) — not the fast path this field is scoped to. See docstring.
+        return None, None
+    review_patch_id = scan.review_assignment.review_patch_id
     if review_patch_id is None:
         return None, None
     return scan.review_assignment, review_patch_id
@@ -428,6 +467,20 @@ def _review_unmet_action(review: GateDecision) -> tuple[str, str]:
     if review.verdict_unparseable:
         return NEXT_ACTION_ESCALATE, reason
     return NEXT_ACTION_DISPATCH_REVIEW, reason
+
+
+def _review_unmet_next_action(truth: EntryTruth) -> tuple[str, str]:
+    """The action for *truth*'s "review is not actually satisfied" slot —
+    either an ordinary unmet review (delegated to `_review_unmet_action`)
+    or a #3948 `review_stale` approval, which always needs the identical
+    `dispatch_review` remedy and never `_review_unmet_action`'s `merge`.
+
+    Shared by both arms of `_derive_next_action`'s `test_precedes_review`
+    branch, which otherwise duplicate this exact check.
+    """
+    if truth.review_stale:
+        return NEXT_ACTION_DISPATCH_REVIEW, truth.review_stale_reason or "review_stale"
+    return _review_unmet_action(truth.review)  # type: ignore[arg-type]
 
 
 def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tuple[str, str]:
@@ -491,14 +544,10 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         if test_unmet:
             return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
         if review_unmet:
-            if truth.review_stale:
-                return NEXT_ACTION_DISPATCH_REVIEW, truth.review_stale_reason or "review_stale"
-            return _review_unmet_action(truth.review)  # type: ignore[arg-type]
+            return _review_unmet_next_action(truth)
     else:
         if review_unmet:
-            if truth.review_stale:
-                return NEXT_ACTION_DISPATCH_REVIEW, truth.review_stale_reason or "review_stale"
-            return _review_unmet_action(truth.review)  # type: ignore[arg-type]
+            return _review_unmet_next_action(truth)
         if test_unmet:
             return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
 
@@ -653,12 +702,14 @@ def reconcile_entry(
             (
                 a
                 for a in assignments_for_issue(board, repo_name, issue_number)
-                if a.assignment_id == truth.latest_worker_assignment_id
+                if truth.latest_worker_assignment_id is not None
+                and a.assignment_id == truth.latest_worker_assignment_id
             ),
             None,
         )
         stale_review, stale_review_patch_id = _stale_approval_review(
             board, config, gh_ops, winner_assignment, repo_github, truth.target_branch,
+            truth.head_sha, truth.patch_id,
         )
         if stale_review is not None and stale_review_patch_id != truth.patch_id:
             truth.review_stale = True
