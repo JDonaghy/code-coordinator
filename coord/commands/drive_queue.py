@@ -3275,7 +3275,7 @@ def drive_queue_sweep(
     `coord fix <REVIEW_ID> --no-finish` instead — that IS the call site
     where Trigger A fires.
     """
-    from coord import board_doctor, board_doctor_policy  # noqa: PLC0415
+    from coord import board_doctor, board_doctor_followthrough, board_doctor_policy  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
     from coord.commands._common import _load_config  # noqa: PLC0415
 
@@ -3337,12 +3337,23 @@ def drive_queue_sweep(
                         }
                         for d in report.decisions
                     ],
+                    "followthrough": [
+                        {
+                            "repo": f.repo_name,
+                            "issue": f.issue_number,
+                            "action": f.action,
+                            "follow_ups": list(f.follow_ups),
+                            "reasons": list(f.reasons),
+                            "rendered_plan": f.rendered_plan,
+                        }
+                        for f in report.followthrough
+                    ],
                 }
             )
         )
         return
 
-    if not report.decisions:
+    if not report.decisions and not report.followthrough:
         click.echo(
             "nothing stuck: no drive-queue, merge-queue, or baseline-red row "
             "was observed"
@@ -3354,6 +3365,24 @@ def drive_queue_sweep(
             f"{d.queue}:{d.key} cause={d.cause} tier={d.tier} "
             f"action={d.action} count={d.count}{escalated}"
         )
+    # #3945: `merged-partial` follow-through runs its own plan-leg/write
+    # pipeline outside the tier loop above (see `run_sweep`'s docstring),
+    # so it is reported separately rather than as a `Decision` row.
+    # `--dry-run` prints exactly `render_plan()`'s rendering of what the
+    # plan leg proposed — the #3864 acceptance item this closes — and
+    # writes nothing, same guarantee the rest of this command gives.
+    for f in report.followthrough:
+        click.echo(f"\ndrive-queue:{f.repo_name}#{f.issue_number} merged-partial follow-through:")
+        click.echo(f"  action={f.action}")
+        if f.rendered_plan:
+            for line in f.rendered_plan.splitlines():
+                click.echo(f"  {line}")
+        if f.action == board_doctor_followthrough.ACTION_FILED and f.follow_ups:
+            click.echo(
+                "  filed: " + ", ".join(f"#{n}" for n in f.follow_ups)
+            )
+        for reason in f.reasons:
+            click.echo(f"  reason: {reason}")
     if dry_run:
         click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
     else:

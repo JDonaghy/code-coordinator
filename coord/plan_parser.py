@@ -211,20 +211,25 @@ def parse_plan_from_log(log_path: str | Path) -> WorkerPlan | None:
     return None if plan.is_empty() else plan
 
 
-def parse_plan_from_agent(
+def fetch_raw_text_from_agent(
     host: str,
     assignment_id: str,
     port: int = 7433,
     timeout: float = 15.0,
-) -> WorkerPlan | None:
-    """Fetch a plan worker's log via the agent's ``/logs/<id>`` endpoint
-    and parse it.
+) -> str | None:
+    """Fetch a worker's assistant-text transcript via the agent's
+    ``/logs/<id>`` endpoint, regardless of what the worker's own system
+    prompt asked it to format the reply as.
 
-    Use this instead of :func:`parse_plan_from_log` when the plan worker
-    ran on a remote agent and the log file isn't on the coordinator's
-    local filesystem.  Mirrors :func:`coord.review.parse_review_from_agent`.
-    Returns ``None`` on network failure, empty log, or no recognised plan
-    sections.
+    The extraction half of :func:`parse_plan_from_agent` (#3945 split):
+    that function additionally parses ``WORKER_PLAN_PROMPT``'s own
+    FILES_READ/FILES_MODIFY/APPROACH/RISKS/ESTIMATE headings and discards
+    the result when none are found, which is exactly wrong for a
+    ``type="plan"`` dispatch given a *different* system prompt (e.g. the
+    board-doctor follow-through's own JSON-plan contract,
+    :func:`coord.board_doctor_followthrough.build_plan_leg_prompt`) — this
+    is the one both callers share. Returns ``None`` on network failure or
+    an empty log, the text itself otherwise (empty string included).
     """
     import httpx  # noqa: PLC0415
 
@@ -250,17 +255,38 @@ def parse_plan_from_agent(
         stream_json = stripped.startswith("{")
         break
 
-    if stream_json:
-        # Reuse the stream-json text extractor by writing to a temp file —
-        # the existing extractor opens by path.  Cheap enough at log sizes
-        # we see in practice (≤ a few MB).
-        import tempfile  # noqa: PLC0415
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=True) as tf:
-            tf.write(text)
-            tf.flush()
-            extracted = _extract_text_from_stream_json(Path(tf.name))
-    else:
-        extracted = text
+    if not stream_json:
+        return text
 
+    # Reuse the stream-json text extractor by writing to a temp file — the
+    # existing extractor opens by path.  Cheap enough at log sizes we see
+    # in practice (≤ a few MB).
+    import tempfile  # noqa: PLC0415
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=True) as tf:
+        tf.write(text)
+        tf.flush()
+        return _extract_text_from_stream_json(Path(tf.name))
+
+
+def parse_plan_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> WorkerPlan | None:
+    """Fetch a plan worker's log via the agent's ``/logs/<id>`` endpoint
+    and parse it.
+
+    Use this instead of :func:`parse_plan_from_log` when the plan worker
+    ran on a remote agent and the log file isn't on the coordinator's
+    local filesystem.  Mirrors :func:`coord.review.parse_review_from_agent`.
+    Returns ``None`` on network failure, empty log, or no recognised plan
+    sections.
+    """
+    extracted = fetch_raw_text_from_agent(
+        host, assignment_id, port=port, timeout=timeout,
+    )
+    if extracted is None:
+        return None
     plan = parse_plan_text(extracted)
     return None if plan.is_empty() else plan

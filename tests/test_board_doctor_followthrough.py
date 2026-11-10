@@ -486,3 +486,155 @@ def test_config_parses_followthrough_auto_queue() -> None:
     assert parsed.followthrough_auto_queue is True
     with pytest.raises(ConfigError):
         _parse_board_doctor_repo_config({"followthrough_auto_queue": "yes"}, 0)
+
+
+# ── Prose-preserving epic splice (#3945) ────────────────────────────────────
+
+
+def test_splice_preserves_existing_row_prose_in_work_order() -> None:
+    body = (
+        "Epic body.\n\n"
+        "## Work order\n"
+        "- #100 — tranche 1 of #99: do the first half\n"
+        "- #101  {after: #100} — tranche 2: do the rest\n\n"
+        "## Notes\nkeep me\n"
+    )
+    disp, writer, _ = _run(_partial(epic_body=body), HAPPY_PLAN, writer=FakeWriter(body))
+
+    assert disp.action == ft.ACTION_FILED
+    new_body = writer.bodies[50]
+    # Every pre-existing line survives byte-for-byte.
+    assert "- #100 — tranche 1 of #99: do the first half" in new_body
+    assert "- #101  {after: #100} — tranche 2: do the rest" in new_body
+    assert "keep me" in new_body
+    # The new rows are still structurally present and parse correctly.
+    wo = parse_work_order(new_body)
+    assert wo.issue_numbers == (100, 101, 200, 201)
+    assert wo.node(201).after == (200,)
+
+
+def test_splice_preserves_prose_in_both_work_order_and_sub_issues() -> None:
+    body = (
+        "## Sub-issues\n"
+        "- #100 — prose for the sub-issues list\n\n"
+        "## Work order\n"
+        "- #100 — different prose for the work order\n\n"
+        "## Notes\nkeep me\n"
+    )
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [{"key": "a", "title": "New piece", "body": "Do it.", "after": ["#100"]}],
+    }
+    disp, writer, _ = _run(_partial(epic_body=body), plan, writer=FakeWriter(body))
+
+    assert disp.action == ft.ACTION_FILED
+    new_body = writer.bodies[50]
+    assert "- #100 — prose for the sub-issues list" in new_body
+    assert "- #100 — different prose for the work order" in new_body
+    assert "keep me" in new_body
+    from coord.milestone_order import parse_sub_issues
+
+    assert parse_sub_issues(new_body).issue_numbers == (100, 200)
+    assert parse_work_order(new_body).issue_numbers == (100, 200)
+
+
+def test_splice_is_idempotent_for_an_already_linked_node() -> None:
+    body = "## Work order\n- #100 — keep this exact row\n- #200\n"
+    disp, writer, _ = _run(_partial(epic_body=body), HAPPY_PLAN, writer=FakeWriter(body))
+    assert disp.action == ft.ACTION_FILED
+    new_body = writer.bodies[50]
+    assert new_body.count("- #200") == 1
+    assert "- #100 — keep this exact row" in new_body
+
+
+def test_splice_appends_fresh_work_order_when_epic_has_neither_section() -> None:
+    body = "Epic body with no checklist at all.\n"
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [{"key": "a", "title": "New piece", "body": "Do it."}],
+    }
+    disp, writer, _ = _run(_partial(epic_body=body), plan, writer=FakeWriter(body))
+    assert disp.action == ft.ACTION_FILED
+    wo = parse_work_order(writer.bodies[50])
+    assert wo.issue_numbers == (200,)
+
+
+def test_splice_raises_on_a_cycle_introduced_by_the_new_rows() -> None:
+    from coord.board_doctor_followthrough import _splice_epic_checklists
+    from coord.milestone_order import WorkOrderError, WorkOrderNode
+
+    # Two new rows that mutually depend on each other — the existing
+    # section (just #100, no `after` at all) is fine on its own; the
+    # cycle is entirely in the two spliced-in nodes.
+    with pytest.raises(WorkOrderError):
+        _splice_epic_checklists(
+            "## Work order\n- #100\n",
+            [
+                WorkOrderNode(issue_number=300, after=(400,)),
+                WorkOrderNode(issue_number=400, after=(300,)),
+            ],
+        )
+
+
+# ── Real GitHub-backed writer (#3945) ───────────────────────────────────────
+
+
+class _FakeGithubOps:
+    """Records every call a :class:`ft.GitHubFollowThroughWriter` makes,
+    standing in for :mod:`coord.github_ops` (never a real `gh` call)."""
+
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+        self.sub_issues: list[tuple[str, int, int]] = []
+        self.bodies: dict[int, str] = {}
+        self.closed: list[tuple[int, str]] = []
+        self.next_number = 500
+
+    def create_issue(self, repo, title, body, labels=None, milestone=None):
+        number = self.next_number
+        self.next_number += 1
+        self.created.append(dict(
+            repo=repo, number=number, title=title, body=body, milestone=milestone,
+        ))
+        self.bodies[number] = body
+        return {"number": number, "url": f"https://x/{number}"}
+
+    def add_sub_issue(self, repo, parent_number, child_number):
+        self.sub_issues.append((repo, parent_number, child_number))
+
+    def get_issue(self, repo, number):
+        return {"number": number, "body": self.bodies.get(number, "")}
+
+    def update_issue_body(self, repo, number, body):
+        self.bodies[number] = body
+
+    def close_issue(self, repo, number, comment=None, force=False):
+        self.closed.append((number, comment))
+
+
+def test_github_writer_routes_every_method_through_github_ops(monkeypatch) -> None:
+    fake = _FakeGithubOps()
+    monkeypatch.setattr("coord.github_ops.create_issue", fake.create_issue)
+    monkeypatch.setattr("coord.github_ops.add_sub_issue", fake.add_sub_issue)
+    monkeypatch.setattr("coord.github_ops.get_issue", fake.get_issue)
+    monkeypatch.setattr("coord.github_ops.update_issue_body", fake.update_issue_body)
+    monkeypatch.setattr("coord.github_ops.close_issue", fake.close_issue)
+
+    writer = ft.GitHubFollowThroughWriter()
+    fake.bodies[50] = "## Work order\n- #100\n"
+
+    number = writer.create_issue(
+        "acme/api", title="New piece", body="Do it.", milestone=None,
+    )
+    assert number == 500
+    assert fake.created[0]["title"] == "New piece"
+
+    writer.add_child("acme/api", epic=50, child=number, after=(100,))
+    assert fake.sub_issues == [("acme/api", 50, 500)]
+
+    assert writer.get_issue_body("acme/api", 50) == "## Work order\n- #100\n"
+    writer.set_issue_body("acme/api", 50, "## Work order\n- #100\n- #500\n")
+    assert fake.bodies[50] == "## Work order\n- #100\n- #500\n"
+
+    writer.close_issue("acme/api", 101, comment="done")
+    assert fake.closed == [(101, "done")]
