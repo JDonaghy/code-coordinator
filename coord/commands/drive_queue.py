@@ -5850,16 +5850,28 @@ def _fetch_size_triage_pending(entries: list) -> dict[str, bool]:
     Re-derives the SAME evidence `enforce_preflight_guard` itself consults
     on its next real invocation — a matching `review_target` row's own
     `status` column (#2096: one question, one answer) — rather than a
-    second, independent notion of "is the triage done". Pure board read, no
+    second, independent notion of "is the triage done". Board read only, no
     `gh` call, and no work at all on a tick where nothing is parked this
     way (the common case).
+
+    Reads the raw ``assignments`` rows out of :func:`_fetch_board_payload`
+    rather than `coord.state.build_board`, for the #615 reason every other
+    reader in this module routes: that fetch answers from the daemon's
+    ``GET /board`` when ``board_service`` is configured and from the local
+    DB only when it is not, so a thin client sees the real rows instead of
+    an empty board. `BoardView` cannot answer this one — it reduces the
+    board to per-issue facts and carries no ``review_target`` at all — and
+    the triage row is keyed by ``review_target``, not by its issue.
 
     Fails **closed**, same posture as :func:`_fetch_gate_a_pending`: an
     entry whose triage status can't be confirmed stays parked. Being wrong
     that way costs a parked row an operator can see and release; being
     wrong the other way resumes Work dispatch while a paid triage session
     might still be about to propose splitting this issue into pieces no
-    single worker should touch at once.
+    single worker should touch at once. A board the fetch CAN read that
+    simply carries no row for this ``review_target`` is a different
+    answer, not an unreadable one — nothing is in flight, so the entry
+    resumes and the relaunch's own guard call re-derives the verdict.
     """
     from coord.decomposition_chat import (  # noqa: PLC0415
         is_size_triage_pending_reason,
@@ -5876,23 +5888,22 @@ def _fetch_size_triage_pending(entries: list) -> dict[str, bool]:
         return {}
 
     try:
-        from coord.state import build_board as _build_board  # noqa: PLC0415
-
-        board = _build_board()
+        payload = _fetch_board_payload()
     except Exception:  # noqa: BLE001 — fail closed, stay parked
         return {e.key: True for e in targets}
 
-    pool = list(getattr(board, "active", []) or []) + list(getattr(board, "completed", []) or [])
+    rows = payload.get("assignments") or []
     pending: dict[str, bool] = {}
     for e in targets:
         review_target = size_triage_review_target_for(e.issue)
         matches = [
-            a for a in pool
-            if getattr(a, "review_target", None) == review_target
-            and getattr(a, "repo_name", None) == e.repo
+            r for r in rows
+            if (r.get("review_target") or "") == review_target
+            and (r.get("repo_name") or "") == e.repo
         ]
         pending[e.key] = any(
-            getattr(a, "status", None) not in TERMINAL_STATUSES for a in matches
+            str(r.get("status") or "").lower() not in TERMINAL_STATUSES
+            for r in matches
         )
     return pending
 
