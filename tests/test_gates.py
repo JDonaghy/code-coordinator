@@ -1832,3 +1832,69 @@ class TestExemptDependencyNote:
         board = Board(active=[], completed=[work])
         report = build_gate_report(board, self._config_with_driver(), "api", 42, gh_ops=None)
         assert not any("3212" in n for n in report.notes)
+
+
+class TestStaleApproveNextAction:
+    """#3948: `coord gates`'s printed output is `format_gate_report(report)`
+    plus the `next_action`/`next_action_reason` line `coord.entry_truth.
+    reconcile_entry` derives from that SAME report (see `coord.commands.
+    gates.gates`). A stale approve — the approving review's own recorded
+    `review_patch_id` no longer matching the live current patch-id, while
+    its `review_head_sha` still matches the live branch head (so
+    `scan_approved_reviews`'s #1475 SHA-match fast path reports it approved
+    without ever comparing patch-ids) — must make that combined output name
+    the stale review, never read "all gates clear; merge-side facts raise
+    no refusal" with `next_action: merge`.
+    """
+
+    def test_stale_approve_names_the_review_not_all_clear(self, config: Config) -> None:
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW, reconcile_entry
+
+        work = _work(test_state="passed")
+        review = _review(
+            "w1", verdict="approve", review_head_sha="branchsha",
+            review_patch_id="old-patch-id",
+        )
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(branch_sha="branchsha", patch_id="live-patch-id")
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, report=report)
+
+        # The raw gate report itself is unaffected (#1475's existing
+        # SHA-match rule is still what `coord merge` acts on today) — the
+        # staleness is additive, surfaced only through `next_action`.
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is True
+
+        output = (
+            format_gate_report(report)
+            + f"\nnext_action: {truth.next_action}  ({truth.next_action_reason})\n"
+        )
+        assert truth.next_action == NEXT_ACTION_DISPATCH_REVIEW
+        assert "r1" in output
+        assert "review_stale" in output
+        assert "all gates clear" not in output
+
+    def test_fresh_approve_still_reports_all_clear(self, config: Config) -> None:
+        """The mirror case: the approving review's `review_patch_id` DOES
+        match the live current patch-id — a genuinely fresh approval, not a
+        stale one — so the combined output must still reach the ordinary
+        "all gates clear" `merge` line."""
+        from coord.entry_truth import NEXT_ACTION_MERGE, reconcile_entry
+
+        work = _work(test_state="passed")
+        review = _review(
+            "w1", verdict="approve", review_head_sha="branchsha",
+            review_patch_id="patchid",
+        )
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(branch_sha="branchsha", patch_id="patchid")
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, report=report)
+
+        output = (
+            format_gate_report(report)
+            + f"\nnext_action: {truth.next_action}  ({truth.next_action_reason})\n"
+        )
+        assert truth.next_action == NEXT_ACTION_MERGE
+        assert "all gates clear" in output

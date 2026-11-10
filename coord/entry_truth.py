@@ -59,7 +59,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from coord.gates import GateDecision, GateReport, build_gate_report, gate_columns_for_issue
+from coord.gates import (
+    GateDecision,
+    GateReport,
+    assignments_for_issue,
+    build_gate_report,
+    gate_columns_for_issue,
+)
 
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.config import Config
@@ -191,6 +197,22 @@ class EntryTruth:
     # Passthrough, for display parity with `coord gates` (#252/#3922's own
     # "what an operator sees is what the merge gate enforces" requirement).
     notes: list[str] = field(default_factory=list)
+
+    # True only when `review` reports an APPROVED gate (`required and ok`)
+    # but the approving review's own recorded `review_patch_id` no longer
+    # matches the LIVE current patch-id this module computed above
+    # (`patch_id`). `coord.merge_queue.scan_approved_reviews`'s own #1475
+    # fast path accepts an approval outright once the branch head SHA still
+    # matches `review_head_sha` — it never re-checks patch-id in that
+    # branch, so an approval whose content (relative to the CURRENT base)
+    # has since drifted purely because the base moved reads as still
+    # approved there. `build_gate_report`'s "review" `GateDecision` — and so
+    # `coord merge`'s live gate — does not see this at all; it is additive
+    # only here (see the module docstring's rule 2), surfaced through
+    # `next_action`/`next_action_reason` rather than by overwriting the
+    # shared `GateDecision` object `review` points at.
+    review_stale: bool = False
+    review_stale_reason: str | None = None
 
     next_action: str = NEXT_ACTION_UNKNOWN
     next_action_reason: str = "reconcile_entry has not run yet"
@@ -332,6 +354,47 @@ def _live_pr_facts(
     return "none", None, None
 
 
+def _stale_approval_review(
+    board: "Board",
+    config: "Config | None",
+    gh_ops: "GhOps | None",
+    winner: "Assignment | None",
+    repo_github: str | None,
+    target_branch: str | None,
+) -> tuple["Assignment | None", str | None]:
+    """Return ``(review_assignment, review_patch_id)`` for the approving
+    review `coord.merge_queue.scan_approved_reviews` itself found for
+    *winner*'s work chain — reusing that one walk's own
+    ``ApprovalScan.review_assignment`` (#3502) rather than re-implementing
+    which review covers a (possibly bounced) branch chain a second time
+    (#2096: one function answers "which review approved this", not two).
+
+    ``(None, None)`` when there is nothing to compare: no *winner*/branch/
+    *gh_ops*/*target_branch*, the scan did not actually approve, or the
+    approving review has no `review_patch_id` of its own to compare (a
+    pre-#1475 row, or one that approved via the SHA-match path with no
+    patch-id ever recorded).
+    """
+    if (
+        winner is None
+        or not winner.branch
+        or gh_ops is None
+        or not repo_github
+        or not target_branch
+    ):
+        return None, None
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    entry = mq.live_gate_entry(winner, repo_github, target_branch, gh_ops)
+    scan = mq.scan_approved_reviews(entry, board, gh_ops, config=config)
+    if not scan.approved or scan.review_assignment is None:
+        return None, None
+    review_patch_id = getattr(scan.review_assignment, "review_patch_id", None)
+    if review_patch_id is None:
+        return None, None
+    return scan.review_assignment, review_patch_id
+
+
 def _review_unmet_action(review: GateDecision) -> tuple[str, str]:
     """The action for an unmet "review" `GateDecision` — split out because
     "review required but not ok" is not always "go dispatch a review".
@@ -414,7 +477,13 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         return NEXT_ACTION_UNKNOWN, "no live gh access requested — cannot determine next action"
 
     test_unmet = truth.test is not None and truth.test.required and not truth.test.ok
-    review_unmet = truth.review is not None and truth.review.required and not truth.review.ok
+    # `review_stale` (set only when the gate otherwise reports APPROVED, see
+    # `EntryTruth.review_stale`'s own docstring) is folded into the same
+    # "review is not actually satisfied" slot as an ordinary unmet review —
+    # it needs the identical dispatch_review remedy, just never `merge`.
+    review_unmet = (
+        truth.review is not None and truth.review.required and not truth.review.ok
+    ) or truth.review_stale
     if test_precedes_review:
         # Work → Test → Review (CLAUDE.md; `coord.review.
         # dispatch_pending_reviews` holds review dispatch on exactly this
@@ -422,9 +491,13 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         if test_unmet:
             return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
         if review_unmet:
+            if truth.review_stale:
+                return NEXT_ACTION_DISPATCH_REVIEW, truth.review_stale_reason or "review_stale"
             return _review_unmet_action(truth.review)  # type: ignore[arg-type]
     else:
         if review_unmet:
+            if truth.review_stale:
+                return NEXT_ACTION_DISPATCH_REVIEW, truth.review_stale_reason or "review_stale"
             return _review_unmet_action(truth.review)  # type: ignore[arg-type]
         if test_unmet:
             return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
@@ -564,6 +637,36 @@ def reconcile_entry(
                 )
             except Exception:  # noqa: BLE001
                 truth.patch_id = None
+
+    if (
+        truth.review is not None
+        and truth.review.required
+        and truth.review.ok
+        and truth.patch_id is not None
+    ):
+        # The review gate already reports APPROVED — check whether that
+        # approval is #3948-stale: the approving review's own recorded
+        # patch-id no longer matches the LIVE one just computed above. See
+        # `EntryTruth.review_stale`'s own docstring for why
+        # `build_gate_report`'s "review" decision cannot already see this.
+        winner_assignment = next(
+            (
+                a
+                for a in assignments_for_issue(board, repo_name, issue_number)
+                if a.assignment_id == truth.latest_worker_assignment_id
+            ),
+            None,
+        )
+        stale_review, stale_review_patch_id = _stale_approval_review(
+            board, config, gh_ops, winner_assignment, repo_github, truth.target_branch,
+        )
+        if stale_review is not None and stale_review_patch_id != truth.patch_id:
+            truth.review_stale = True
+            truth.review_stale_reason = (
+                f"review_stale: review {stale_review.assignment_id!r} approved "
+                f"patch-id {stale_review_patch_id!r}, which no longer matches "
+                f"the live patch-id {truth.patch_id!r} — needs a fresh review"
+            )
 
     if gh_ops is not None and repo_github:
         try:

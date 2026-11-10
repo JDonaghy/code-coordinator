@@ -62,7 +62,13 @@ def _work(
 
 
 def _review(
-    of_aid: str, *, aid: str = "r1", issue: int = 42, verdict: str | None = "approve",
+    of_aid: str,
+    *,
+    aid: str = "r1",
+    issue: int = 42,
+    verdict: str | None = "approve",
+    review_head_sha: str | None = None,
+    review_patch_id: str | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="dellserver",
@@ -74,6 +80,8 @@ def _review(
         status="done",
         review_of_assignment_id=of_aid,
         review_verdict=verdict,
+        review_head_sha=review_head_sha,
+        review_patch_id=review_patch_id,
         dispatched_at=2.0,
     )
 
@@ -473,3 +481,48 @@ class TestNextAction:
         assert truth.pr_state == "closed"
         assert truth.next_action == NEXT_ACTION_ESCALATE
         assert "closed" in truth.next_action_reason.lower()
+
+    def test_stale_approval_dispatches_review_never_merges(self, config: Config) -> None:
+        """#3948: the approving review's own `review_head_sha` still matches
+        the live branch head — `scan_approved_reviews`'s #1475 SHA-match
+        fast path accepts it outright without ever comparing patch-ids — but
+        its `review_patch_id` no longer matches the LIVE current patch-id
+        (the base moved under it). `build_gate_report`'s own "review" gate
+        cannot see this (it is additive here, see `EntryTruth.review_stale`),
+        so `next_action` must still be `dispatch_review`, never `merge`."""
+        board = Board(
+            active=[],
+            completed=[
+                _work(),
+                _review(
+                    "w1", review_head_sha="branchsha", review_patch_id="old-patch-id",
+                ),
+            ],
+        )
+        gh = FakeGh(branch_sha="branchsha", patch_id="live-patch-id")
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.review is not None and truth.review.ok  # approved via SHA match
+        assert truth.review_stale is True
+        assert truth.next_action == NEXT_ACTION_DISPATCH_REVIEW
+        assert "r1" in truth.next_action_reason
+        assert "all gates clear" not in truth.next_action_reason
+
+    def test_fresh_patch_id_approval_still_merges(self, config: Config) -> None:
+        """The mirror of the stale case above: the approving review's own
+        `review_patch_id` DOES match the live current patch-id, so this is a
+        genuinely fresh approval — `review_stale` must stay `False` and
+        `next_action` must still reach `merge`."""
+        board = Board(
+            active=[],
+            completed=[
+                _work(),
+                _review(
+                    "w1", review_head_sha="branchsha", review_patch_id="patchid",
+                ),
+            ],
+        )
+        gh = FakeGh(branch_sha="branchsha", patch_id="patchid")
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.review is not None and truth.review.ok
+        assert truth.review_stale is False
+        assert truth.next_action == NEXT_ACTION_MERGE
