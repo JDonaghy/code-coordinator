@@ -3455,6 +3455,88 @@ def test_exhausted_ci_stale_escalation_proposes_revalidate_not_a_requeue(
     assert proposed == f"coord merge --revalidate --only {REPO}#2983"
 
 
+def test_a_size_triage_pending_refusal_parks_and_resumes_on_verdict(
+    cli, seed, launches, coord_db,
+):
+    """#3971, end-to-end — the quadraui#2304 incident reproduced and fixed.
+    `coord.dispatch.enforce_preflight_guard`'s "a size-triage review is
+    running ... retry once it posts its verdict" refusal carries the SAME
+    `EXIT_DISPATCH_REFUSED` exit code as the genuinely permanent refusal
+    pinned by the test just below, but it is TEMPORARY: the row must PARK,
+    not BLOCK, with `attempts` untouched, while the triage leg is in
+    flight, and must resume to `waiting` — and relaunch, same tick — the
+    first tick after that leg's own `review_target` assignment goes
+    terminal. No queue surgery, no cascaded `blocked` on any `after=`
+    dependent.
+    """
+    from coord.audit import record_audit
+    from coord.decomposition_chat import (
+        SIZE_TRIAGE_PENDING_MARKER,
+        size_triage_review_target_for,
+    )
+    from coord.drive import EXIT_DISPATCH_REFUSED
+
+    seed(issues={2304: "open"})
+    cli("add", REPO, "2304")
+    cli("tick")
+    assert queued(2304)["attempts"] == 0
+
+    refusal = (
+        "drive exited for claude-coordinator#2304 (exit_code="
+        f"{EXIT_DISPATCH_REFUSED}): dispatch failed: issue #2304 flagged "
+        "by the preflight size scorer (score 4/4): 3 file(s) declared. A "
+        "size-triage review is running on 'dellserver' "
+        "(review_target='size-triage-2304') — retry once it posts its "
+        f"verdict. {SIZE_TRIAGE_PENDING_MARKER}"
+    )
+    launched_at = queued(2304)["launched_at"]
+    _backdate(2304, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=refusal, repo=REPO, issue=2304,
+        ts=launched_at + 5,
+        details={"exit_code": EXIT_DISPATCH_REFUSED, "error": refusal},
+    )
+
+    # The triage leg itself is still on the board, non-terminal.
+    review_target = size_triage_review_target_for(2304)
+    coord_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, "
+        " machine_name, type, status, review_target, dispatched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "triage-2304", REPO, 2304, "[size-triage] issue 2304",
+            "dellserver", "review", "running", review_target, launched_at + 1,
+        ),
+    )
+    coord_db.commit()
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert len(launches) == 1, launches  # parked, not retried — no relaunch
+
+    entry = queued(2304)
+    assert entry["state"] == "parked"
+    assert entry["attempts"] == 0
+    assert SIZE_TRIAGE_PENDING_MARKER in entry["last_reason"]
+
+    # The triage leg posts its verdict and goes terminal.
+    coord_db.execute(
+        "UPDATE assignments SET status = 'done' WHERE assignment_id = ?",
+        ("triage-2304",),
+    )
+    coord_db.commit()
+
+    resumed = cli("tick")
+    assert resumed.exit_code == 0, resumed.output
+    assert len(launches) == 2, launches  # resumed AND relaunched, same tick
+
+    entry = queued(2304)
+    assert entry["state"] == "running"
+    assert entry["attempts"] == 0
+
+
 def test_a_permanent_dispatch_refusal_blocks_on_the_first_tick_no_attempt_spent(
     cli, seed, launches,
 ):

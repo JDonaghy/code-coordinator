@@ -5842,6 +5842,61 @@ def _fetch_gate_a_pending(entries: list) -> dict[str, bool]:
     return pending
 
 
+def _fetch_size_triage_pending(entries: list) -> dict[str, bool]:
+    """``{entry_key: still_waiting_on_the_triage_leg}`` for every entry
+    parked on `coord.dispatch.enforce_preflight_guard`'s size-triage-pending
+    refusal (#3971, `coord.decomposition_chat.SIZE_TRIAGE_PENDING_MARKER`).
+
+    Re-derives the SAME evidence `enforce_preflight_guard` itself consults
+    on its next real invocation — a matching `review_target` row's own
+    `status` column (#2096: one question, one answer) — rather than a
+    second, independent notion of "is the triage done". Pure board read, no
+    `gh` call, and no work at all on a tick where nothing is parked this
+    way (the common case).
+
+    Fails **closed**, same posture as :func:`_fetch_gate_a_pending`: an
+    entry whose triage status can't be confirmed stays parked. Being wrong
+    that way costs a parked row an operator can see and release; being
+    wrong the other way resumes Work dispatch while a paid triage session
+    might still be about to propose splitting this issue into pieces no
+    single worker should touch at once.
+    """
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        is_size_triage_pending_reason,
+        size_triage_review_target_for,
+    )
+    from coord.drive_state import TERMINAL_STATUSES  # noqa: PLC0415
+
+    targets = [
+        e for e in entries
+        if e.state == STATE_PARKED
+        and is_size_triage_pending_reason(getattr(e, "last_reason", "") or "")
+    ]
+    if not targets:
+        return {}
+
+    try:
+        from coord.state import build_board as _build_board  # noqa: PLC0415
+
+        board = _build_board()
+    except Exception:  # noqa: BLE001 — fail closed, stay parked
+        return {e.key: True for e in targets}
+
+    pool = list(getattr(board, "active", []) or []) + list(getattr(board, "completed", []) or [])
+    pending: dict[str, bool] = {}
+    for e in targets:
+        review_target = size_triage_review_target_for(e.issue)
+        matches = [
+            a for a in pool
+            if getattr(a, "review_target", None) == review_target
+            and getattr(a, "repo_name", None) == e.repo
+        ]
+        pending[e.key] = any(
+            getattr(a, "status", None) not in TERMINAL_STATUSES for a in matches
+        )
+    return pending
+
+
 def _fetch_live_ci_gate(
     entries: list, config_path: Path | None
 ) -> tuple[dict[str, bool], dict[str, str]]:
@@ -8509,6 +8564,13 @@ def drive_queue_tick(
         # tick when no entry is parked that way — which is the common case.
         gate_a_pending = _fetch_gate_a_pending(entries)
 
+        # #3971: the same live re-read, for every entry parked on a size-
+        # triage review still in flight — see `_fetch_size_triage_pending`'s
+        # docstring for the incident this closes (a flagged issue's
+        # drive-queue row, and every `after=` dependent behind it, stuck
+        # `blocked` even after the triage leg posted `proceed`).
+        size_triage_pending = _fetch_size_triage_pending(entries)
+
         # #2182: for every entry parked on a CI reason, a fresh single-entry
         # re-derivation of its gate, taken live THIS tick — see
         # `_fetch_live_ci_gate`'s docstring for the gap this closes (a park
@@ -8614,6 +8676,7 @@ def drive_queue_tick(
             exit_refused=exit_refused,
             exit_dead_end=exit_dead_end,
             gate_a_pending=gate_a_pending,
+            size_triage_pending=size_triage_pending,
             cordons=cordons,
             no_eligible_host=no_eligible_host,
             live_ci_gate=live_ci_gate,

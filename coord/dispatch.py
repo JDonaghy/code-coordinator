@@ -450,6 +450,7 @@ def enforce_preflight_guard(
         return
 
     from coord.decomposition_chat import (  # noqa: PLC0415
+        SIZE_TRIAGE_PENDING_MARKER,
         SizeTriageError,
         dispatch_size_triage_review,
         size_triage_review_target_for,
@@ -540,12 +541,22 @@ def enforce_preflight_guard(
             # follow-up in flight to ever clear the refusal.
             return
 
+    # #3971: this refusal is TEMPORARY — the triage leg just dispatched (or
+    # already in flight) clears it on its own the moment it posts a
+    # verdict, unlike `enforce_oracle_readiness`/`enforce_epic_dispatch_
+    # guard`'s refusals above, which nothing but an operator action can
+    # clear. `SIZE_TRIAGE_PENDING_MARKER` lets `coord.drive_queue.
+    # _reconcile_running` tell this ONE `DispatchRefused` shape apart from
+    # every other one sharing the same `EXIT_DISPATCH_REFUSED` exit code
+    # (#1844) and park the drive-queue row instead of blocking it forever —
+    # see that function's #3971 comment for the quadraui#2304 incident this
+    # closes.
     raise DispatchRefused(
         f"issue #{issue_number} flagged by the preflight size scorer "
         f"(score {score.total:g}/{score.threshold:g}): {score.reason}. "
         f"A size-triage review is {'already ' if in_flight is not None else ''}"
         f"running on {machine.name!r} (review_target={review_target!r}) — "
-        "retry once it posts its verdict."
+        f"retry once it posts its verdict. {SIZE_TRIAGE_PENDING_MARKER}"
     )
 
 

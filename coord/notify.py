@@ -49,6 +49,7 @@ from coord.comments import (
     format_stuck,
 )
 from coord.config import Config
+from coord.decomposition_chat import is_size_triage_review_target
 from coord.dispatch import (
     AGENT_PORT,
     post_advisory,
@@ -4450,6 +4451,31 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         mark_notified(
             transition.assignment_id,
             EVENT_PLAN if posted else EVENT_COMPLETION,
+            branch=entry.get("branch"),
+        )
+    elif (
+        transition.event == EVENT_COMPLETION
+        and assignment_type == "review"
+        and is_size_triage_review_target(record.get("review_target"))
+    ):
+        # #3971: a size-triage leg (`coord.decomposition_chat.
+        # dispatch_size_triage_review`) is dispatched as `type="review"`
+        # ONLY to reuse `coord.agent`'s CLI-enforced read-only deny-list for
+        # that type (see that function's own comment) — it is never a real
+        # code review, has no PR to review, and (per its own briefing) never
+        # emits REVIEW_VERDICT/END_REVIEW. Before this branch existed, the
+        # generic `assignment_type == "review"` arm below tried to extract
+        # findings from a `SIZE_TRIAGE_VERDICT`-shaped log, failed, and
+        # posted "Review assignment completed but findings could not be
+        # extracted" to the issue (quadraui#2304, 2026-11-10 UTC) — a
+        # confusing, actionable-looking comment about a leg that already
+        # posts no comment at all by design (`dispatch_size_triage_review`'s
+        # own docstring). `coord.dispatch.enforce_preflight_guard` is what
+        # actually consumes this leg's verdict (fetching and parsing the
+        # raw log itself the next time it runs) — nothing here needs to.
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
             branch=entry.get("branch"),
         )
     elif transition.event == EVENT_COMPLETION and assignment_type == "review":

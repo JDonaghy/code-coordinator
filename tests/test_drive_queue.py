@@ -7683,6 +7683,87 @@ def test_a_genuine_death_still_retries_and_exhausts_with_no_refused_flag():
     assert plan.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
 
 
+# ── plan_tick: a size-triage-pending refusal parks, not blocks (#3971) ───────
+#
+# quadraui#2304 (2026-11-10 UTC): `coord.dispatch.enforce_preflight_guard`'s
+# "a size-triage review is running — retry once it posts its verdict"
+# refusal reaches `coord drive`'s subprocess boundary with the SAME
+# `EXIT_DISPATCH_REFUSED` code every OTHER `DispatchRefused` carries (#1844)
+# — but unlike those, it is TEMPORARY: the condition clears the moment the
+# triage leg posts a verdict, no operator action needed. Before this, it
+# fell into the generic `exit_refused` → `blocked` branch and stayed blocked
+# forever, cascading `blocked` onto every `after=` dependent, even after the
+# triage leg returned `proceed` three minutes later.
+
+TRIAGE_PENDING_REFUSAL = (
+    "drive exited for claude-coordinator#2304 (exit_code=5): dispatch "
+    "failed: issue #2304 flagged by the preflight size scorer (score "
+    "4/4): 3 file(s) declared. A size-triage review is running on "
+    "'dell64' (review_target='size-triage-2304') — retry once it posts "
+    "its verdict. [size-triage-pending]"
+)
+
+
+def test_a_size_triage_pending_refusal_parks_with_attempts_unspent():
+    """The acceptance bar: NOT `blocked` — `parked`, same "no attempt
+    spent" contract #1844's `refused` branch gives a genuinely permanent
+    guard refusal, but recoverable without queue surgery."""
+    entries = [entry(2304, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 2304): TRIAGE_PENDING_REFUSAL},
+        exit_refused={entry_key(REPO, 2304): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.occupies is False
+    assert reconcile.updates["state"] == STATE_PARKED
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()
+    assert TRIAGE_PENDING_REFUSAL in reconcile.reason
+
+
+def test_a_parked_triage_pending_entry_stays_parked_while_still_in_flight():
+    """`size_triage_pending` defaults every unresolved entry to "still
+    waiting" (fail closed) — the same posture `_fetch_gate_a_pending` takes
+    for an unreadable verdict."""
+    entries = [
+        entry(
+            2304, position=3, state=STATE_PARKED, attempts=0,
+            last_reason=TRIAGE_PENDING_REFUSAL,
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        size_triage_pending={entry_key(REPO, 2304): True},
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_parked_triage_pending_entry_resumes_once_the_verdict_posts():
+    """Once the shell confirms the matching `review_target` assignment went
+    terminal, the entry resumes to `waiting` — with `attempts` reset to 0
+    (#2273's convention for every positive-evidence resume) — so the next
+    real `coord assign`/`coord fix`/`coord approve-plan` dispatch runs
+    `enforce_preflight_guard` again and consumes whatever verdict actually
+    posted (PROCEED falls through to Work; SPLIT supersedes the entry)."""
+    entries = [
+        entry(
+            2304, position=3, state=STATE_PARKED, attempts=2,
+            last_reason=TRIAGE_PENDING_REFUSAL,
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        size_triage_pending={entry_key(REPO, 2304): False},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+
+
 # ── plan_tick: a dead-end exit blocks the entry (#2019) ──────────────────────
 #
 # The second PERMANENT cause, sharing #1844's branch. Before #2019 this shape

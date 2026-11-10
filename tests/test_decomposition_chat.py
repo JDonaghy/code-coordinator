@@ -1749,6 +1749,47 @@ class TestSizeTriageReviewTargetFor:
             int(target)
 
 
+class TestIsSizeTriageReviewTarget:
+    """#3971: the inverse of `size_triage_review_target_for` — recognising a
+    size-triage `review_target` back out of a board row, so a caller like
+    `coord.notify` can tell it apart from a real PR review."""
+
+    def test_recognises_its_own_sentinel(self):
+        target = decomposition_chat.size_triage_review_target_for(3818)
+        assert decomposition_chat.is_size_triage_review_target(target) is True
+
+    def test_rejects_a_real_pr_number(self):
+        assert decomposition_chat.is_size_triage_review_target("42") is False
+
+    def test_rejects_none_and_empty(self):
+        assert decomposition_chat.is_size_triage_review_target(None) is False
+        assert decomposition_chat.is_size_triage_review_target("") is False
+
+
+class TestIsSizeTriagePendingReason:
+    """#3971: the marker `enforce_preflight_guard` embeds in its "retry
+    once it posts its verdict" refusal, and nothing else, so
+    `coord.drive_queue._reconcile_running` can park on it instead of
+    blocking on the generic `exit_refused` classification every other
+    `DispatchRefused` shares."""
+
+    def test_recognises_the_marker(self):
+        text = (
+            f"issue #99 flagged ... retry once it posts its verdict. "
+            f"{decomposition_chat.SIZE_TRIAGE_PENDING_MARKER}"
+        )
+        assert decomposition_chat.is_size_triage_pending_reason(text) is True
+
+    def test_rejects_unrelated_text(self):
+        assert decomposition_chat.is_size_triage_pending_reason(
+            "issue #99 is part of oracle-opted-in milestone ms-51"
+        ) is False
+
+    def test_rejects_none_and_empty(self):
+        assert decomposition_chat.is_size_triage_pending_reason(None) is False
+        assert decomposition_chat.is_size_triage_pending_reason("") is False
+
+
 class TestBuildSizeTriageBriefing:
     def test_includes_issue_body_and_contract(self):
         briefing = decomposition_chat.build_size_triage_briefing(
