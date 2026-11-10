@@ -89,10 +89,11 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.entry_truth import (
+    EntryTruth,
     NEXT_ACTION_ESCALATE,
     NEXT_ACTION_MARK_DONE,
     NEXT_ACTION_UNKNOWN,
@@ -124,9 +125,6 @@ from coord.models import (
     parse_issue_resolution,
 )
 from coord.worker_events import classify_zero_commit_outcome
-
-if TYPE_CHECKING:  # avoid a hard import cycle at module load (#3934)
-    from coord.entry_truth import EntryTruth
 
 # ── dispatch type selection (#3132) ─────────────────────────────────────────
 #
@@ -2016,24 +2014,39 @@ def _after_satisfied(
 
     *prereq_truth* (#3934) maps a pre-req key to its LIVE, just-reconciled
     :class:`~coord.entry_truth.EntryTruth`, when the caller has one. Once
-    present for a key, it decides that edge outright — the pre-req's own
-    queue-row `state` (a latched conclusion that can go stale the moment a
-    different actor changes the pre-req's reality without rewriting that
-    row, e.g. vimcode#2140: pre-req quadraui#2256 sat `blocked` while the
-    feature it named had already shipped upstream) is never consulted for
-    a key a live truth already answers — `other.state` only decides a key
-    `prereq_truth` has nothing decisive to say about (absent entirely, or
-    :data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN` — no live access was
-    even gathered this tick for that key, same as it being absent).
+    present for a key WITH something decisive to say, it decides that edge
+    outright — the pre-req's own queue-row `state` (a latched conclusion
+    that can go stale the moment a different actor changes the pre-req's
+    reality without rewriting that row, e.g. vimcode#2140: pre-req
+    quadraui#2256 sat `blocked` while the feature it named had already
+    shipped upstream) is never consulted for a key a live truth already
+    answers — `other.state` only decides a key `prereq_truth` has nothing
+    decisive to say about: absent entirely, :data:`~coord.entry_truth.
+    NEXT_ACTION_UNKNOWN` (no live access was even gathered this tick), or
+    an ESCALATE whose `escalate_probe_failure` is set (a live read FAILED
+    rather than confirming an operator is actually needed — inconclusive,
+    same as UNKNOWN).
+
+    Checked BEFORE the `_entry_is_holding` scan just above: a pre-req
+    whose own deploy gate is CURRENTLY FIRED is unsatisfied regardless of
+    what a live truth says about it — `mark_done` on a `done` row whose
+    gate has since fired is a real, later fact a `reconcile_entry` call
+    taken before the gate fired cannot see, so the gate always wins.
     """
     for key in entry.after:
         if any(other.key == key and _entry_is_holding(other) for other in all_entries):
             return False
         truth = (prereq_truth or {}).get(key)
         if truth is not None and truth.next_action != NEXT_ACTION_UNKNOWN:
-            if truth.next_action != NEXT_ACTION_MARK_DONE:
+            if truth.next_action == NEXT_ACTION_MARK_DONE:
+                continue
+            if not (
+                truth.next_action == NEXT_ACTION_ESCALATE
+                and truth.escalate_probe_failure
+            ):
                 return False
-            continue
+            # else: an inconclusive probe failure — fall through to the
+            # dep's own queue-row `state` below, same as UNKNOWN/absent.
         unsatisfied = any(
             other.key == key and other.state not in STATE_DONE_LIKE
             for other in all_entries
@@ -3631,34 +3644,38 @@ class _Verdict:
     reason: str = ""
 
 
+def _truth_is_done(truth: "EntryTruth | None") -> bool:
+    """Whether *truth* is :data:`~coord.entry_truth.NEXT_ACTION_MARK_DONE` —
+    the single predicate for "a live EntryTruth says this pre-req already
+    landed", shared by :func:`_prereq_truth_verdict` and
+    :func:`diagnose_blocked_after`'s own check so the two answers to the
+    same question can never silently drift apart (#2096).
+    """
+    return truth is not None and truth.next_action == NEXT_ACTION_MARK_DONE
+
+
 def _prereq_truth_verdict(dep: str, truth: "EntryTruth") -> "_Verdict | None":
     """The after= verdict *dep*'s live :class:`~coord.entry_truth.EntryTruth`
-    decides outright (#3934) — never *dep*'s own queue-row ``state``, a
-    latched conclusion that can go stale the moment a different actor
-    changes *dep*'s reality without rewriting that row. The incident this
-    replaces: vimcode#2140's pre-req quadraui#2256 sat `blocked`, so
-    `_resolve_prereqs` called the edge "will never satisfy" — but the
-    feature it named had already shipped upstream, and #2140 itself merged
-    outside the queue while quadraui#2256's row still showed `blocked`.
+    decides, in place of *dep*'s own queue-row ``state`` — a latched
+    conclusion that can go stale the moment a different actor changes
+    *dep*'s reality without rewriting that row.
 
-    Returns ``None`` when *truth* has nothing decisive to say —
-    :data:`~coord.entry_truth.NEXT_ACTION_UNKNOWN` (no live access was even
-    gathered for *dep* this tick) — so the caller falls through to the
-    board/queue-row reasoning exactly as if *dep* had no truth supplied at
-    all, the same fail-closed posture every other live read in this module
-    takes (#2704).
+    Returns ``None`` when *truth* has nothing decisive to say (no live
+    access was gathered for *dep* this tick, or its probe only failed —
+    see below), so the caller falls through to the board/queue-row
+    reasoning exactly as if *dep* had no truth supplied at all.
 
-    Otherwise:
-
-    * :data:`~coord.entry_truth.NEXT_ACTION_MARK_DONE` (merged, or
-      premise-refused on the #3931 "already implemented" finding — the
-      live equivalent of this module's own ``facts.landed``/
-      ``facts.already_done`` checks) satisfies the edge.
-    * :data:`~coord.entry_truth.NEXT_ACTION_ESCALATE` (a live probe failed,
-      or *dep*'s own pipeline is stuck needing an operator) is this
-      vocabulary's analogue of "it will never satisfy without operator
-      action" — the same disposition ``_resolve_prereqs``'s pre-#3934
-      `blocked`/`failed`-row branch already gave an unsatisfiable dep.
+    * :data:`~coord.entry_truth.NEXT_ACTION_MARK_DONE` satisfies the edge.
+    * :data:`~coord.entry_truth.NEXT_ACTION_ESCALATE` with
+      ``truth.escalate_probe_failure`` set means a live read FAILED (e.g.
+      the branch head or PR state could not be confirmed) — inconclusive,
+      not a confirmed block, so this returns ``None`` the same as
+      ``NEXT_ACTION_UNKNOWN`` and lets the caller retry next tick.
+    * ``NEXT_ACTION_ESCALATE`` WITHOUT ``escalate_probe_failure`` means a
+      fact WAS read and it confirms *dep* needs an operator (refused
+      premise/needs-decomposition, a PR closed without merging, a latched
+      merge-gate) — unsatisfiable, the same disposition this function's
+      pre-EntryTruth `blocked`/`failed`-row branch already gave.
     * anything else (`wait`, `dispatch_review`, `dispatch_test`,
       `dispatch_ci_fix`, `conflict_fix`, `merge`) means *dep* is
       demonstrably still in flight — an ordinary, plausibly-temporary
@@ -3666,9 +3683,11 @@ def _prereq_truth_verdict(dep: str, truth: "EntryTruth") -> "_Verdict | None":
     """
     if truth.next_action == NEXT_ACTION_UNKNOWN:
         return None
-    if truth.next_action == NEXT_ACTION_MARK_DONE:
+    if _truth_is_done(truth):
         return _Verdict(True)
     if truth.next_action == NEXT_ACTION_ESCALATE:
+        if truth.escalate_probe_failure:
+            return None
         return _Verdict(
             False,
             True,
@@ -3757,23 +3776,25 @@ def _resolve_prereqs(
 
     *prereq_truth* (#3934) maps a dep key to its LIVE, just-reconciled
     :class:`~coord.entry_truth.EntryTruth`, when the caller has one — see
-    :func:`_prereq_truth_verdict` for exactly what it decides and the
-    vimcode#2140 incident it replays. Checked AFTER *held_gates* (a fired
-    deploy gate always wins, live truth or not) AND AFTER `facts.landed`/
-    `facts.already_done` (board-level signals this module already trusted
-    pre-#3934, `already_done` included — EntryTruth does not yet have its
-    own equivalent of the #3931 "already implemented" reading, so a dep's
-    facts are consulted first rather than letting a less-informed live
-    ESCALATE shadow them) but BEFORE `dep_state`: once present for a key
-    AND `facts` had nothing conclusive to say, it is what decides this
-    edge instead — the dep's own `dep_state`/`live_prereq_terminal`/
-    `dep_reasons` reading below is never reached for that key. A key
+    :func:`_prereq_truth_verdict` for exactly what it decides. Checked
+    AFTER every board-level positive signal this module already trusts —
+    *held_gates* (a fired deploy gate always wins), `facts.landed`/
+    `facts.already_done` (EntryTruth does not yet have its own equivalent
+    of the #3931 "already implemented" reading), and `dep_state in
+    STATE_DONE_LIKE` (the queue's own row is at least as trustworthy a
+    positive signal as `facts.landed`) — so a confirmed-done dep is never
+    shadowed by a live truth whose own probe happens to fail against it.
+    Checked BEFORE the REST of `dep_state`'s reasoning (`live_prereq_
+    terminal`/`dep_reasons`/anything else below): once present for a key
+    and none of those positive signals fired, it is what decides this
+    edge instead — that reasoning is never reached for that key. A key
     ABSENT from *prereq_truth* (no caller-side live truth for that dep
     this tick), or present with :data:`~coord.entry_truth.
-    NEXT_ACTION_UNKNOWN`, falls straight through to that unchanged
-    pre-#3934 reasoning — the production default today,
-    since nothing yet wires a live `reconcile_entry` call into the shell
-    that builds this mapping.
+    NEXT_ACTION_UNKNOWN` or an inconclusive probe-failure ESCALATE (see
+    `EntryTruth.escalate_probe_failure`), falls straight through to that
+    unchanged pre-#3934 reasoning — the production default today, since
+    nothing yet wires a live `reconcile_entry` call into the shell that
+    builds this mapping.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -3804,6 +3825,33 @@ def _resolve_prereqs(
             # edge from releasing, the same claude-coordinator#3380 shape
             # `landed` already guards against.
             continue
+        dep_state = states.get(dep)
+        if dep_state in STATE_DONE_LIKE:
+            # #2715: the queue's OWN row for *dep* already knows it
+            # landed — every `STATE_DONE` write in this module
+            # (`_reconcile_running`'s `facts.landed` branch, the
+            # `parked`/`blocked`/`failed` #2055 re-check, and step 4's
+            # own `facts.landed` short-circuit just below) is gated on a
+            # landed fact from `board.facts`, and the one write outside
+            # this module — `_run_merge_only_candidates` in
+            # `coord.commands.drive_queue` — only fires after its own
+            # `coord merge --only` attempt lands, confirmed by reading
+            # the merge queue's row back as `MERGED`
+            # (`_merge_only_landed`). `done` is therefore never written
+            # speculatively, so it is as trustworthy as `facts.landed`
+            # itself — and unlike `facts.landed`, it does not depend on
+            # the `issues` cache's own refresh cadence (observed ~10m
+            # behind) to reflect a merge the queue performed itself this
+            # same tick. Treating it as satisfied here is what lets a
+            # dependent resume on the tick right after its pre-req's row
+            # flips to `done`, instead of the tick after the cache
+            # independently rediscovers the same fact. Checked BEFORE
+            # *prereq_truth* below: this row is at least as trustworthy a
+            # positive signal as `facts.landed`/`already_done` above, so a
+            # pre-req the queue itself confirmed `done` this tick must not
+            # be shadowed by a live truth read whose OWN probe happens to
+            # fail against that same pre-req.
+            continue
         dep_truth = (prereq_truth or {}).get(dep)
         if dep_truth is not None:
             truth_verdict = _prereq_truth_verdict(dep, dep_truth)
@@ -3811,29 +3859,7 @@ def _resolve_prereqs(
                 if truth_verdict.satisfied:
                     continue
                 return truth_verdict
-        dep_state = states.get(dep)
         if dep_state is not None:
-            if dep_state in STATE_DONE_LIKE:
-                # #2715: the queue's OWN row for *dep* already knows it
-                # landed — every `STATE_DONE` write in this module
-                # (`_reconcile_running`'s `facts.landed` branch, the
-                # `parked`/`blocked`/`failed` #2055 re-check, and step 4's
-                # own `facts.landed` short-circuit just below) is gated on a
-                # landed fact from `board.facts`, and the one write outside
-                # this module — `_run_merge_only_candidates` in
-                # `coord.commands.drive_queue` — only fires after its own
-                # `coord merge --only` attempt lands, confirmed by reading
-                # the merge queue's row back as `MERGED`
-                # (`_merge_only_landed`). `done` is therefore never written
-                # speculatively, so it is as trustworthy as `facts.landed`
-                # itself — and unlike `facts.landed`, it does not depend on
-                # the `issues` cache's own refresh cadence (observed ~10m
-                # behind) to reflect a merge the queue performed itself this
-                # same tick. Treating it as satisfied here is what lets a
-                # dependent resume on the tick right after its pre-req's row
-                # flips to `done`, instead of the tick after the cache
-                # independently rediscovers the same fact.
-                continue
             if (live_prereq_terminal or {}).get(dep):
                 # #2850: *dep*'s OWN queue row says it is still in play
                 # (``running``, ``waiting``, ``blocked``, ...) — but a live
@@ -4003,16 +4029,12 @@ def diagnose_blocked_after(
     live_terminal = live_prereq_terminal or {}
     truth_map = prereq_truth or {}
 
-    def _dep_truth_done(dep: str) -> bool:
-        truth = truth_map.get(dep)
-        return truth is not None and truth.next_action == NEXT_ACTION_MARK_DONE
-
     unsatisfied = tuple(
         dep for dep in entry.after
         if not board.facts(dep).landed
         and not (board.facts(dep).already_done and not board.facts(dep).reopened)
         and not live_terminal.get(dep)
-        and not _dep_truth_done(dep)
+        and not _truth_is_done(truth_map.get(dep))
         and states.get(dep) not in STATE_DONE_LIKE
     )
     if not entry.after:

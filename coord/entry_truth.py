@@ -216,6 +216,17 @@ class EntryTruth:
 
     next_action: str = NEXT_ACTION_UNKNOWN
     next_action_reason: str = "reconcile_entry has not run yet"
+    # Meaningful only when `next_action == NEXT_ACTION_ESCALATE`: True when
+    # the escalation is a LIVE PROBE that failed to read a fact (a branch
+    # head, or the PR state itself could not be confirmed) rather than a
+    # fact that WAS read and confirms something needs an operator. A probe
+    # failure is plausibly transient — the next tick's probe may succeed —
+    # so a consumer that persists `next_action` as a terminal verdict must
+    # treat this case as an ordinary, retryable deferral, never the same
+    # permanent block a confirmed escalate (a refused/needs-decomposition
+    # worker outcome, a PR closed without merging, a latched
+    # HUMAN_REQUIRED/SKIPPED merge-gate) warrants.
+    escalate_probe_failure: bool = False
 
 
 def _live_ci_state(
@@ -434,7 +445,7 @@ def _stale_approval_review(
     return scan.review_assignment, review_patch_id
 
 
-def _review_unmet_action(review: GateDecision) -> tuple[str, str]:
+def _review_unmet_action(review: GateDecision) -> tuple[str, str, bool]:
     """The action for an unmet "review" `GateDecision` — split out because
     "review required but not ok" is not always "go dispatch a review".
 
@@ -457,33 +468,48 @@ def _review_unmet_action(review: GateDecision) -> tuple[str, str]:
       review. The remedy is OPERATOR RECOVERY (`review.reason` carries the
       exact `coord report-result --verdict-source recovered` command), not
       another dispatched review, which would just re-derive a conclusion
-      that already exists in the log.
+      that already exists in the log. This is a successfully-read defect,
+      not a failed probe, so the returned `escalate_probe_failure` is
+      always `False` here.
+
+    Returns ``(next_action, reason, escalate_probe_failure)`` — the third
+    element is only ever `True` when ``next_action`` is
+    :data:`NEXT_ACTION_WAIT` here, never :data:`NEXT_ACTION_ESCALATE`;
+    kept for a uniform return shape with :func:`_derive_next_action`.
     """
     from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON  # noqa: PLC0415
 
     reason = review.reason or "review required but not approved"
     if reason.startswith(UNKNOWN_BRANCH_HEAD_REASON):
-        return NEXT_ACTION_WAIT, reason
+        return NEXT_ACTION_WAIT, reason, False
     if review.verdict_unparseable:
-        return NEXT_ACTION_ESCALATE, reason
-    return NEXT_ACTION_DISPATCH_REVIEW, reason
+        return NEXT_ACTION_ESCALATE, reason, False
+    return NEXT_ACTION_DISPATCH_REVIEW, reason, False
 
 
-def _review_unmet_next_action(truth: EntryTruth) -> tuple[str, str]:
+def _review_unmet_next_action(truth: EntryTruth) -> tuple[str, str, bool]:
     """The action for *truth*'s "review is not actually satisfied" slot —
     either an ordinary unmet review (delegated to `_review_unmet_action`)
     or a #3948 `review_stale` approval, which always needs the identical
     `dispatch_review` remedy and never `_review_unmet_action`'s `merge`.
 
     Shared by both arms of `_derive_next_action`'s `test_precedes_review`
-    branch, which otherwise duplicate this exact check.
+    branch, which otherwise duplicate this exact check. Returns the same
+    ``(next_action, reason, escalate_probe_failure)`` shape as
+    :func:`_review_unmet_action`.
     """
     if truth.review_stale:
-        return NEXT_ACTION_DISPATCH_REVIEW, truth.review_stale_reason or "review_stale"
+        return (
+            NEXT_ACTION_DISPATCH_REVIEW,
+            truth.review_stale_reason or "review_stale",
+            False,
+        )
     return _review_unmet_action(truth.review)  # type: ignore[arg-type]
 
 
-def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tuple[str, str]:
+def _derive_next_action(
+    truth: EntryTruth, *, test_precedes_review: bool,
+) -> tuple[str, str, bool]:
     """Rule 1: branches ONLY on the live facts already gathered onto
     *truth* — never on a persisted string like `merge_queue.error`.
 
@@ -497,11 +523,20 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
     Fails closed throughout: every live fact that could not be confirmed
     (`None`/"unknown"/"checks_absent") routes to `wait`/`escalate`, never
     silently falls through to `merge`.
+
+    Returns ``(next_action, reason, escalate_probe_failure)``. The third
+    element is meaningful only when ``next_action`` is
+    :data:`NEXT_ACTION_ESCALATE`: `True` for the two cases where a LIVE
+    PROBE failed to read a fact at all (the branch head, or the PR state),
+    `False` for every other escalate — a successfully-read fact (a
+    refused/needs-decomposition worker outcome, an unmet registry gate, a
+    closed-without-merging PR, a latched merge-gate) that genuinely needs
+    an operator. See :attr:`EntryTruth.escalate_probe_failure`.
     """
     if truth.issue_state == "closed":
-        return NEXT_ACTION_MARK_DONE, "issue is already closed"
+        return NEXT_ACTION_MARK_DONE, "issue is already closed", False
     if truth.pr_state == "merged":
-        return NEXT_ACTION_MARK_DONE, "PR merged; issue should close"
+        return NEXT_ACTION_MARK_DONE, "PR merged; issue should close", False
     if truth.latest_worker_status in (
         _REFUSED_PREMISE, _REFUSED_POLICY, _NEEDS_DECOMPOSITION,
     ):
@@ -509,6 +544,7 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
             NEXT_ACTION_ESCALATE,
             f"latest worker leg exited {truth.latest_worker_status!r} — needs "
             "operator recovery, not another dispatch",
+            False,
         )
     if (
         truth.latest_worker_status is not None
@@ -519,6 +555,7 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
             f"latest worker leg {truth.latest_worker_assignment_id!r} is still "
             f"in flight (status={truth.latest_worker_status!r}) — dispatching "
             "another action now would race it",
+            False,
         )
     if truth.head_sha is None:
         if truth.head_probe_attempted:
@@ -526,8 +563,13 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
                 NEXT_ACTION_ESCALATE,
                 "branch head could not be read live (#2704) — fail closed, "
                 "cannot safely decide the next action",
+                True,
             )
-        return NEXT_ACTION_UNKNOWN, "no live gh access requested — cannot determine next action"
+        return (
+            NEXT_ACTION_UNKNOWN,
+            "no live gh access requested — cannot determine next action",
+            False,
+        )
 
     test_unmet = truth.test is not None and truth.test.required and not truth.test.ok
     # `review_stale` (set only when the gate otherwise reports APPROVED, see
@@ -542,14 +584,22 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         # dispatch_pending_reviews` holds review dispatch on exactly this
         # condition) — a pending test outranks a pending review.
         if test_unmet:
-            return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
+            return (
+                NEXT_ACTION_DISPATCH_TEST,
+                truth.test.reason or "test required",  # type: ignore[union-attr]
+                False,
+            )
         if review_unmet:
             return _review_unmet_next_action(truth)
     else:
         if review_unmet:
             return _review_unmet_next_action(truth)
         if test_unmet:
-            return NEXT_ACTION_DISPATCH_TEST, truth.test.reason or "test required"  # type: ignore[union-attr]
+            return (
+                NEXT_ACTION_DISPATCH_TEST,
+                truth.test.reason or "test required",  # type: ignore[union-attr]
+                False,
+            )
 
     for gate in truth.other_gates:
         if gate.required and not gate.ok:
@@ -557,6 +607,7 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
                 NEXT_ACTION_ESCALATE,
                 f"{gate.gate} gate required but not satisfied: "
                 f"{gate.reason or 'no reason recorded'}",
+                False,
             )
 
     if truth.pr_state == "open":
@@ -567,39 +618,48 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
             # CONFIRMED `False` names the conflict; an inconclusive read
             # just waits for the next pass to try again.
             if truth.pr_mergeable is False:
-                return NEXT_ACTION_CONFLICT_FIX, "PR reports CONFLICTING against its base"
+                return (
+                    NEXT_ACTION_CONFLICT_FIX,
+                    "PR reports CONFLICTING against its base",
+                    False,
+                )
             return (
                 NEXT_ACTION_WAIT,
                 "PR mergeability could not be confirmed live — fail closed, "
                 "never a green light to merge",
+                False,
             )
         if truth.ci_state == "red":
-            return NEXT_ACTION_DISPATCH_CI_FIX, "a required CI check failed"
+            return NEXT_ACTION_DISPATCH_CI_FIX, "a required CI check failed", False
         if truth.ci_state == "pending":
-            return NEXT_ACTION_WAIT, "a required CI check is still running"
+            return NEXT_ACTION_WAIT, "a required CI check is still running", False
         if truth.ci_state == "checks_absent":
             return (
                 NEXT_ACTION_DISPATCH_CI_FIX,
                 "no checks reported though this repo declares CI (#1904) — "
                 "merging would run untested code",
+                False,
             )
         if truth.ci_state == "unknown":
             if truth.ci_probed:
                 return (
                     NEXT_ACTION_WAIT,
                     "CI check read failed live — fail closed, cannot confirm green",
+                    False,
                 )
             return (
                 NEXT_ACTION_UNKNOWN,
                 "no live CI access requested — cannot evaluate the CI gate",
+                False,
             )
         # "none" — this repo genuinely has no CI gate wired. Falls through.
     elif truth.pr_state == "closed":
-        return NEXT_ACTION_ESCALATE, "PR closed without merging"
+        return NEXT_ACTION_ESCALATE, "PR closed without merging", False
     elif truth.pr_state == "unknown":
         return (
             NEXT_ACTION_ESCALATE,
             "PR state could not be read live — fail closed, cannot safely decide",
+            True,
         )
     # else "none" (no PR yet — the normal pre-merge-queue pipeline state):
     # falls through to merge, which creates the PR (`merge_queue.process()`).
@@ -610,10 +670,14 @@ def _derive_next_action(truth: EntryTruth, *, test_precedes_review: bool) -> tup
         # "merge" decision can still be unmet here is its one piece of
         # information nothing else above carries: a latched, operator-only
         # HUMAN_REQUIRED/SKIPPED `merge_queue` row (#3445).
-        return NEXT_ACTION_ESCALATE, truth.merge_gate.reason or "merge gate blocked"
+        return (
+            NEXT_ACTION_ESCALATE,
+            truth.merge_gate.reason or "merge gate blocked",
+            False,
+        )
 
     # review/test/registry/PR/CI/merge-queue-latch gates all clear.
-    return NEXT_ACTION_MERGE, "all gates clear; merge-side facts raise no refusal"
+    return NEXT_ACTION_MERGE, "all gates clear; merge-side facts raise no refusal", False
 
 
 def reconcile_entry(
@@ -735,7 +799,7 @@ def reconcile_entry(
         and getattr(config, "pipeline", None) is not None
         and config.pipeline.test_precedes_review()
     )
-    truth.next_action, truth.next_action_reason = _derive_next_action(
-        truth, test_precedes_review=bool(test_precedes_review),
+    truth.next_action, truth.next_action_reason, truth.escalate_probe_failure = (
+        _derive_next_action(truth, test_precedes_review=bool(test_precedes_review))
     )
     return truth

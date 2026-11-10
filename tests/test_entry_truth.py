@@ -200,6 +200,10 @@ class TestLiveFacts:
         assert truth.head_sha is None
         assert truth.next_action == NEXT_ACTION_ESCALATE
         assert "2704" in truth.next_action_reason
+        # #3934: a FAILED live probe is inconclusive, never a confirmed
+        # block — a consumer that persists `next_action` as a terminal
+        # verdict must retry rather than latch this permanently.
+        assert truth.escalate_probe_failure is True
 
     def test_latest_worker_status_is_a_direct_live_read(self, config: Config) -> None:
         board = Board(active=[], completed=[_work(status="refused_premise")])
@@ -233,6 +237,9 @@ class TestNextAction:
         truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
         assert truth.next_action == NEXT_ACTION_ESCALATE
         assert "refused_premise" in truth.next_action_reason
+        # A SUCCESSFULLY READ worker outcome, not a failed probe — this is
+        # the confirmed, operator-required shape (#3934).
+        assert truth.escalate_probe_failure is False
 
     def test_review_required_but_missing_dispatches_review(self, config: Config) -> None:
         board = Board(active=[], completed=[_work()])
@@ -257,6 +264,9 @@ class TestNextAction:
         assert truth.next_action == NEXT_ACTION_ESCALATE
         assert "r1" in truth.next_action_reason
         assert "recovered" in truth.next_action_reason
+        # A successfully-read defect (the review row DID finish), not a
+        # failed probe (#3934).
+        assert truth.escalate_probe_failure is False
 
     def test_review_unknown_branch_head_waits_not_dispatch_review(
         self, config: Config
@@ -283,9 +293,12 @@ class TestNextAction:
         )
         from coord.entry_truth import _derive_next_action  # noqa: PLC0415
 
-        next_action, reason = _derive_next_action(truth, test_precedes_review=True)
+        next_action, reason, probe_failure = _derive_next_action(
+            truth, test_precedes_review=True,
+        )
         assert next_action == NEXT_ACTION_WAIT
         assert reason == mq.UNKNOWN_BRANCH_HEAD_REASON
+        assert probe_failure is False
 
     def test_test_required_but_missing_dispatches_test(self, config: Config) -> None:
         # default_gates == ["test", "review", "merge"] (coord.config.
@@ -374,6 +387,9 @@ class TestNextAction:
         truth = reconcile_entry(board, config, "api", 42, gh_ops=gh, ci_store=ci)
         assert truth.next_action == NEXT_ACTION_ESCALATE
         assert "HUMAN_REQUIRED" in truth.next_action_reason
+        # A latched, operator-only merge-gate read, not a failed probe
+        # (#3934).
+        assert truth.escalate_probe_failure is False
 
     def test_in_flight_worker_leg_waits_rather_than_redispatching(self, config: Config) -> None:
         """A still-running work leg has no verdicts yet — that must read
@@ -495,6 +511,35 @@ class TestNextAction:
         assert truth.pr_state == "closed"
         assert truth.next_action == NEXT_ACTION_ESCALATE
         assert "closed" in truth.next_action_reason.lower()
+        # A CONFIRMED close, not a failed probe (#3934) — see
+        # `test_pr_state_unknown_escalates_as_a_probe_failure` for the
+        # contrasting "could not read live" shape.
+        assert truth.escalate_probe_failure is False
+
+    def test_pr_state_unknown_escalates_as_a_probe_failure(self, config: Config) -> None:
+        """`pr_state == "unknown"` means the live PR-state read itself
+        failed — a `#3934` probe-failure ESCALATE, flagged via
+        `escalate_probe_failure` so a consumer that persists `next_action`
+        as a terminal verdict treats it as an ordinary retry rather than a
+        confirmed, permanent block."""
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh()
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        # Force the shape directly, matching `test_review_unknown_branch_
+        # head_waits_not_dispatch_review`'s own pattern: `_live_pr_facts`
+        # cannot actually return "unknown" once `gh_ops`/`repo_github`/
+        # `branch` are all present (as they are once `head_sha` reads
+        # successfully), so this substitutes the field it would have set
+        # had the read genuinely failed.
+        truth.pr_state = "unknown"
+        from coord.entry_truth import _derive_next_action  # noqa: PLC0415
+
+        next_action, reason, probe_failure = _derive_next_action(
+            truth, test_precedes_review=True,
+        )
+        assert next_action == NEXT_ACTION_ESCALATE
+        assert "PR state" in reason
+        assert probe_failure is True
 
     def test_stale_approval_dispatches_review_never_merges(self, config: Config) -> None:
         """#3948: the approving review's own `review_head_sha` still matches
