@@ -76,7 +76,9 @@ from coord.drive import (
 )
 from coord.drive_state import IssueState
 from coord.drive_queue import entry_key
+from coord.entry_truth import EntryTruth
 from coord.failure_class import environmental_backoff_secs
+from coord.gates import GateDecision
 from coord.models import (
     EPIC_DECOMPOSE_TYPE,
     NEEDS_DECOMPOSITION_MARKER,
@@ -139,17 +141,26 @@ class FakeVerifier:
         # touched this, so leaving it off preserves their assertions
         # byte-for-byte; the #3479 tests below override it explicitly.
         github_backoff: bool = False,
+        # #3933: the live `EntryTruth` `GitMergeVerifier.entry_truth` would
+        # return. `None` (the default) is "no live truth available" — every
+        # pre-#3933 test never touched this, so `_decide_merge`'s truth-
+        # driven override never fires and every existing assertion is
+        # preserved byte-for-byte; the #3933 tests below pass a real
+        # `EntryTruth` to exercise it.
+        entry_truth: "EntryTruth | None" = None,
     ) -> None:
         self._has_commits = has_commits
         self._merged = merged
         self._head_sha = head_sha
         self._epic_snapshot = epic_snapshot
         self._github_backoff = github_backoff
+        self._entry_truth = entry_truth
         self.commits_calls = 0
         self.merged_calls = 0
         self.head_sha_calls = 0
         self.epic_snapshot_calls = 0
         self.github_backoff_calls = 0
+        self.entry_truth_calls = 0
 
     def branch_has_commits(self, s: IssueState) -> bool | None:
         self.commits_calls += 1
@@ -170,6 +181,10 @@ class FakeVerifier:
     def github_backoff_active(self) -> bool:
         self.github_backoff_calls += 1
         return self._github_backoff
+
+    def entry_truth(self, s: IssueState) -> "EntryTruth | None":
+        self.entry_truth_calls += 1
+        return self._entry_truth
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -5873,6 +5888,128 @@ def test_stale_smoke_divergence_also_matches_the_plan_wording():
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #3933: live EntryTruth overrides a stale "smoke" classification — the
+# quadraui#2173 replay (part of epic #3924, following #3922's EntryTruth).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_entry_truth_review_unmet_overrides_a_stale_smoke_classification():
+    """quadraui#2173: the board's persisted `merge_reason` named the SMOKE
+    gate (a stale conclusion from an earlier attempt) while `work_test_state`
+    read "passed" — the classic #1526 divergence. A live `EntryTruth`
+    confirms test is genuinely fine and the gate ACTUALLY still unmet is
+    review (voided by a patch-id change after `merge_reason` was captured).
+
+    Expected: dispatch_review — never the smoke re-test arm, and never an
+    escalation naming the wrong gate.
+    """
+    counters = DriveCounters()
+    truth = EntryTruth(
+        repo_name=REPO,
+        issue_number=ISSUE,
+        test=GateDecision(gate="test", required=True, ok=True),
+        review=GateDecision(
+            gate="review", required=True, ok=False,
+            reason="review voided by patch-id change",
+        ),
+        next_action="dispatch_review",
+        next_action_reason="review voided by patch-id change",
+    )
+    verifier = FakeVerifier(entry_truth=truth)
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+        counters=counters,
+        verifier=verifier,
+    )
+    assert action.kind == RUN
+    assert not action.is_exit
+    assert action.command == ("review", "w1")
+    assert "review" in action.label.lower()
+    assert counters.merge_attempts == 0
+    assert counters.fix_rounds == 0  # no Test re-run was ever dispatched
+    assert verifier.entry_truth_calls == 1
+
+
+def test_entry_truth_review_unmet_overrides_the_stale_smoke_redispatch_arm_too():
+    """Same override, against the OTHER smoke-divergence arm (#1738's
+    already-stale, not merely missing, verdict wording) — the live truth
+    must win regardless of which of the two smoke sub-cases classified the
+    persisted reason."""
+    truth = EntryTruth(
+        repo_name=REPO,
+        issue_number=ISSUE,
+        test=GateDecision(gate="test", required=True, ok=True),
+        review=GateDecision(gate="review", required=True, ok=False),
+        next_action="dispatch_review",
+    )
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason=(
+                "smoke test verdict is stale: recorded against base "
+                "23acfbb, base is now b263929 — re-verify against the "
+                "current base, then `coord test w1 --passed`"
+            ),
+        ),
+        verifier=FakeVerifier(entry_truth=truth),
+    )
+    assert action.command == ("review", "w1")
+
+
+def test_entry_truth_unavailable_preserves_the_pre_3933_escalate_behaviour():
+    """When `entry_truth()` returns `None` (no config, a board/gh read
+    failure) the override never fires — every pre-#3933 assertion about this
+    exact board shape (see `test_smoke_required_with_a_passed_test_state_
+    escalates_instead_of_retrying` above) must still hold byte-for-byte."""
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert "coord test w1 --passed" in " ".join(action.command)
+
+
+def test_entry_truth_not_consulted_when_there_is_no_smoke_divergence():
+    """The live truth read is not free (`reconcile_entry` fetches the branch
+    head, patch-id, issue state, PR lifecycle and CI summary) — it must only
+    be consulted once a smoke divergence is already suspected, never on
+    every merge-stage poll."""
+    verifier = FakeVerifier()
+    step(approved_work())  # no divergence at all: plain merge retry
+    step(approved_work(), verifier=verifier)
+    assert verifier.entry_truth_calls == 0
+
+
+def test_entry_truth_review_ok_does_not_override_a_genuine_smoke_divergence():
+    """A live truth that AGREES the test gate is fine but has nothing to say
+    against review (review satisfied or not required) must change nothing —
+    the override is specific to "review is the gate that's really unmet",
+    not "any truth is available"."""
+    truth = EntryTruth(
+        repo_name=REPO,
+        issue_number=ISSUE,
+        test=GateDecision(gate="test", required=True, ok=True),
+        review=GateDecision(gate="review", required=True, ok=True),
+        next_action="merge",
+    )
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+        verifier=FakeVerifier(entry_truth=truth),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+
+
 def test_stale_smoke_redispatch_is_bounded_by_max_fix_rounds():
     """The re-test arm shares the SAME `fix_rounds` budget as the test-failed
     and review-fix arms (#1738) — it must converge to an escalation, not spin
@@ -6830,6 +6967,72 @@ def test_github_backoff_active_clears_once_the_window_expires():
     # `now=1000.0` + 1s window this recorded — same "fails open once
     # expired" contract `coord.github_throttle.current()` documents.
     assert GitMergeVerifier().github_backoff_active() is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GitMergeVerifier.entry_truth — #3933's live-truth seam
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_entry_truth_returns_none_without_a_config():
+    """No `config` was ever threaded through (an older construction site, or
+    a test double that never set it) — fail closed to "no truth available",
+    never attempt the live reads at all."""
+    assert GitMergeVerifier(config=None).entry_truth(state()) is None
+
+
+def test_entry_truth_calls_reconcile_entry_with_the_live_seams(monkeypatch):
+    """The happy path: `build_board()` and `reconcile_entry()` are called
+    with exactly the arguments the one existing production call site
+    (`coord.commands.gates.gates`) uses — same `gh_ops` module, same
+    `GitHubCi` — so this driver's truth can never silently diverge from what
+    `coord gates` would print for the identical issue."""
+    import coord.drive as drive_mod
+
+    sentinel_board = object()
+    sentinel_truth = object()
+    captured: dict = {}
+
+    def fake_build_board():
+        return sentinel_board
+
+    def fake_reconcile_entry(board, config, repo, issue, *, gh_ops=None, ci_store=None):
+        captured["board"] = board
+        captured["config"] = config
+        captured["repo"] = repo
+        captured["issue"] = issue
+        captured["gh_ops"] = gh_ops
+        captured["ci_store"] = ci_store
+        return sentinel_truth
+
+    monkeypatch.setattr("coord.state.build_board", fake_build_board)
+    monkeypatch.setattr("coord.entry_truth.reconcile_entry", fake_reconcile_entry)
+
+    cfg = make_config()
+    verifier = GitMergeVerifier(config=cfg)
+    result = verifier.entry_truth(state())
+
+    assert result is sentinel_truth
+    assert captured["board"] is sentinel_board
+    assert captured["config"] is cfg
+    assert captured["repo"] == REPO
+    assert captured["issue"] == ISSUE
+    import coord.github_ops as github_ops_mod
+
+    assert captured["gh_ops"] is github_ops_mod
+    assert captured["ci_store"] is not None
+
+
+def test_entry_truth_fails_closed_to_none_on_any_live_read_exception(monkeypatch):
+    """A board read that raises (daemon unreachable, DB locked, ...) must
+    never propagate out of `_decide_merge`'s own poll loop — same fail-
+    closed contract every other live read in this module already has."""
+    def boom():
+        raise RuntimeError("daemon unreachable")
+
+    monkeypatch.setattr("coord.state.build_board", boom)
+    verifier = GitMergeVerifier(config=make_config())
+    assert verifier.entry_truth(state()) is None
 
 
 @pytest.mark.parametrize(
