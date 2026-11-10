@@ -84,7 +84,17 @@ class PlanError(ValueError):
 
 @dataclass(frozen=True)
 class PartialMerge:
-    """Everything the plan leg and the validator need about one row."""
+    """Everything the plan leg and the validator need about one row.
+
+    ``repo_name`` is the LOCAL `coordinator.yml` repo name — the identity
+    used for drive-queue/board bookkeeping (disposition keys, auto-queue
+    entries, machine routing). ``github_repo`` is the GitHub ``owner/repo``
+    slug, which every GitHub-side read/write must use instead
+    (:mod:`coord.github_ops` takes the slug, never the local name — the two
+    differ for most repos in this fleet). Use :attr:`github_slug`, never
+    ``github_repo`` directly, since it falls back to ``repo_name`` when
+    unset.
+    """
 
     repo_name: str
     issue_number: int
@@ -98,6 +108,15 @@ class PartialMerge:
     epic_body: str = ""
     milestone: str | None = None
     claude_md: str = ""
+    github_repo: str = ""
+
+    @property
+    def github_slug(self) -> str:
+        """The ``owner/repo`` slug every :class:`FollowThroughWriter` call
+        for this row must use. Falls back to :attr:`repo_name` when
+        ``github_repo`` is unset, which keeps every existing caller/test
+        that already treats the local name as the slug unchanged."""
+        return self.github_repo or self.repo_name
 
 
 @dataclass(frozen=True)
@@ -202,6 +221,14 @@ class GitHubFollowThroughWriter:
     is recorded separately, in the epic body's own checklist
     (:func:`_write_follow_ups`/:func:`_splice_epic_checklists`), since the
     sub-issues API has no concept of inter-child ordering.
+
+    Every write here reads its own result back and raises when the read
+    disagrees with what was requested — a clean `gh`/REST return only
+    proves the request was issued, not that it landed (the same rule
+    `coord.merge_queue.process` applies to its own post-`close_issue`
+    check). The caller (:func:`run_followthrough`) already treats any
+    exception from a write as a failure to alert on, so an unconfirmed
+    write surfaces exactly the same way a `gh` error would.
     """
 
     def create_issue(
@@ -218,6 +245,14 @@ class GitHubFollowThroughWriter:
         from coord import github_ops  # noqa: PLC0415
 
         github_ops.add_sub_issue(repo_name, parent_number=epic, child_number=child)
+        parent = github_ops.get_issue_parent(repo_name, child)
+        linked = parent.get("number") if parent else None
+        if linked != epic:
+            raise RuntimeError(
+                f"add_sub_issue({repo_name}, parent={epic}, child={child}) "
+                f"returned without error but {repo_name}#{child}'s parent "
+                f"now reads {linked!r}, not {epic}"
+            )
 
     def get_issue_body(self, repo_name: str, number: int) -> str:
         from coord import github_ops  # noqa: PLC0415
@@ -228,11 +263,24 @@ class GitHubFollowThroughWriter:
         from coord import github_ops  # noqa: PLC0415
 
         github_ops.update_issue_body(repo_name, number, body)
+        actual = github_ops.get_issue(repo_name, number).get("body") or ""
+        if actual != body:
+            raise RuntimeError(
+                f"update_issue_body({repo_name}#{number}) returned without "
+                "error but the issue body read back afterward does not "
+                "match what was written"
+            )
 
     def close_issue(self, repo_name: str, number: int, *, comment: str) -> None:
         from coord import github_ops  # noqa: PLC0415
 
         github_ops.close_issue(repo_name, number, comment=comment)
+        state = github_ops.get_issue_state(repo_name, number)
+        if state != "closed":
+            raise RuntimeError(
+                f"close_issue({repo_name}#{number}) returned without error "
+                f"but the issue reads {state!r}, not confirmed closed"
+            )
 
 
 # ── Gating ───────────────────────────────────────────────────────────────────
@@ -428,6 +476,26 @@ def validate_plan(
     except WorkOrderError as exc:
         declared = set()
         reasons.append(f"epic's ## Work order does not parse: {exc}")
+
+    # #3945 review: `_splice_epic_checklists` splices the SAME `after`
+    # edges into `## Sub-issues` too, whenever that section also exists —
+    # `parse_sub_issues` then requires every edge to be declared WITHIN
+    # that section (it does not fall back to `## Work order`'s). Checking
+    # that here, before anything is written, turns a plan this validator
+    # would otherwise accept but the write would hard-fail on (after the
+    # follow-up issues already exist — orphaning them) into an ordinary
+    # rejection: alert, write nothing.
+    sub_issues_bounds = _find_checklist_bounds(
+        (partial.epic_body or "").splitlines(), _SUB_ISSUES_HEADING_RE,
+    )
+    declared_sub_issues: set[int] | None = None
+    if sub_issues_bounds is not None:
+        try:
+            declared_sub_issues = set(parse_sub_issues(partial.epic_body or "").issue_numbers)
+        except WorkOrderError as exc:
+            declared_sub_issues = set()
+            reasons.append(f"epic's ## Sub-issues does not parse: {exc}")
+
     seen_keys: set[str] = set()
     for fu in plan.follow_ups:
         label = f"follow-up {fu.key!r} ({fu.title})"
@@ -440,6 +508,15 @@ def validate_plan(
                     reasons.append(
                         f"{label}: `after` target {target} is not declared in the "
                         "epic's ## Work order"
+                    )
+                elif (
+                    declared_sub_issues is not None
+                    and int(ref.group(1)) not in declared_sub_issues
+                ):
+                    reasons.append(
+                        f"{label}: `after` target {target} is declared in the "
+                        "epic's ## Work order but not its ## Sub-issues section "
+                        "— splicing the same edge into both would fail"
                     )
             elif target not in seen_keys:
                 reasons.append(
@@ -762,7 +839,7 @@ def run_followthrough(
     try:
         successors = _write_follow_ups(partial, plan, writer, disposition)
         writer.close_issue(
-            partial.repo_name, partial.issue_number,
+            partial.github_slug, partial.issue_number,
             comment=_close_comment(plan, successors),
         )
     except Exception as exc:  # noqa: BLE001 — every write failure must alert
@@ -794,9 +871,10 @@ def _write_follow_ups(
     by_key: dict[str, int] = {}
     successors: list[tuple[int, str]] = []
     new_nodes: dict[int, list[WorkOrderNode]] = {}
+    repo = partial.github_slug
     for fu in plan.follow_ups:
         number = writer.create_issue(
-            partial.repo_name, title=fu.title,
+            repo, title=fu.title,
             body=_follow_up_body(fu, partial.issue_number),
             milestone=fu.milestone or partial.milestone,
         )
@@ -809,14 +887,14 @@ def _write_follow_ups(
         )
         epic = fu.epic if fu.epic is not None else partial.epic_number
         if epic is not None:
-            writer.add_child(partial.repo_name, epic=epic, child=number, after=after)
+            writer.add_child(repo, epic=epic, child=number, after=after)
             new_nodes.setdefault(epic, []).append(
                 WorkOrderNode(issue_number=number, after=after)
             )
     for epic, nodes in new_nodes.items():
-        body = writer.get_issue_body(partial.repo_name, epic)
+        body = writer.get_issue_body(repo, epic)
         updated = _splice_epic_checklists(body or "", nodes)
-        writer.set_issue_body(partial.repo_name, epic, updated)
+        writer.set_issue_body(repo, epic, updated)
     return successors
 
 
@@ -875,6 +953,11 @@ def _splice_epic_checklists(body: str, nodes: Sequence[WorkOrderNode]) -> str:
     corrupted checklist.
     """
     lines = body.splitlines()
+    # `splitlines()` drops whether *body* ended in a trailing newline;
+    # restore it on the way out so a splice is a true byte-for-byte
+    # preservation of the rest of the body, not just its lines (#3945
+    # review).
+    trailing_newline = body.endswith("\n")
     spliced_any = False
     for heading_re, parser in (
         (_WORK_ORDER_HEADING_RE, parse_work_order),
@@ -890,14 +973,22 @@ def _splice_epic_checklists(body: str, nodes: Sequence[WorkOrderNode]) -> str:
         to_add = [n for n in nodes if n.issue_number not in known]
         if not to_add:
             continue
-        new_lines = render_work_order(WorkOrder(nodes=tuple(to_add))).splitlines()
+        # `checkbox=False`: matches the "neither section exists" fallback
+        # below and `coord.milestone_order`'s own migration away from the
+        # checkbox grammar (#1061) — a splice must not introduce a new
+        # `- [ ] #N` row into a section the rest of this body already
+        # writes checkbox-free.
+        new_lines = render_work_order(
+            WorkOrder(nodes=tuple(to_add)), checkbox=False,
+        ).splitlines()
         section_end = end
         while section_end > start and not lines[section_end - 1].strip():
             section_end -= 1
-        lines = lines[:section_end] + new_lines + lines[section_end:end] + lines[end:]
+        lines = lines[:section_end] + new_lines + lines[section_end:]
         parser("\n".join(lines))  # raises WorkOrderError on a corrupted splice
     if spliced_any:
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return result + "\n" if trailing_newline else result
     existing = parse_work_order(body)
     merged = WorkOrder(nodes=existing.nodes + tuple(
         n for n in nodes if n.issue_number not in set(existing.issue_numbers)
