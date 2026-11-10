@@ -102,6 +102,7 @@ class FakeGh:
         mergeable_override: bool | None = None,
         raise_on_branch_sha: bool = False,
         pr_state_for_branch: str | None = None,
+        compare_diffs: dict[str, str | None] | None = None,
     ):
         self.branch_sha = branch_sha
         self.base_sha = base_sha
@@ -115,6 +116,14 @@ class FakeGh:
         # `get_pr_state_for_branch` capability at all" — distinct from the
         # method existing and itself returning `None` (no PR/read failure).
         self.pr_state_for_branch = pr_state_for_branch
+        # #3948: keyed by the `head` SHA passed to `get_compare_diff` — lets
+        # a test exercise `merge_queue`'s #3707/#3749 base-relative-diff
+        # exemptions (both call this same `gh_ops` object, since
+        # `reconcile_entry` opts in via `config=config` rather than a
+        # separately-resolved `ancillary_gh_ops`). `None` (the default)
+        # means this stand-in doesn't implement `get_compare_diff` at all —
+        # both exemptions fail closed to "not exempt" in that case.
+        self.compare_diffs = compare_diffs
 
     def get_branch_sha(self, repo: str, branch: str) -> str | None:
         if self.raise_on_branch_sha:
@@ -135,6 +144,11 @@ class FakeGh:
 
     def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
         return self.mergeable_override
+
+    def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+        if self.compare_diffs is None:
+            return None
+        return self.compare_diffs.get(head)
 
 
 class FakeGhWithPrState(FakeGh):
@@ -523,6 +537,107 @@ class TestNextAction:
         )
         gh = FakeGh(branch_sha="branchsha", patch_id="patchid")
         truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.review is not None and truth.review.ok
+        assert truth.review_stale is False
+        assert truth.next_action == NEXT_ACTION_MERGE
+
+    def test_context_only_rebase_carried_forward_approval_still_merges(
+        self, config: Config,
+    ) -> None:
+        """#3948 review: the approving review's `review_head_sha` does NOT
+        match the live branch head — a rebase moved the commit — so this
+        does NOT take the #1475 SHA-match fast path `review_stale` is
+        scoped to. `scan_approved_reviews`'s own #3749 context-only
+        exemption carries the approval forward anyway (the reviewed hunks'
+        +/- content is byte-identical; only the diff's context lines
+        shifted because the base moved). `review_stale` must stay `False`
+        and `next_action` must still reach `merge` — re-flagging an
+        approval `scan_approved_reviews` itself just exempted would answer
+        the same question differently (#2085/#2096)."""
+        board = Board(
+            active=[],
+            completed=[
+                _work(),
+                _review(
+                    "w1", review_head_sha="oldsha", review_patch_id="old-patch-id",
+                ),
+            ],
+        )
+        gh = FakeGh(
+            branch_sha="newsha",
+            patch_id="new-patch-id",
+            compare_diffs={
+                "oldsha": (
+                    "diff --git a/src/main.py b/src/main.py\n"
+                    "@@ -10,3 +10,3 @@\n"
+                    " context before\n"
+                    "-old line\n"
+                    "+new line\n"
+                    " context after\n"
+                ),
+                "newsha": (
+                    "diff --git a/src/main.py b/src/main.py\n"
+                    "@@ -40,3 +40,3 @@\n"
+                    " shifted context before\n"
+                    "-old line\n"
+                    "+new line\n"
+                    " shifted context after\n"
+                ),
+            },
+        )
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        # Carried forward via #3749 — not the SHA-match fast path.
+        assert truth.review is not None and truth.review.ok
+        assert truth.review_stale is False
+        assert truth.next_action == NEXT_ACTION_MERGE
+
+    def test_ancillary_only_rebase_carried_forward_approval_still_merges(
+        self, config: Config,
+    ) -> None:
+        """#3948 review: same shape as the context-only case above, but via
+        the #3707 ancillary-files exemption — the rebase delta is confined
+        to a repo-configured ancillary path (e.g. CHANGELOG.md), which
+        `scan_approved_reviews` also carries forward with a mismatched
+        patch-id. `review_stale` must stay `False`."""
+        ancillary_config = Config(
+            repos=[
+                Repo(
+                    name="api",
+                    github="acme/api",
+                    default_branch="main",
+                    ancillary_files=["CHANGELOG.md"],
+                ),
+            ],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+        )
+        board = Board(
+            active=[],
+            completed=[
+                _work(),
+                _review(
+                    "w1", review_head_sha="oldsha", review_patch_id="old-patch-id",
+                ),
+            ],
+        )
+        gh = FakeGh(
+            branch_sha="newsha",
+            patch_id="new-patch-id",
+            compare_diffs={
+                "oldsha": (
+                    "diff --git a/CHANGELOG.md b/CHANGELOG.md\n"
+                    "@@ -1,2 +1,2 @@\n"
+                    "-old entry\n"
+                    "+new entry\n"
+                ),
+                "newsha": (
+                    "diff --git a/CHANGELOG.md b/CHANGELOG.md\n"
+                    "@@ -1,2 +1,2 @@\n"
+                    "-old entry\n"
+                    "+newer entry\n"
+                ),
+            },
+        )
+        truth = reconcile_entry(board, ancillary_config, "api", 42, gh_ops=gh)
         assert truth.review is not None and truth.review.ok
         assert truth.review_stale is False
         assert truth.next_action == NEXT_ACTION_MERGE
