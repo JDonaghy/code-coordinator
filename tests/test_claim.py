@@ -973,12 +973,37 @@ def test_any_matching_branch_merged_issue_scoped_ignores_gate_b_leg(
     assert claim_mod.any_matching_branch_merged("acme/vimcode", 900) is False
 
 
+def test_any_matching_branch_merged_issue_scoped_ignores_size_triage_leg(
+    monkeypatch,
+) -> None:
+    """#3975: quadraui#2304's exact shape — a zero-commit
+    `issue-{N}-size-triage-*` branch (cut from the default branch's tip by
+    the read-only size-triage leg) sitting at `ahead_by == 0`, with no real
+    work branch dispatched yet. `any_matching_branch_merged` with no
+    *branch* (the dispatch-liveness fallback a re-queued Work dispatch
+    hits right after the triage leg says `proceed`) must not read the
+    triage branch as "this issue's work already merged" — that misread is
+    exactly what refused the Work dispatch in the incident."""
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(
+            ["issue-2304-size-triage-shared-app-layer-2a-widgetid"],
+            "develop",
+            {"issue-2304-size-triage-shared-app-layer-2a-widgetid": 0},
+        ),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/vimcode", 2304) is False
+
+
 def test_is_observer_leg_branch_matches_review_scoped_review_smoke_and_gate_b() -> None:
-    """#3442: the exact prefixes review/smoke/gate-b legs mint, and nothing
-    else — a bare `issue-N-review` (no trailing content) and the slugified
-    `issue-N-review-...`/`issue-N-scoped-review-...`/`issue-N-smoke-...`/
-    `issue-N-gate-b-...` shapes all match; an unrelated branch, or one that
-    merely CONTAINS "review" past the issue-number prefix, must not."""
+    """#3442/#3975: the exact prefixes review/smoke/gate-b/size-triage legs
+    mint, and nothing else — a bare `issue-N-review` (no trailing content)
+    and the slugified `issue-N-review-...`/`issue-N-scoped-review-...`/
+    `issue-N-smoke-...`/`issue-N-gate-b-...`/`issue-N-size-triage-...` shapes
+    all match; an unrelated branch, or one that merely CONTAINS "review"
+    past the issue-number prefix, must not."""
     import coord.claim as claim_mod
 
     assert claim_mod._is_observer_leg_branch("issue-9-review", 9) is True
@@ -989,6 +1014,9 @@ def test_is_observer_leg_branch_matches_review_scoped_review_smoke_and_gate_b() 
     assert claim_mod._is_observer_leg_branch("issue-9-smoke-track-a", 9) is True
     assert claim_mod._is_observer_leg_branch(
         "issue-9-gate-b-ms-9-milestone-verdict", 9
+    ) is True
+    assert claim_mod._is_observer_leg_branch(
+        "issue-9-size-triage-shared-app-layer", 9
     ) is True
     assert claim_mod._is_observer_leg_branch("issue-9-real-work", 9) is False
     assert claim_mod._is_observer_leg_branch(

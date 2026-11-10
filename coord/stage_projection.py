@@ -34,6 +34,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Protocol, runtime_checkable
 
+from coord.decomposition_chat import is_size_triage_review_target
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, effective_issue_number
 # #3191: the two #3182 fan-out encodings this module has to PARSE to count
 # Test *rounds* rather than raw smoke rows — see `_test_stage_leg_count`.
@@ -167,6 +168,16 @@ def assignments_for_stage(
     ``require_plan`` and no ``type="plan"`` assignment for this issue),
     plan-typed assignments fold into "work" so a ``--plan-only`` dispatch
     without ``require_plan`` doesn't disappear from the Work stage.
+
+    #3975: a size-triage leg is dispatched with ``type="review"`` purely to
+    reuse ``coord.agent``'s read-only deny-list for that type (see
+    ``coord.decomposition_chat.dispatch_size_triage_review``'s own comment)
+    — it is not a code review and carries no ``review_verdict`` a real
+    review would. Counting it toward the "review" stage painted
+    quadraui#2304's board as "review" while Work hadn't even been
+    dispatched yet (a size-triage leg's ``status="running"`` trips the
+    ACTIVE check in ``stage_status_for`` before any work row exists). Drop
+    it here, once, rather than at every stage-status call site.
     """
     fold_plan_into_work = (
         stage == "work"
@@ -175,6 +186,8 @@ def assignments_for_stage(
     )
     out = []
     for a in assignments_for_issue:
+        if is_size_triage_review_target(getattr(a, "review_target", None)):
+            continue
         t = a.type or "work"
         if fold_plan_into_work:
             if t in ("work", "plan"):

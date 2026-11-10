@@ -201,9 +201,24 @@ class GateReport:
 
 
 def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
+    from coord.decomposition_chat import is_size_triage_review_target  # noqa: PLC0415
+
+    # #3975: a size-triage leg is dispatched with `type="review"` only to
+    # reuse coord.agent's read-only deny-list for that type — it never
+    # produces a REVIEW_VERDICT and is not evidence toward the issue's
+    # review gate. Label the raw row "size-triage" instead of "review" so
+    # `coord gates`' row listing (and its `--json`/`report_to_dict` form)
+    # can't be mistaken for the issue's actual review stage — see
+    # `build_gate_report`'s `work_like` gate above, which already excludes
+    # this row from ever backing a "review" GateDecision.
+    row_type = (
+        "size-triage"
+        if a.type == "review" and is_size_triage_review_target(a.review_target)
+        else (a.type or "work")
+    )
     return AssignmentGateRow(
         assignment_id=a.assignment_id,
-        type=a.type or "work",
+        type=row_type,
         status=a.status,
         branch=a.branch,
         machine_name=a.machine_name,

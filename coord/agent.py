@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from coord import cargo_cache
 from coord.claude_setup_token import inject_setup_token
 from coord.config_reload import reload_config_if_stale
+from coord.decomposition_chat import is_size_triage_review_target
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
 from coord.smoke_tags import smoke_leg_capabilities
@@ -11971,7 +11972,20 @@ class AgentServer:
             # timeout (60 s) but MUST NOT let a hung push block the
             # status update — so we catch both _GitError *and*
             # subprocess.TimeoutExpired and treat both as non-fatal.
-            if assignment.worktree_path:
+            # #3975: a size-triage leg is read-only by its own system prompt
+            # (`build_size_triage_briefing` forbids commits) and its branch
+            # is cut fresh from the default branch's tip with zero commits
+            # of its own. Pushing that branch anyway gives #3376's
+            # issue-scoped `any_matching_branch_merged` fallback a
+            # zero-commit `issue-N-size-triage-*` branch to mis-read as
+            # "already merged" (it's an ancestor of the default branch),
+            # which refuses the very Work dispatch the triage verdict just
+            # unblocked. Skip the push entirely for this leg shape — there
+            # is nothing of this leg's own to push, so there's nothing lost.
+            _is_size_triage_leg = is_size_triage_review_target(
+                getattr(assignment.spec, "review_target", None)
+            )
+            if assignment.worktree_path and not _is_size_triage_leg:
                 wt_path = Path(assignment.worktree_path)
                 if wt_path.exists() and exit_code == 0:
                     # #3869: a history-rewrite leg (today, only

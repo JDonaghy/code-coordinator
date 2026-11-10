@@ -74,6 +74,28 @@ def test_stage_status_running_is_active():
     assert sp.stage_status_for(a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False) == sp.ACTIVE
 
 
+def test_stage_status_review_ignores_size_triage_leg():
+    """#3975: a size-triage leg is dispatched `type="review"` only to reuse
+    coord.agent's read-only deny-list for that type — it is not evidence
+    toward the "review" stage. Before this fix, its `status="running"`
+    tripped the generic ACTIVE check and painted the board "review: active"
+    for an issue where Work hadn't even been dispatched yet (quadraui#2304:
+    "went straight to review, skipping Work and Test")."""
+    a = [
+        Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[size-triage] t", type="review", status="running",
+            review_target="size-triage-1", dispatched_at=1.0,
+        )
+    ]
+    assert sp.stage_status_for(
+        a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False
+    ) == sp.PENDING
+    assert sp.stage_status_for(
+        a, "work", stage_names=["work", "review"], is_closed=False, require_plan=False
+    ) == sp.PENDING
+
+
 def test_stage_status_review_approve_is_done():
     a = [_review(status="done", review_verdict="approve", dispatched_at=1.0)]
     assert sp.stage_status_for(a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False) == sp.DONE

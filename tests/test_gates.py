@@ -295,6 +295,38 @@ class TestRows:
         assert report.decisions == []
         assert any("no work-like assignment" in n for n in report.notes)
 
+    def test_size_triage_only_assignment_reports_no_review_stage(
+        self, config: Config
+    ) -> None:
+        """#3975: a size-triage leg is dispatched with `type="review"` only
+        to reuse `coord.agent`'s read-only deny-list for that type — it is
+        not a code review. An issue with no work dispatched yet and only a
+        size-triage leg on the board must not have `coord gates` present
+        that leg as the issue's review stage: no "review" `GateDecision`
+        (already true — `review` isn't in `WORK_LIKE_TYPES`, so the
+        work-like gate above bails first) AND the raw row itself must not
+        render `[review]`, which is what actually misled quadraui#2304."""
+        triage = Assignment(
+            machine_name="precision",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[size-triage] t",
+            assignment_id="triage-1",
+            type="review",
+            status="running",
+            review_target="size-triage-42",
+            branch="main",
+        )
+        board = Board(active=[triage], completed=[])
+        report = build_gate_report(board, config, "api", 42)
+        assert len(report.rows) == 1
+        assert report.rows[0].type == "size-triage"
+        assert report.decisions == []
+        assert not any(d.gate == "review" for d in report.decisions)
+        assert any("no work-like assignment" in n for n in report.notes)
+        assert "[review]" not in format_gate_report(report)
+        assert "[size-triage]" in format_gate_report(report)
+
     def test_winner_with_no_branch_leaves_decision_empty(self, config: Config) -> None:
         work = _work(branch=None)
         board = Board(active=[], completed=[work])
