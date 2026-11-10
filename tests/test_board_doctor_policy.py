@@ -23,6 +23,7 @@ from coord.board_doctor import (
     CAUSE_LATCH_STALE_MERGEABLE,
     CAUSE_MERGE_PENDING_STUCK,
     CAUSE_SMOKE_NO_VERDICT,
+    CAUSE_STRANDED_PREREQ,
     CONVERGENCE_LIMIT,
     MERGE_PENDING_STALE_AFTER_SECONDS,
     TIER_ALERT,
@@ -131,7 +132,8 @@ class TestPolicyTierOf:
         # generic fix-it leg, which cannot repair staleness by editing
         # code), and a never-attempted-but-otherwise-clear merge row
         # reuses the SAME "merge" action `CAUSE_MERGE_PENDING_STUCK`
-        # already does.
+        # already does. #3944 adds a thirteenth: a `waiting` row stranded
+        # on an open, unqueued `after=` pre-req gets the pre-req enqueued.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
             queue_diagnose.CAUSE_PR_MERGED: "mark_done",
@@ -145,6 +147,7 @@ class TestPolicyTierOf:
             queue_diagnose.CAUSE_REVIEW_STALE: "restage",
             queue_diagnose.CAUSE_TEST_STALE: "restage",
             board_doctor_policy.CAUSE_MERGE_NEVER_ATTEMPTED: "merge",
+            CAUSE_STRANDED_PREREQ: "drive_queue_add",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:

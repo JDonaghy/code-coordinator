@@ -24,7 +24,10 @@ from coord.board_doctor import (
     CAUSE_CHECKS_STALE_RACE,
     CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_SMOKE_NO_VERDICT,
+    CAUSE_STRANDED_PREREQ,
+    CAUSE_STRANDED_PREREQ_BLOCKED,
     MERGE_PENDING_STALE_AFTER_SECONDS,
+    STRANDED_PREREQ_OPT_OUT_LABEL,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
@@ -36,6 +39,9 @@ from coord.board_doctor import (
     drive_queue_rows,
     no_progress_rows,
     smoke_no_verdict_rows,
+    stranded_prereq_dep,
+    stranded_prereq_guard,
+    stranded_prereq_rows,
     sweep,
 )
 from coord.config import BoardDoctorConfig, Config, ConfigError, _parse_board_doctor
@@ -4079,3 +4085,381 @@ class TestSmokeNoVerdictRows:
         [row] = smoke_no_verdict_rows(board)
 
         assert row.key == "acme/widgets#10"
+
+
+class TestStrandedPrereqDep:
+    """#3944: :func:`stranded_prereq_dep` is the one place outside
+    `coord.drive_queue` that knows `_resolve_prereqs`'s "open, not queued"
+    verdict text."""
+
+    def test_matches_the_exact_verdict_text(self) -> None:
+        assert (
+            stranded_prereq_dep("waiting on quadraui#2172 (open, not queued)")
+            == "quadraui#2172"
+        )
+
+    def test_none_for_other_waiting_reasons(self) -> None:
+        assert stranded_prereq_dep("waiting on quadraui#2172 (queued, waiting)") is None
+        assert stranded_prereq_dep("waiting on quadraui#2172 (work in flight, not queued)") is None
+        assert stranded_prereq_dep("") is None
+        assert stranded_prereq_dep(None) is None
+
+    def test_none_for_trailing_garbage(self) -> None:
+        # The real verdict never has anything after the closing paren; a
+        # reason that merely CONTAINS the marker must not match.
+        assert stranded_prereq_dep("waiting on quadraui#2172 (open, not queued) — retrying") is None
+
+
+class TestStrandedPrereqGuard:
+    """#3944's "Must NOT auto-queue" list: epic, operator opt-out label,
+    operator-removed history, and an unresolvable repo must all refuse —
+    and fail CLOSED (refuse) on a `gh` read it could not complete."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[],
+        )
+
+    def test_open_plain_issue_may_be_queued(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue", lambda *a, **k: {"labels": []},
+        )
+        guard = stranded_prereq_guard("quadraui#2172", self._config())
+        assert guard.may_queue is True
+
+    def test_unparseable_key_is_refused(self) -> None:
+        guard = stranded_prereq_guard("not-a-key", self._config())
+        assert guard.may_queue is False
+
+    def test_unknown_repo_is_refused(self) -> None:
+        guard = stranded_prereq_guard("vimcode#50", self._config())
+        assert guard.may_queue is False
+        assert "coordinator.yml" in guard.reason
+
+    def test_epic_is_refused(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"labels": [{"name": "epic"}]},
+        )
+        guard = stranded_prereq_guard("quadraui#2283", self._config())
+        assert guard.may_queue is False
+        assert "epic" in guard.reason
+
+    def test_opt_out_label_is_refused(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"labels": [{"name": STRANDED_PREREQ_OPT_OUT_LABEL}]},
+        )
+        guard = stranded_prereq_guard("quadraui#2283", self._config())
+        assert guard.may_queue is False
+        assert STRANDED_PREREQ_OPT_OUT_LABEL in guard.reason
+
+    def test_operator_removed_is_refused_without_even_reading_github(
+        self, monkeypatch
+    ) -> None:
+        from coord.block_log import operator_resolution_event, record
+        from coord.drive_queue import QueueEntry as _QE
+
+        def _boom(*a, **k):
+            raise AssertionError("must not read GitHub once operator-removed is confirmed")
+
+        monkeypatch.setattr("coord.github_ops.get_issue", _boom)
+        entry = _QE(repo="quadraui", issue=2172, state="waiting")
+        record([operator_resolution_event(entry, resolution="operator_removed")])
+
+        guard = stranded_prereq_guard("quadraui#2172", self._config())
+        assert guard.may_queue is False
+        assert "operator" in guard.reason
+
+    def test_a_later_non_operator_record_does_not_shadow_the_removal(
+        self, monkeypatch
+    ) -> None:
+        # The MOST RECENT record decides — an operator removal followed by
+        # a later tick-driven `enter` record (the only shape a key that is
+        # back in the queue could produce) must not still read as
+        # removed-on-purpose: `_dep_last_operator_removed` only matches a
+        # RESOLVE record whose own `resolution` is exactly
+        # "operator_removed", and the latest record here is an `enter`.
+        from coord.block_log import enter_event, operator_resolution_event, record
+        from coord.drive_queue import QueueEntry as _QE
+
+        entry = _QE(repo="quadraui", issue=2172, state="blocked", last_reason="ci red")
+        record([operator_resolution_event(entry, resolution="operator_removed", now=100.0)])
+        record([enter_event(entry, state="blocked", reason="ci red", now=200.0)])
+
+        monkeypatch.setattr("coord.github_ops.get_issue", lambda *a, **k: {"labels": []})
+        guard = stranded_prereq_guard("quadraui#2172", self._config())
+        assert guard.may_queue is True
+
+    def test_gh_read_failure_is_refused_not_assumed_safe(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("gh: rate limited")
+
+        monkeypatch.setattr("coord.github_ops.get_issue", _boom)
+        guard = stranded_prereq_guard("quadraui#2172", self._config())
+        assert guard.may_queue is False
+        assert "could not read" in guard.reason
+
+
+class TestStrandedPrereqRows:
+    """#3944: the classifier that walks every current `waiting` entry and
+    produces :data:`CAUSE_STRANDED_PREREQ` / :data:`CAUSE_STRANDED_PREREQ_
+    BLOCKED` rows — the shape neither the episode walk nor
+    :func:`no_progress_rows` ever sees (quadraui#2174/#2178, 960+
+    deferrals)."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[],
+        )
+
+    def test_a_stranded_waiting_row_is_flagged_auto_queueable(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.github_ops.get_issue", lambda *a, **k: {"labels": []})
+        entry = QueueEntry(
+            repo="quadraui", issue=2174, state="waiting",
+            after=("quadraui#2172",),
+            last_reason="waiting on quadraui#2172 (open, not queued)",
+            deferrals=960,
+        )
+
+        [row] = stranded_prereq_rows([entry], config=self._config())
+
+        assert row.key == "quadraui#2174"
+        assert row.cause == CAUSE_STRANDED_PREREQ
+        assert "quadraui#2172" in row.evidence[0]
+        assert row.fresh is True
+
+    def test_an_epic_dep_is_flagged_blocked_not_auto_queueable(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"labels": [{"name": "epic"}]},
+        )
+        entry = QueueEntry(
+            repo="vimcode", issue=2141, state="waiting",
+            after=("quadraui#2283",),
+            last_reason="waiting on quadraui#2283 (open, not queued)",
+        )
+
+        [row] = stranded_prereq_rows(
+            [entry],
+            config=Config(
+                repos=[
+                    Repo(name="quadraui", github="acme/quadraui"),
+                    Repo(name="vimcode", github="acme/vimcode"),
+                ],
+                machines=[],
+            ),
+        )
+
+        assert row.key == "vimcode#2141"
+        assert row.cause == CAUSE_STRANDED_PREREQ_BLOCKED
+        assert "epic" in row.evidence[0]
+
+    def test_a_non_stranded_waiting_row_is_not_flagged(self) -> None:
+        entry = QueueEntry(
+            repo="quadraui", issue=1, state="waiting",
+            after=("quadraui#2",),
+            last_reason="waiting on quadraui#2 (queued, waiting)",
+        )
+        assert stranded_prereq_rows([entry], config=self._config()) == []
+
+    def test_a_non_waiting_row_is_never_flagged_even_with_matching_text(self) -> None:
+        # Defensive: the shape is only ever meaningful for `waiting` —
+        # `_resolve_prereqs` never writes this text for any other state.
+        entry = QueueEntry(
+            repo="quadraui", issue=2174, state="blocked",
+            after=("quadraui#2172",),
+            last_reason="waiting on quadraui#2172 (open, not queued)",
+        )
+        assert stranded_prereq_rows([entry], config=self._config()) == []
+
+    def test_declined_cause_routes_to_the_alert_tier(self) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+
+        assert policy_tier_of(CAUSE_STRANDED_PREREQ_BLOCKED) == TIER_ALERT
+
+
+class TestQueueStrandedPrereqDispatcher:
+    """#3944: end to end through the REAL `coord.board_doctor_policy`
+    dispatcher (not a fake) — settle window, idempotency, and same-repo vs.
+    cross-repo placement, the load-bearing evidence this cause is actually
+    wired up rather than a tautology.
+    """
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(
+            repos=[
+                Repo(name="quadraui", github="acme/quadraui"),
+                Repo(name="vimcode", github="acme/vimcode"),
+            ],
+            machines=[],
+        )
+
+    @pytest.fixture(autouse=True)
+    def _wire_seams(self, monkeypatch):
+        """Every test in this class hits the same two external seams: the
+        epic/opt-out label read (`coord.github_ops.get_issue`) and the
+        audit comment (`coord.github_ops.post_issue_comment`) — stubbed
+        here so no test needs to re-declare them, and so a comment attempt
+        is recorded (``self.comments``) instead of reaching the real `gh`
+        seam `_wire_config` cannot stub (#1484)."""
+        self.comments: list[tuple[str, int, str]] = []
+        monkeypatch.setattr("coord.github_ops.get_issue", lambda *a, **k: {"labels": []})
+        monkeypatch.setattr(
+            "coord.github_ops.post_issue_comment",
+            lambda repo, issue, body, **k: self.comments.append((repo, issue, body)),
+        )
+        self._monkeypatch = monkeypatch
+
+    def _wire_config(self, config) -> None:
+        import coord.commands._common as common
+
+        self._monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+    def _sweep(self, config, *, sweep_id: str):
+        from coord.board_doctor_policy import AUTO_DISPATCHERS, policy_tier_of
+
+        rows = stranded_prereq_rows(
+            [QueueEntry.from_row(r) for r in state.list_drive_queue()], config=config,
+        )
+        return sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_Recorder(),
+            sweep_id=sweep_id,
+        )
+
+    def test_not_enqueued_before_the_settle_window(self) -> None:
+        config = self._config()
+        self._wire_config(config)
+
+        state.enqueue_drive_queue("quadraui", 2174, after=["quadraui#2172"])
+        state.update_drive_queue_entry(
+            "quadraui", 2174, state="waiting",
+            last_reason="waiting on quadraui#2172 (open, not queued)",
+        )
+
+        report = self._sweep(config, sweep_id="sweep-1")
+
+        [decision] = [d for d in report.decisions if d.key == "quadraui#2174"]
+        assert decision.cause == CAUSE_STRANDED_PREREQ
+        assert decision.action == "auto-dispatch-noop"
+        assert state.get_drive_queue_entry("quadraui", 2172) is None
+        assert self.comments == []
+
+    def test_second_sweep_enqueues_at_the_dependents_position(self) -> None:
+        config = self._config()
+        self._wire_config(config)
+
+        # Another row ahead of the dependent, so the dependent's own
+        # position is NOT 0 — the dep must land exactly there, pushing the
+        # dependent back by one, not at the front of the whole repo queue.
+        state.enqueue_drive_queue("quadraui", 999)
+        state.enqueue_drive_queue("quadraui", 2174, after=["quadraui#2172"])
+        state.update_drive_queue_entry(
+            "quadraui", 2174, state="waiting",
+            last_reason="waiting on quadraui#2172 (open, not queued)",
+        )
+        dependent_position_before = state.get_drive_queue_entry("quadraui", 2174)["position"]
+
+        self._sweep(config, sweep_id="sweep-1")
+        report = self._sweep(config, sweep_id="sweep-2")
+
+        [decision] = [d for d in report.decisions if d.key == "quadraui#2174"]
+        assert decision.action == "auto-dispatch"
+
+        dep_row = state.get_drive_queue_entry("quadraui", 2172)
+        assert dep_row is not None
+        assert dep_row["state"] == "waiting"
+        assert dep_row["machine"] in ("", None)
+        assert dep_row["position"] == dependent_position_before
+
+        # `coord drive-queue list`'s own order is by position — the dep is
+        # now ahead of the dependent it was stranding.
+        ordered = [r["issue_number"] for r in state.list_drive_queue("quadraui")]
+        assert ordered.index(2172) < ordered.index(2174)
+
+        # The audit comment on the dependent names both issues (#3944).
+        [(repo, issue, body)] = self.comments
+        assert (repo, issue) == ("acme/quadraui", 2174)
+        assert "quadraui#2172" in body and "quadraui#2174" in body
+
+    def test_third_sweep_is_idempotent(self) -> None:
+        config = self._config()
+        self._wire_config(config)
+
+        state.enqueue_drive_queue(
+            "quadraui", 2174, after=["quadraui#2172"], machine="laptop",
+        )
+        state.update_drive_queue_entry(
+            "quadraui", 2174, state="waiting",
+            last_reason="waiting on quadraui#2172 (open, not queued)",
+        )
+
+        self._sweep(config, sweep_id="sweep-1")
+        self._sweep(config, sweep_id="sweep-2")
+        dep_after_first_enqueue = state.get_drive_queue_entry("quadraui", 2172)
+        dependent_after_first_enqueue = state.get_drive_queue_entry("quadraui", 2174)
+
+        # A third sweep still classifies the dependent as stranded (its
+        # OWN `after=` text hasn't changed — nothing in this harness runs
+        # the real tick that would flip it) — the dep is already queued,
+        # so `queue_prereq` must report "left as-is", never resetting its
+        # machine/after/position, and the dependent's own declared fields
+        # (machine="laptop") must never be rewritten either.
+        self._sweep(config, sweep_id="sweep-3")
+
+        assert state.get_drive_queue_entry("quadraui", 2172) == dep_after_first_enqueue
+        dependent_now = state.get_drive_queue_entry("quadraui", 2174)
+        assert dependent_now["machine"] == "laptop"
+        assert dependent_now["after_json"] == dependent_after_first_enqueue["after_json"]
+        # Only the ONE enqueue (sweep-2) ever wrote a comment.
+        assert len(self.comments) == 1
+
+    def test_cross_repo_dep_lands_at_the_front_of_its_own_repo_queue(self) -> None:
+        config = self._config()
+        self._wire_config(config)
+
+        # An existing backlog in the pre-req's repo — the pre-req must
+        # still jump to the front, not sink behind it (same rule
+        # `_queue_upstream` already applies to a blocker).
+        state.enqueue_drive_queue("quadraui", 601)
+        state.enqueue_drive_queue("quadraui", 602)
+        state.enqueue_drive_queue("vimcode", 2141, after=["quadraui#2172"])
+        state.update_drive_queue_entry(
+            "vimcode", 2141, state="waiting",
+            last_reason="waiting on quadraui#2172 (open, not queued)",
+        )
+
+        self._sweep(config, sweep_id="sweep-1")
+        self._sweep(config, sweep_id="sweep-2")
+
+        ordered = [r["issue_number"] for r in state.list_drive_queue("quadraui")]
+        assert ordered == [2172, 601, 602]
+
+    def test_an_epic_dep_is_never_enqueued_even_past_the_settle_window(self) -> None:
+        config = self._config()
+        self._wire_config(config)
+        self._monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"labels": [{"name": "epic"}]},
+        )
+
+        state.enqueue_drive_queue("vimcode", 2141, after=["quadraui#2283"])
+        state.update_drive_queue_entry(
+            "vimcode", 2141, state="waiting",
+            last_reason="waiting on quadraui#2283 (open, not queued)",
+        )
+
+        self._sweep(config, sweep_id="sweep-1")
+        report = self._sweep(config, sweep_id="sweep-2")
+
+        assert state.get_drive_queue_entry("quadraui", 2283) is None
+        [decision] = [d for d in report.decisions if d.key == "vimcode#2141"]
+        assert decision.cause == CAUSE_STRANDED_PREREQ_BLOCKED
+        assert decision.tier == TIER_ALERT
+        assert self.comments == []

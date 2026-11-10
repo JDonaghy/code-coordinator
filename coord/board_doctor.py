@@ -57,6 +57,7 @@ resolves and recurs.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
@@ -258,6 +259,221 @@ CAUSE_AFTER_PREREQS_LANDED = "after-prereqs-landed"
 _AFTER_PREREQS_LANDED_SAFE_CAUSES = frozenset(
     {queue_diagnose.CAUSE_UNKNOWN, queue_diagnose.CAUSE_NO_PR}
 )
+
+#: #3944: a `waiting` row's `after=` edge names an issue that is open on
+#: the board but has no drive-queue row of its own —
+#: `coord.drive_queue._resolve_prereqs`'s own `facts.open` verdict (see
+#: :data:`_STRANDED_PREREQ_RE`). Nothing ever enqueues the pre-req, so the
+#: row just repeats the same deferral forever — the board-doctor sweep
+#: (#3758) never saw this shape before #3944 because it carries neither a
+#: `block_log` episode (only `blocked`/`parked` opens one) nor merge-queue
+#: evidence, the two things :func:`collect_rows` walked before this.
+#: :func:`stranded_prereq_rows` is this sweep's own classifier for it.
+CAUSE_STRANDED_PREREQ = "stranded-prereq"
+
+#: Same shape as :data:`CAUSE_STRANDED_PREREQ`, but the pre-req is one
+#: :func:`stranded_prereq_guard` says this sweep must NOT enqueue on its
+#: own authority — an epic, an operator opt-out label, a repo this sweep
+#: cannot resolve, or one an operator deliberately removed from the queue
+#: (see the issue's "Must NOT auto-queue" list, #3944). Left off
+#: :data:`coord.board_doctor_policy.ALLOWLIST` on purpose, so
+#: :func:`coord.board_doctor_policy.policy_tier_of` routes it straight to
+#: the alert tier — the same backoff-gated escalation path every other
+#: un-registered cause already gets, never a bespoke comment/event of its
+#: own.
+CAUSE_STRANDED_PREREQ_BLOCKED = "stranded-prereq-blocked"
+
+#: #3944: the one marker `_resolve_prereqs`'s `facts.open` branch writes —
+#: see that f-string in ``coord/drive_queue.py`` (``f"waiting on {dep}
+#: (open, not queued)"``). No public alias exists in that module for this
+#: one shape (unlike `is_unsatisfiable_prereq_reason`'s two), so this
+#: regex is the one place outside it that knows the text; keep it in sync
+#: with that f-string if it ever changes.
+_STRANDED_PREREQ_RE = re.compile(r"^waiting on (?P<dep>\S+) \(open, not queued\)$")
+
+#: The operator opt-out marker for #3944's "satisfied by a human act, not
+#: a drive" case (e.g. a release-gate tracking issue like quadraui#2283) —
+#: see the module-level "Must NOT auto-queue" list in the issue this
+#: closes. Checked by :func:`stranded_prereq_guard` the same way it checks
+#: :data:`coord.milestone_order.TRACKING_ISSUE_LABEL`.
+STRANDED_PREREQ_OPT_OUT_LABEL = "coord:no-autoqueue"
+
+
+def stranded_prereq_dep(last_reason: str | None) -> str | None:
+    """The pre-req key named by *last_reason*, if it is exactly
+    `_resolve_prereqs`'s "open, not queued" verdict text (#3944) — else
+    ``None``. The one place both :func:`stranded_prereq_rows`
+    (classification) and `coord.board_doctor_policy._queue_stranded_prereq`
+    (dispatch, re-reading the row's LIVE reason right before acting) parse
+    this shape, so the two can never disagree about what counts (#2096).
+    """
+    if not last_reason:
+        return None
+    m = _STRANDED_PREREQ_RE.match(last_reason)
+    return m.group("dep") if m else None
+
+
+@dataclass(frozen=True)
+class StrandedPrereqGuard:
+    """Whether #3944's sweep may enqueue a stranded pre-req, and why not."""
+
+    may_queue: bool
+    reason: str = ""
+
+
+def _dep_last_operator_removed(dep: str) -> bool:
+    """True when *dep*'s most recent `block_log` record is an operator
+    `drive-queue remove` (#3944's "removed on purpose" guard).
+
+    `coord.commands.drive_queue._record_operator_release`/`_record_operator_
+    release_entry` are the ONLY writers of `resolution="operator_removed"`
+    (:func:`coord.block_log.operator_resolution_event`) anywhere in this
+    tree — every tick-driven resolution instead records `"landed"`,
+    `"auto_merged"`, `"auto_resumed"` or a bare `"moved"`
+    (:func:`coord.block_log._resolve_record`) — so the latest record for a
+    key reading this resolution is specifically a human's `remove`, never a
+    self-heal. See the memory note "removing a queue row strands its green
+    PR": a removal can be deliberate, and this sweep must not second-guess
+    one by re-adding the row right back.
+
+    A key with no record at all (never queued, or queued and simply left
+    alone) reads ``False`` — nothing here says "removed on purpose".
+    """
+    from coord import block_log  # noqa: PLC0415
+
+    matching = [e for e in block_log.read_events() if e.get("key") == dep]
+    if not matching:
+        return False
+    return matching[-1].get("resolution") == "operator_removed"
+
+
+def stranded_prereq_guard(dep: str, config: Any) -> StrandedPrereqGuard:
+    """Checks #3944's "Must NOT auto-queue" list for *dep*.
+
+    Fails CLOSED: any check this sweep could not actually run — an
+    unresolvable repo, a `gh` read that errors — reads as "do not queue",
+    never as "assume it's fine". Dispatching a worker onto an epic, or onto
+    a release-gate issue an operator deliberately opted out with
+    :data:`STRANDED_PREREQ_OPT_OUT_LABEL`, is the one mistake this guard
+    exists to prevent, and a probe failure must never relax it.
+
+    Order matters only in that the cheapest/most structural checks (an
+    unparseable key, an unconfigured repo) run before anything that needs a
+    `gh` round-trip. Shared verbatim by :func:`stranded_prereq_rows`
+    (classification) and `coord.board_doctor_policy._queue_stranded_prereq`
+    (the dispatcher's own immediate-before-acting re-check) — #2096 again:
+    one question, one answer.
+    """
+    from coord.drive_queue import parse_key  # noqa: PLC0415
+
+    parsed = parse_key(dep)
+    if parsed is None:
+        return StrandedPrereqGuard(False, f"{dep!r} is not a parseable repo#issue key")
+    dep_repo, dep_issue = parsed
+
+    repo_cfg = next(
+        (r for r in (getattr(config, "repos", None) or []) if r.name == dep_repo), None,
+    )
+    if repo_cfg is None:
+        return StrandedPrereqGuard(
+            False, f"{dep_repo!r} is not a repo in coordinator.yml"
+        )
+
+    if _dep_last_operator_removed(dep):
+        return StrandedPrereqGuard(
+            False,
+            f"{dep}'s last drive-queue history is an operator `drive-queue "
+            "remove` — removals can be deliberate, escalating instead of "
+            "re-adding it",
+        )
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.milestone_order import TRACKING_ISSUE_LABEL  # noqa: PLC0415
+
+    try:
+        issue_data = github_ops.get_issue(repo_cfg.github or dep_repo, dep_issue)
+    except Exception as exc:  # noqa: BLE001 — fail CLOSED, see docstring
+        return StrandedPrereqGuard(
+            False, f"could not read {dep}'s labels to check epic/opt-out: {exc}"
+        )
+    labels = {lbl.get("name", "") for lbl in (issue_data.get("labels") or [])}
+    if TRACKING_ISSUE_LABEL in labels:
+        return StrandedPrereqGuard(
+            False,
+            f"{dep} carries the {TRACKING_ISSUE_LABEL!r} label — an `after=` "
+            "on an epic is an operator modelling error, not something to "
+            "auto-queue",
+        )
+    if STRANDED_PREREQ_OPT_OUT_LABEL in labels:
+        return StrandedPrereqGuard(
+            False,
+            f"{dep} carries {STRANDED_PREREQ_OPT_OUT_LABEL!r} — explicitly "
+            "opted out of auto-queueing (satisfied by a human act, not a "
+            "drive)",
+        )
+    return StrandedPrereqGuard(True)
+
+
+def stranded_prereq_rows(entries: Sequence[Any], *, config: Any) -> list[StuckRow]:
+    """One :class:`StuckRow` per `waiting` row stranded on an open,
+    unqueued pre-req (#3944).
+
+    Walks the FULL current *entries* — same posture as :func:`no_progress_
+    rows` — because this shape carries no `block_log` episode (only
+    `blocked`/`parked` opens one) and no merge-queue row, the two things
+    the rest of :func:`collect_rows` already walks: a plain `waiting` row
+    whose `after=` names an open-but-unqueued issue would otherwise never
+    reach this sweep at all (the gap quadraui#2174/#2178 hit, 960+
+    deferrals, #3944). :func:`no_progress_rows`'s own `waiting` shape is
+    the deliberate complement of this one — it requires every `after=` dep
+    to already read LANDED; this requires one to read exactly the
+    "open, not queued" shape instead — so the two never double-classify the
+    same row.
+
+    Every match gets :data:`CAUSE_STRANDED_PREREQ` (auto-queueable) or
+    :data:`CAUSE_STRANDED_PREREQ_BLOCKED` (alert-only) per
+    :func:`stranded_prereq_guard` — decided HERE, once per sweep, so
+    `coord.board_doctor_policy._queue_stranded_prereq` never has to
+    re-derive which guard tripped, only re-confirm the shape still holds
+    immediately before it acts.
+    """
+    from coord.drive_queue import STATE_WAITING  # noqa: PLC0415
+
+    rows: list[StuckRow] = []
+    for entry in entries:
+        if entry.state != STATE_WAITING:
+            continue
+        dep = stranded_prereq_dep(entry.last_reason)
+        if dep is None:
+            continue
+        guard = stranded_prereq_guard(dep, config)
+        if guard.may_queue:
+            cause = CAUSE_STRANDED_PREREQ
+            evidence = (
+                f"drive_queue: after={dep} is open on the board but has no "
+                "drive-queue row of its own — nothing ever dispatches it, "
+                f"so this row's own deferral count ({entry.deferrals}) just "
+                f"keeps climbing; last reason: {entry.last_reason!r}",
+            )
+        else:
+            cause = CAUSE_STRANDED_PREREQ_BLOCKED
+            evidence = (
+                f"drive_queue: after={dep} is open on the board but has no "
+                f"drive-queue row of its own, and {guard.reason} — not "
+                "auto-queued",
+            )
+        rows.append(
+            StuckRow(
+                queue="drive-queue",
+                key=entry.key,
+                state=entry.state,
+                cause=cause,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=evidence,
+                fresh=True,
+            )
+        )
+    return rows
 
 
 def default_tier_of(cause: str) -> str:
@@ -2090,6 +2306,19 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
     rows = _reclassify_merge_never_attempted(rows, merge_entries, board=board, config=config)
     rows.extend(smoke_no_verdict_rows(board))
+
+    # #3944: a `waiting` row stranded on an open, unqueued `after=` pre-req
+    # carries neither a `block_log` episode nor merge-queue evidence, so
+    # nothing above this line ever classifies it — see
+    # `stranded_prereq_rows`'s own docstring. `covered_keys` guards against
+    # double-classifying a key some other pass already explained, same
+    # discipline as the no-progress pass above (though in practice no
+    # other pass here ever produces this exact shape).
+    covered_keys = frozenset(row.key for row in rows)
+    rows.extend(
+        row for row in stranded_prereq_rows(entries, config=config)
+        if row.key not in covered_keys
+    )
 
     blocked_streaks = {
         repo_name: streak
