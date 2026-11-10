@@ -220,6 +220,51 @@ class TestNextAction:
         assert not truth.review.ok
         assert truth.next_action == NEXT_ACTION_DISPATCH_REVIEW
 
+    def test_review_verdict_unparseable_escalates_not_dispatch_review(
+        self, config: Config
+    ) -> None:
+        """#1956: a review row that finished (status="done") with NO
+        parseable verdict is a DEFECT, not a pending review — the remedy is
+        operator recovery (`coord report-result --verdict-source
+        recovered`), never another dispatched review that just re-derives a
+        conclusion already sitting in the log."""
+        board = Board(active=[], completed=[_work(), _review("w1", verdict=None)])
+        gh = FakeGh()
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        assert truth.review is not None and truth.review.verdict_unparseable
+        assert truth.next_action == NEXT_ACTION_ESCALATE
+        assert "r1" in truth.next_action_reason
+        assert "recovered" in truth.next_action_reason
+
+    def test_review_unknown_branch_head_waits_not_dispatch_review(
+        self, config: Config
+    ) -> None:
+        """#2704: `review.reason` carrying `mq.UNKNOWN_BRANCH_HEAD_REASON`
+        means the branch head could not be CONFIRMED at all — never collapse
+        that into "not approved", which asserts a refusal this scan never
+        actually confirmed. `coord.drive._merge_gate_kind` already treats
+        this string as its own gate kind the auto-loop WAITS on; this must
+        agree, not escalate or dispatch a review against an unconfirmed
+        read."""
+        from coord.gates import GateDecision
+
+        board = Board(active=[], completed=[_work(), _review("w1")])
+        gh = FakeGh()
+        truth = reconcile_entry(board, config, "api", 42, gh_ops=gh)
+        # Force the specific defect shape this guards (build_gate_report's
+        # own live_gate_entry probe failing independently of reconcile_
+        # entry's own head-sha read) without re-deriving a second probe —
+        # substitute the "review" decision directly, matching exactly what
+        # `coord.gates.build_gate_report` would produce for that case.
+        truth.review = GateDecision(
+            gate="review", required=True, ok=False, reason=mq.UNKNOWN_BRANCH_HEAD_REASON,
+        )
+        from coord.entry_truth import _derive_next_action  # noqa: PLC0415
+
+        next_action, reason = _derive_next_action(truth, test_precedes_review=True)
+        assert next_action == NEXT_ACTION_WAIT
+        assert reason == mq.UNKNOWN_BRANCH_HEAD_REASON
+
     def test_test_required_but_missing_dispatches_test(self, config: Config) -> None:
         # default_gates == ["test", "review", "merge"] (coord.config.
         # PipelineConfig) already requires "test" with no per-row override.
