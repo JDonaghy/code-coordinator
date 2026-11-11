@@ -592,6 +592,12 @@ that hosts it.
 # half (parse, file through the issue-tracker seam, link, block the queue row
 # `after=` it). The example deliberately uses `<placeholders>`: the parser
 # rejects them, so a log that echoes this briefing never files a fake gap.
+# #3977: the body MUST name a real inline-code symbol (not `<placeholder>`,
+# not a backtick-quoted sentence or shell command — `_named_symbols` only
+# recognises a single identifier path) — a marker with none can't be checked
+# against the upstream repo before filing (`_verify_gap`), so it goes out
+# unverified and unqueued, costing a human a confirmation round-trip that
+# naming the symbol up front would have skipped.
 UPSTREAM_GAP_BRIEFING_NOTE = """
 
 ## Cross-repo gaps — `BLOCKED_ON_UPSTREAM` (#3676)
@@ -608,11 +614,17 @@ the lines directly below it (a blank line ends the body):
 where this repo would call it>
 
 `<repo>` is the upstream repo's coordinator name or its `owner/name` GitHub \
-slug. The coordinator files the upstream issue for you, links it to this \
-one, and holds this issue's drive-queue row until it lands — you never need \
-the issue number. Still commit and push whatever is genuinely done; if the \
-gap leaves this issue unresolved, also declare `ISSUE_RESOLUTION: partial — \
-blocked on upstream (BLOCKED_ON_UPSTREAM above)`.
+slug. The body MUST name at least one inline-code symbol for the missing \
+API (`` `Foo::bar` ``, not a path-prefixed or call-decorated span like \
+`` `a/b.rs::Foo::bar(Baz)` `` — write the bare symbol) — the coordinator \
+greps the upstream repo's own default branch for it before filing, so a \
+marker with no checkable symbol is filed unverified and held unqueued \
+until a human confirms it (#3977). The coordinator files the upstream \
+issue for you, links it to this one, and holds this issue's drive-queue \
+row until it lands — you never need the issue number. Still commit and \
+push whatever is genuinely done; if the gap leaves this issue unresolved, \
+also declare `ISSUE_RESOLUTION: partial — blocked on upstream \
+(BLOCKED_ON_UPSTREAM above)`.
 """
 
 # #3711: appended to every `type="work"` briefing, alongside
