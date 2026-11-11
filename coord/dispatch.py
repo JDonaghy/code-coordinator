@@ -615,11 +615,11 @@ where this repo would call it>
 
 `<repo>` is the upstream repo's coordinator name or its `owner/name` GitHub \
 slug. The body MUST name at least one inline-code symbol for the missing \
-API (`` `Foo::bar` ``, not a path-prefixed or call-decorated span like \
-`` `a/b.rs::Foo::bar(Baz)` `` — write the bare symbol) — the coordinator \
-greps the upstream repo's own default branch for it before filing, so a \
-marker with no checkable symbol is filed unverified and held unqueued \
-until a human confirms it (#3977). The coordinator files the upstream \
+API — a bare symbol (`` `Foo::bar` ``) is clearest, and a path-prefixed or \
+call-decorated span (`` `a/b.rs::Foo::bar(Baz)` ``) is also recognised — \
+the coordinator greps the upstream repo's own default branch for it before \
+filing, so a marker with no checkable symbol is filed unverified and held \
+unqueued until a human confirms it (#3977). The coordinator files the upstream \
 issue for you, links it to this one, and holds this issue's drive-queue \
 row until it lands — you never need the issue number. Still commit and \
 push whatever is genuinely done; if the gap leaves this issue unresolved, \

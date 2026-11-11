@@ -1142,6 +1142,39 @@ def is_needs_decomposition_reason(text: str | None) -> bool:
     return bool(text) and NEEDS_DECOMPOSITION_MARKER in text
 
 
+# #3977: the machine-readable tag `coord.upstream_gaps._park_queue_row`
+# embeds in a downstream drive-queue row's `last_reason` when it parks the
+# row directly — no upstream issue, no `after=` edge: a symbol confirmed on
+# the upstream default branch (unreleased, not missing) or a dedup match
+# that closed within the recent-close window. Same SIBLING shape as
+# `POLICY_REFUSAL_MARKER`/`PREMISE_REFUSAL_MARKER`/`NEEDS_DECOMPOSITION_
+# MARKER` above: nothing on the board signals a release landing or a
+# coordinator's confirmation, so there is no external verdict to poll for.
+#
+# Text-marker matching (not a dedicated exit code), same rationale as the
+# three markers above: `coord/drive_queue.py`'s parked pre-pass recognises
+# this straight out of the row's own `last_reason` and leaves the row
+# parked rather than falling through to the CI-park "resume" default, which
+# would otherwise flip it back to `waiting` on the very next tick and
+# relaunch a worker straight into re-emitting the identical marker.
+UPSTREAM_GAP_PARK_MARKER = "[parked-on-upstream-gap #3977]"
+
+
+def is_upstream_gap_park_reason(text: str | None) -> bool:
+    """Whether *text* is a #3977 upstream-gap park reason.
+
+    Like a policy/premise refusal or a needs-decomposition park, this has
+    no external verdict that can arrive and clear it on its own — a
+    release landing, or a coordinator confirming a dedup/unverified gap,
+    leaves no trace on the board that this module (or anything else) polls
+    for — so nothing auto-resumes an entry parked for this reason. An
+    operator clears it by hand once the release lands / the pin is bumped,
+    or once the gap is confirmed, the same way they clear a `blocked` entry
+    (`coord drive-queue remove` + `add` for a fresh row).
+    """
+    return bool(text) and UPSTREAM_GAP_PARK_MARKER in text
+
+
 # #2850: the machine-readable tag `coord.drive.decide` embeds in its
 # `_succeed()` message when the "terminal: merged" branch's own LIVE check
 # (`MergeVerifier.verify_merged`) confirms the issue has genuinely landed —

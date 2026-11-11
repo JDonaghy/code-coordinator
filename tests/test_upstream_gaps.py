@@ -11,14 +11,16 @@ from unittest.mock import patch
 import pytest
 
 from coord import state
+from coord.board_doctor import STRANDED_PREREQ_OPT_OUT_LABEL
 from coord.config import Config
 from coord.dispatch import UPSTREAM_GAP_BRIEFING_NOTE
-from coord.models import Machine, Repo
+from coord.models import Machine, Repo, UPSTREAM_GAP_PARK_MARKER, is_upstream_gap_park_reason
 from coord.upstream_gaps import (
     UPSTREAM_GAP_SOURCE,
     UpstreamGap,
     _DEDUP_RECENT_CLOSE_DAYS,
     _named_symbols,
+    _park_queue_row,
     _queue_upstream,
     _verify_symbols,
     final_message_from_log_text,
@@ -41,7 +43,10 @@ class FakeTracker:
     def create_issue(self, repo, title, body, labels=None, milestone=None):
         number = self.next_number
         self.next_number += 1
-        self.created.append({"repo": repo, "title": title, "body": body, "number": number})
+        self.created.append({
+            "repo": repo, "title": title, "body": body, "number": number,
+            "labels": list(labels or []),
+        })
         return {"number": number, "url": f"https://github.com/{repo}/issues/{number}"}
 
     def post_issue_comment(self, repo, issue_number, body, *args, **kwargs):
@@ -344,10 +349,14 @@ class TestDedupPerDownstreamIssue:
         )[0]
         assert first.status == "filed" and first.number == 501
 
-        with patch("coord.github_ops.get_issue_state", return_value="open"):
+        # `issue_is_closed` patched too (even though this specific gap is
+        # unverified and so never reaches it): hermetic regardless of which
+        # branch `_reassert_block_and_queue` takes.
+        with patch("coord.github_ops.get_issue_state", return_value="open"), \
+                patch("coord.github_ops.issue_is_closed", return_value=False):
             second = process_upstream_gaps(
                 "BLOCKED_ON_UPSTREAM: quadraui: Gap two, worded completely differently\n"
-                "body two\n",
+                "body two, with more specifics\n",
                 config=config, repo_name="vimcode", issue_number=42,
             )[0]
 
@@ -356,6 +365,53 @@ class TestDedupPerDownstreamIssue:
         assert len(tracker.created) == 1  # no second issue filed
         row = _row(42)
         assert _after(row) == ["quadraui#501"]
+        # The second marker's own report is not silently discarded.
+        assert tracker.comments[-1][:2] == ("acme/vimcode", 42)
+        assert "body two, with more specifics" in tracker.comments[-1][2]
+        ctx = [e for e in state.list_issue_context("vimcode", 42)
+               if e["source"] == UPSTREAM_GAP_SOURCE]
+        assert any("quadraui#501" in e["body"] and "still open" in e["body"] for e in ctx)
+
+        # A replay of the SAME second title reasserts the block without a
+        # fresh `get_issue_state` round-trip — `issue_is_closed`/
+        # `get_issue_state` are unpatched here, so a call to either would
+        # raise `AttributeError` (no live `gh`), proving neither ran.
+        third = process_upstream_gaps(
+            "BLOCKED_ON_UPSTREAM: quadraui: Gap two, worded completely differently\n"
+            "body two, with more specifics\n",
+            config=config, repo_name="vimcode", issue_number=42,
+        )[0]
+        assert third.status == "deduped" and third.number == 501
+        assert len(tracker.created) == 1
+
+    def test_open_dup_still_auto_queues_a_verified_second_gap(
+        self, tracker, verify_config,
+    ) -> None:
+        """The dedup-open hold only ever withholds auto-queue for an
+        UNVERIFIED filing — a verified one still gets its upstream issue
+        queued as a root exactly like a fresh filing would."""
+        state.enqueue_drive_queue("vimcode", 42)
+        first = process_upstream_gaps(
+            "BLOCKED_ON_UPSTREAM: quadraui: Add FormSpacing::padding\n"
+            "needs `RowAlign` (present) and `FormSpacing::padding` (missing).\n",
+            config=verify_config, repo_name="vimcode", issue_number=42,
+        )[0]
+        assert first.status == "filed" and first.upstream_queued is True
+
+        with patch("coord.github_ops.get_issue_state", return_value="open"):
+            second = process_upstream_gaps(
+                "BLOCKED_ON_UPSTREAM: quadraui: Also needs FormSpacing::padding\n"
+                "worded completely differently\n",
+                config=verify_config, repo_name="vimcode", issue_number=42,
+            )[0]
+
+        assert second.status == "deduped"
+        # Already queued by the first call — left as-is, not re-enqueued —
+        # but critically an ATTEMPT was made (unlike the unverified case,
+        # which skips `_queue_upstream` outright): no "unverified" note.
+        assert second.upstream_queued is False
+        assert not any("unverified" in n for n in second.notes)
+        assert any("already" in n for n in second.notes)
 
     def test_second_title_after_recent_close_parks_instead_of_refiling(
         self, tracker, config,
@@ -379,8 +435,23 @@ class TestDedupPerDownstreamIssue:
         assert len(tracker.created) == 1  # no second issue filed
         row = _row(42)
         assert row["state"] == "parked"
+        assert is_upstream_gap_park_reason(row["last_reason"])
         assert tracker.comments[-1][:2] == ("acme/vimcode", 42)
         assert "quadraui#501" in tracker.comments[-1][2]
+
+        # A replay of this SAME second title must report "deduped" again
+        # (it never ran a real verification check for THIS title), not
+        # "not-a-gap" — reusing `_NOT_A_GAP_MARK` for this outcome would say
+        # "checked against upstream and confirmed not real", which is false.
+        again = process_upstream_gaps(
+            "BLOCKED_ON_UPSTREAM: quadraui: Gap two, worded completely differently\n"
+            "body two\n",
+            config=config, repo_name="vimcode", issue_number=42,
+        )[0]
+        assert again.status == "deduped"
+        assert again.detail != "already checked against upstream and confirmed not real — not re-checked"
+        assert len(tracker.comments) == 2  # not reposted a third time
+        assert len(tracker.created) == 1
 
     def test_stale_closed_dup_falls_through_to_a_fresh_filing(
         self, tracker, config,
@@ -411,6 +482,20 @@ class TestDedupPerDownstreamIssue:
         assert second.status == "filed"
         assert second.number == 502
         assert len(tracker.created) == 2
+
+    def test_missing_dedup_timestamp_treats_as_recent_not_stale(self) -> None:
+        """A dedup entry with no recorded `created_at` (the DB column is
+        `NOT NULL`, but a daemon-routed response dict is not schema-checked
+        the same way) must fail toward NOT re-filing — treated as
+        just-closed, never as ancient — the opposite of what reading a
+        missing timestamp as epoch 0 would compute."""
+        from coord.upstream_gaps import _dedup_entry_age_days
+
+        assert _dedup_entry_age_days({}) == 0.0
+        assert _dedup_entry_age_days({"created_at": None}) == 0.0
+        assert _dedup_entry_age_days({"created_at": 0}) == 0.0
+        recent_age = _dedup_entry_age_days({"created_at": time.time() - 3600})
+        assert 0 < recent_age < 1
 
 
 # ── gap verification (#3930) ──────────────────────────────────────────────
@@ -456,6 +541,104 @@ def verify_config(quadraui_checkout: Path) -> Config:
                     repo_paths={"quadraui": str(quadraui_checkout)}),
         ],
     )
+
+
+@pytest.fixture
+def quadraui_fieldkind_checkout(tmp_path: Path) -> Path:
+    """A local checkout whose default branch already has `FieldKind::
+    NumberInput`/`FieldKind::ComboBox` — the vimcode#2114 incident's own
+    shape: both variants exist on quadraui's `develop`, just not in the
+    0.9.0 release vimcode pins."""
+    seed = tmp_path / "fieldkind-seed"
+    origin = tmp_path / "fieldkind-origin.git"
+    checkout = tmp_path / "fieldkind-checkout"
+
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "config", "user.email", "t@example.com")
+    _git(seed, "config", "user.name", "t")
+    (seed / "primitives").mkdir()
+    (seed / "primitives" / "form.rs").write_text(
+        "pub enum FieldKind {\n"
+        "    NumberInput,\n"
+        "    RadioGroup,\n"
+        "    ComboBox(ComboBox),\n"
+        "}\n"
+        "\n"
+        "// A `git grep -F` matches a literal substring regardless of\n"
+        "// context, same as the real quadraui#2325/#2326/#2328 incident's\n"
+        "// own enum-path usages (FieldKind::NumberInput, FieldKind::RadioGroup,\n"
+        "// FieldKind::ComboBox) would have been found at.\n"
+    )
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-q", "-m", "base")
+
+    subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(origin)],
+                   check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(checkout)],
+                   check=True, capture_output=True, text=True)
+    return checkout
+
+
+@pytest.fixture
+def fieldkind_config(quadraui_fieldkind_checkout: Path) -> Config:
+    return Config(
+        repos=[
+            Repo(name="vimcode", github="JDonaghy/vimcode"),
+            Repo(name="quadraui", github="JDonaghy/quadraui"),
+        ],
+        machines=[
+            Machine(name="laptop", host="laptop.tailnet", repos=["vimcode", "quadraui"],
+                    repo_paths={"quadraui": str(quadraui_fieldkind_checkout)}),
+        ],
+    )
+
+
+class TestReplayVimcode2114:
+    """Replays the vimcode#2114 incident's own shape (three
+    `BLOCKED_ON_UPSTREAM` markers, three separate worker legs, all for
+    `FieldKind` variants already on quadraui's default branch) through the
+    real pipeline — the issue's own acceptance bullet, not a synthetic
+    `Gap one`/`Gap two` stand-in."""
+
+    def test_replaying_the_three_markers_files_nothing(
+        self, tracker, fieldkind_config,
+    ) -> None:
+        state.enqueue_drive_queue("vimcode", 2114)
+
+        # quadraui#2325's own shape: a path-prefixed span.
+        leg_one = process_upstream_gaps(
+            "BLOCKED_ON_UPSTREAM: quadraui: Add FieldKind::NumberInput\n"
+            "vimcode's form widget needs "
+            "`primitives/form.rs::FieldKind::NumberInput`.\n",
+            config=fieldkind_config, repo_name="vimcode", issue_number=2114,
+            assignment_id="59d117bdd0c9",
+        )
+        # quadraui#2326's own shape: a differently-worded title.
+        leg_two = process_upstream_gaps(
+            "BLOCKED_ON_UPSTREAM: quadraui: Add FieldKind::RadioGroup\n"
+            "vimcode's form widget needs `FieldKind::RadioGroup`.\n",
+            config=fieldkind_config, repo_name="vimcode", issue_number=2114,
+            assignment_id="ff3fb9f139a6",
+        )
+        # quadraui#2328's own shape: both variants, worded a third way,
+        # plus the tuple-arg-decorated span.
+        leg_three = process_upstream_gaps(
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose the missing FieldKind variants\n"
+            "vimcode's form widget still needs `FieldKind::NumberInput` and "
+            "`FieldKind::ComboBox(ComboBox)`.\n",
+            config=fieldkind_config, repo_name="vimcode", issue_number=2114,
+            assignment_id="66eee603d85d",
+        )
+
+        assert tracker.created == []  # nothing ever filed
+        for outcomes in (leg_one, leg_two, leg_three):
+            assert [o.status for o in outcomes] == ["not-a-gap"]
+            assert outcomes[0].parked is True
+        row = _row(2114)
+        assert row["state"] == "parked"
+        assert is_upstream_gap_park_reason(row["last_reason"])
+        assert "unreleased" in row["last_reason"]
 
 
 class TestNamedSymbols:
@@ -572,6 +755,10 @@ class TestVerifyGapFiling:
         assert _after(row) == ["vimcode#40"]  # no edge added
         assert row["state"] == "parked"
         assert "unreleased" in (row["last_reason"] or "")
+        # The parked walk (`coord/drive_queue.py`) must never auto-resume
+        # this on its own — no release-qualified `after=` edge exists yet,
+        # so nothing on the board signals when one lands.
+        assert is_upstream_gap_park_reason(row["last_reason"])
         # The next leg reads where the symbol was found, not just that it
         # wasn't filed.
         assert tracker.comments and tracker.comments[0][:2] == ("acme/vimcode", 42)
@@ -645,6 +832,9 @@ class TestVerifyGapFiling:
         assert len(tracker.created) == 1
         body = tracker.created[0]["body"]
         assert "Not verified" not in body  # a real check ran and confirmed it
+        # A VERIFIED filing never carries the stranded-prereq opt-out label
+        # — that's reserved for an unverified one.
+        assert tracker.created[0]["labels"] == []
         # Unqueued downstream: nothing to hold, but the upstream is still
         # auto-filed exactly as an unverified gap would be.
         assert outcomes[0].number == 501
@@ -652,6 +842,7 @@ class TestVerifyGapFiling:
     def test_no_checkable_symbols_files_with_a_note(
         self, tracker, verify_config: Config,
     ) -> None:
+        state.enqueue_drive_queue("vimcode", 42)
         msg = (
             "BLOCKED_ON_UPSTREAM: quadraui: Expose per-pane scroll offset\n"
             "vimcode's minimap needs the f32 scroll offset of a pane; today "
@@ -662,12 +853,26 @@ class TestVerifyGapFiling:
                                          repo_name="vimcode", issue_number=42)
 
         assert [o.status for o in outcomes] == ["filed"]
-        body = tracker.created[0]["body"]
-        assert "Not verified against upstream before filing" in body
-        assert "no checkable symbols" in body
+        created = tracker.created[0]
+        assert "Not verified against upstream before filing" in created["body"]
+        assert "no checkable symbols" in created["body"]
         # #3977: unverified -- never auto-queued as a drive-queue root, so no
-        # worker is spent on a gap taken on the reporting worker's word alone.
+        # worker is spent on a gap taken on the reporting worker's word alone
+        # — but the dependency is real either way, so the downstream row
+        # still blocks on it.
         assert outcomes[0].upstream_queued is False
+        assert outcomes[0].queued_after is True
+        assert state.list_drive_queue("quadraui") == []
+        assert _after(_row(42)) == ["quadraui#501"]
+        # Opts the filed issue itself out of the stranded-prereq sweep too.
+        assert created["labels"] == [STRANDED_PREREQ_OPT_OUT_LABEL]
+
+        # A replay (same message twice) must not auto-queue it either —
+        # the hold is read back off the ledger entry, not re-derived.
+        again = process_upstream_gaps(msg, config=verify_config,
+                                      repo_name="vimcode", issue_number=42)
+        assert again[0].status == "already-filed"
+        assert again[0].upstream_queued is False
         assert state.list_drive_queue("quadraui") == []
 
     def test_unverifiable_check_still_files_with_a_note(
@@ -676,6 +881,7 @@ class TestVerifyGapFiling:
         """`config` (module fixture) has no real local checkout for
         quadraui, so the check itself cannot run — that must never be read
         as a refutation, only as "not verified"."""
+        state.enqueue_drive_queue("vimcode", 42)
         msg = (
             "BLOCKED_ON_UPSTREAM: quadraui: Expose RowAlign\n"
             "vimcode's layout needs `RowAlign`.\n"
@@ -685,14 +891,16 @@ class TestVerifyGapFiling:
                                          repo_name="vimcode", issue_number=42)
 
         assert [o.status for o in outcomes] == ["filed"]
-        body = tracker.created[0]["body"]
-        assert "Not verified against upstream before filing" in body
-        assert "no local checkout" in body
+        created = tracker.created[0]
+        assert "Not verified against upstream before filing" in created["body"]
+        assert "no local checkout" in created["body"]
         # #3977: a tool failure must never silently swallow a real gap (it's
-        # still filed) but must also never spend a worker on an unconfirmed
-        # one — not auto-queued either.
+        # still filed, and the downstream row still blocks on it) but must
+        # also never spend a worker on an unconfirmed one — not auto-queued.
         assert outcomes[0].upstream_queued is False
+        assert outcomes[0].queued_after is True
         assert state.list_drive_queue("quadraui") == []
+        assert created["labels"] == [STRANDED_PREREQ_OPT_OUT_LABEL]
 
 
 class TestInFlightRow:
@@ -822,6 +1030,63 @@ class TestInFlightRow:
         row = _row(42)
         assert row["state"] == "waiting"
         assert _after(row) == ["quadraui#501", "widgets#502"]
+
+    def test_running_row_is_stopped_and_parked_for_an_unreleased_symbol(
+        self, tracker, verify_config, stopped,
+    ) -> None:
+        """`_park_queue_row`'s `running` branch (#3977's own park path, not
+        `_block_queue_row`'s) — the module docstring says a row is usually
+        `running` when a gap is read, so this must be covered too, not just
+        a plain `waiting` row."""
+        state.enqueue_drive_queue("vimcode", 42, machine="laptop", max_fix_rounds=3)
+        self._launch(42)
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose RowAlign\n"
+            "vimcode's layout needs `RowAlign`.\n"
+        )
+
+        outcomes = process_upstream_gaps(msg, config=verify_config,
+                                         repo_name="vimcode", issue_number=42)
+
+        assert [o.status for o in outcomes] == ["not-a-gap"]
+        assert outcomes[0].parked is True
+        assert stopped == [("vimcode", 42)]
+        row = _row(42)
+        assert row["state"] == "parked"
+        assert row["machine"] == "laptop"
+        assert row["max_fix_rounds"] == 3
+        assert is_upstream_gap_park_reason(row["last_reason"])
+
+    def test_park_restores_the_row_if_the_re_enqueue_fails(
+        self, tracker, verify_config, stopped,
+    ) -> None:
+        """Mirrors `_block_queue_row`'s own restore guard (review of
+        #3676): a `running` row taken out of flight must not be left
+        dropped from the queue if putting it back fails."""
+        state.enqueue_drive_queue("vimcode", 42, machine="laptop")
+        self._launch(42)
+
+        calls = {"n": 0}
+        real_enqueue = state.enqueue_drive_queue
+
+        def flaky_enqueue(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated enqueue failure")
+            return real_enqueue(*args, **kwargs)
+
+        with patch("coord.state.enqueue_drive_queue", side_effect=flaky_enqueue):
+            with pytest.raises(RuntimeError, match="simulated enqueue failure"):
+                _park_queue_row("vimcode", 42, "blocked on upstream quadraui release: x")
+
+        # Restored, not dropped from the queue — the retry inside the
+        # except block put it back (as a fresh `waiting` row, same as
+        # `_block_queue_row`'s identical restore guard: the row was already
+        # taken out of flight by the preceding dequeue, so "restored" means
+        # "still in the queue", not "still running").
+        row = _row(42)
+        assert row["state"] == "waiting"
+        assert row["machine"] == "laptop"
 
 
 class TestQueueUpstream:

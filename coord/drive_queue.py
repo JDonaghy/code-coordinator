@@ -123,6 +123,7 @@ from coord.models import (
     is_needs_decomposition_reason,
     is_policy_refusal_reason,
     is_premise_refusal_reason,
+    is_upstream_gap_park_reason,
     parse_issue_resolution,
 )
 from coord.worker_events import classify_zero_commit_outcome
@@ -8759,6 +8760,21 @@ def plan_tick(
         # parked until a human decomposes the issue and clears it by hand
         # (`coord drive-queue remove`).
         if is_needs_decomposition_reason(entry.last_reason):
+            continue
+        # #3977: an upstream-gap park (`coord.upstream_gaps._park_queue_row`)
+        # has the SAME "no external verdict to poll for" shape as the three
+        # checks just above — a release landing or a coordinator confirming
+        # a dedup/unverified gap leaves no trace this tick can read, so this
+        # never resumes itself either. Without this check the row would read
+        # exactly like a cleared CI gate (`facts.merge_ci_pending` is False —
+        # this row was never in the merge queue) and fall straight into the
+        # #1891 default below, flipping back to `waiting`, resetting
+        # `attempts`, and relaunching a worker straight into re-emitting the
+        # identical marker — the park/relaunch bounce #2234's comment above
+        # exists to prevent, replayed here for a park written outside this
+        # module. Stays parked until a human clears it by hand (`coord
+        # drive-queue remove`).
+        if is_upstream_gap_park_reason(entry.last_reason):
             continue
         # #2977: a throttle-skip park (`github_ops.is_throttle_skip_reason`)
         # carries its OWN known wall-clock expiry (`until=<epoch>`, embedded
