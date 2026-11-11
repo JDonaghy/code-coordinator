@@ -60,6 +60,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from coord.drive_queue import QueueEntry, is_unreachable_wait_shape
+from coord.models import (
+    is_needs_decomposition_reason,
+    is_premise_refusal_reason,
+    is_upstream_gap_park_reason,
+)
 
 if TYPE_CHECKING:
     from coord.gates import GateReport
@@ -68,11 +73,14 @@ _log = logging.getLogger(__name__)
 
 __all__ = [
     "CAUSE_INTEGRATION_RED",
+    "CAUSE_NEEDS_DECOMPOSITION",
     "CAUSE_NEVER_DISPATCHED",
+    "CAUSE_PREMISE_REFUSAL",
     "CAUSE_PROSE",
     "CAUSE_REVIEW_STALE",
     "CAUSE_TEST_STALE",
     "CAUSE_UNKNOWN",
+    "CAUSE_UPSTREAM_GAP_PARK",
     "CONFIDENCE_HIGH",
     "CONFIDENCE_LOW",
     "CONFIDENCE_MEDIUM",
@@ -115,6 +123,37 @@ __all__ = [
 # what Phase 2's scoping would count.  Keep them stable: a renamed slug
 # silently splits a bucket in the corpus.
 
+#: #3979: a row the tick's own parked pre-pass (`coord.drive_queue`'s
+#: parked branch inside its main loop) ALREADY recognises as terminal from
+#: `entry.last_reason` carrying `coord.models.NEEDS_DECOMPOSITION_MARKER`
+#: (`coord.models.is_needs_decomposition_reason`) — a worker leg concluded
+#: the issue itself needs splitting and pushed 0 commits by design, so
+#: there is, and never will be, a PR. Checked FIRST in `_RULES`, strictly
+#: ahead of every PR-shaped rule (`_rule_pr_merged`/`_rule_no_pr`/etc.):
+#: without that ordering a parked needs-decomposition row reads
+#: byte-for-byte like `CAUSE_NO_PR` — which IS investigate-eligible — and
+#: board-doctor's sweep dispatches a fix-it leg that re-reports the
+#: identical split proposal (#3979's incident: two legs, zero commits,
+#: then a `coord status` alert that never mentions decomposition at all).
+#: Never auto-dispatch-eligible and never on the investigate tier — see
+#: `coord.board_doctor_policy`'s module docstring: nothing on the board
+#: signals when decomposition has happened, so there is no external
+#: verdict a fix-it leg or an auto-action could ever observe.
+CAUSE_NEEDS_DECOMPOSITION = "needs-decomposition"
+#: #3979 audit of the sibling terminal park `coord.drive_queue`'s parked
+#: pre-pass already skips (`coord.models.is_premise_refusal_reason`): the
+#: same "no PR, no external verdict, never auto-dispatch" shape as
+#: :data:`CAUSE_NEEDS_DECOMPOSITION` above, for a worker that found a named
+#: prerequisite missing rather than the issue needing a split. Checked
+#: immediately after it, same ordering rationale.
+CAUSE_PREMISE_REFUSAL = "premise-refusal"
+#: #3979 audit of the other sibling terminal park
+#: (`coord.models.is_upstream_gap_park_reason`, written by
+#: `coord.upstream_gaps._park_queue_row` rather than a worker exit): the
+#: same shape again — no PR, no external verdict, never auto-dispatch —
+#: for a row parked on a confirmed upstream gap (unreleased symbol, or a
+#: recent-close dedup).
+CAUSE_UPSTREAM_GAP_PARK = "upstream-gap-park"
 CAUSE_PR_MERGED = "pr-merged"
 CAUSE_PR_CLOSED = "pr-closed"
 CAUSE_MERGE_CONFLICT = "merge-conflict"
@@ -195,6 +234,9 @@ CAUSE_TEST_STALE = "test-stale"
 CAUSE_UNKNOWN = "unknown"
 
 CAUSE_PROSE: dict[str, str] = {
+    CAUSE_NEEDS_DECOMPOSITION: "a worker leg already concluded the issue needs splitting and parked the row by design (#3931) — not fixable by any fix-it leg or relaunch; decompose the issue into the proposed sub-issues and clear the row by hand",
+    CAUSE_PREMISE_REFUSAL: "a worker leg already concluded a named prerequisite is missing and parked the row by design (#3164) — not fixable by any fix-it leg or relaunch; re-scope or close the issue once the prerequisite is confirmed, then clear the row by hand",
+    CAUSE_UPSTREAM_GAP_PARK: "the row is parked on a confirmed upstream gap (#3977) — not fixable by any fix-it leg or relaunch; clear the row by hand once the release lands or the gap is confirmed",
     CAUSE_PR_MERGED: "the PR merged while the entry sat stalled, so whatever the queue said had outlived its subject",
     CAUSE_PR_CLOSED: "the PR was closed while the entry sat stalled, so the queue is waiting on work that no longer exists",
     CAUSE_MERGE_CONFLICT: "GitHub reports the PR as conflicting; the branch needs a rebase before anything else can be true",
@@ -587,6 +629,46 @@ def _stated_still_supported(family: str, live: LiveState) -> bool | None:
 # probes, never average them.
 
 
+def _rule_terminal_park(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
+    """#3979: classify a row the tick's own parked pre-pass already treats
+    as terminal, straight off ``entry.last_reason`` — never off any live
+    probe. Checked FIRST in :data:`_RULES`, strictly ahead of every
+    PR-shaped rule below: a terminal park has, by construction, no PR (the
+    worker that parked it pushed 0 commits), so :func:`_rule_no_pr` would
+    otherwise claim every one of these, and :data:`CAUSE_NO_PR` IS
+    investigate-eligible — which is exactly the #3979 incident, a fix-it
+    leg relaunched against a row nothing can fix by relaunching.
+
+    The three predicates this reads
+    (``coord.models.is_needs_decomposition_reason``/
+    ``is_premise_refusal_reason``/``is_upstream_gap_park_reason``) are the
+    SAME ones ``coord.drive_queue``'s own parked pre-pass already trusts
+    to leave these rows parked rather than resuming them (#2096: one
+    question, one answer) — this can never answer "terminal" for a row
+    that tick would itself flip back to ``waiting``.
+    """
+    reason = entry.last_reason
+    if is_needs_decomposition_reason(reason):
+        return (
+            CAUSE_NEEDS_DECOMPOSITION,
+            CONFIDENCE_HIGH,
+            f"last_reason: needs-decomposition park (#3931) — {reason}",
+        )
+    if is_premise_refusal_reason(reason):
+        return (
+            CAUSE_PREMISE_REFUSAL,
+            CONFIDENCE_HIGH,
+            f"last_reason: premise-refusal park (#3164) — {reason}",
+        )
+    if is_upstream_gap_park_reason(reason):
+        return (
+            CAUSE_UPSTREAM_GAP_PARK,
+            CONFIDENCE_HIGH,
+            f"last_reason: upstream-gap park (#3977) — {reason}",
+        )
+    return None
+
+
 def _rule_pr_merged(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
     if live.pr_state == "MERGED":
         return CAUSE_PR_MERGED, CONFIDENCE_HIGH, _pr_line(live)
@@ -752,6 +834,10 @@ def _rule_agent_unreachable(
 
 
 _RULES = (
+    # #3979: a terminal park's marker in `entry.last_reason` wins outright,
+    # strictly before every PR-shaped rule below — see
+    # `_rule_terminal_park`'s own docstring for why the ordering matters.
+    _rule_terminal_park,
     _rule_pr_merged,
     _rule_pr_closed,
     _rule_conflict,

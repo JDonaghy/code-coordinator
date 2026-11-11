@@ -2856,14 +2856,39 @@ def _diagnosis_options(
     return tuple(options)
 
 
+def _most_recent_leg_aid(repo_name: str, issue_number: int) -> str | None:
+    """The ``assignment_id`` of the most recently dispatched leg against
+    *repo_name*#*issue_number*, or ``None`` on no match or a read failure.
+
+    Reads `coord.state.load_dispatched`, the SAME dispatched-ledger read
+    `coord log`/`coord sessions`/`coord status` already use (#2096) rather
+    than a second history source — its own docstring guarantees the result
+    is sorted oldest-first, so the last match is the most recent leg. Only
+    used to make a board-doctor alert's suggested ``coord log <aid>``
+    concrete; a missing or unreadable ledger must never block the alert
+    itself, so this fails open to ``None`` rather than raising.
+    """
+    from coord.state import load_dispatched  # noqa: PLC0415
+
+    try:
+        matches = [
+            d
+            for d in load_dispatched()
+            if d.get("repo_name") == repo_name and d.get("issue_number") == issue_number
+            and d.get("assignment_id")
+        ]
+    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        return None
+    return str(matches[-1]["assignment_id"]) if matches else None
+
+
 def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:
     """``(reason_suffix, proposed_command)`` for *row*'s cause (#3761's C4).
 
     Every alert-only cause gets a one-line, ready-to-run operator command
     rather than a self-executing fix — the whole point of this tier is that
     recovery needs a human decision. ``"coord status"`` is the fallback for
-    causes with no single-command remedy; the two causes below each have
-    one:
+    causes with no single-command remedy; the causes below each have one:
 
     * ``queue_diagnose.CAUSE_GATE_BLOCKED`` on a **merge-queue** row — this
       cause is only ever minted there (`_MERGE_QUEUE_STUCK_CAUSE`) from the
@@ -2888,7 +2913,49 @@ def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple
       is actually true rather than claiming a pause that doesn't exist;
       the command stays ``coord status`` — the streak clears on its own
       the next time the base goes green.
+    * #3979: :data:`queue_diagnose.CAUSE_NEEDS_DECOMPOSITION`/
+      :data:`queue_diagnose.CAUSE_PREMISE_REFUSAL`/
+      :data:`queue_diagnose.CAUSE_UPSTREAM_GAP_PARK` — a row the tick's
+      own parked pre-pass already treats as terminal (the worker/upstream
+      park that parked it wrote one of `coord.models`'
+      ``NEEDS_DECOMPOSITION_MARKER``/``PREMISE_REFUSAL_MARKER``/
+      ``UPSTREAM_GAP_PARK_MARKER`` into `last_reason`). There is no
+      single-command *fix* for any of the three — each needs an
+      operator judgment call (decompose, re-scope, or wait on a release)
+      — so unlike every other alert-only cause above the "command" here
+      is the read-only inspection step, never ``coord status``: the whole
+      point is naming the SPECIFIC action, not pointing at the generic
+      fleet view.
     """
+    if row.cause in (
+        queue_diagnose.CAUSE_NEEDS_DECOMPOSITION,
+        queue_diagnose.CAUSE_PREMISE_REFUSAL,
+        queue_diagnose.CAUSE_UPSTREAM_GAP_PARK,
+    ):
+        command = f"coord log {_most_recent_leg_aid(repo_name, issue_number) or '<aid>'}"
+        action = {
+            queue_diagnose.CAUSE_NEEDS_DECOMPOSITION: (
+                "decompose the issue into the sub-issues already proposed "
+                "on it (posted as a comment by the coordinator), then "
+                "`coord drive-queue remove` + `add` for the replacement(s)"
+            ),
+            queue_diagnose.CAUSE_PREMISE_REFUSAL: (
+                "re-scope or close the issue once the missing prerequisite "
+                "it named is confirmed, then `coord drive-queue clear-refusal` "
+                "and `remove` + `add` for a fresh row"
+            ),
+            queue_diagnose.CAUSE_UPSTREAM_GAP_PARK: (
+                "wait for the named release to land or the gap to be "
+                "confirmed, then `coord drive-queue remove` + `add` for a "
+                "fresh row"
+            ),
+        }[row.cause]
+        return (
+            f" — this row is parked terminal, not stuck; no fix-it leg or "
+            f"relaunch can resolve it — {action}; re-read its own evidence "
+            f"first with: `{command}`",
+            command,
+        )
     if row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
         if row.queue == "merge-queue":
             command = (

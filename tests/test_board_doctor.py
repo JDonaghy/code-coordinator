@@ -2358,6 +2358,86 @@ class TestNeverDispatchedRowReachesTheSweep:
         assert alert.count == 0
 
 
+class TestNeedsDecompositionRowNeverReDispatches:
+    """#3979: a row the tick's own parked pre-pass already treats as
+    terminal (a `WORK_OUTCOME: needs-decomposition` worker exit, parked by
+    `coord.models.NEEDS_DECOMPOSITION_MARKER`) must classify as its own
+    cause — never `queue_diagnose.CAUSE_NO_PR`, which IS investigate-
+    eligible — and the sweep must take no auto-dispatch action for it,
+    in a dry run or a real one.
+
+    Same end-to-end shape as `TestNeverDispatchedRowReachesTheSweep` above:
+    `queue_diagnose.run_pass` -> `coord.board_doctor.drive_queue_rows` ->
+    `sweep`, with the real `policy_tier_of` — load-bearing evidence the
+    row is actually routed to the alert tier, not a tautology.
+    """
+
+    def _rows(self) -> list:
+        from coord.drive_queue import STATE_PARKED
+        from coord.models import NEEDS_DECOMPOSITION_MARKER
+        from coord.queue_diagnose import LiveState
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=3979,
+            state=STATE_PARKED,
+            attempts=1,
+            last_reason=(
+                f"{NEEDS_DECOMPOSITION_MARKER} split into: (1) the API "
+                "surface, (2) the CLI wiring"
+            ),
+        )
+        episode = {
+            "key": entry.key,
+            "state": STATE_PARKED,
+            "diagnoses": 0,
+            "diagnosed_cause": "",
+        }
+
+        class _NoPrProbe:
+            def probe(self, entry_):
+                return LiveState(pr_number=None, pr_state="none")
+
+        diagnoses = queue_diagnose.run_pass([entry], [episode], probe=_NoPrProbe())
+        return drive_queue_rows(diagnoses)
+
+    def test_classifies_as_needs_decomposition_not_no_pr(self) -> None:
+        [row] = self._rows()
+        assert row.cause == queue_diagnose.CAUSE_NEEDS_DECOMPOSITION
+        assert row.cause != queue_diagnose.CAUSE_NO_PR
+
+    def test_dry_run_sweep_dispatches_nothing(self) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+
+        rows = self._rows()
+        auto = _Recorder()
+        alert = _Recorder()
+        sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers={queue_diagnose.CAUSE_NEEDS_DECOMPOSITION: auto},
+            alert_dispatcher=alert,
+            dry_run=True,
+        )
+        assert auto.count == 0
+        assert alert.count == 0
+
+    def test_real_sweep_alerts_but_never_auto_dispatches(self) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+
+        rows = self._rows()
+        auto = _Recorder()
+        alert = _Recorder()
+        sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers={queue_diagnose.CAUSE_NEEDS_DECOMPOSITION: auto},
+            alert_dispatcher=alert,
+        )
+        assert auto.count == 0
+        assert alert.count == 1
+
+
 class TestParseNoProgressMinutes:
     """#3888 review: `no_progress_minutes` validates the same way its
     sibling `followthrough_cap` already does — tested here since

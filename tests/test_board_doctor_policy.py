@@ -164,6 +164,13 @@ class TestPolicyTierOf:
             queue_diagnose.CAUSE_NOTHING_BLOCKING,
             queue_diagnose.CAUSE_CI_GREEN,
             CAUSE_BASELINE_RED,
+            # #3979: a terminal park has no external verdict to resume it,
+            # so it must never auto-dispatch or compete for the shared
+            # investigate-tier budget — see TestAlertResolutionTerminalPark
+            # below for the alert text itself.
+            queue_diagnose.CAUSE_NEEDS_DECOMPOSITION,
+            queue_diagnose.CAUSE_PREMISE_REFUSAL,
+            queue_diagnose.CAUSE_UPSTREAM_GAP_PARK,
         ):
             assert cause not in ALLOWLIST
             assert cause not in INVESTIGATE_CAUSES
@@ -770,6 +777,46 @@ class TestEscalationAlertDispatcher:
         assert "needs a design decision" in reason
         assert "tests/acceptance/test_descriptor.py" in reason
         assert "redesign" in reason
+
+
+class TestTerminalParkAlert:
+    """#3979: a row the sweep classifies as a terminal park (needs-
+    decomposition/premise-refusal/upstream-gap) must alert with the real
+    action named, never the generic ``coord status`` fallback — and must
+    never auto-dispatch or escalate to the investigate tier."""
+
+    @pytest.mark.parametrize(
+        ("cause", "expected_fragment"),
+        [
+            (queue_diagnose.CAUSE_NEEDS_DECOMPOSITION, "decompose"),
+            (queue_diagnose.CAUSE_PREMISE_REFUSAL, "re-scope"),
+            (queue_diagnose.CAUSE_UPSTREAM_GAP_PARK, "release"),
+        ],
+    )
+    def test_alert_names_the_real_action_not_coord_status(
+        self, cause: str, expected_fragment: str,
+    ) -> None:
+        row = _row(f"acme/widgets#{hash(cause) % 1000}", cause)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        repo, issue = board_doctor_policy._parse_row_key(row.key)
+        escalation = state.get_drive_escalation(repo, issue)
+        assert escalation is not None
+        assert escalation["proposed_command"] != "coord status"
+        assert escalation["proposed_command"].startswith("coord log ")
+        assert expected_fragment in escalation["reason"]
+        assert "parked terminal" in escalation["reason"]
+
+    def test_sweep_takes_no_dispatch_action_for_a_needs_decomposition_row(
+        self,
+    ) -> None:
+        # Not in ALLOWLIST/INVESTIGATE_CAUSES -> policy_tier_of reads
+        # TIER_ALERT, so `coord.board_doctor.sweep` routes it through the
+        # alert dispatcher, never a fix-it leg or a mechanical requeue.
+        assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION not in ALLOWLIST
+        assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION not in INVESTIGATE_CAUSES
+        assert policy_tier_of(queue_diagnose.CAUSE_NEEDS_DECOMPOSITION) == TIER_ALERT
 
 
 class TestClassifyEnvProbeOutput:
