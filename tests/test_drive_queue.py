@@ -81,6 +81,7 @@ from coord.models import (
     MERGE_LANDED_MARKER,
     NEEDS_DECOMPOSITION_MARKER,
     PREMISE_REFUSAL_MARKER,
+    UPSTREAM_GAP_PARK_MARKER,
 )
 
 REPO = "claude-coordinator"
@@ -4816,6 +4817,54 @@ def test_a_needs_decomposition_leg_and_a_premise_refusal_are_never_conflated():
     assert decomp_reason != premise_reason
     assert "decompose" in decomp_reason
     assert "decompose" not in premise_reason
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3977: an upstream-gap park — `coord.upstream_gaps._park_queue_row` writes
+# `UPSTREAM_GAP_PARK_MARKER` into a downstream row's `last_reason` directly
+# (never through `coord.drive.decide`'s `exit_reasons`/`own_reason` path the
+# three parks above go through, since this one fires from a coordinator-side
+# gap check, not a worker leg's own exit), when a symbol the worker named
+# turned out to be on the upstream default branch already — unreleased, not
+# missing — or a dedup match closed too recently to trust a re-file. Same
+# "no external verdict to poll for" posture as a policy/premise refusal or a
+# needs-decomposition park: nothing on the board signals a release landing
+# or a coordinator's confirmation, so this must never auto-resume either.
+# ═══════════════════════════════════════════════════════════════════════════
+
+UPSTREAM_GAP_PARK_REASON = (
+    "blocked on upstream quadraui release: `RowAlign` (layout.rs:1) already "
+    f"on quadraui@main, unreleased {UPSTREAM_GAP_PARK_MARKER}"
+)
+
+
+def test_a_parked_upstream_gap_does_not_auto_resume_next_tick():
+    """Without the #3977 pre-pass check this reads exactly like a cleared
+    CI park (this row was never in the merge queue) and would flip back to
+    `waiting` with `attempts` reset, relaunching a worker straight into
+    re-emitting the identical marker every tick — the park/relaunch bounce
+    #2234's own comment (the sibling check right above this one in
+    production code) exists to prevent, replayed here for a park written
+    outside `coord/drive_queue.py` entirely."""
+    entries = [
+        entry(2114, position=3, state="parked", attempts=0,
+              last_reason=UPSTREAM_GAP_PARK_REASON)
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()  # left alone — still parked
+    assert plan.launch is None
+
+
+def test_a_parked_upstream_gap_still_reconciles_to_done_if_it_lands_by_hand():
+    """A human confirming the release landed and merging out of band must
+    not leave the entry parked forever — the #2055 landed-check still
+    applies on top of #3977, same as every other park shape."""
+    entries = [entry(2114, position=3, state="parked", attempts=0,
+                      last_reason=UPSTREAM_GAP_PARK_REASON)]
+    plan = plan_tick(entries, board(merged=(2114,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
 
 
 # ═══════════════════════════════════════════════════════════════════════════

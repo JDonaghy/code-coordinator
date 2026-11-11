@@ -67,16 +67,28 @@ for work already on quadraui's ``develop``, unreleased:
    parks the downstream row (:func:`_park_queue_row`) rather than leaving it
    to loop: there is no release-qualified ``after=`` edge yet (that's
    coord#3927), so a human notices the release and resumes it by hand.
-2. Symbol extraction (:func:`_strip_symbol_decor`) now strips a leading file
+2. Symbol extraction (:func:`_strip_symbol_decor`) strips a leading file
    path (``a/b.rs::X`` -> ``X``) and a non-empty trailing call/tuple arg
    list (``X(Y)`` -> ``X``) before matching — the exact spans #2325/#2326
-   actually wrote, previously dropped as unchecked.
-3. Dedup is per DOWNSTREAM issue, not per :func:`gap_key` — three
-   differently-worded markers for the identical bug used to hash to three
-   different keys and file three issues. :func:`_latest_filed_gap_for_downstream`
-   finds any earlier gap this downstream issue already carries for the same
-   upstream repo (whatever its title) and blocks on it if still open, or
-   parks for a coordinator if it closed within :data:`_DEDUP_RECENT_CLOSE_DAYS`.
+   actually wrote.
+3. Dedup is per DOWNSTREAM issue, not per :func:`gap_key`:
+   :func:`_latest_filed_gap_for_downstream` finds any earlier gap this
+   downstream issue already carries for the same upstream repo (whatever
+   its title) and blocks on it if still open, or parks for a coordinator if
+   it closed within :data:`_DEDUP_RECENT_CLOSE_DAYS`.
+
+An unverified filing (no checkable symbols, or the check couldn't run) is
+filed and still blocks the downstream row (the dependency is real either
+way, confirmed or not) but is never auto-queued as a drive-queue root — the
+filed issue carries :data:`coord.board_doctor.STRANDED_PREREQ_OPT_OUT_LABEL`
+so that sweep won't queue it either, and its own ledger entry carries
+:data:`_UNVERIFIED_FILED_MARK`. A worker is never spent on a gap taken on
+the reporting worker's word alone until a coordinator confirms it and
+queues it by hand — across a replay or a cross-title dedup match too:
+:func:`_reassert_block_and_queue` re-reads whether the matched filing was
+unverified from that same ledger entry before deciding whether to re-queue
+it, rather than re-deriving (and getting wrong) a fact only the original
+filing ever determined.
 """
 
 from __future__ import annotations
@@ -455,7 +467,20 @@ def _verify_symbols(upstream: "Repo", config: "Config", symbols: list[str]) -> _
     for symbol in symbols:
         try:
             res = _run_git(
-                ["git", "grep", "-I", "-n", "-F", "-e", symbol, "FETCH_HEAD"],
+                [
+                    "git", "grep", "-I", "-n", "-F", "-e", symbol, "FETCH_HEAD",
+                    "--",
+                    ".",
+                    # A symbol mentioned only in a changelog or doc is not
+                    # evidence the API exists in code — these two excludes
+                    # catch the common case; a mention buried in a source
+                    # comment is a real, accepted limitation of a mechanical
+                    # `git grep` (see the module docstring).
+                    ":(glob,exclude)**/*.md",
+                    ":(glob,exclude)*.md",
+                    ":(glob,exclude)**/CHANGELOG*",
+                    ":(glob,exclude)CHANGELOG*",
+                ],
                 cwd=repo_dir,
             )
         except (subprocess.SubprocessError, OSError) as exc:
@@ -556,6 +581,28 @@ def _ledger_tag(key: str) -> str:
 # actual filing — distinguishes the two in `_already_filed`'s loose
 # source+tag match, which would otherwise treat either kind as "filed".
 _NOT_A_GAP_MARK = "(verified not-a-gap)"
+# #3977: marks a ledger entry recorded by the dedup "recently closed" park
+# path (:func:`_file_one`'s dedup branch) — a DIFFERENT finding from
+# `_NOT_A_GAP_MARK` (no fetch+grep ever ran for THIS title; an earlier
+# differently-worded gap for the same upstream repo closed recently) that
+# must not be reported back as "checked against upstream and confirmed not
+# real" on replay, which is what reusing `_NOT_A_GAP_MARK` for it would say.
+_DEDUP_RECENT_CLOSE_MARK = "(deduped, recently closed)"
+# #3977: marks a ledger entry recorded when a DIFFERENT title's gap_key
+# blocks on an earlier still-OPEN filing for the same downstream issue +
+# upstream repo — so a replay of this exact title finds its own record
+# (and the number it blocks on) without re-running the `get_issue_state`
+# round-trip every earlier `BLOCKED_ON_UPSTREAM` reword under the same key
+# would otherwise repeat.
+_DEDUP_OPEN_MARK = "(deduped, open)"
+# #3977: marks a "filed" ledger entry (the SAME shape `_already_filed`
+# matches) whose issue was filed WITHOUT verification — no checkable
+# symbols, or the check itself couldn't run. A replay or a cross-title
+# dedup match reading this mark must not auto-queue the referenced upstream
+# issue: the whole point of leaving it unqueued at filing time is that a
+# coordinator, not a worker, confirms it first, and that hold must survive
+# every later read of the same filing, not just the first.
+_UNVERIFIED_FILED_MARK = "(unverified filing)"
 
 
 def _already_verified_not_a_gap(repo_name: str, issue_number: int, key: str) -> dict | None:
@@ -572,17 +619,54 @@ def _already_verified_not_a_gap(repo_name: str, issue_number: int, key: str) -> 
     return None
 
 
-def _already_filed(repo_name: str, issue_number: int, key: str) -> dict | None:
-    """The downstream issue's existing "filed" ledger entry for *key*, if
-    any — never a `not-a-gap` entry (see :func:`_already_verified_not_a_gap`,
-    checked first by :func:`_file_one`)."""
+def _already_deduped_recent_close(repo_name: str, issue_number: int, key: str) -> dict | None:
+    """The downstream issue's existing "deduped, recently closed" ledger
+    entry for *key*, if any — the same idempotent-replay shape as
+    :func:`_already_verified_not_a_gap`, for the OTHER park-without-filing
+    outcome (see :data:`_DEDUP_RECENT_CLOSE_MARK`)."""
     from coord.state import list_issue_context  # noqa: PLC0415
 
     tag = _ledger_tag(key)
     for entry in list_issue_context(repo_name, issue_number):
         body = entry.get("body") or ""
         if (entry.get("source") == UPSTREAM_GAP_SOURCE and tag in body
-                and _NOT_A_GAP_MARK not in body):
+                and _DEDUP_RECENT_CLOSE_MARK in body):
+            return entry
+    return None
+
+
+def _already_deduped_open(repo_name: str, issue_number: int, key: str) -> dict | None:
+    """The downstream issue's existing "deduped, open" ledger entry for
+    *key*, if any (see :data:`_DEDUP_OPEN_MARK`) — lets a replay of a
+    cross-title dedup match reassert the block without a fresh
+    ``get_issue_state`` round-trip."""
+    from coord.state import list_issue_context  # noqa: PLC0415
+
+    tag = _ledger_tag(key)
+    for entry in list_issue_context(repo_name, issue_number):
+        body = entry.get("body") or ""
+        if (entry.get("source") == UPSTREAM_GAP_SOURCE and tag in body
+                and _DEDUP_OPEN_MARK in body):
+            return entry
+    return None
+
+
+def _already_filed(repo_name: str, issue_number: int, key: str) -> dict | None:
+    """The downstream issue's existing "filed" ledger entry for *key*, if
+    any — never a park-only entry (:func:`_already_verified_not_a_gap`,
+    :func:`_already_deduped_recent_close`, :func:`_already_deduped_open`,
+    all checked first by :func:`_file_one`). May carry
+    :data:`_UNVERIFIED_FILED_MARK` — callers that re-queue off this entry
+    must check for it (see :func:`_reassert_block_and_queue`)."""
+    from coord.state import list_issue_context  # noqa: PLC0415
+
+    tag = _ledger_tag(key)
+    for entry in list_issue_context(repo_name, issue_number):
+        body = entry.get("body") or ""
+        if (entry.get("source") == UPSTREAM_GAP_SOURCE and tag in body
+                and _NOT_A_GAP_MARK not in body
+                and _DEDUP_RECENT_CLOSE_MARK not in body
+                and _DEDUP_OPEN_MARK not in body):
             return entry
     return None
 
@@ -840,6 +924,30 @@ def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str)
 _DEDUP_RECENT_CLOSE_DAYS = 14
 
 
+def _upstream_number_in(body: str, upstream_name: str) -> int | None:
+    """The upstream issue number *body* names for *upstream_name*, if any —
+    shared text-parsing for every cached dedup/filed ledger entry this
+    module reads back (all of which embed ``{upstream_name}#{number}``
+    somewhere in their own text)."""
+    m = re.search(re.escape(f"{upstream_name}#") + r"(\d+)", body)
+    return int(m.group(1)) if m else None
+
+
+def _dedup_entry_age_days(entry: dict) -> float:
+    """Days since *entry*'s ledger row was recorded.
+
+    A MISSING ``created_at`` reads as recent (age 0), not infinitely old: a
+    dedup window exists to say "don't re-file right after a close", so
+    missing data must fail toward NOT re-filing, never toward refiling —
+    the opposite of what ``float(entry.get("created_at") or 0)`` (treating
+    absence as epoch 0) would compute.
+    """
+    created_at = entry.get("created_at")
+    if not created_at:
+        return 0.0
+    return (time.time() - float(created_at)) / 86400
+
+
 def _latest_filed_gap_for_downstream(
     repo_name: str, issue_number: int, upstream_name: str,
 ) -> tuple[dict, int] | None:
@@ -864,7 +972,12 @@ def _latest_filed_gap_for_downstream(
         if entry.get("source") != UPSTREAM_GAP_SOURCE:
             continue
         body = entry.get("body") or ""
-        if _NOT_A_GAP_MARK in body:
+        # Only an actual FILING entry (`_already_filed`'s own shape) names
+        # an upstream issue this can safely block on — none of the
+        # park-only marks do (and none of their messages match `prefix`
+        # anyway, but skip explicitly rather than relying on wording).
+        if (_NOT_A_GAP_MARK in body or _DEDUP_RECENT_CLOSE_MARK in body
+                or _DEDUP_OPEN_MARK in body):
             continue
         m = pattern.search(body)
         if m:
@@ -881,15 +994,26 @@ def _reassert_block_and_queue(
     number: int,
     status: str,
     detail: str,
+    unverified: bool = False,
 ) -> UpstreamGapOutcome:
-    """Re-apply the downstream ``after=`` edge and the upstream enqueue for
-    an upstream issue *number* that is already filed.
+    """Re-apply the downstream hold and the upstream enqueue for an upstream
+    issue *number* that is already filed.
 
     Shared by an exact :func:`gap_key` replay (:func:`_already_filed`) and a
-    #3977 cross-title dedup match (:func:`_latest_filed_gap_for_downstream`)
-    — both land on the identical "an upstream issue for this already exists;
-    make sure the queue still reflects it" shape, so there is one function
-    that does it rather than two call sites that could drift (#2096).
+    #3977 cross-title dedup match (:func:`_latest_filed_gap_for_downstream`
+    or its own cached replay, :func:`_already_deduped_open`) — all land on
+    the identical "an upstream issue for this already exists; make sure the
+    queue still reflects it" shape, so there is one function that does it
+    rather than several call sites that could drift (#2096).
+
+    *unverified* — read by the caller off the ORIGINAL filing's own ledger
+    entry (:data:`_UNVERIFIED_FILED_MARK`), never re-derived here — decides
+    whether the upstream issue gets re-queued, same split as a first filing
+    in :func:`_file_one`: the downstream ``after=`` hold always re-applies
+    (the dependency is real either way, confirmed or not), but an
+    unverified upstream issue is never auto-queued as a drive-queue root on
+    ANY pass, first or replayed — only a coordinator spends a worker on one
+    of those, by hand, once confirmed.
     """
     from coord.drive_queue import entry_key  # noqa: PLC0415
 
@@ -903,6 +1027,12 @@ def _reassert_block_and_queue(
         outcome.notes.append(note)
     except Exception as exc:  # noqa: BLE001
         outcome.notes.append(f"queue block failed: {exc}")
+    if unverified:
+        outcome.notes.append(
+            "unverified filing — left unqueued for a coordinator to "
+            "confirm before a worker is spent on it"
+        )
+        return outcome
     try:
         outcome.upstream_queued, qnote = _queue_upstream(
             upstream.name, number, upstream_github=upstream.github or None,
@@ -922,8 +1052,21 @@ def _park_queue_row(repo_name: str, issue_number: int, reason: str) -> tuple[boo
     tick-owned columns :func:`coord.state.update_drive_queue_entry` already
     exposes for exactly this.
 
-    Returns ``(applied, note)``. A `running` row is taken out of flight
-    first (its live driver session stopped, #3282, through
+    *reason* always carries :data:`coord.models.UPSTREAM_GAP_PARK_MARKER` on
+    write — appended here, once, rather than trusting every caller to embed
+    it — so ``coord/drive_queue.py``'s parked walk
+    (``is_upstream_gap_park_reason``) can tell this park apart from a
+    CI-pending one and never auto-resume it: there is no external verdict
+    (a release landing, a coordinator's confirmation) for a tick to poll
+    for, so falling through to the default CI-cleared resume would relaunch
+    a worker straight into re-emitting the identical marker.
+
+    Returns ``(applied, note)`` — *applied* is the write the DB actually
+    confirmed (``coord.state.update_drive_queue_entry``'s own return),
+    never an assumption that an unraised call means a row was touched
+    (#2096: a zero-row update is reachable when the row changed shape
+    between the read above and the write). A `running` row is taken out of
+    flight first (its live driver session stopped, #3282, through
     :func:`coord.state.dequeue_drive_queue`'s own seam) — same reasoning as
     `_block_queue_row`: a row left `running` would still sail through
     Test -> Review -> Merge regardless of what this write says. A
@@ -931,13 +1074,17 @@ def _park_queue_row(repo_name: str, issue_number: int, reason: str) -> tuple[boo
     now would misreport a completed row), and an already-`parked` row just
     gets its reason refreshed.
     """
-    from coord.drive_queue import STATE_DONE_LIKE, STATE_PARKED, QueueEntry
+    from coord.drive_queue import STATE_DONE_LIKE, STATE_PARKED, QueueEntry  # noqa: PLC0415
+    from coord.models import UPSTREAM_GAP_PARK_MARKER  # noqa: PLC0415
     from coord.state import (  # noqa: PLC0415
         dequeue_drive_queue,
         enqueue_drive_queue,
         list_drive_queue,
         update_drive_queue_entry,
     )
+
+    if UPSTREAM_GAP_PARK_MARKER not in reason:
+        reason = f"{reason} {UPSTREAM_GAP_PARK_MARKER}"
 
     entries = [QueueEntry.from_row(r) for r in list_drive_queue(repo_name)]
     entry = next((e for e in entries if e.issue == issue_number), None)
@@ -946,7 +1093,9 @@ def _park_queue_row(repo_name: str, issue_number: int, reason: str) -> tuple[boo
     if entry.state in STATE_DONE_LIKE:
         return False, f"queue row already {entry.state} — landed, not parked"
     if entry.state == STATE_PARKED:
-        update_drive_queue_entry(repo_name, issue_number, last_reason=reason)
+        updated = update_drive_queue_entry(repo_name, issue_number, last_reason=reason)
+        if not updated:
+            return False, "already parked — reason refresh wrote no row (vanished first)"
         return True, "already parked — reason refreshed"
 
     note = f"parked: {reason}"
@@ -956,10 +1105,27 @@ def _park_queue_row(repo_name: str, issue_number: int, reason: str) -> tuple[boo
         removal = dequeue_drive_queue(repo_name, issue_number, operator=False)
         if not removal.get("removed"):
             return False, f"running queue row vanished before it could be parked ({reason})"
-        enqueue_drive_queue(
-            repo_name, issue_number, position=entry.position,
-            **_enqueue_kwargs(entry, list(entry.after)),
-        )
+        try:
+            enqueue_drive_queue(
+                repo_name, issue_number, position=entry.position,
+                **_enqueue_kwargs(entry, list(entry.after)),
+            )
+        except Exception:
+            # Never leave the issue dropped from the queue: retry putting
+            # the row back as it was declared (nothing about `after` is
+            # changing here, unlike `_block_queue_row`'s edge-add), then
+            # surface the original failure.
+            try:
+                enqueue_drive_queue(
+                    repo_name, issue_number, position=entry.position,
+                    **_enqueue_kwargs(entry, list(entry.after)),
+                )
+            except Exception:  # noqa: BLE001 — the original error is the one to report
+                log.warning(
+                    "upstream gap: could not restore queue row %s#%s after a "
+                    "failed park", repo_name, issue_number,
+                )
+            raise
         session = removal.get("driver_session")
         if session and removal.get("driver_ok", True):
             note += f"; stopped driver session {session}"
@@ -969,7 +1135,10 @@ def _park_queue_row(repo_name: str, issue_number: int, reason: str) -> tuple[boo
                 f"({removal.get('driver_detail') or 'unknown'}) — kill it by hand"
             )
 
-    update_drive_queue_entry(repo_name, issue_number, state=STATE_PARKED, last_reason=reason)
+    updated = update_drive_queue_entry(repo_name, issue_number, state=STATE_PARKED,
+                                        last_reason=reason)
+    if not updated:
+        return False, f"{note} — but the park write affected no row (vanished first)"
     return True, note
 
 
@@ -1017,49 +1186,102 @@ def _file_one(
             outcome.notes.append(f"park failed: {exc}")
         return outcome
 
+    already_deduped_closed = _already_deduped_recent_close(repo_name, issue_number, gap.key)
+    if already_deduped_closed is not None:
+        body = already_deduped_closed.get("body") or ""
+        number = _upstream_number_in(body, upstream.name)
+        outcome = UpstreamGapOutcome(
+            gap, "deduped", upstream_repo=upstream.name, number=number,
+            detail="already deduped against a recently-closed upstream gap — not re-checked",
+        )
+        # Re-assert the park: idempotent, and heals a first pass that
+        # recorded the ledger entry but died before parking the row.
+        try:
+            outcome.parked, pnote = _park_queue_row(repo_name, issue_number, body)
+            outcome.notes.append(pnote)
+        except Exception as exc:  # noqa: BLE001
+            outcome.notes.append(f"park failed: {exc}")
+        return outcome
+
     existing = _already_filed(repo_name, issue_number, gap.key)
     if existing is not None:
-        m = re.search(r"#(\d+)", existing.get("body") or "")
+        body = existing.get("body") or ""
+        m = re.search(r"#(\d+)", body)
         number = int(m.group(1)) if m else None
         if number is None:
             return UpstreamGapOutcome(
                 gap, "already-filed", upstream_repo=upstream.name,
                 detail="already filed for this issue — not re-filed",
             )
-        # Re-assert the queue edge: idempotent, and heals a first pass that
-        # filed + recorded but died before blocking the row.
+        # Re-assert the queue/park hold: idempotent, and heals a first pass
+        # that filed + recorded but died before holding the row.
         return _reassert_block_and_queue(
             gap, upstream, repo_name=repo_name, issue_number=issue_number,
             number=number, status="already-filed",
             detail="already filed for this issue — not re-filed",
+            unverified=_UNVERIFIED_FILED_MARK in body,
         )
 
+    already_deduped_open = _already_deduped_open(repo_name, issue_number, gap.key)
+    if already_deduped_open is not None:
+        body = already_deduped_open.get("body") or ""
+        number = _upstream_number_in(body, upstream.name)
+        if number is not None:
+            return _reassert_block_and_queue(
+                gap, upstream, repo_name=repo_name, issue_number=issue_number,
+                number=number, status="deduped",
+                detail="already deduped against a still-open upstream gap — not re-checked",
+                unverified=_UNVERIFIED_FILED_MARK in body,
+            )
+        # Unparseable cached entry — should not happen for text this module
+        # itself wrote; fall through to a live re-check rather than give up.
+
     # #3977: dedup per DOWNSTREAM issue, not per gap_key/title — a worker
-    # that rewords the same bug files it under a fresh gap_key every time,
-    # which is exactly how vimcode#2114 chained quadraui#2325/#2326/#2328
-    # for the identical missing symbols. Any earlier gap this downstream
-    # issue already carries for the SAME upstream repo, whatever its
-    # title, is treated as the one gap, not a new one.
+    # that rewords the same bug files it under a fresh gap_key every time.
+    # Any earlier gap this downstream issue already carries for the SAME
+    # upstream repo, whatever its title, is treated as the one gap, not a
+    # new one.
     dup = _latest_filed_gap_for_downstream(repo_name, issue_number, upstream.name)
     if dup is not None:
         dup_entry, dup_number = dup
+        dup_unverified = _UNVERIFIED_FILED_MARK in (dup_entry.get("body") or "")
         from coord.github_ops import get_issue_state  # noqa: PLC0415
 
         dup_state = get_issue_state(upstream.github or upstream.name, dup_number)
         if dup_state != "closed":
             # Open (or unknown — fail toward not piling on another filing):
             # block on the existing one instead of filing a near-duplicate.
+            msg = (
+                f"An upstream gap for this issue is already filed as "
+                f"{upstream.name}#{dup_number} and still open — not filed "
+                "again under new wording."
+            )
+            # Recorded (and, if the worker gave one, the new marker's own
+            # body posted) so this reword's own report isn't silently
+            # dropped, and so a replay of THIS title (`_already_deduped_
+            # open`) finds its own record instead of re-running the
+            # `get_issue_state` round-trip every reword under the same
+            # upstream repo would otherwise repeat.
+            add_issue_context_entry(
+                repo_name, issue_number,
+                f"{msg} {_ledger_tag(gap.key)} {_DEDUP_OPEN_MARK}"
+                + (f" {_UNVERIFIED_FILED_MARK}" if dup_unverified else ""),
+                pinned=True, source=UPSTREAM_GAP_SOURCE,
+            )
+            try:
+                comment_on_issue(
+                    repo_name, issue_number,
+                    f"{msg}\n\n{gap.body}" if gap.body else msg,
+                    repo_github=downstream.github if downstream is not None else None,
+                )
+            except Exception as exc:  # noqa: BLE001 — the ledger entry already records why
+                log.warning("upstream gap %s: dedup comment failed: %s", gap.key, exc)
             return _reassert_block_and_queue(
                 gap, upstream, repo_name=repo_name, issue_number=issue_number,
-                number=dup_number, status="deduped",
-                detail=(
-                    f"an upstream gap for this issue is already filed as "
-                    f"{upstream.name}#{dup_number} and still open — not filed "
-                    "again under new wording"
-                ),
+                number=dup_number, status="deduped", detail=msg,
+                unverified=dup_unverified,
             )
-        age_days = (time.time() - float(dup_entry.get("created_at") or 0)) / 86400
-        if age_days <= _DEDUP_RECENT_CLOSE_DAYS:
+        if _dedup_entry_age_days(dup_entry) <= _DEDUP_RECENT_CLOSE_DAYS:
             # Closed recently: a third near-duplicate re-filed under new
             # wording moments after the second one closed is the exact loop
             # this issue exists to stop — park it for a human instead.
@@ -1072,7 +1294,7 @@ def _file_one(
             )
             add_issue_context_entry(
                 repo_name, issue_number,
-                f"{msg} {_ledger_tag(gap.key)} {_NOT_A_GAP_MARK}",
+                f"{msg} {_ledger_tag(gap.key)} {_DEDUP_RECENT_CLOSE_MARK}",
                 pinned=True, source=UPSTREAM_GAP_SOURCE,
             )
             try:
@@ -1137,6 +1359,15 @@ def _file_one(
             outcome.notes.append(f"park failed: {exc}")
         return outcome
 
+    unverified = bool(verification.note)
+    # #3977: an unverified filing opts the filed issue out of
+    # `coord.board_doctor`'s stranded-prereq sweep too — this issue's own
+    # queue block below already withholds `_queue_upstream`, but the SAME
+    # label keeps the sweep from auto-queueing it on a worker's word alone
+    # if some OTHER dependent ever names it directly via a hand-added
+    # `after=` edge.
+    from coord.board_doctor import STRANDED_PREREQ_OPT_OUT_LABEL  # noqa: PLC0415
+
     created = create_issue(
         upstream.name,
         gap.title,
@@ -1144,6 +1375,7 @@ def _file_one(
             gap, downstream_ref=downstream_ref, assignment_id=assignment_id,
             verify_note=verification.note,
         ),
+        labels=[STRANDED_PREREQ_OPT_OUT_LABEL] if unverified else None,
         repo_github=upstream.github or None,
     )
     number = int(created["number"])
@@ -1160,13 +1392,14 @@ def _file_one(
         issue_number,
         f"Blocked on upstream {upstream.name}#{number}: {gap.title} — "
         f"auto-filed from a {UPSTREAM_GAP_MARKER} marker; build on it, don't "
-        f"re-draft it. {_ledger_tag(gap.key)}",
+        f"re-draft it. {_ledger_tag(gap.key)}"
+        + (f" {_UNVERIFIED_FILED_MARK}" if unverified else ""),
         pinned=True,
         source=UPSTREAM_GAP_SOURCE,
     )
     unverified_note = (
         " Not verified before filing — held unqueued for a coordinator to "
-        "confirm before a worker is spent on it (#3977)." if verification.note else ""
+        "confirm before a worker is spent on it (#3977)." if unverified else ""
     )
     try:
         comment_on_issue(
@@ -1187,15 +1420,17 @@ def _file_one(
         outcome.notes.append(note)
     except Exception as exc:  # noqa: BLE001
         outcome.notes.append(f"queue block failed: {exc}")
-    if verification.note:
-        # #3977: unverified (no checkable symbols, or the check itself
-        # couldn't run) — filed, but deliberately NOT auto-queued as a
-        # drive-queue root. The downstream row stays `waiting` on an
-        # unqueued upstream issue (read as "open, not queued" — no attempt
-        # spent, never auto-dispatched), which is exactly the hold this
-        # wants: nobody gets a worker leg spent on a gap taken on the
+    if unverified:
+        # #3977: filed, but deliberately NOT auto-queued as a drive-queue
+        # root — nobody gets a worker leg spent on a gap taken on the
         # reporting worker's word alone until a coordinator confirms it and
-        # queues it by hand.
+        # queues it by hand. The filed issue itself carries
+        # `coord.board_doctor.STRANDED_PREREQ_OPT_OUT_LABEL` (above) so
+        # that sweep doesn't auto-queue it either if some OTHER dependent
+        # ever names it directly, and this filing's own ledger entry
+        # carries `_UNVERIFIED_FILED_MARK` so a later replay or cross-title
+        # dedup match (`_reassert_block_and_queue`) reads the same hold
+        # back rather than re-deriving it and getting it wrong.
         outcome.notes.append(
             "unverified gap — filed but left unqueued for a coordinator to "
             "confirm before a worker is spent on it"
