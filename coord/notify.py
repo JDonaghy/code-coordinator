@@ -2364,6 +2364,55 @@ def _capture_upstream_gaps(transition: Transition, entry: dict, record: dict) ->
         )
 
 
+def _capture_needs_decomposition_split(
+    transition: Transition, entry: dict, record: dict
+) -> None:
+    """File the split a ``needs-decomposition`` work leg proposed in the
+    machine-readable size-triage block — see
+    :func:`coord.decomposition_chat.auto_split_needs_decomposition`.
+
+    Reads the worker's final message from the row's
+    ``needs_decomposition_reason`` first, falling back to the final message
+    in the worker log. Best-effort: any failure is logged and the issue
+    stays parked for the coordinator, the same as a prose-only proposal.
+    """
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        SIZE_TRIAGE_END_MARKER,
+        auto_split_needs_decomposition,
+    )
+
+    if (record.get("type") or "work") != "work" or not transition.issue_number:
+        return
+    try:
+        text = entry.get("needs_decomposition_reason") or ""
+        if SIZE_TRIAGE_END_MARKER not in text:
+            from coord.upstream_gaps import (  # noqa: PLC0415
+                final_message_from_log_text,
+            )
+
+            text = final_message_from_log_text(_worker_log_text(transition, entry))
+        if SIZE_TRIAGE_END_MARKER not in text:
+            return
+        from coord.config import load as _load_config  # noqa: PLC0415
+
+        epic_number = auto_split_needs_decomposition(
+            text,
+            config=_load_config(),
+            repo_name=transition.repo_name,
+            issue_number=transition.issue_number,
+        )
+        if epic_number is not None:
+            log.info(
+                "_capture_needs_decomposition_split: %s#%s split into epic #%s",
+                transition.repo_name, transition.issue_number, epic_number,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "_capture_needs_decomposition_split: failed for %s: %s",
+            transition.assignment_id, exc,
+        )
+
+
 def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
     """#252: parse the worker's SMOKE_TESTS block and persist it on the row.
 
@@ -4966,6 +5015,9 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             transition.event,
             branch=entry.get("branch"),
         )
+        # Runs after `mark_notified` so a split that files issues and then
+        # fails partway can never be replayed into a duplicate epic.
+        _capture_needs_decomposition_split(transition, entry, record)
     else:
         # #1605/#1797: carry the agent's own diagnostic (a usage-limit kill,
         # a terminal API-error classification, or an auth-shaped push
