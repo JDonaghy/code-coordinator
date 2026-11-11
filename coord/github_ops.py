@@ -3661,13 +3661,43 @@ def create_issue(
     labels: list[str] | None = None,
     milestone: str | None = None,
 ) -> dict:
+    """Create an issue via ``gh issue create``. Returns ``{"number", "url"}``.
+
+    ``gh`` hard-fails the create when a requested label does not exist in
+    *repo*, so a label-not-found failure auto-creates every requested label
+    and retries the create once — the same recovery
+    :func:`change_issue_labels` performs on its add path, and what lets a
+    caller pass a policy label (e.g.
+    `coord.board_doctor.STRANDED_PREREQ_OPT_OUT_LABEL`) without every
+    target repo having been provisioned with it first. Only label-not-found
+    errors trigger it: :func:`_is_label_not_found` screens out auth,
+    network and rate-limit failures, which propagate untouched so a create
+    is never retried against a forge that may have accepted the first one.
+    A retry that still reports label-not-found raises :class:`GhNotFound`.
+    """
     args = ["issue", "create", "--repo", repo, "--title", title, "--body", body]
     if labels:
         for label in labels:
             args.extend(["--label", label])
     if milestone:
         args.extend(["--milestone", milestone])
-    raw = _gh(*args, caller="github_ops.create_issue")
+    try:
+        raw = _gh(*args, caller="github_ops.create_issue")
+    except RuntimeError as exc:
+        if not (labels and _is_label_not_found(exc)):
+            raise
+        for label in labels:
+            try:
+                _gh("label", "create", label, "--repo", repo,
+                    caller="github_ops.create_issue")
+            except RuntimeError:
+                pass  # idempotent: label may already exist (concurrent create)
+        try:
+            raw = _gh(*args, caller="github_ops.create_issue")
+        except RuntimeError as retry_exc:
+            if _is_label_not_found(retry_exc):
+                raise GhNotFound(str(retry_exc)) from retry_exc
+            raise
     url = raw.strip()
     number = int(url.rstrip("/").rsplit("/", 1)[-1])
     return {"number": number, "url": url}

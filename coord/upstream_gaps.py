@@ -1367,23 +1367,51 @@ def _file_one(
     # if some OTHER dependent ever names it directly via a hand-added
     # `after=` edge.
     from coord.board_doctor import STRANDED_PREREQ_OPT_OUT_LABEL  # noqa: PLC0415
+    from coord.github_ops import _is_label_not_found  # noqa: PLC0415
 
-    created = create_issue(
-        upstream.name,
-        gap.title,
-        _upstream_issue_body(
-            gap, downstream_ref=downstream_ref, assignment_id=assignment_id,
-            verify_note=verification.note,
-        ),
-        labels=[STRANDED_PREREQ_OPT_OUT_LABEL] if unverified else None,
-        repo_github=upstream.github or None,
+    body = _upstream_issue_body(
+        gap, downstream_ref=downstream_ref, assignment_id=assignment_id,
+        verify_note=verification.note,
     )
+    labels = [STRANDED_PREREQ_OPT_OUT_LABEL] if unverified else None
+    label_note = ""
+    try:
+        created = create_issue(
+            upstream.name, gap.title, body,
+            labels=labels, repo_github=upstream.github or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — see the fall-back below
+        # The opt-out label is a second line of defence (the ledger entry
+        # and the withheld `_queue_upstream` below are the first), so a repo
+        # whose labels cannot be written must never cost the filing itself:
+        # an unfiled gap leaves the downstream row unheld and the next leg
+        # re-emits the same marker forever. `github_ops.create_issue`
+        # already auto-creates a missing label and retries, so reaching
+        # here means the label could not be created at all — file without
+        # it and say so. Narrowed to label failures: any other error may
+        # have left an issue behind, and a blind retry would duplicate it.
+        if not labels or not _is_label_not_found(exc):
+            raise
+        log.warning(
+            "upstream gap %s: filing without %s (%s)",
+            gap.key, STRANDED_PREREQ_OPT_OUT_LABEL, exc,
+        )
+        created = create_issue(
+            upstream.name, gap.title, body,
+            labels=None, repo_github=upstream.github or None,
+        )
+        label_note = (
+            f"{STRANDED_PREREQ_OPT_OUT_LABEL} could not be applied to "
+            f"{upstream.name}: {exc}"
+        )
     number = int(created["number"])
     url = created.get("url")
     upstream_ref = f"{upstream.github or upstream.name}#{number}"
     outcome = UpstreamGapOutcome(
         gap, "filed", upstream_repo=upstream.name, number=number, url=url,
     )
+    if label_note:
+        outcome.notes.append(label_note)
 
     # The ledger entry goes first — it is what makes a replay a no-op, so
     # the window between "filed" and "recorded" is kept as short as possible.
