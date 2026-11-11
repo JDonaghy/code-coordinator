@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from coord import state
+from coord import github_ops, state
 from coord.board_doctor import STRANDED_PREREQ_OPT_OUT_LABEL
 from coord.config import Config
 from coord.dispatch import UPSTREAM_GAP_BRIEFING_NOTE
@@ -901,6 +901,79 @@ class TestVerifyGapFiling:
         assert outcomes[0].queued_after is True
         assert state.list_drive_queue("quadraui") == []
         assert created["labels"] == [STRANDED_PREREQ_OPT_OUT_LABEL]
+
+    def test_a_repo_that_rejects_the_opt_out_label_is_still_filed(
+        self, config: Config,
+    ) -> None:
+        """An upstream repo whose labels cannot be written must not cost the
+        filing — losing it would leave the downstream row unheld and the next
+        leg re-emitting the same marker forever."""
+        fake = FakeTracker()
+        attempts: list[list[str]] = []
+
+        def _create(repo, title, body, labels=None, milestone=None):
+            attempts.append(list(labels or []))
+            if labels:
+                raise github_ops.GhNotFound(
+                    "gh issue create failed: GraphQL: Could not resolve to a "
+                    f"Label with the name '{STRANDED_PREREQ_OPT_OUT_LABEL}'."
+                )
+            return fake.create_issue(repo, title, body, labels, milestone)
+
+        state.enqueue_drive_queue("vimcode", 42)
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose RowAlign\n"
+            "vimcode's layout needs `RowAlign`.\n"
+        )
+        with patch("coord.github_ops.create_issue", side_effect=_create), \
+                patch("coord.github_ops.post_issue_comment",
+                      side_effect=fake.post_issue_comment):
+            outcomes = process_upstream_gaps(msg, config=config,
+                                             repo_name="vimcode", issue_number=42)
+
+        assert attempts == [[STRANDED_PREREQ_OPT_OUT_LABEL], []]
+        assert [o.status for o in outcomes] == ["filed"]
+        assert fake.created[0]["labels"] == []
+        # Every other part of the unverified hold still stands.
+        assert outcomes[0].upstream_queued is False
+        assert outcomes[0].queued_after is True
+        assert state.list_drive_queue("quadraui") == []
+        assert _after(_row(42)) == ["quadraui#501"]
+        assert any(STRANDED_PREREQ_OPT_OUT_LABEL in n for n in outcomes[0].notes)
+        # The ledger entry is what makes a replay a no-op, so a later leg
+        # re-emitting the same marker files nothing more.
+        with patch("coord.github_ops.create_issue", side_effect=_create), \
+                patch("coord.github_ops.post_issue_comment",
+                      side_effect=fake.post_issue_comment):
+            again = process_upstream_gaps(msg, config=config,
+                                          repo_name="vimcode", issue_number=42)
+        assert [o.status for o in again] == ["already-filed"]
+        assert len(fake.created) == 1
+        assert again[0].upstream_queued is False
+        assert state.list_drive_queue("quadraui") == []
+
+    def test_a_non_label_failure_is_never_re_attempted(
+        self, config: Config,
+    ) -> None:
+        """A transient failure may have filed the issue already — retrying
+        without the label would file a duplicate."""
+        attempts: list[list[str]] = []
+
+        def _create(repo, title, body, labels=None, milestone=None):
+            attempts.append(list(labels or []))
+            raise RuntimeError("HTTP 503: upstream connect error")
+
+        state.enqueue_drive_queue("vimcode", 42)
+        msg = (
+            "BLOCKED_ON_UPSTREAM: quadraui: Expose RowAlign\n"
+            "vimcode's layout needs `RowAlign`.\n"
+        )
+        with patch("coord.github_ops.create_issue", side_effect=_create):
+            outcomes = process_upstream_gaps(msg, config=config,
+                                             repo_name="vimcode", issue_number=42)
+
+        assert attempts == [[STRANDED_PREREQ_OPT_OUT_LABEL]]
+        assert [o.status for o in outcomes] == ["error"]
 
 
 class TestInFlightRow:

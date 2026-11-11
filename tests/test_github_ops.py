@@ -1142,6 +1142,102 @@ class TestChangeIssueLabelsAutoCreate:
         assert create_called["v"] is False, "auto-create must not fire for remove-only changes"
 
 
+_LABEL_NOT_FOUND = (
+    "gh issue create --repo acme/api failed: "
+    "GraphQL: Could not resolve to a Label with the name 'coord:no-autoqueue'."
+)
+_NEW_ISSUE_URL = "https://github.com/acme/api/issues/77"
+
+
+class TestCreateIssueLabelAutoCreate:
+    """`create_issue` must not hard-fail on a label the target repo lacks.
+
+    A caller that attaches a policy label (e.g. the stranded-prereq opt-out)
+    to an issue it files in an arbitrary repo would otherwise lose the whole
+    filing to a missing label.
+    """
+
+    def test_no_label_create_when_the_first_attempt_succeeds(self) -> None:
+        calls: list = []
+
+        def _dispatch(*args: str, **_kwargs) -> str:
+            calls.append(args)
+            return _NEW_ISSUE_URL
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            result = github_ops.create_issue(
+                "acme/api", "t", "b", labels=["coord:no-autoqueue"]
+            )
+
+        assert result == {"number": 77, "url": _NEW_ISSUE_URL}
+        assert [c for c in calls if c[0] == "label"] == []
+
+    def test_missing_label_is_created_and_the_create_retried(self) -> None:
+        calls: list = []
+        creates = {"n": 0}
+
+        def _dispatch(*args: str, **_kwargs) -> str:
+            calls.append(args)
+            if args[0] == "issue" and args[1] == "create":
+                creates["n"] += 1
+                if creates["n"] == 1:
+                    raise RuntimeError(_LABEL_NOT_FOUND)
+                return _NEW_ISSUE_URL
+            return ""
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            result = github_ops.create_issue(
+                "acme/api", "t", "b", labels=["coord:no-autoqueue"]
+            )
+
+        assert result["number"] == 77
+        label_creates = [
+            c for c in calls
+            if c[0] == "label" and c[1] == "create" and "coord:no-autoqueue" in c
+        ]
+        assert len(label_creates) == 1
+        assert creates["n"] == 2
+
+    def test_retry_that_still_reports_not_found_raises_gh_not_found(self) -> None:
+        def _dispatch(*args: str, **_kwargs) -> str:
+            if args[0] == "issue" and args[1] == "create":
+                raise RuntimeError(_LABEL_NOT_FOUND)
+            return ""  # label create "succeeds"
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with pytest.raises(github_ops.GhNotFound):
+                github_ops.create_issue(
+                    "acme/api", "t", "b", labels=["coord:no-autoqueue"]
+                )
+
+    def test_transient_failure_is_not_retried(self) -> None:
+        """An auth/network failure may well have created the issue — never
+        auto-create labels or re-run the create for one."""
+        calls: list = []
+
+        def _dispatch(*args: str, **_kwargs) -> str:
+            calls.append(args)
+            raise RuntimeError("HTTP 401: Bad credentials")
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with pytest.raises(RuntimeError, match="Bad credentials"):
+                github_ops.create_issue(
+                    "acme/api", "t", "b", labels=["coord:no-autoqueue"]
+                )
+
+        assert len([c for c in calls if c[0] == "issue"]) == 1
+        assert [c for c in calls if c[0] == "label"] == []
+
+    def test_unlabelled_create_propagates_its_error_unchanged(self) -> None:
+        def _dispatch(*args: str, **_kwargs) -> str:
+            raise RuntimeError(_LABEL_NOT_FOUND)
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with pytest.raises(RuntimeError) as excinfo:
+                github_ops.create_issue("acme/api", "t", "b")
+        assert not isinstance(excinfo.value, github_ops.GhNotFound)
+
+
 # ── #873: durable issue_comments mirror — capture-at-write ──────────────────
 
 class TestParseCommentId:
