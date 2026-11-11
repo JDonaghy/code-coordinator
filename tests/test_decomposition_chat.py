@@ -2229,3 +2229,152 @@ class TestFileAndQueueSplitProposal:
                 proposal=self._proposal(), verification=self._verification(), repo=repo,
             )
         mock_close_issue.assert_not_called()
+
+
+class TestAutoSplitNeedsDecomposition:
+    """`auto_split_needs_decomposition` files a needs-decomposition work
+    leg's machine-readable split through the same verify + file + queue path
+    a size-triage SPLIT verdict uses, and files nothing otherwise."""
+
+    _SPLIT = (
+        "WORK_OUTCOME: needs-decomposition — two independent halves\n\n"
+        "SIZE_TRIAGE_VERDICT: split\n"
+        "## Child 1: Parser half\n"
+        "Add the parser.\n\n"
+        "## Files\n"
+        "- coord/parser_part.py\n\n"
+        "## Child 2: Wiring half\n"
+        "Wire it in.\n\n"
+        "## Files\n"
+        "- coord/wiring_part.py\n\n"
+        "END_SIZE_TRIAGE\n"
+    )
+
+    class _Config:
+        def __init__(self, enabled: bool = True) -> None:
+            from coord.models import Repo
+
+            self._repo = Repo(name="api", github="acme/api")
+            self._enabled = enabled
+
+        def repo(self, name: str):
+            return self._repo if name == "api" else None
+
+        def preflight_guard_enabled(self, repo_name: str) -> bool:
+            return self._enabled
+
+    @patch("coord.state.dequeue_drive_queue")
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal", return_value=900)
+    @patch("coord.github_ops.get_issue")
+    def test_files_verified_split_and_dequeues_original(
+        self, mock_get_issue, mock_file, mock_dequeue,
+    ) -> None:
+        mock_get_issue.return_value = {"state": "OPEN", "title": "Big issue"}
+
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            self._SPLIT, config=self._Config(), repo_name="api", issue_number=99,
+        )
+
+        assert epic == 900
+        kwargs = mock_file.call_args.kwargs
+        proposal = kwargs["proposal"]
+        assert proposal.issue_number == 99
+        assert proposal.issue_title == "Big issue"
+        assert [c.title for c in proposal.chunks] == ["Parser half", "Wiring half"]
+        assert proposal.chunks[0].files_likely == ["coord/parser_part.py"]
+        assert kwargs["verification"].ok is True
+        assert kwargs["repo"].github == "acme/api"
+        assert kwargs["origin"] == decomposition_chat.NEEDS_DECOMPOSITION_SPLIT_ORIGIN
+        mock_dequeue.assert_called_once_with("api", 99, operator=False)
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.github_ops.get_issue")
+    def test_prose_only_proposal_files_nothing(self, mock_get_issue, mock_file) -> None:
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            "WORK_OUTCOME: needs-decomposition — split into auth and billing",
+            config=self._Config(), repo_name="api", issue_number=99,
+        )
+        assert epic is None
+        mock_get_issue.assert_not_called()
+        mock_file.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.github_ops.get_issue")
+    def test_repo_not_opted_in_files_nothing(self, mock_get_issue, mock_file) -> None:
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            self._SPLIT, config=self._Config(enabled=False),
+            repo_name="api", issue_number=99,
+        )
+        assert epic is None
+        mock_get_issue.assert_not_called()
+        mock_file.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.github_ops.get_issue")
+    def test_closed_original_files_nothing(self, mock_get_issue, mock_file) -> None:
+        mock_get_issue.return_value = {"state": "CLOSED", "title": "Big issue"}
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            self._SPLIT, config=self._Config(), repo_name="api", issue_number=99,
+        )
+        assert epic is None
+        mock_file.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.github_ops.get_issue")
+    def test_truncated_block_files_nothing(self, mock_get_issue, mock_file) -> None:
+        mock_get_issue.return_value = {"state": "OPEN", "title": "Big issue"}
+        truncated = self._SPLIT.replace("END_SIZE_TRIAGE\n", "")
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            truncated, config=self._Config(), repo_name="api", issue_number=99,
+        )
+        assert epic is None
+        mock_file.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.preflight_size.verify_split_proposal")
+    @patch("coord.github_ops.get_issue")
+    def test_gate_rejected_split_files_nothing(
+        self, mock_get_issue, mock_verify, mock_file,
+    ) -> None:
+        from coord.preflight_size import SplitVerification
+
+        mock_get_issue.return_value = {"state": "OPEN", "title": "Big issue"}
+        mock_verify.return_value = SplitVerification(ok=False, reason="overlap")
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            self._SPLIT, config=self._Config(), repo_name="api", issue_number=99,
+        )
+        assert epic is None
+        mock_file.assert_not_called()
+
+    @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_filer_origin_is_quoted_in_epic_and_close_comment(
+        self, mock_create_issue, mock_update_body, mock_close_issue,
+        mock_get_issue_state, mock_enqueue, mock_get_entry,
+    ) -> None:
+        from coord.milestone_order import WorkOrder, WorkOrderNode
+        from coord.models import Repo, SplitChunk, SplitProposal
+        from coord.preflight_size import SplitVerification
+
+        mock_create_issue.side_effect = [{"number": 500}, {"number": 501}]
+        decomposition_chat.file_and_queue_split_proposal(
+            proposal=SplitProposal(
+                id=0, repo_name="api", issue_number=99, issue_title="Big",
+                rationale="r", chunks=[
+                    SplitChunk(title="P1", scope="s", files_likely=["a.py"]),
+                ],
+            ),
+            verification=SplitVerification(
+                ok=True, reason=None, epic_body="e",
+                work_order=WorkOrder(nodes=(WorkOrderNode(issue_number=1, after=()),)),
+            ),
+            repo=Repo(name="api", github="acme/api"),
+            origin=decomposition_chat.NEEDS_DECOMPOSITION_SPLIT_ORIGIN,
+        )
+        origin = decomposition_chat.NEEDS_DECOMPOSITION_SPLIT_ORIGIN
+        assert origin in mock_create_issue.call_args_list[0].kwargs["body"]
+        assert origin in mock_close_issue.call_args.kwargs["comment"]

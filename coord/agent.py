@@ -4521,6 +4521,22 @@ only re-propose the same split. Omit the marker entirely for every other \
 or a false/unmet premise that is NOT "already done") — those still read \
 off your prose exactly as before.
 
+With `needs-decomposition`, also put the split in your final message as \
+this block (one `## Child N:` per proposed issue, each with its own \
+`## Files` list); the coordinator files the children and supersedes this \
+issue automatically when it is well-formed:
+
+  SIZE_TRIAGE_VERDICT: split
+  ## Child 1: <title>
+  <one paragraph of scope>
+
+  ## Files
+  - path/a.py
+
+  ## Child 2: <title>
+  ...
+  END_SIZE_TRIAGE
+
 Progress reporting:
 - After each significant step (first build, test run, approach change), \
 output a status line in exactly this format:

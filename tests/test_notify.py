@@ -931,6 +931,97 @@ class TestNeedsDecompositionNotify:
             "needs_decomposition comment"
         )
 
+    def test_structured_split_block_is_auto_filed(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """A final message carrying a complete size-triage split block is
+        handed to the auto-split filer with the row's repo and issue."""
+        _record("ndc-run7")
+        reason = (
+            "WORK_OUTCOME: needs-decomposition — split in two\n\n"
+            "SIZE_TRIAGE_VERDICT: split\n"
+            "## Child 1: Part one\nscope one\n\n## Files\n- coord/a.py\n\n"
+            "## Child 2: Part two\nscope two\n\n## Files\n- coord/b.py\n\n"
+            "END_SIZE_TRIAGE\n"
+        )
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "ndc-run7",
+                    "needs_decomposition",
+                    exit_code=0,
+                    needs_decomposition_reason=reason,
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch(
+                 "coord.decomposition_chat.auto_split_needs_decomposition",
+                 return_value=777,
+             ) as mock_split:
+            notify_mod.run(config)
+        mock_split.assert_called_once()
+        assert mock_split.call_args.args[0] == reason
+        assert mock_split.call_args.kwargs["repo_name"] == "api"
+        assert mock_split.call_args.kwargs["issue_number"] == 42
+        assert "ndc-run7" in state_mod.load_notified()
+
+    def test_prose_only_proposal_is_not_auto_filed(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("ndc-run8")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "ndc-run8",
+                    "needs_decomposition",
+                    exit_code=0,
+                    needs_decomposition_reason="Split into auth and billing",
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch.object(notify_mod, "_worker_log_text", return_value=""), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post, \
+             patch(
+                 "coord.decomposition_chat.auto_split_needs_decomposition",
+             ) as mock_split:
+            notify_mod.run(config)
+        mock_split.assert_not_called()
+        mock_post.assert_called_once()
+
+    def test_auto_split_failure_still_notifies(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("ndc-run9")
+        reason = (
+            "SIZE_TRIAGE_VERDICT: split\n## Child 1: A\nx\n\n## Files\n- a.py\n"
+            "END_SIZE_TRIAGE\n"
+        )
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "ndc-run9",
+                    "needs_decomposition",
+                    exit_code=0,
+                    needs_decomposition_reason=reason,
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post, \
+             patch(
+                 "coord.decomposition_chat.auto_split_needs_decomposition",
+                 side_effect=RuntimeError("gh exploded"),
+             ):
+            notify_mod.run(config)
+        mock_post.assert_called_once()
+        assert "ndc-run9" in state_mod.load_notified()
+
 
 class TestBranchCapture:
     def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:

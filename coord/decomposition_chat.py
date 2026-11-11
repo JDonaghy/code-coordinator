@@ -1319,8 +1319,12 @@ def file_and_queue_split_proposal(
     proposal: "SplitProposal",
     verification: "SplitVerification",
     repo: "Repo",
+    origin: str = "preflight size-triage review",
 ) -> int:
     """File *proposal*'s chunks as a real epic + children and queue them.
+
+    *origin* names what proposed the split; it is quoted in the epic body
+    and in the comment closing the superseded original.
 
     Called only after :func:`coord.preflight_size.verify_split_proposal` has
     returned ``ok=True`` for *verification* — this function trusts
@@ -1365,9 +1369,8 @@ def file_and_queue_split_proposal(
 
     epic_body = (
         f"{proposal.rationale}\n\n"
-        f"Split from #{proposal.issue_number} by the preflight "
-        "size-triage review. Children are filed below and queued in "
-        "overlap order."
+        f"Split from #{proposal.issue_number} by the {origin}. Children "
+        "are filed below and queued in overlap order."
     )
     epic = github_ops.create_issue(
         repo.github,
@@ -1419,8 +1422,7 @@ def file_and_queue_split_proposal(
         proposal.issue_number,
         comment=(
             f"Superseded by #{epic_number} — split into "
-            f"{len(proposal.chunks)} child issue(s) per the size-triage "
-            "review."
+            f"{len(proposal.chunks)} child issue(s) per the {origin}."
         ),
         force=True,
     )
@@ -1435,6 +1437,105 @@ def file_and_queue_split_proposal(
             f"did not read back closed (got {post_close_state!r})"
         )
 
+    return epic_number
+
+
+#: The ``origin`` text :func:`auto_split_needs_decomposition` passes to
+#: :func:`file_and_queue_split_proposal`.
+NEEDS_DECOMPOSITION_SPLIT_ORIGIN = "work leg's needs-decomposition split proposal"
+
+
+def auto_split_needs_decomposition(
+    final_message: str | None,
+    *,
+    config: "Config",
+    repo_name: str,
+    issue_number: int,
+) -> int | None:
+    """File the split a ``needs-decomposition`` work leg proposed, if it
+    proposed one in the machine-readable size-triage format.
+
+    *final_message* is the worker's own final message. The worker states its
+    split as a ``SIZE_TRIAGE_VERDICT: split`` / ``## Child N:`` /
+    ``## Files`` / ``END_SIZE_TRIAGE`` block — the same wire format the
+    size-triage agent uses, parsed by :func:`parse_size_triage_response` —
+    and the split then goes through the identical
+    :func:`coord.preflight_size.verify_split_proposal` gate and
+    :func:`file_and_queue_split_proposal` filer a size-triage SPLIT verdict
+    does: an epic plus chained children are filed and queued, and the
+    original is closed as superseded. The original's own (parked) drive-
+    queue row is then removed, since the issue it tracks is closed.
+
+    Returns the new epic's issue number, or ``None`` when nothing was filed:
+    the repo has not opted into the preflight decomposition guard
+    (:meth:`coord.config.Config.preflight_guard_enabled` — the same opt-in
+    that governs every other automatic split), the message carries no
+    complete split block (prose-only proposals stay with the coordinator,
+    exactly as before), the original issue is already closed (a replayed
+    transition, or someone already decomposed it), or the proposal fails the
+    verification gate — a broken epic is never filed. A failure *inside*
+    the filer propagates: by then real issues exist on GitHub.
+    """
+    text = final_message or ""
+    if not _SIZE_TRIAGE_VERDICT_RE.search(text):
+        return None
+    repo = config.repo(repo_name)
+    if repo is None or not config.preflight_guard_enabled(repo_name):
+        return None
+
+    from coord import github_ops
+    from coord.preflight_size import verify_split_proposal
+
+    issue_data = github_ops.get_issue(repo.github, issue_number)
+    if str(issue_data.get("state") or "").upper() == "CLOSED":
+        return None
+    issue_title = issue_data.get("title") or f"issue #{issue_number}"
+
+    try:
+        proposal = parse_size_triage_response(
+            text,
+            repo_name=repo_name,
+            issue_number=issue_number,
+            issue_title=issue_title,
+        )
+    except SizeTriageError as exc:
+        _log.info(
+            "auto_split_needs_decomposition: %s#%s split block unparseable: %s",
+            repo_name, issue_number, exc,
+        )
+        return None
+    if proposal is None:
+        return None
+    proposal.rationale = (
+        "a work leg concluded this issue needs decomposition and proposed "
+        "this split"
+    )
+
+    verification = verify_split_proposal(proposal)
+    if not verification.ok:
+        _log.info(
+            "auto_split_needs_decomposition: %s#%s split rejected: %s",
+            repo_name, issue_number, verification.reason,
+        )
+        return None
+
+    epic_number = file_and_queue_split_proposal(
+        proposal=proposal,
+        verification=verification,
+        repo=repo,
+        origin=NEEDS_DECOMPOSITION_SPLIT_ORIGIN,
+    )
+
+    from coord.state import dequeue_drive_queue
+
+    try:
+        dequeue_drive_queue(repo_name, issue_number, operator=False)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "auto_split_needs_decomposition: filed epic #%s but could not "
+            "dequeue superseded %s#%s: %s",
+            epic_number, repo_name, issue_number, exc,
+        )
     return epic_number
 
 
