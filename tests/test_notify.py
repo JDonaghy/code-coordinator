@@ -957,6 +957,7 @@ class TestNeedsDecompositionNotify:
         }
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.config.load", return_value=config), \
              patch(
                  "coord.decomposition_chat.auto_split_needs_decomposition",
                  return_value=777,
@@ -1014,11 +1015,13 @@ class TestNeedsDecompositionNotify:
         }
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post, \
+             patch("coord.config.load", return_value=config), \
              patch(
                  "coord.decomposition_chat.auto_split_needs_decomposition",
                  side_effect=RuntimeError("gh exploded"),
-             ):
+             ) as mock_split:
             notify_mod.run(config)
+        mock_split.assert_called_once()
         mock_post.assert_called_once()
         assert "ndc-run9" in state_mod.load_notified()
 
