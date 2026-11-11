@@ -416,3 +416,78 @@ def test_no_work_assignment_at_all_cannot_tell_not_confirmed_fresh(monkeypatch):
 
     assert review_stale is None
     assert test_stale is None
+
+
+# ── #3979: a terminal park must never read as a PR-shaped cause ─────────────
+
+
+def test_a_needs_decomposition_park_classifies_as_its_own_cause_not_no_pr():
+    """A row the tick's own parked pre-pass already treats as terminal
+    (`coord.models.NEEDS_DECOMPOSITION_MARKER` in `last_reason`) has, by
+    design, no PR — `_rule_no_pr` would otherwise claim it, and
+    `CAUSE_NO_PR` IS investigate-eligible, which is exactly the #3979
+    incident: a fix-it leg relaunched against a row nothing can fix by
+    relaunching."""
+    from coord.models import NEEDS_DECOMPOSITION_MARKER
+
+    got = qd.diagnose(
+        entry(
+            10,
+            last_reason=f"{NEEDS_DECOMPOSITION_MARKER} split into A and B",
+        ),
+        live(pr_number=None, pr_state="none", mergeable=None, checks=None),
+    )
+    assert got.cause == qd.CAUSE_NEEDS_DECOMPOSITION
+    assert got.cause != qd.CAUSE_NO_PR
+    assert got.confidence == qd.CONFIDENCE_HIGH
+
+
+def test_a_premise_refusal_park_classifies_as_its_own_cause_not_no_pr():
+    from coord.models import PREMISE_REFUSAL_MARKER
+
+    got = qd.diagnose(
+        entry(11, last_reason=f"{PREMISE_REFUSAL_MARKER} missing prereq"),
+        live(pr_number=None, pr_state="none", mergeable=None, checks=None),
+    )
+    assert got.cause == qd.CAUSE_PREMISE_REFUSAL
+    assert got.cause != qd.CAUSE_NO_PR
+
+
+def test_an_upstream_gap_park_classifies_as_its_own_cause_not_no_pr():
+    from coord.models import UPSTREAM_GAP_PARK_MARKER
+
+    got = qd.diagnose(
+        entry(12, last_reason=f"{UPSTREAM_GAP_PARK_MARKER} unreleased symbol"),
+        live(pr_number=None, pr_state="none", mergeable=None, checks=None),
+    )
+    assert got.cause == qd.CAUSE_UPSTREAM_GAP_PARK
+    assert got.cause != qd.CAUSE_NO_PR
+
+
+def test_a_genuine_no_pr_stall_with_no_marker_still_classifies_no_pr():
+    """Regression: a row with no terminal-park marker at all must still
+    reach the ordinary `CAUSE_NO_PR` reading — the new rule must never
+    fire on prose that merely happens to be stalled with no PR."""
+    got = qd.diagnose(
+        entry(13, last_reason="blocked: CI red, 2/2 attempts"),
+        live(pr_number=None, pr_state="none", mergeable=None, checks=None),
+    )
+    assert got.cause == qd.CAUSE_NO_PR
+
+
+def test_needs_decomposition_is_not_auto_or_investigate_eligible():
+    """#3979's whole point: the new cause must never land on the
+    auto-dispatch or investigate tier — `coord.board_doctor_policy.
+    policy_tier_of` must read it as alert-only, the same place an
+    unregistered cause already lands."""
+    from coord import board_doctor_policy as bdp
+    from coord.board_doctor import TIER_ALERT
+
+    for cause in (
+        qd.CAUSE_NEEDS_DECOMPOSITION,
+        qd.CAUSE_PREMISE_REFUSAL,
+        qd.CAUSE_UPSTREAM_GAP_PARK,
+    ):
+        assert cause not in bdp.ALLOWLIST
+        assert cause not in bdp.INVESTIGATE_CAUSES
+        assert bdp.policy_tier_of(cause) == TIER_ALERT
