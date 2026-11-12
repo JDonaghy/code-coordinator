@@ -2633,7 +2633,14 @@ class TestUatStateAndReasonColumns:
 # decision log used to live in with a real table that has its own
 # age-based retention prune; `coord.db._migrate_board_doctor_log_table`
 # moves every existing blob entry across losslessly.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (26, 101)
+# #3992 bumped this to (27, 101): a new `idx_merge_queue_assignment_id`
+# UNIQUE index (not a column — `_MIGRATE_ADD_COLUMNS`'s length is unchanged
+# at 101, same table-only shape as the bumps above) — backs `coord.
+# merge_queue.save_queue`'s atomic `sql.upsert(..., conflict_columns=
+# ["assignment_id"])`. `coord.db._dedupe_merge_queue_assignment_ids` runs
+# ahead of the index creation so an upgrading database that already has a
+# duplicate `assignment_id` doesn't fail it outright.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (27, 101)
 
 
 class TestMigrateAddColumnsVersionGuard:

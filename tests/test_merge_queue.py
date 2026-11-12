@@ -16662,15 +16662,15 @@ class TestHeadUnmovedFixAssignmentId:
         assert mq.head_unmoved_fix_assignment_id(error) is None
 
 
-# ── #3992: coord.commands.merge._save_merge_back ──────────────────────────
+# ── coord.commands.merge._save_merge_back ──────────────────────────────────
 
 class TestSaveMergeBack:
     """`_save_merge_back` is the shared tail of every merge-back save in
     `coord merge` (the ``--only`` path, the standing-conflict early return,
-    and the whole-queue path) -- it re-reads the queue fresh and persists
-    only the entries it was handed, re-inserting one that vanished from
-    disk mid-run instead of silently dropping it (#3992's second bug: the
-    ``--only`` merge-back used to never restore a vanished ``only_entry``).
+    and the whole-queue path) -- it upserts exactly the entries it was
+    handed, by key, never touching any other row, and re-inserts one that
+    vanished from disk mid-run (e.g. a concurrent drop/prune) instead of
+    silently dropping it.
     """
 
     def test_persists_mutated_entry_over_fresh_reload(self, coord_db) -> None:

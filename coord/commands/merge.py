@@ -1747,34 +1747,22 @@ def _board_row_merge_gate_ok(a, config, board, gh_ops: "GhOps | None") -> bool:
 
 
 def _save_merge_back(mutated: list) -> None:
-    """Persist *mutated* queue entries over a fresh reload, keyed by
-    ``assignment_id`` — the shared tail of every merge-back save in
-    :func:`merge` (the ``--only`` path, the standing-conflict early return,
-    and the whole-queue path all reach this instead of repeating it).
+    """Persist *mutated* queue entries, keyed by ``assignment_id`` — the
+    shared tail of every merge-back save in :func:`merge` (the ``--only``
+    path, the standing-conflict early return, and the whole-queue path all
+    reach this instead of repeating it).
 
-    Reloads the queue right before saving, then overrides only the rows
-    *mutated* actually touched — :func:`coord.merge_queue.save_queue` itself
-    now upserts by key (#3992) rather than replacing the whole table, so a
-    row this call never saw (inserted by a concurrent writer between this
-    command's own earlier load and this save) is left exactly as that
-    writer left it.
-
-    #3992: a row in *mutated* can be entirely missing from the fresh
-    reload — a concurrent prune/archive sweep removed it, or it never made
-    it to disk in the first place — in which case the dict-merge above
-    would silently drop it, discarding whatever this call just mutated
-    (e.g. a ``--only`` entry moved to CONFLICT/MERGED this very pass).
-    Appended back explicitly so a save never loses the entry it was
-    actually asked to persist.
+    :func:`coord.merge_queue.save_queue` upserts by key rather than
+    replacing the whole table, so handing it exactly *mutated* — the rows
+    THIS call actually changed — is sufficient: any other row is left
+    exactly as whatever last wrote it left it, concurrent writer or not.
+    Reloading the queue and re-saving every row in it, mutated or not,
+    would only widen the lost-update window onto rows this call never
+    touched, for no benefit.
     """
     from coord import merge_queue as _mq  # noqa: PLC0415
 
-    fresh = _mq.load_queue()
-    by_id = {x.assignment_id: x for x in mutated}
-    merged = [by_id.get(x.assignment_id, x) for x in fresh]
-    seen_ids = {x.assignment_id for x in fresh}
-    merged.extend(x for x in mutated if x.assignment_id not in seen_ids)
-    _mq.save_queue(merged)
+    _mq.save_queue(mutated)
 
 
 def _explain_missing_only_entry(

@@ -455,12 +455,15 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("load_queue", "get_connection"),
         ("save_queue", "get_connection"),
         ("_load_milestones_for_queue", "get_connection"),
-        # #3992: save_queue upserts by assignment_id instead of replacing the
-        # whole table, so row removal and re-keying are their own explicit,
-        # audited statements against the same daemon-side merge-queue table.
-        # delete_entries is the single DELETE seam (drop_entry and
-        # prune_stale_queue_entries both route through it); rekey_entry is the
-        # UPDATE-by-old-key seam for refresh_entry_assignment.
+        # save_queue upserts by assignment_id rather than replacing the whole
+        # table, so row removal and re-keying are their own explicit, audited
+        # statements against the same daemon-side merge-queue table.
+        # delete_entries is the only seam that deletes a LIVE row by key
+        # (drop_entry and prune_stale_queue_entries both route through it) —
+        # besides housekeeping.sweep()'s own direct archive-and-delete, which
+        # moves a MERGED row out rather than removing it outright. rekey_entry
+        # re-points a row from its old assignment_id to its new one for
+        # refresh_entry_assignment.
         ("delete_entries", "get_connection"),
         ("rekey_entry", "get_connection"),
         # #1107 Part 3: unions merge_queue with merge_queue_archive so the

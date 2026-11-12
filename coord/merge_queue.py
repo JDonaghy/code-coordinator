@@ -5637,52 +5637,36 @@ def save_queue(items: list[QueuedMerge]) -> None:
     ``assignment_id`` — insert a row that doesn't exist yet, update one that
     does, never touch any other row.
 
-    #3992: this used to ``DELETE FROM merge_queue`` and re-insert the whole
-    table from *items* on every call — the only thing serializing writers
-    was serve's in-process lock, and most writers (``coord merge --only``,
-    the notify pass, ``reconcile.on_conflict_fix_done``, the drive's inline
-    enqueue) never took it. A writer that loaded its in-memory snapshot
-    *before* a concurrent writer inserted a brand-new row, then saved late,
-    silently deleted that row — the delete-then-reinsert-all left no trace
-    of which row vanished, so the audit log recorded nothing. Upserting by
-    key means a row this call wasn't handed is never touched, concurrent
-    insert or not — a writer with a stale snapshot can still clobber a row
-    it WAS handed back to a stale value (that's a narrower, pre-existing
-    lost-update risk, not this issue's silent-deletion one), but it can
-    never make an entry it never saw simply disappear.
+    The insert-vs-update decision is made by the database itself
+    (``INSERT ... ON CONFLICT (assignment_id) DO UPDATE``, via
+    :func:`coord.sql.upsert`, backed by the ``idx_merge_queue_assignment_id``
+    UNIQUE index) rather than by this call reading ``cursor.rowcount`` off a
+    separate UPDATE to decide whether to fall through to an INSERT. On the
+    shared, multi-threaded SQLite connection every ``get_connection()``
+    caller writes through, ``rowcount`` is ``sqlite3_changes()`` — a
+    per-connection value another thread's statement can overwrite in the
+    gap between this call's own statement and the read of it (see
+    ``coord.state.claim_review_post``'s #3668 comment for the mechanism) —
+    which could either skip inserting a genuinely new row or insert a
+    second row for one that already exists. A single atomic statement per
+    item has no such gap, on SQLite or Postgres.
 
-    Removing a row from the table entirely is therefore no longer something
-    a save can do by omission (passing a shorter *items* list leaves the
-    missing rows exactly as they were) — see :func:`drop_entry` /
-    :func:`delete_entries` for the explicit, audited way to do that.
+    Removing a row from the table entirely is not something a save can do
+    by omission — passing a shorter *items* list leaves the missing rows
+    exactly as they were. See :func:`drop_entry` / :func:`delete_entries`
+    for the explicit, audited way to do that.
     """
     if not items:
         return
     conn = get_connection()
-    collist = ", ".join(_MERGE_QUEUE_UPSERT_COLUMNS)
-    placeholders = ", ".join(["?"] * len(_MERGE_QUEUE_UPSERT_COLUMNS))
-    update_clause = ", ".join(
-        f"{c} = ?" for c in _MERGE_QUEUE_UPSERT_COLUMNS if c != "assignment_id"
-    )
 
     def _write() -> None:
         with conn:
             for item in items:
-                params = _merge_queue_upsert_params(item)
-                # UPDATE first, by key: cheap existence check that doubles as
-                # the write itself, so a pre-existing row is touched exactly
-                # once per save — no separate SELECT-then-branch round trip.
-                cursor = sql.execute(
-                    conn,
-                    f"UPDATE merge_queue SET {update_clause} WHERE assignment_id = ?",  # noqa: S608
-                    (*params[1:], item.assignment_id),
-                )
-                if cursor.rowcount:
-                    continue
-                sql.execute(
-                    conn,
-                    f"INSERT INTO merge_queue ({collist}) VALUES ({placeholders})",  # noqa: S608
-                    params,
+                sql.upsert(
+                    conn, "merge_queue", _MERGE_QUEUE_UPSERT_COLUMNS,
+                    _merge_queue_upsert_params(item),
+                    conflict_columns=["assignment_id"],
                 )
 
     # #2802: ride out transient `database is locked` contention the same way
@@ -5693,44 +5677,57 @@ def save_queue(items: list[QueuedMerge]) -> None:
 
 
 def rekey_entry(old_assignment_id: str, entry: "QueuedMerge") -> bool:
-    """Update the merge_queue row currently keyed to *old_assignment_id* so
-    it is keyed to ``entry.assignment_id`` instead, writing every other
-    field on *entry* too. Returns ``True`` when a row was actually renamed.
+    """Re-point the merge_queue row currently keyed to *old_assignment_id*
+    so it is keyed to ``entry.assignment_id`` instead, writing every other
+    field on *entry* too. Returns ``True`` when a row existed under
+    *old_assignment_id* at the start of this call (i.e. an actual rename
+    happened, as opposed to just upserting *entry* fresh).
 
-    #3992: :func:`save_queue` upserts by the item's CURRENT
-    ``assignment_id`` — a caller that changes ``assignment_id`` in place
-    (a re-key, not an ordinary field update) must say so explicitly by
-    naming the row's OLD key, or the upsert can't find the existing row
-    under its old identity and inserts a second one instead of renaming
-    the first. :func:`refresh_entry_assignment` is the one caller that
-    re-keys (a review-bounce fix taking over an entry originally keyed to
-    the pre-bounce work assignment).
+    :func:`save_queue` upserts by the item's CURRENT ``assignment_id`` — a
+    caller that changes ``assignment_id`` in place (a re-key, not an
+    ordinary field update) must say so explicitly by naming the row's OLD
+    key, or the upsert can't find the existing row under its old identity
+    and inserts a second one instead of renaming the first.
+    :func:`refresh_entry_assignment` is the one caller that re-keys (a
+    review-bounce fix taking over an entry originally keyed to the
+    pre-bounce work assignment).
 
-    Falls back to an ordinary :func:`save_queue` upsert of *entry* alone
-    when no row matches *old_assignment_id* (it was already renamed, or
-    removed by a concurrent writer) — so the right row still ends up
-    present even though nothing was renamed.
+    Deletes whatever row sits under *old_assignment_id* (if any) and
+    upserts *entry* under its own key, in one transaction — rather than an
+    UPDATE whose success is read off ``cursor.rowcount``, which is
+    unreliable on the shared SQLite connection (see :func:`save_queue`'s
+    docstring). Deciding from a read-back instead means the result is
+    correct however a concurrent writer's rename or insert lands: if some
+    other call already created (or renamed another row into)
+    ``entry.assignment_id`` first, this call's delete still clears the
+    stale old-keyed row and its upsert still lands *entry*'s current
+    fields on the surviving row.
     """
     if old_assignment_id == entry.assignment_id:
         save_queue([entry])
         return True
     conn = get_connection()
-    set_clause = ", ".join(f"{c} = ?" for c in _MERGE_QUEUE_UPSERT_COLUMNS)
     params = _merge_queue_upsert_params(entry)
 
     def _write() -> bool:
         with conn:
-            cursor = sql.execute(
+            existed = sql.execute(
                 conn,
-                f"UPDATE merge_queue SET {set_clause} WHERE assignment_id = ?",  # noqa: S608
-                (*params, old_assignment_id),
+                "SELECT 1 FROM merge_queue WHERE assignment_id = ?",
+                (old_assignment_id,),
+            ).fetchone() is not None
+            sql.execute(
+                conn,
+                "DELETE FROM merge_queue WHERE assignment_id = ?",
+                (old_assignment_id,),
             )
-            return cursor.rowcount > 0
+            sql.upsert(
+                conn, "merge_queue", _MERGE_QUEUE_UPSERT_COLUMNS, params,
+                conflict_columns=["assignment_id"],
+            )
+            return existed
 
-    renamed = retry_on_locked(_write)
-    if not renamed:
-        save_queue([entry])
-    return renamed
+    return retry_on_locked(_write)
 
 
 def delete_entries(
@@ -5738,19 +5735,24 @@ def delete_entries(
 ) -> int:
     """Remove exactly the ``merge_queue`` rows for *entries*, by key, inside
     one transaction — each deleted row gets its own ``queue_entry_removed``
-    audit row naming *reason*.
+    audit row naming *reason*, best-effort (``record_audit`` swallows its
+    own failures, so a commit can land with no matching audit row).
 
-    #3992: the explicit, audited counterpart to :func:`save_queue`'s
-    upsert-only contract. A caller that genuinely wants rows gone (``coord
-    merge --drop``'s single-entry :func:`drop_entry`, :func:`
+    The explicit, audited counterpart to :func:`save_queue`'s upsert-only
+    contract. A caller that genuinely wants rows gone (``coord merge
+    --drop``'s single-entry :func:`drop_entry`, :func:`
     prune_stale_queue_entries`'s batch) must say so by key here rather than
     by omitting rows from a ``save_queue`` list — a stale snapshot omits
-    rows it simply never saw, which is exactly the silent-deletion bug this
-    issue is about, not a real removal intent.
+    rows it simply never saw, which silently drops them rather than
+    expressing a real removal intent.
 
     An entry already gone by the time this runs (e.g. removed by a
     concurrent writer) is not re-added and not double-counted — only rows
     this call itself deletes are audited and counted in the return value.
+    Whether a row existed is decided by reading it back before the DELETE,
+    not from ``cursor.rowcount`` (unreliable on the shared SQLite
+    connection — see :func:`save_queue`'s docstring); a misread there would
+    mean a real removal goes unaudited, or a no-op gets logged as one.
     """
     if not entries:
         return 0
@@ -5758,15 +5760,20 @@ def delete_entries(
     removed: list[QueuedMerge] = []
 
     def _write() -> None:
-        removed.clear()  # #3992: reset so a retried attempt doesn't double-count
+        removed.clear()  # reset so a retried attempt doesn't double-count
         with conn:
             for entry in entries:
-                cursor = sql.execute(
+                existed = sql.execute(
+                    conn,
+                    "SELECT 1 FROM merge_queue WHERE assignment_id = ?",
+                    (entry.assignment_id,),
+                ).fetchone() is not None
+                sql.execute(
                     conn,
                     "DELETE FROM merge_queue WHERE assignment_id = ?",
                     (entry.assignment_id,),
                 )
-                if cursor.rowcount:
+                if existed:
                     removed.append(entry)
 
     retry_on_locked(_write)
@@ -6805,10 +6812,12 @@ def sweep_sibling_conflicts(
             # was built before the retry-sleep loop above (up to
             # ``(attempts - 1) * interval``, longer under real GitHub
             # latency), so by the time we get here it can be stale for every
-            # entry in the queue, not just the swept candidates. Building
-            # `by_id` from it and replacing the whole table would silently
-            # revert any concurrent writer's changes to unrelated rows made
-            # during that wait — exactly the convention this function's
+            # entry in the queue, not just the swept candidates. `save_queue`
+            # upserts every row it's handed, so saving `rows` (or a `by_id`
+            # built from it) rather than a *fresh* read merged with only the
+            # entries this call actually changed would overwrite any
+            # concurrent writer's changes to unrelated rows with this call's
+            # stale values of them — exactly the convention this function's
             # docstring promises to follow (mutate in place, override only
             # what changed, default everything else to the fresh read).
             by_id = {ev.entry.assignment_id: ev.entry for ev in out}

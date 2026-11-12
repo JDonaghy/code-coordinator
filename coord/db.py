@@ -1173,7 +1173,19 @@ def retry_on_locked(
 # actually creates it on an existing database). `_migrate_board_doctor_log_
 # table` then moves every entry out of the old `board_meta` JSON-blob log
 # into it, losslessly, the first time this runs.
-_DB_SCHEMA_VERSION = 26
+#
+# #3992: bumped 26 -> 27 for the new `idx_merge_queue_assignment_id` UNIQUE
+# index appended to `_SCHEMA_SQL` (not a column — `_MIGRATE_ADD_COLUMNS`
+# below is unchanged, same table-only shape as #3470/#2468/#3889 above).
+# `coord.merge_queue.save_queue` upserts by `assignment_id` via `sql.
+# upsert()`'s `ON CONFLICT (assignment_id)`, which needs a real UNIQUE
+# constraint to target rather than a hand-rolled UPDATE-then-INSERT decided
+# by `cursor.rowcount` — untrustworthy on the shared, multi-threaded SQLite
+# connection (see `coord.state.claim_review_post`'s #3668 comment for why).
+# `_dedupe_merge_queue_assignment_ids` runs immediately before this index is
+# created so an upgrading database that already carries duplicate
+# `assignment_id` rows doesn't fail the `CREATE UNIQUE INDEX` outright.
+_DB_SCHEMA_VERSION = 27
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1267,6 +1279,31 @@ def _fix_schema_version_table(conn: sqlite3.Connection) -> None:
         """,
     )
     conn.commit()
+
+
+def _dedupe_merge_queue_assignment_ids(conn: sqlite3.Connection) -> None:
+    """Collapse duplicate ``merge_queue.assignment_id`` rows, keeping the
+    highest ``id`` (the most recently written row) for each key.
+
+    Runs immediately ahead of ``_SCHEMA_SQL``'s ``CREATE UNIQUE INDEX
+    idx_merge_queue_assignment_id`` (#3992) — that statement fails outright
+    on a database that still carries a duplicate, which a database that
+    predates this index could, in principle, already have.
+
+    A no-op (one cheap ``DELETE`` matching zero rows) on a database with no
+    duplicates, and on a fresh database that has no ``merge_queue`` table
+    yet at all — the missing-table driver error is swallowed the same way
+    :func:`_read_schema_version` swallows it.
+    """
+    try:
+        sql.execute(
+            conn,
+            "DELETE FROM merge_queue WHERE id NOT IN "
+            "(SELECT MAX(id) FROM merge_queue GROUP BY assignment_id)",
+        )
+        conn.commit()
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+        rollback_after_driver_error(conn, exc)  # table doesn't exist yet
 
 
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
@@ -2158,6 +2195,14 @@ _SCHEMA_SQL = """
         CREATE INDEX IF NOT EXISTS idx_assignments_dispatched_at
             ON assignments(dispatched_at);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
+        -- #3992: backs `save_queue`'s `sql.upsert(..., conflict_columns=
+        -- ["assignment_id"])` — `ON CONFLICT (assignment_id)` needs a real
+        -- UNIQUE constraint to target. `_dedupe_merge_queue_assignment_ids`
+        -- runs ahead of this in `_ensure_schema` so an upgrading database
+        -- already carrying a duplicate `assignment_id` doesn't fail this
+        -- statement outright.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_queue_assignment_id
+            ON merge_queue(assignment_id);
         CREATE INDEX IF NOT EXISTS idx_issue_context_issue
             ON issue_context(repo_name, issue_number);
         CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
@@ -2205,6 +2250,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     backend-specific schema syntax itself.
     """
     _fix_schema_version_table(conn)
+    _dedupe_merge_queue_assignment_ids(conn)
     dialect = sql.detect_dialect(conn)
     pk_ddl = sql.autoincrement_pk_ddl(dialect)
     schema_sql = _SCHEMA_SQL.replace("__AUTOPK_DDL__", pk_ddl)

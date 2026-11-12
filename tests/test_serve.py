@@ -781,12 +781,13 @@ def test_serve_merge_drop_serializes_on_merge_lock(
 
     ``drop_entry()`` issues a direct SQL ``DELETE`` on the row, but a
     concurrent real merge's ``load_queue()`` -> mutate -> ``save_queue()``
-    cycle replaces the WHOLE table (see ``merge_queue.save_queue``). If that
-    merge already snapshotted the queue (via ``load_queue()``) before this
-    drop's ``DELETE`` lands, its own ``save_queue()`` writes the stale
-    snapshot back over the table and silently resurrects the just-dropped
-    row. Taking ``_merge_lock`` around the drop closes the same gap #1400
-    closed for two concurrent ``/merge`` requests.
+    cycle upserts every row in its snapshot (see ``merge_queue.save_queue``).
+    If that merge already snapshotted the queue (via ``load_queue()``)
+    before this drop's ``DELETE`` lands, its own ``save_queue()`` finds the
+    dropped row's key gone and re-inserts it from the stale snapshot,
+    silently resurrecting the just-dropped row. Taking ``_merge_lock``
+    around the drop closes the same gap #1400 closed for two concurrent
+    ``/merge`` requests.
 
     Holds ``_merge_lock`` in the main thread and fires the drop request on a
     background thread; asserts the request blocks (the row is still present)
