@@ -1086,8 +1086,8 @@ def collect_needs_decomposition_comments(
     comments, no needs-decomposition comment, or the fetch itself fails —
     a best-effort enrichment, not a precondition for dispatching the leg.
     """
-    from coord import github_ops
-    from coord.comments import parse_marker
+    from coord import github_ops  # noqa: PLC0415
+    from coord.comments import parse_marker  # noqa: PLC0415
 
     try:
         raw_comments = github_ops.get_issue_comments(repo_github, issue_number)
@@ -1637,9 +1637,63 @@ def file_and_queue_split_proposal(
 #: :func:`file_and_queue_split_proposal`.
 NEEDS_DECOMPOSITION_SPLIT_ORIGIN = "work leg's needs-decomposition split proposal"
 
-#: The ``origin`` text the board-doctor's #3986 act tier
+#: The ``origin`` text the board-doctor's decomposition act tier
 #: (`coord.board_doctor_policy`) passes to :func:`consume_split_verdict`.
 BOARD_DOCTOR_DECOMPOSITION_ORIGIN = "board-doctor decomposition-followup leg"
+
+#: :func:`consume_split_verdict`'s filed-proposal rationale, keyed by
+#: *origin* — the two callers describe genuinely different provenance (a
+#: worker leg's own proposal versus a dedicated read-only followup leg
+#: the board doctor dispatched), so one hardcoded sentence for both would
+#: misstate whichever one did not actually happen. A caller passing some
+#: other *origin* string gets a rationale built straight from it instead
+#: of a silently wrong guess.
+_SPLIT_RATIONALE_BY_ORIGIN: dict[str, str] = {
+    NEEDS_DECOMPOSITION_SPLIT_ORIGIN: (
+        "a worker leg concluded this issue needs decomposition and "
+        "proposed this split"
+    ),
+    BOARD_DOCTOR_DECOMPOSITION_ORIGIN: (
+        "a worker leg concluded this issue needs decomposition and a "
+        "read-only decomposition-followup leg proposed this split"
+    ),
+}
+
+
+def find_filed_split_epic(repo: "Repo", issue_number: int) -> int | None:
+    """An already-filed split epic for *issue_number* in *repo*, if its
+    original is still open.
+
+    :func:`file_and_queue_split_proposal` writes the literal body text
+    ``f"Split from #{issue_number} by "`` into the epic it creates before
+    doing anything else that can fail (re-pointing queued dependents,
+    closing the original) — so a caller that wants to know "did an
+    earlier attempt already get far enough to create the epic, even if it
+    never finished superseding the original" can answer from that marker
+    alone, without needing its own separate bookkeeping. The trailing
+    ``" by "`` anchors the match so issue ``#397`` can never match a
+    marker actually written for ``#3979``.
+
+    Scans *repo*'s OPEN issues only — a split epic is itself an open
+    tracking issue the moment it is filed, and the original being
+    superseded is the only thing this exists to protect against re-filing
+    for. Returns ``None`` when nothing matches, or when the issue list
+    itself cannot be fetched — a best-effort guard against a duplicate
+    filing, never a precondition the caller must satisfy first.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    marker = f"Split from #{issue_number} by "
+    try:
+        candidates = github_ops.get_open_issues(repo.github)
+    except Exception:  # noqa: BLE001 — best-effort guard, not a precondition
+        return None
+    for candidate in candidates:
+        if marker in (candidate.get("body") or ""):
+            number = candidate.get("number")
+            if isinstance(number, int):
+                return number
+    return None
 
 
 def consume_split_verdict(
@@ -1689,9 +1743,10 @@ def consume_split_verdict(
     )
     if proposal is None:
         return None
-    proposal.rationale = (
-        "a worker leg concluded this issue needs decomposition and a "
-        "read-only decomposition-followup leg proposed this split"
+    proposal.rationale = _SPLIT_RATIONALE_BY_ORIGIN.get(
+        origin,
+        f"a worker leg concluded this issue needs decomposition; {origin} "
+        "proposed this split",
     )
 
     from coord.preflight_size import verify_split_proposal  # noqa: PLC0415

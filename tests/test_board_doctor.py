@@ -2366,11 +2366,10 @@ class TestNeedsDecompositionRowClassification:
     cause — never `queue_diagnose.CAUSE_NO_PR`, which IS investigate-
     eligible.
 
-    #3986 superseded this cause's own tier: see
-    `TestNeedsDecompositionRoutesToTheActTier` and
-    `TestNeedsDecompositionLegDispatcher` below for what the sweep now
-    DOES with it — this class only pins the classification itself, which
-    #3986 does not change.
+    See `TestNeedsDecompositionRoutesToTheActTier` and
+    `TestNeedsDecompositionLegDispatcher` below for what the sweep does
+    with this cause once classified — this class only pins the
+    classification itself.
 
     Same end-to-end shape as `TestNeverDispatchedRowReachesTheSweep` above:
     `queue_diagnose.run_pass` -> `coord.board_doctor.drive_queue_rows` ->
@@ -2619,6 +2618,40 @@ class TestNeedsDecompositionLegDispatcher:
         assert len(dispatch_calls) == 1
         assert state.list_drive_escalations() == []
 
+    def test_dispatch_failure_produces_one_alert_and_no_assignment(
+        self, monkeypatch,
+    ) -> None:
+        """A `SizeTriageError` out of `dispatch_size_triage_review` itself
+        (an unreachable machine, a missing repo path, an HTTP failure) —
+        distinct from a consume-side failure — alerts once and leaves no
+        assignment behind to be mistaken for an in-flight leg later."""
+        import coord.commands._common as common
+        from coord.board_doctor_policy import AUTO_DISPATCHERS
+        from coord.decomposition_chat import SizeTriageError
+
+        config = self._config()
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"state": "OPEN", "title": "A giant issue", "body": "do it all"},
+        )
+        self._prose_proposals(monkeypatch)
+
+        board = Board(active=[], completed=[])
+        monkeypatch.setattr("coord.state.build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.decomposition_chat.dispatch_size_triage_review",
+            lambda **k: (_ for _ in ()).throw(
+                SizeTriageError("agent 'dell64' rejected the size-triage dispatch")
+            ),
+        )
+
+        dispatched = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+
+        assert dispatched is False
+        assert board.active == []
+        assert len(state.list_drive_escalations()) == 1
+
     def _terminal_board(self, *, raw_log: str, monkeypatch) -> Board:
         from coord.decomposition_chat import board_doctor_decomposition_review_target_for
 
@@ -2672,6 +2705,13 @@ class TestNeedsDecompositionLegDispatcher:
         from coord.drive_queue import entry_key
         from coord.state import list_drive_queue
 
+        issue_state = {"state": "OPEN"}
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {**issue_state, "title": "A giant issue"},
+        )
+        monkeypatch.setattr("coord.github_ops.get_open_issues", lambda *a, **k: [])
+
         with (
             patch("coord.github_ops.create_issue") as mock_create,
             patch("coord.github_ops.update_issue_body"),
@@ -2702,13 +2742,43 @@ class TestNeedsDecompositionLegDispatcher:
                 assert original_key not in row["after_json"]
 
             # The original's own (parked) row is gone from the drive queue
-            # entirely (`dequeue_drive_queue`, inside `AUTO_DISPATCHERS`'s
-            # own success path) — a SECOND sweep's `collect_rows` builds
-            # its row set from exactly this same `list_drive_queue()` read,
-            # so there is nothing left for it to even classify as stuck
-            # for this issue, let alone dispatch a second decomposition-
-            # followup leg or file a second epic against.
+            # entirely (`dispatch_sweep_action("drive_queue_remove", ...)`,
+            # inside `AUTO_DISPATCHERS`'s own success path).
             assert (self.REPO, self.ISSUE) not in rows
+
+            # The real-world consequence of filing the split is that
+            # GitHub now reports the original as closed.
+            issue_state["state"] = "CLOSED"
+
+            # A SECOND sweep's `collect_rows` does NOT see an empty row
+            # set here — `block_log`'s episode for this key was never
+            # resolved (nothing in this path writes an `EVENT_RESOLVE`
+            # record), so `_episode_stuck_row` rebuilds the exact same
+            # stuck row from the episode's own stored diagnosis, and
+            # `_decomposition_followthrough` matches the SAME terminal
+            # assignment on the board again. The idempotency guard inside
+            # `_consume_decomposition_leg` — re-reading the original's now
+            # ``CLOSED`` GitHub state — is what actually stops a second
+            # epic from being filed, not an empty row set.
+            from coord.board_doctor import _episode_stuck_row
+
+            episode = {
+                "key": original_key,
+                "state": "parked",
+                "diagnosed_cause": queue_diagnose.CAUSE_NEEDS_DECOMPOSITION,
+                "diagnosis_confidence": "high",
+                "diagnosis_evidence": (),
+            }
+            second_row = _episode_stuck_row(episode)
+            assert second_row is not None
+
+            second_result = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](
+                second_row
+            )
+            assert second_result is False
+            assert mock_create.call_count == 3  # no fourth call — no new epic
+            mock_close.assert_called_once()  # no second close
+            assert state.list_drive_escalations() == []  # no new alert either
 
     def test_gate_rejected_split_produces_one_alert_and_files_nothing(
         self, monkeypatch,
@@ -2732,6 +2802,11 @@ class TestNeedsDecompositionLegDispatcher:
             "coord.preflight_size.verify_split_proposal",
             lambda proposal: SplitVerification(ok=False, reason="overlaps in-flight work"),
         )
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"state": "OPEN", "title": "A giant issue"},
+        )
+        monkeypatch.setattr("coord.github_ops.get_open_issues", lambda *a, **k: [])
 
         with patch("coord.github_ops.create_issue") as mock_create:
             from coord.board_doctor_policy import AUTO_DISPATCHERS
@@ -2741,11 +2816,45 @@ class TestNeedsDecompositionLegDispatcher:
             mock_create.assert_not_called()
             assert len(state.list_drive_escalations()) == 1
 
-            # #3986: "never relaunch the original Work leg" — a second
-            # sweep must not file a second epic, and the alert stays a
-            # single row, not a growing pile.
+            # "Never relaunch the original Work leg" — a second sweep must
+            # not file a second epic, and the alert stays a single row,
+            # not a growing pile.
             second = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
             assert second is False
+            mock_create.assert_not_called()
+            assert len(state.list_drive_escalations()) == 1
+
+    def test_prose_only_response_produces_one_alert_and_files_nothing(
+        self, monkeypatch,
+    ) -> None:
+        """The prose-only/truncated shape this issue exists for: the
+        decomposition-followup leg's raw log carries no `SIZE_TRIAGE_
+        VERDICT:` line at all — `parse_size_triage_response` raises
+        `SizeTriageError` before `verify_split_proposal` is ever reached,
+        which is a DIFFERENT failure path than the gate-rejection test
+        above (that one parses fine and fails verification instead)."""
+        import coord.commands._common as common
+
+        config = self._config()
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+        raw_log = (
+            "I looked at this issue and I think it would be cleanest to "
+            "split it along the API/CLI boundary, but I'm not going to "
+            "commit to an exact file list here."
+        )
+        self._terminal_board(raw_log=raw_log, monkeypatch=monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"state": "OPEN", "title": "A giant issue"},
+        )
+        monkeypatch.setattr("coord.github_ops.get_open_issues", lambda *a, **k: [])
+
+        with patch("coord.github_ops.create_issue") as mock_create:
+            from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+            result = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+            assert result is False
             mock_create.assert_not_called()
             assert len(state.list_drive_escalations()) == 1
 

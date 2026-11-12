@@ -167,8 +167,8 @@ class TestPolicyTierOf:
             # #3979: a terminal park has no external verdict to resume it,
             # so it must never auto-dispatch or compete for the shared
             # investigate-tier budget — see TestAlertResolutionTerminalPark
-            # below for the alert text itself. #3986 moved
-            # `CAUSE_NEEDS_DECOMPOSITION` OFF this list onto its own
+            # below for the alert text itself. `CAUSE_NEEDS_DECOMPOSITION`
+            # is NOT in this tuple: it routes through its own
             # `DECOMPOSITION_CAUSES` act tier (a mechanically-gated split
             # filing, not a fix-it leg) — see `TestNeedsDecomposition
             # RoutesToTheActTier`/`TestNeedsDecompositionLegDispatcher` in
