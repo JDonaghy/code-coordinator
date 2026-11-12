@@ -306,18 +306,23 @@ AUTO_DISPATCHERS: dict[str, Callable[[StuckRow], bool]] = {}
 #: no-ops (#3768's in-flight lock and machine-routing refusal).
 INVESTIGATE_CAUSES: set[str] = set()
 
-#: Causes routed to the #3986 decomposition act tier — a THIRD, separate
-#: bucket from :data:`ALLOWLIST` and :data:`INVESTIGATE_CAUSES`, because the
-#: action it dispatches (a read-only decomposition-followup leg, then a
-#: mechanically-verified split filing) is not on `coord.board_doctor_
-#: permissions.SAFE_TIER_ACTIONS` at all — that closed allow-list governs
-#: actions which mutate a drive-queue/merge-queue ROW; filing a split is a
-#: GitHub-issue-filing primitive with its OWN, already-reviewed mechanical
-#: gate (`coord.preflight_size.verify_split_proposal`), the same one
-#: `coord.dispatch.enforce_preflight_guard` (#3818) and #3980's
+#: Causes routed to the decomposition act tier — a THIRD, separate bucket
+#: from :data:`ALLOWLIST` and :data:`INVESTIGATE_CAUSES`, because dispatching
+#: a read-only decomposition-followup leg and filing the split it proposes
+#: is not on `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` at all —
+#: that closed allow-list governs actions which mutate a drive-queue/
+#: merge-queue ROW; filing a split is a GitHub-issue-filing primitive with
+#: its OWN, already-reviewed mechanical gate
+#: (`coord.preflight_size.verify_split_proposal`), the same one
+#: `coord.dispatch.enforce_preflight_guard` and
 #: `coord.decomposition_chat.auto_split_needs_decomposition` already call
-#: directly with no `SAFE_TIER_ACTIONS` entry of their own. Populated only
-#: via :func:`_register_decomposition_action`.
+#: directly with no `SAFE_TIER_ACTIONS` entry of their own. The ONE
+#: drive-queue-row mutation this tier does perform — removing the
+#: superseded original once its split is confirmed filed — still goes
+#: through `dispatch_sweep_action("drive_queue_remove", ...)`, the same
+#: authorized primitive every other tier's row removal uses; only the
+#: leg-dispatch/split-filing half answers to the separate mechanical gate
+#: above. Populated only via :func:`_register_decomposition_action`.
 DECOMPOSITION_CAUSES: set[str] = set()
 
 
@@ -2268,23 +2273,56 @@ def _consume_decomposition_leg(
     terminal: "Assignment",
     config: "Config",
 ) -> bool:
-    """#3986: the "a decomposition-followup leg already ran" half — fetch
-    its raw log and feed it through the SAME `coord.decomposition_chat.
-    consume_split_verdict` chain #3980's own auto-split uses, so a verified
-    SPLIT is filed exactly once and anything else alerts instead of
-    retrying.
+    """The "a decomposition-followup leg already ran" half — fetch its raw
+    log and feed it through the SAME `coord.decomposition_chat.
+    consume_split_verdict` chain `coord.decomposition_chat.
+    auto_split_needs_decomposition` uses, so a verified SPLIT is filed
+    exactly once and anything else alerts instead of retrying.
+
+    `_decomposition_followthrough`'s board scan matches the SAME terminal
+    `Assignment` on every later sweep for as long as it stays on the
+    board — nothing in this module ever removes it, and `block_log`'s own
+    episode for this row only resolves via a tick that still sees the key
+    in the queue, which a filed split's own dequeue ensures never happens
+    again. So this function is its own idempotency boundary: it re-reads
+    the original issue's live GitHub state, and separately checks for an
+    already-filed epic, BEFORE ever calling `consume_split_verdict` again
+    for the same `terminal` leg — two checks, because a single "is the
+    original closed" test only catches the shape where filing fully
+    succeeded; it misses a filing that raised partway through (the epic,
+    maybe its children, already exist, but closing the original failed
+    and never ran), which the epic-body marker scan catches instead.
 
     Every failure branch here is terminal for THIS leg — it calls
-    :func:`_alert_fallback` and returns ``False``, never raises. The one
-    decomposition leg this issue is ever allowed is this exact `terminal`
-    assignment (enforced by :func:`_decomposition_followthrough`'s board
-    scan, not by anything in this function), so there is nothing left to
-    retry even on failure — `coord.board_doctor.sweep`'s own convergence
-    counter (`CONVERGENCE_LIMIT`) stops calling this dispatcher at all
-    once it has been observed enough times, falling to the plain alert
-    path for good.
+    :func:`_alert_fallback` and returns ``False``, never raises, except
+    the two idempotency short-circuits below, which quietly return
+    ``False`` with no new alert since there is nothing new to report: an
+    earlier sweep already alerted (or already succeeded) for this exact
+    leg.
     """
     import click  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        issue_data = github_ops.get_issue(repo.github, issue_number)
+    except RuntimeError as exc:
+        click.echo(
+            f"warning: board-doctor could not fetch {repo.name}#"
+            f"{issue_number} to consume its decomposition-followup leg: "
+            f"{exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    if str(issue_data.get("state") or "").upper() == "CLOSED":
+        # A split for this exact terminal leg was already filed (and the
+        # original closed) by an earlier sweep — or an operator closed it
+        # some other way. Either way there is nothing left for this leg
+        # to do, and no new alert: whichever sweep actually finished this
+        # already reported its own outcome.
+        return False
 
     machine = next(
         (m for m in config.machines if m.name == terminal.machine_name), None
@@ -2304,6 +2342,29 @@ def _consume_decomposition_leg(
         BOARD_DOCTOR_DECOMPOSITION_ORIGIN,
         SizeTriageError,
         consume_split_verdict,
+        find_filed_split_epic,
+    )
+
+    existing_epic = find_filed_split_epic(repo, issue_number)
+    if existing_epic is not None:
+        # The original is still open, but an epic for it already exists —
+        # a previous consume got far enough to file the epic (and maybe
+        # its children) before something downstream (re-pointing a
+        # dependent, closing the original) raised. Filing a second epic
+        # from the same raw log would duplicate it; finishing the
+        # supersede by hand is now an operator's job.
+        click.echo(
+            f"warning: board-doctor found an already-filed split epic "
+            f"#{existing_epic} for {repo.name}#{issue_number} that never "
+            "confirmed superseding the original — not filing a second "
+            "one",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    issue_title = (
+        issue_data.get("title") or terminal.issue_title or f"issue #{issue_number}"
     )
 
     try:
@@ -2311,7 +2372,7 @@ def _consume_decomposition_leg(
             raw_log,
             repo=repo,
             issue_number=issue_number,
-            issue_title=terminal.issue_title or f"issue #{issue_number}",
+            issue_title=issue_title,
             origin=BOARD_DOCTOR_DECOMPOSITION_ORIGIN,
         )
     except SizeTriageError as exc:
@@ -2335,20 +2396,26 @@ def _consume_decomposition_leg(
         # A clean PROCEED verdict: the followup leg read the issue and
         # decided no split is warranted after all. Nothing was filed, so
         # the row stays parked exactly as it was — an operator judgment
-        # call, same as every other #3979 terminal-park cause, so this
-        # alerts rather than silently leaving it with no next step named.
+        # call, same as every other terminal-park cause, so this alerts
+        # rather than silently leaving it with no next step named.
         _alert_fallback(row)
         return False
 
-    from coord.state import dequeue_drive_queue  # noqa: PLC0415
-
     try:
-        dequeue_drive_queue(repo.name, issue_number, operator=False)
-    except Exception as exc:  # noqa: BLE001
+        removal = dispatch_sweep_action("drive_queue_remove", repo.name, issue_number)
+    except SweepPermissionError as exc:
         click.echo(
             f"warning: board-doctor filed epic #{epic_number} for "
-            f"{repo.name}#{issue_number} but could not dequeue the "
-            f"superseded original: {exc}",
+            f"{repo.name}#{issue_number} but the sweep refused to remove "
+            f"its superseded drive-queue row: {exc}",
+            err=True,
+        )
+        return True
+    if not removal.get("removed"):
+        click.echo(
+            f"warning: board-doctor filed epic #{epic_number} for "
+            f"{repo.name}#{issue_number} but its drive-queue row did not "
+            "confirm removed",
             err=True,
         )
     return True
@@ -2460,14 +2527,16 @@ def _register_decomposition_action(
     cause: str, handler: Callable[[StuckRow], bool]
 ) -> None:
     """The only way this module may populate :data:`DECOMPOSITION_CAUSES` /
-    :data:`AUTO_DISPATCHERS` for the #3986 decomposition act tier.
+    :data:`AUTO_DISPATCHERS` for the decomposition act tier.
 
-    Deliberately does NOT call `authorize_sweep_action` the way
-    :func:`_register_auto_action`/:func:`_register_investigate_action` do
-    — see :data:`DECOMPOSITION_CAUSES`'s own docstring for why this tier
-    answers to a different, already-reviewed mechanical gate
+    Deliberately does NOT call `authorize_sweep_action` for the tier as a
+    whole the way :func:`_register_auto_action`/
+    :func:`_register_investigate_action` do — see
+    :data:`DECOMPOSITION_CAUSES`'s own docstring for why leg-dispatch and
+    split-filing answer to a different, already-reviewed mechanical gate
     (`coord.preflight_size.verify_split_proposal`) instead of
-    `SAFE_TIER_ACTIONS`.
+    `SAFE_TIER_ACTIONS`. The registered handler's own drive-queue-row
+    removal still goes through `dispatch_sweep_action` at the call site.
     """
     DECOMPOSITION_CAUSES.add(cause)
     AUTO_DISPATCHERS[cause] = handler
