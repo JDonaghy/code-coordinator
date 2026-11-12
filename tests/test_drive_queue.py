@@ -74,6 +74,8 @@ from coord.drive_queue import (
     plan_tick,
     remaining_fix_rounds,
     render_plan,
+    rewrite_after_for_split,
+    sink_children,
     summarize_drive_queue,
     total_fix_round_budget,
     unreachable_wait_alert,
@@ -386,6 +388,61 @@ def test_a_malformed_after_entry_raises_rather_than_being_dropped():
     # feature exists to prevent.
     with pytest.raises(QueueError, match="malformed"):
         parse_after_spec("not-an-issue", REPO)
+
+
+# ── split-supersede dependent re-pointing (#3984) ────────────────────────────
+
+
+def test_sink_children_excludes_a_node_something_else_depends_on():
+    """#3984: split into `C1 -> C2` plus a parallel `C3` — C1 is excluded
+    (C2 depends on it), C2 and C3 are each a chain's own tail."""
+    from coord.milestone_order import WorkOrderNode
+
+    nodes = (
+        WorkOrderNode(issue_number=501, after=()),
+        WorkOrderNode(issue_number=502, after=(501,)),
+        WorkOrderNode(issue_number=503, after=()),
+    )
+    assert sink_children(nodes) == [502, 503]
+
+
+def test_sink_children_of_a_single_linear_chain_is_just_the_tail():
+    from coord.milestone_order import WorkOrderNode
+
+    nodes = (
+        WorkOrderNode(issue_number=501, after=()),
+        WorkOrderNode(issue_number=502, after=(501,)),
+        WorkOrderNode(issue_number=503, after=(502,)),
+    )
+    assert sink_children(nodes) == [503]
+
+
+def test_rewrite_after_for_split_drops_original_and_appends_sinks():
+    """D1's `after=O` becomes `after=C2,C3` — the acceptance shape."""
+    assert rewrite_after_for_split(
+        ["repo#99"], "repo#99", ["repo#502", "repo#503"]
+    ) == ["repo#502", "repo#503"]
+
+
+def test_rewrite_after_for_split_keeps_other_prereqs_before_the_sinks():
+    """D2's `after=O,X` becomes `after=X,C2,C3` — the OTHER pre-req (`X`) is
+    kept, the superseded original is dropped, and the sink children are
+    appended after it, not spliced into O's old position."""
+    assert rewrite_after_for_split(
+        ["repo#99", "repo#300"], "repo#99", ["repo#502", "repo#503"]
+    ) == ["repo#300", "repo#502", "repo#503"]
+
+
+def test_rewrite_after_for_split_is_a_no_op_when_original_key_absent():
+    assert rewrite_after_for_split(
+        ["repo#300"], "repo#99", ["repo#502", "repo#503"]
+    ) == ["repo#300"]
+
+
+def test_rewrite_after_for_split_deduplicates_an_already_named_sink():
+    assert rewrite_after_for_split(
+        ["repo#99", "repo#502"], "repo#99", ["repo#502", "repo#503"]
+    ) == ["repo#502", "repo#503"]
 
 
 # ── cycle validation (the `add` gate) ────────────────────────────────────────

@@ -114,7 +114,7 @@ from coord.merge_queue import (
     is_ci_unreadable_reason,
     is_stale_smoke_reason,
 )
-from coord.milestone_order import TRACKING_ISSUE_LABEL
+from coord.milestone_order import TRACKING_ISSUE_LABEL, WorkOrderNode
 from coord.models import (
     CLOSES_ISSUE_TYPES,
     EPIC_DECOMPOSE_TYPE,
@@ -1648,6 +1648,51 @@ def parse_after_spec(raw: str | Iterable[str], default_repo: str) -> list[str]:
             seen.add(key)
             out.append(key)
     return out
+
+
+def sink_children(nodes: Iterable[WorkOrderNode]) -> list[int]:
+    """The subset of a split's children nothing else in *nodes* depends on.
+
+    A split's own ``after=`` graph can fan out into more than one
+    independent chain (e.g. ``C1 -> C2`` alongside a parallel ``C3``) — this
+    is every chain's own tail, i.e. the split's full "everything landed"
+    frontier. :func:`coord.decomposition_chat.file_and_queue_split_proposal`
+    re-points a dependent chained on the SUPERSEDED original onto exactly
+    this set: a dependent re-pointed at only the last-filed child would
+    launch the moment that ONE chain lands, while a sibling chain is still
+    mid-flight (#3984).
+
+    Order follows *nodes*' own order, not issue-number order — filed issue
+    numbers need not increase in work-order position order.
+    """
+    nodes = list(nodes)
+    depended_on = {dep for node in nodes for dep in node.after}
+    return [node.issue_number for node in nodes if node.issue_number not in depended_on]
+
+
+def rewrite_after_for_split(
+    after: Sequence[str], original_key: str, sink_keys: Sequence[str]
+) -> list[str]:
+    """Drop *original_key* from *after* and append *sink_keys* in its place.
+
+    Every OTHER pre-req *after* already names (the ``X`` in ``after=O,X``)
+    is kept, untouched — a dependent chained on more than the superseded
+    original still waits on those too. De-duplicates, preserving
+    first-seen order, so a dependent that already names one of the sink
+    children (unusual, but not impossible) doesn't end up listing it
+    twice. Returns a list with the same keys and order as *after* — never
+    raises — when *original_key* isn't present; callers are expected to
+    check that themselves before deciding whether a rewrite happened.
+    """
+    kept = [key for key in after if key != original_key]
+    if len(kept) == len(after):
+        return kept
+    seen = set(kept)
+    for key in sink_keys:
+        if key not in seen:
+            seen.add(key)
+            kept.append(key)
+    return kept
 
 
 # ── the queue row ────────────────────────────────────────────────────────────
