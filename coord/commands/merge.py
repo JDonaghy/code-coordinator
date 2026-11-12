@@ -386,9 +386,7 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
     # so a fresh conflict elsewhere isn't clobbered.
     if sweep_events:
         try:
-            fresh = _mq.load_queue()
-            by_id = {ev.entry.assignment_id: ev.entry for ev in sweep_events}
-            _mq.save_queue([by_id.get(x.assignment_id, x) for x in fresh])
+            _save_merge_back([ev.entry for ev in sweep_events])
         except Exception as e:  # noqa: BLE001 — fail open, per the sweep's own contract
             click.echo(
                 "  sibling-conflict fix-dispatch state failed to persist "
@@ -1748,6 +1746,37 @@ def _board_row_merge_gate_ok(a, config, board, gh_ops: "GhOps | None") -> bool:
     return merge_decision is not None and merge_decision.ok
 
 
+def _save_merge_back(mutated: list) -> None:
+    """Persist *mutated* queue entries over a fresh reload, keyed by
+    ``assignment_id`` — the shared tail of every merge-back save in
+    :func:`merge` (the ``--only`` path, the standing-conflict early return,
+    and the whole-queue path all reach this instead of repeating it).
+
+    Reloads the queue right before saving, then overrides only the rows
+    *mutated* actually touched — :func:`coord.merge_queue.save_queue` itself
+    now upserts by key (#3992) rather than replacing the whole table, so a
+    row this call never saw (inserted by a concurrent writer between this
+    command's own earlier load and this save) is left exactly as that
+    writer left it.
+
+    #3992: a row in *mutated* can be entirely missing from the fresh
+    reload — a concurrent prune/archive sweep removed it, or it never made
+    it to disk in the first place — in which case the dict-merge above
+    would silently drop it, discarding whatever this call just mutated
+    (e.g. a ``--only`` entry moved to CONFLICT/MERGED this very pass).
+    Appended back explicitly so a save never loses the entry it was
+    actually asked to persist.
+    """
+    from coord import merge_queue as _mq  # noqa: PLC0415
+
+    fresh = _mq.load_queue()
+    by_id = {x.assignment_id: x for x in mutated}
+    merged = [by_id.get(x.assignment_id, x) for x in fresh]
+    seen_ids = {x.assignment_id for x in fresh}
+    merged.extend(x for x in mutated if x.assignment_id not in seen_ids)
+    _mq.save_queue(merged)
+
+
 def _explain_missing_only_entry(
     key: str, config, gh_ops: "GhOps | None" = None
 ) -> list[str]:
@@ -2497,12 +2526,7 @@ def merge(
                 cfg_only, dry_run=dry_run,
             )
             if not dry_run:
-                all_items_only = mq.load_queue()
-                by_id_only = {only_entry.assignment_id: only_entry}
-                merged_only = [
-                    by_id_only.get(x.assignment_id, x) for x in all_items_only
-                ]
-                mq.save_queue(merged_only)
+                _save_merge_back([only_entry])
         # #2157/#3836: the dispatch above can land `only_entry` on MERGED
         # (e.g. a future in-pass takeover reachable from this retry), same
         # as the early MERGED short-circuit above it — re-check here too, so
@@ -2631,10 +2655,7 @@ def merge(
         )
         if not dry_run:
             # Save only the modified entry back; all other entries are untouched.
-            all_items_only = mq.load_queue()
-            by_id_only = {only_entry.assignment_id: only_entry}
-            merged_only = [by_id_only.get(x.assignment_id, x) for x in all_items_only]
-            mq.save_queue(merged_only)
+            _save_merge_back([only_entry])
         click.echo("")
         click.echo(
             "Summary (--only): "
@@ -3013,10 +3034,7 @@ def merge(
             # redispatch above mutated (e.g. a retry-cap escalation to
             # HUMAN_REQUIRED) before returning, same convention as the
             # --only path above.
-            all_items = mq.load_queue()
-            by_id = {x.assignment_id: x for x in items}
-            merged = [by_id.get(x.assignment_id, x) for x in all_items]
-            mq.save_queue(merged)
+            _save_merge_back(items)
         # Still surface terminal states so the user knows what happened.
         for x in items:
             click.echo(f"  [{x.state}] {x.repo_name} #{x.issue_number} ({x.branch})")
@@ -3091,10 +3109,7 @@ def merge(
     # Save state only when we actually moved
     if not dry_run:
         # Persist the updated entries by merging back over the on-disk queue.
-        all_items = mq.load_queue()
-        by_id = {x.assignment_id: x for x in items}
-        merged = [by_id.get(x.assignment_id, x) for x in all_items]
-        mq.save_queue(merged)
+        _save_merge_back(items)
 
     # Summary
     states: dict[str, int] = {}

@@ -372,11 +372,48 @@ class TestPersistence:
     def test_load_empty_returns_empty(self, coord_db) -> None:
         assert load_queue() == []
 
-    def test_save_replaces_all(self, coord_db) -> None:
+    def test_save_upserts_without_deleting_rows_it_was_not_given(self, coord_db) -> None:
+        """#3992: `save_queue` used to `DELETE FROM merge_queue` and
+        re-insert the whole table from its *items* argument on every call —
+        a second save with a different snapshot silently erased the first
+        one's row. It now upserts by `assignment_id`: a row this call
+        wasn't handed is left exactly as it was.
+        """
         save_queue([_q("old")])
         save_queue([_q("new1"), _q("new2")])
         items = load_queue()
-        assert [x.assignment_id for x in items] == ["new1", "new2"]
+        assert {x.assignment_id for x in items} == {"old", "new1", "new2"}
+
+    def test_save_updates_existing_row_in_place(self, coord_db) -> None:
+        save_queue([_q("a", size=10), _q("b", size=20)])
+        save_queue([_q("a", size=99)])
+        items = {x.assignment_id: x for x in load_queue()}
+        assert items["a"].size == 99
+        assert items["b"].size == 20  # untouched by the second save
+
+    def test_interleaved_writers_do_not_lose_each_others_rows(self, coord_db) -> None:
+        """#3992 acceptance: A loads, B enqueues X and saves, A modifies a
+        different row and saves. X must survive A's save even though A's
+        in-memory snapshot predates X and never mentions it.
+        """
+        save_queue([_q("y")])
+
+        # Writer A loads its snapshot first.
+        a_items = load_queue()
+
+        # Writer B enqueues a brand-new entry X and saves — A's snapshot
+        # has no idea this happened.
+        save_queue([_q("x")])
+
+        # Writer A now modifies a row it DID see (not X) and saves late.
+        for entry in a_items:
+            if entry.assignment_id == "y":
+                entry.size = 777
+        save_queue(a_items)
+
+        items = {x.assignment_id: x for x in load_queue()}
+        assert set(items) == {"x", "y"}
+        assert items["y"].size == 777
 
     def test_roundtrip_preserves_assignment_type(self, coord_db) -> None:
         # #1077: assignment_type must survive a save/load cycle so the merge
@@ -9307,6 +9344,75 @@ class TestDropEntry:
         assert "aid" not in remaining
 
 
+class TestDeleteEntries:
+    """#3992: delete_entries() is the explicit, audited counterpart to
+    save_queue()'s upsert-only contract — the only way a row leaves the
+    table now, besides a direct archive sweep.
+    """
+
+    def test_removes_rows_by_key(self, coord_db) -> None:
+        save_queue([_q("aid1"), _q("aid2")])
+        removed = mq.delete_entries([_q("aid1")], reason="test removal")
+        assert removed == 1
+        assert [x.assignment_id for x in load_queue()] == ["aid2"]
+
+    def test_records_one_audit_row_per_removed_entry(self, coord_db) -> None:
+        from coord.audit import query_audit_log
+
+        save_queue([_q("aid1"), _q("aid2")])
+        mq.delete_entries([_q("aid1"), _q("aid2")], reason="test sweep")
+        rows = query_audit_log(event_type="queue_entry_removed")["entries"]
+        assert len(rows) == 2
+        assert {r["assignment_id"] for r in rows} == {"aid1", "aid2"}
+        assert all(r["details"]["reason"] == "test sweep" for r in rows)
+
+    def test_does_not_audit_or_count_an_entry_already_gone(self, coord_db) -> None:
+        from coord.audit import query_audit_log
+
+        save_queue([_q("aid1")])
+        removed = mq.delete_entries([_q("ghost")], reason="test removal")
+        assert removed == 0
+        rows = query_audit_log(event_type="queue_entry_removed")["entries"]
+        assert rows == []
+        assert [x.assignment_id for x in load_queue()] == ["aid1"]
+
+    def test_drop_entry_records_an_audit_row(self, coord_db) -> None:
+        from coord.audit import query_audit_log
+
+        save_queue([_q("aid1")])
+        assert mq.drop_entry("aid1") is True
+        rows = query_audit_log(event_type="queue_entry_removed")["entries"]
+        assert len(rows) == 1
+        assert rows[0]["assignment_id"] == "aid1"
+
+
+class TestRekeyEntry:
+    """#3992: rekey_entry() renames a row's own assignment_id (the key
+    save_queue upserts on), which a plain save_queue([...]) upsert of the
+    already-renamed object can't do — it would match on the NEW id, find
+    nothing, and insert a second row instead of renaming the first.
+    """
+
+    def test_renames_row_in_place_without_duplicating(self, coord_db) -> None:
+        save_queue([_q("old-aid", size=5), _q("other")])
+        renamed_entry = _q("new-aid", size=5)
+        renamed = mq.rekey_entry("old-aid", renamed_entry)
+        assert renamed is True
+        items = {x.assignment_id: x for x in load_queue()}
+        assert set(items) == {"new-aid", "other"}
+        assert items["new-aid"].size == 5
+
+    def test_falls_back_to_insert_when_old_key_is_gone(self, coord_db) -> None:
+        """The row to rename vanished (e.g. a concurrent drop) -- rekey_entry
+        still leaves the right (new-keyed) entry present rather than losing
+        it entirely.
+        """
+        entry = _q("new-aid")
+        renamed = mq.rekey_entry("never-existed", entry)
+        assert renamed is False
+        assert [x.assignment_id for x in load_queue()] == ["new-aid"]
+
+
 class TestPruneStaleQueueEntries:
     """#732: prune_stale_queue_entries() removes closed-issue / merged-PR entries."""
 
@@ -9320,13 +9426,9 @@ class TestPruneStaleQueueEntries:
         monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: False)
 
         self._seed(coord_db, [
-            _q("stale", state=CONFLICT),
-            _q("live"),
-        ])
-        pruned = mq.prune_stale_queue_entries()
-        assert len(pruned) == 0  # issue_number on _q() is 1, not 217
-        # Seed with the right issue number
-        save_queue([
+            # issue_number on _q() is 1, not 217 -- the mismatch means this
+            # one must NOT be pruned despite otherwise looking stale.
+            _q("not-closed", state=CONFLICT),
             QueuedMerge(
                 assignment_id="stale217",
                 repo_name="api", repo_github="acme/api",
@@ -9337,11 +9439,9 @@ class TestPruneStaleQueueEntries:
             _q("live"),
         ])
         pruned = mq.prune_stale_queue_entries()
-        assert len(pruned) == 1
-        assert pruned[0].assignment_id == "stale217"
-        remaining = load_queue()
-        assert len(remaining) == 1
-        assert remaining[0].assignment_id == "live"
+        assert [x.assignment_id for x in pruned] == ["stale217"]
+        remaining = {x.assignment_id for x in load_queue()}
+        assert remaining == {"not-closed", "live"}
 
     def test_prunes_merged_pr(self, coord_db, monkeypatch) -> None:
         from coord import github_ops
@@ -16560,3 +16660,55 @@ class TestHeadUnmovedFixAssignmentId:
         error = f"parked. [{mq.HEAD_UNMOVED_FIX_ASSIGNMENT_MARKER_PREFIX}]"
 
         assert mq.head_unmoved_fix_assignment_id(error) is None
+
+
+# ── #3992: coord.commands.merge._save_merge_back ──────────────────────────
+
+class TestSaveMergeBack:
+    """`_save_merge_back` is the shared tail of every merge-back save in
+    `coord merge` (the ``--only`` path, the standing-conflict early return,
+    and the whole-queue path) -- it re-reads the queue fresh and persists
+    only the entries it was handed, re-inserting one that vanished from
+    disk mid-run instead of silently dropping it (#3992's second bug: the
+    ``--only`` merge-back used to never restore a vanished ``only_entry``).
+    """
+
+    def test_persists_mutated_entry_over_fresh_reload(self, coord_db) -> None:
+        from coord.commands.merge import _save_merge_back
+
+        save_queue([_q("aid1"), _q("aid2")])
+        entry = next(x for x in load_queue() if x.assignment_id == "aid1")
+        entry.state = CONFLICT
+        _save_merge_back([entry])
+        items = {x.assignment_id: x for x in load_queue()}
+        assert items["aid1"].state == CONFLICT
+        assert items["aid2"].state == PENDING
+
+    def test_reinserts_entry_missing_from_fresh_reload(self, coord_db) -> None:
+        """The entry this call was asked to persist is gone from disk by the
+        time it reloads (e.g. a concurrent drop/prune) -- it must still be
+        written back, not silently discarded.
+        """
+        from coord.commands.merge import _save_merge_back
+
+        save_queue([_q("aid1")])
+        only_entry = next(x for x in load_queue() if x.assignment_id == "aid1")
+        only_entry.state = MERGED
+        # Simulate a concurrent writer removing the row out from under this
+        # call, between its own earlier load and this save.
+        mq.drop_entry("aid1")
+
+        _save_merge_back([only_entry])
+
+        items = {x.assignment_id: x for x in load_queue()}
+        assert items["aid1"].state == MERGED
+
+    def test_does_not_touch_rows_it_was_not_given(self, coord_db) -> None:
+        from coord.commands.merge import _save_merge_back
+
+        save_queue([_q("aid1"), _q("aid2")])
+        entry = next(x for x in load_queue() if x.assignment_id == "aid1")
+        entry.error = "boom"
+        _save_merge_back([entry])
+        other = next(x for x in load_queue() if x.assignment_id == "aid2")
+        assert other.error is None
