@@ -290,11 +290,12 @@ _stdio_capture_install_lock = threading.Lock()
 #     ``daemon_reroute_target()`` check can flip and re-route B's merge back
 #     out over HTTP to itself.
 #   * does a full read-modify-write of the merge queue
-#     (``merge_queue.load_queue()`` → mutate → ``save_queue()`` replaces the
-#     WHOLE table). Two concurrent cycles built from the same stale snapshot
-#     silently lose whichever ran first's writes when the second's
-#     ``save_queue()`` overwrites them — an entry another driver just
-#     verified MERGED can revert to PENDING with no error anywhere.
+#     (``merge_queue.load_queue()`` → mutate → ``save_queue()`` upserts every
+#     row of that snapshot back by ``assignment_id``). Two concurrent cycles
+#     built from the same stale snapshot silently lose whichever ran first's
+#     writes when the second's ``save_queue()`` overwrites the same rows — an
+#     entry another driver just verified MERGED can revert to PENDING with no
+#     error anywhere.
 #
 # Both are real "silently misreports" hazards distinct from stdout
 # cross-talk, and neither is fixed by per-thread capture alone. A single
@@ -1555,7 +1556,7 @@ def _auto_drain_tick(config: Config) -> "list":
     # load->process->save cycle further down are the exact same merge-queue
     # read-modify-write hazard ``_merge_lock`` was introduced to close for
     # ``POST /merge`` — every one of these does a full ``load_queue()`` ->
-    # mutate -> ``save_queue()`` replace of the WHOLE table. Without holding
+    # mutate -> ``save_queue()`` upsert of that whole snapshot. Without holding
     # ``_merge_lock`` across *all* of them here, a driver's ``/merge``
     # request and this tick (fired independently every ~30s by
     # ``_tick_loop``, off the event loop via ``run_in_threadpool``) can
@@ -10664,11 +10665,12 @@ def build_app(
 
                 # #1400-review: a concurrent real merge can snapshot the
                 # queue via load_queue() before this drop's DELETE lands,
-                # then overwrite it right back in when its own save_queue()
-                # replaces the whole table — silently resurrecting the row
-                # this just removed. Take the same _merge_lock the merge
-                # critical section holds so the two can never interleave;
-                # see _merge_lock's module-level docstring.
+                # then write it right back in when its own save_queue()
+                # upserts every row of that pre-drop snapshot — silently
+                # resurrecting the row this just removed, because an upsert
+                # inserts a key it no longer finds. Take the same _merge_lock
+                # the merge critical section holds so the two can never
+                # interleave; see _merge_lock's module-level docstring.
                 with _merge_lock:
                     removed = _mq.drop_entry(str(drop_aid))
                 if removed:

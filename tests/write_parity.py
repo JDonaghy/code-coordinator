@@ -537,12 +537,17 @@ def _step_save_plan() -> None:
 
 
 def _step_save_merge_queue() -> None:
-    """``merge_queue`` — DELETE-all + re-INSERT under ``retry_on_locked``.
+    """``merge_queue`` — per-key UPDATE-then-INSERT under ``retry_on_locked``.
 
-    Run twice so the auto-increment key is exercised *after* a delete, which is
-    where SQLite's ``AUTOINCREMENT`` and Postgres's identity sequence are most
-    likely to disagree on absolute values (and where the harness's rank
-    normalisation earns its place).
+    The first save takes the INSERT branch for both rows; the second re-saves
+    one of them with a changed field so the UPDATE branch runs too, and its
+    ``cursor.rowcount`` (the existence check ``save_queue`` decides on) is
+    read on both drivers — rowcount semantics are exactly the kind of
+    per-driver behaviour worth diffing. Leaving the other row out of the
+    second save also pins that an un-named row keeps its surrogate ``id``,
+    which is where SQLite's ``AUTOINCREMENT`` and Postgres's identity
+    sequence are most likely to disagree on absolute values (and where the
+    harness's rank normalisation earns its place).
     """
     from coord import merge_queue
 
@@ -578,7 +583,39 @@ def _step_save_merge_queue() -> None:
         ),
     ]
     merge_queue.save_queue(items)
+    items[0].state = "merging"
+    items[0].last_attempt = StepClock.BASE + 220.0
     merge_queue.save_queue(items[:1])
+
+
+def _step_delete_merge_queue_entry() -> None:
+    """``merge_queue`` DELETE-by-key + the ``queue_entry_removed`` ``audit_log``
+    row it writes per row it actually deleted.
+
+    Two entries are named but only one exists, so the ``cursor.rowcount`` that
+    decides whether an audit row is written is exercised in both directions on
+    each driver — the already-gone entry must produce no audit row on either.
+    """
+    from coord import merge_queue
+
+    queue = {item.assignment_id: item for item in merge_queue.load_queue()}
+    merge_queue.delete_entries(
+        [
+            queue[REVIEW_ID],
+            merge_queue.QueuedMerge(
+                assignment_id="never-enqueued",
+                repo_name=REPO,
+                repo_github=REPO_GITHUB,
+                branch="issue-0000-not-a-real-branch",
+                target_branch="main",
+                issue_number=0,
+                issue_title="an entry that is not in the table",
+                state="queued",
+                enqueued_at=StepClock.BASE + 230.0,
+            ),
+        ],
+        reason="write-path parity oracle",
+    )
 
 
 def _step_enqueue_drive_queue() -> None:
@@ -667,6 +704,11 @@ WORKLOAD: tuple[WorkloadStep, ...] = (
     WorkloadStep("mark_notified", ("notifications", "assignments"), _step_mark_notified),
     WorkloadStep("save_plan", ("plans",), _step_save_plan),
     WorkloadStep("save_merge_queue", ("merge_queue",), _step_save_merge_queue),
+    WorkloadStep(
+        "delete_merge_queue_entry",
+        ("merge_queue", "audit_log"),
+        _step_delete_merge_queue_entry,
+    ),
     WorkloadStep("enqueue_drive_queue", ("drive_queue",), _step_enqueue_drive_queue),
     WorkloadStep("update_drive_queue", ("drive_queue",), _step_update_drive_queue),
     WorkloadStep("dequeue_drive_queue", ("drive_queue",), _step_dequeue_drive_queue),
