@@ -5645,6 +5645,144 @@ class TestScopedReviewCandidate:
         assert mq.only_bounded_fix_since_review(entry, board, found) is True
 
 
+class TestScopedReviewBlockReason:
+    """#3993: ``scoped_review_block_reason_for_entry`` is the single
+    predicate deciding whether a review-gate-blocked row is the ONE shape
+    (a prior approval voided by a DONE, chain-linked bounded fix) that
+    still deserves a merge-queue entry — PENDING, with the reason recorded
+    on ``entry.error`` — so
+    :func:`coord.review.dispatch_scoped_reviews_for_queue`'s PENDING-only
+    scan has a row to find. Every other failing-gate shape must return
+    ``None``: that row needs a FULL review (or its own fix), never an entry
+    this predicate has no business creating."""
+
+    @staticmethod
+    def _config(*, gates: list[str] | None = None):
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = gates if gates is not None else ["review", "test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = "passed") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done", branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    @staticmethod
+    def _review(
+        of_aid: str, *, verdict: str = "approve", head_sha: str = "abc123",
+        patch_id: str | None = "patchid-old", dispatched_at: float = 100.0,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=f"rev-{of_aid}", type="review", status="done",
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+            review_head_sha=head_sha, review_patch_id=patch_id,
+            dispatched_at=dispatched_at,
+        )
+
+    @staticmethod
+    def _conflict_fix(
+        merge_entry_id: str, *, status: str = "done", dispatched_at: float = 200.0,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] t", assignment_id="cf1",
+            type="conflict-fix", status=status,
+            review_of_assignment_id=merge_entry_id, dispatched_at=dispatched_at,
+        )
+
+    @staticmethod
+    def _voided_entry() -> QueuedMerge:
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+        return entry
+
+    def test_returns_reason_when_approval_voided_by_done_conflict_fix(self) -> None:
+        """The #3993 headline shape: approve → done conflict-fix rebase →
+        patch-id moved. The review gate is the only failure, and it's
+        entirely attributable to that bounded leg."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1")
+        fix = self._conflict_fix("w1")
+        board = self._board(completed=[work, review, fix])
+        entry = self._voided_entry()
+
+        reason = mq.scoped_review_block_reason_for_entry(entry, cfg, board)
+
+        assert reason == "review required but not approved"
+
+    def test_returns_none_with_no_prior_approval(self) -> None:
+        """A row that was never reviewed at all has no scoped candidate —
+        it must fall through to a FULL review, not a scoped one."""
+        cfg = self._config()
+        work = self._work("w1")
+        board = self._board(completed=[work])
+        entry = self._voided_entry()
+
+        assert mq.scoped_review_block_reason_for_entry(entry, cfg, board) is None
+
+    def test_returns_none_when_smoke_also_fails(self) -> None:
+        """More than one failing gate is a hard skip, even when the review
+        half would otherwise be scoped-eligible — a smoke failure needs its
+        own fix, not a sneak-in via the review-only recovery path."""
+        cfg = self._config()
+        work = self._work("w1", test_state="failed")
+        review = self._review("w1")
+        fix = self._conflict_fix("w1")
+        board = self._board(completed=[work, review, fix])
+        entry = self._voided_entry()
+
+        assert mq.scoped_review_block_reason_for_entry(entry, cfg, board) is None
+
+    def test_returns_none_when_review_gate_already_passes(self) -> None:
+        """Nothing to recover from — every gate already passes."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", head_sha="def456", patch_id="patchid-new")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+
+        assert mq.scoped_review_block_reason_for_entry(entry, cfg, board) is None
+
+    def test_returns_none_when_no_bounded_fix_explains_the_delta(self) -> None:
+        """A voided approval with nothing coord-tracked to attribute the
+        delta to (no conflict-fix, no fix round at all) stays a hard skip —
+        the same fail-closed posture ``find_scoped_review_candidate``/
+        ``only_bounded_fix_since_review`` already have."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])  # no conflict-fix at all
+        entry = self._voided_entry()
+
+        assert mq.scoped_review_block_reason_for_entry(entry, cfg, board) is None
+
+
 class TestPassesMergeGates:
     """#946: passes_merge_gates() is the shared predicate composing the
     review + smoke gates, used by every enqueue path (enqueue_approved_work,
@@ -7886,6 +8024,49 @@ class TestRefreshEntryAssignment:
         assert result is False
         assert load_queue() == []
 
+    # ── #3993: caller-supplied block reason ─────────────────────────────────
+
+    def test_stamps_error_on_freshly_created_entry(self, coord_db) -> None:
+        """A caller that already decided a row is scoped-review-eligible
+        (but still gate-blocked) can hand the reason straight through, so
+        the created entry visibly records WHY it's blocked instead of
+        reading as an ordinary clean PENDING row."""
+        work = self._work("w1")
+        result = mq.refresh_entry_assignment(
+            work, repo_github="acme/api", target_branch="main",
+            error="review required but not approved",
+        )
+        assert result is True
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].error == "review required but not approved"
+
+    def test_stamps_error_on_rekey(self, coord_db) -> None:
+        """The same reason is recorded on a re-key too — a row re-pointed
+        at a new fix assignment can still be scoped-review-blocked."""
+        orig = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", branch="worker/orig", status="done",
+        )
+        mq.enqueue(orig, repo_github="acme/api", target_branch="main")
+
+        fix = self._work("fix1", branch="worker/orig")
+        result = mq.refresh_entry_assignment(
+            fix, repo_github="acme/api", target_branch="main",
+            error="review required but not approved",
+        )
+        assert result is True
+        items = load_queue()
+        assert items[0].assignment_id == "fix1"
+        assert items[0].error == "review required but not approved"
+
+    def test_no_error_stamped_by_default(self, coord_db) -> None:
+        """The pre-#3993 default: an ordinary creation leaves ``error``
+        unset."""
+        work = self._work("fix1")
+        mq.refresh_entry_assignment(work, repo_github="acme/api", target_branch="main")
+        assert load_queue()[0].error is None
+
 
 class TestClearStaleSmokeErrorForAssignment:
     """#3917: a fresh terminal test verdict clears a persisted stale-smoke
@@ -9298,6 +9479,76 @@ class TestEnqueueApprovedWork:
         assert len(items) == 1
         assert items[0].assignment_id == "8b26520edabb"
         assert items[0].branch == "issue-1566-fix"
+
+    # ── #3993: deadlock recovery for a review-blocked row with no entry ────
+
+    def test_enqueues_blocked_entry_for_approval_voided_by_conflict_fix(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#3993: a review approval voided ONLY by a DONE, chain-linked
+        conflict-fix rebase must still get a merge-queue entry — PENDING,
+        with the block reason recorded on ``entry.error`` — so
+        ``coord.review.dispatch_scoped_reviews_for_queue``'s PENDING-only
+        scan has a row to find and re-review. Before #3993 this shape fell
+        straight into the gate-blocked ``continue``: no entry, nothing for
+        the scanner to see, and the drive's only recovery paths
+        (``enqueue_approved_work`` itself, and the ``--only`` retry that
+        calls it) could never create one for a gate-blocked row."""
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+        monkeypatch.setattr(
+            github_ops, "get_branch_sha",
+            lambda repo, branch: "sha-new" if branch == "issue-1-impl" else "sha-main",
+        )
+        monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda *a, **k: "patchid-new")
+        monkeypatch.setattr(github_ops, "get_compare_diff", lambda *a, **k: None)
+
+        cfg = self._config()
+        work = self._work("w1", branch="issue-1-impl", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-old"
+        review.review_patch_id = "patchid-old"
+        review.dispatched_at = 100.0
+        conflict_fix = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] t", assignment_id="cf1",
+            type="conflict-fix", status="done",
+            review_of_assignment_id="w1", dispatched_at=200.0,
+        )
+        board = self._board(completed=[work, review, conflict_fix])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["w1"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "w1"
+        assert items[0].state == mq.PENDING
+        assert items[0].error == "review required but not approved"
+
+    def test_does_not_enqueue_blocked_row_with_no_prior_approval(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#3993 acceptance: a row that was NEVER approved at all (no
+        scoped-review candidate exists) must be left for the full-review
+        path — ``enqueue_approved_work`` must not create a merge-queue
+        entry for it just because #3993 widened the one review-gate-blocked
+        shape it handles."""
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+        monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: "sha-new")
+        monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda *a, **k: "patchid-new")
+
+        cfg = self._config()
+        work = self._work("w1", branch="issue-1-impl", test_state="passed")
+        board = self._board(completed=[work])  # no review at all
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []
+        assert load_queue() == []
 
 
 class TestPendingSummary:

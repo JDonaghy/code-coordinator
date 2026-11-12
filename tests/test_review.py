@@ -5045,6 +5045,46 @@ def test_dispatch_scoped_reviews_for_queue_dispatches_when_eligible(
     assert dispatched[0].review_of_assignment_id == "w1"
 
 
+def test_dispatch_scoped_reviews_for_queue_dispatches_for_entry_with_recorded_block_reason(
+    two_machine_config: Config,
+) -> None:
+    """#3993: a merge-queue entry created by
+    ``coord.merge_queue.enqueue_approved_work``'s recovery path for a
+    review-blocked row carries ``entry.error`` set to the block reason
+    (#1695's same visibility a gate-blocked ``coord merge`` row already
+    gets). This scan must still find and dispatch a scoped re-review for
+    it — the PENDING/``requires_review`` eligibility check this function
+    runs is unconditioned on ``entry.error`` at all, so a pre-recorded
+    block reason must never make the row invisible to it."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING, error="review required but not approved")
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"  # differs from prior.review_patch_id
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-recovered"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+    assert dispatched[0].review_of_assignment_id == "w1"
+
+
 def test_dispatch_scoped_reviews_for_queue_dispatches_when_fix_round_intervened(
     two_machine_config: Config,
 ) -> None:
