@@ -537,17 +537,17 @@ def _step_save_plan() -> None:
 
 
 def _step_save_merge_queue() -> None:
-    """``merge_queue`` — per-key UPDATE-then-INSERT under ``retry_on_locked``.
+    """``merge_queue`` — per-key ``sql.upsert`` (``INSERT ... ON CONFLICT
+    (assignment_id) DO UPDATE``) under ``retry_on_locked``.
 
-    The first save takes the INSERT branch for both rows; the second re-saves
-    one of them with a changed field so the UPDATE branch runs too, and its
-    ``cursor.rowcount`` (the existence check ``save_queue`` decides on) is
-    read on both drivers — rowcount semantics are exactly the kind of
-    per-driver behaviour worth diffing. Leaving the other row out of the
-    second save also pins that an un-named row keeps its surrogate ``id``,
-    which is where SQLite's ``AUTOINCREMENT`` and Postgres's identity
-    sequence are most likely to disagree on absolute values (and where the
-    harness's rank normalisation earns its place).
+    The first save takes the INSERT branch for both rows; the second
+    re-saves one of them with a changed field so the ``DO UPDATE`` branch
+    runs too — the two branches of the same ``ON CONFLICT`` clause are
+    exactly the kind of per-driver behaviour worth diffing. Leaving the
+    other row out of the second save also pins that an un-named row keeps
+    its surrogate ``id``, which is where SQLite's ``AUTOINCREMENT`` and
+    Postgres's identity sequence are most likely to disagree on absolute
+    values (and where the harness's rank normalisation earns its place).
     """
     from coord import merge_queue
 
@@ -592,9 +592,10 @@ def _step_delete_merge_queue_entry() -> None:
     """``merge_queue`` DELETE-by-key + the ``queue_entry_removed`` ``audit_log``
     row it writes per row it actually deleted.
 
-    Two entries are named but only one exists, so the ``cursor.rowcount`` that
-    decides whether an audit row is written is exercised in both directions on
-    each driver — the already-gone entry must produce no audit row on either.
+    Two entries are named but only one exists, so the read-back ``delete_
+    entries`` uses (instead of ``cursor.rowcount``) to decide whether an
+    audit row is written is exercised in both directions on each driver —
+    the already-gone entry must produce no audit row on either.
     """
     from coord import merge_queue
 
