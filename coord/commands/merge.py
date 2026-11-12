@@ -2340,14 +2340,33 @@ def merge(
             # a row with a genuinely STALE verdict used to read as "gated"
             # here and get enqueued (and then merge-attempted) on the same
             # false-green basis the fallback message below was fixed for.
+            #
+            # #3993: a row that ISN'T fully gated can still be worth the
+            # inline scan — when the only thing blocking it is a review
+            # gate that `mq.scoped_review_block_reason` confirms is a voided
+            # approval eligible for a SCOPED re-review (a prior approve
+            # voided by a DONE conflict-fix/ci-fix/fix-round, not a fresh
+            # never-reviewed row). `enqueue_approved_work` itself only ever
+            # creates an entry for that one shape when a gate is failing —
+            # every other failing-gate row still falls straight through to
+            # `_explain_missing_only_entry` below, unchanged. This is the
+            # ONLY place the drive's `--only` retry can recover a review
+            # voided by a conflict-fix whose merge-queue entry went missing
+            # (or was never created) — without it the row deadlocks: no
+            # entry exists for `dispatch_scoped_reviews_for_queue` to scan,
+            # and nothing else ever re-creates one for a gate-blocked row on
+            # this path.
             _retry_board = load_board()
             if _retry_board is not None:
                 _retry_rows = mq.resolve_board_work_key(_retry_board, only_assignment)
-                _retry_all_gated = bool(_retry_rows) and all(
+                _retry_all_recoverable = bool(_retry_rows) and all(
                     _board_row_merge_gate_ok(a, cfg_only, _retry_board, gh_ops)
+                    or mq.scoped_review_block_reason(
+                        a, cfg_only, _retry_board, gh_ops,
+                    ) is not None
                     for a in _retry_rows
                 )
-                if _retry_all_gated:
+                if _retry_all_recoverable:
                     mq.enqueue_approved_work(cfg_only, _retry_board)
                     only_queue = mq.load_queue()
                     only_entry = mq.resolve_entry_key(only_queue, only_assignment)

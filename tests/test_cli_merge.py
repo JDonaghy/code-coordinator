@@ -766,6 +766,80 @@ class TestMergeOnly:
         states = {e.assignment_id: e.state for e in mq.load_queue()}
         assert states.get("w1845") == mq.MERGED, result.output
 
+    def test_only_recovers_review_blocked_row_with_no_queue_entry(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#3993: a review approval voided ONLY by a DONE conflict-fix, with
+        NO merge-queue entry at all (lost, or never created), must still get
+        an entry out of `--only`'s inline recovery scan — even though the
+        review gate is still failing. Before #3993 the inline scan only ran
+        when `_board_row_merge_gate_ok` was already True for every matching
+        row, so a genuinely gate-blocked row (this one) never reached
+        `enqueue_approved_work` at all: no entry, nothing for
+        `dispatch_scoped_reviews_for_queue`'s PENDING-only scan to find, and
+        the row deadlocked exactly like the quadraui#2409 incident.
+
+        The merge itself still correctly refuses (the review gate is not
+        waived here) — #3993 is about the entry existing and being visibly
+        blocked, not about skipping the gate.
+        """
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=3993,
+            issue_title="#3993", assignment_id="w3993", type="work",
+            status="done", branch="issue-3993-fix", test_state="passed",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=3993,
+            issue_title="[review] #3993", assignment_id="rev3993", type="review",
+            status="done", review_of_assignment_id="w3993", review_verdict="approve",
+            review_head_sha="sha-old", review_patch_id="patchid-old",
+            dispatched_at=100.0,
+        )
+        conflict_fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=3993,
+            issue_title="[conflict-fix] #3993", assignment_id="cf3993",
+            type="conflict-fix", status="done",
+            review_of_assignment_id="w3993", dispatched_at=200.0,
+        )
+        save_board(Board(active=[], completed=[work, review, conflict_fix]))
+        # No `_seed_queue(...)` call — the entry is missing entirely, the
+        # exact quadraui#2409 shape (lost after the conflict-fix landed).
+        assert mq.load_queue() == []
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 3993, "url": "u/3993", "existed": False}
+
+        with patch("coord.github_ops.work_is_terminal", return_value=False), \
+             patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch(
+                 "coord.github_ops.get_branch_sha",
+                 side_effect=lambda repo, branch: (
+                     "sha-new" if branch == "issue-3993-fix" else "sha-main"
+                 ),
+             ), \
+             patch("coord.github_ops.get_branch_patch_id", return_value="patchid-new"), \
+             patch("coord.github_ops.get_compare_diff", return_value=None):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "w3993"]
+            )
+
+        # The merge itself is still refused — the review gate is real and
+        # unwaived (SAFETY: enqueueing changed visibility, not eligibility,
+        # same invariant #1695 established) — but the entry must now exist,
+        # PENDING, visibly naming the review gate as the reason.
+        entries = [e for e in mq.load_queue() if e.issue_number == 3993]
+        assert len(entries) == 1, f"expected an entry to be created: {mq.load_queue()}"
+        assert entries[0].state != mq.MERGED
+        assert "review_required" in result.output, result.output
+        merge_fn.assert_not_called()
+
     def test_only_errors_when_entry_not_found(
         self, config_file: Path, coord_dir: Path
     ) -> None:

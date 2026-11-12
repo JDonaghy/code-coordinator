@@ -1976,6 +1976,80 @@ def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
     return not merge_gate_failures(a, config, board, gh_ops, stop_early=True)
 
 
+def scoped_review_block_reason_for_entry(
+    gate_entry: "QueuedMerge", config, board, gh_ops: "GhOps | None" = None,
+) -> str | None:
+    """``None`` unless *gate_entry* is blocked on EXACTLY the one shape
+    #3993 exists to recover: the review gate is the ONLY failing gate, and
+    the reason it fails is a prior ``approve`` (or ``request-changes``)
+    review that :func:`find_scoped_review_candidate` confirms was voided
+    ONLY by a DONE, chain-linked bounded leg
+    (:func:`only_bounded_fix_since_review` — a conflict-fix rebase, a
+    ci-fix, or an ordinary fix round).
+
+    Returns the (short, human-readable) block reason string when eligible —
+    the same wording :func:`merge_gate_failures` would report — so a caller
+    can both decide *whether* to enqueue a review-blocked row and record
+    *why* it's blocked on the resulting entry (``entry.error``), matching
+    what the ``coord merge`` (no ``--only``) auto-enqueue scan already does
+    for a visibly-``BLOCKED`` row (#1695).
+
+    Callers: :func:`enqueue_approved_work` (already has *gate_entry* built
+    via :func:`live_gate_entry`) and the ``coord merge --only`` retry path
+    in :mod:`coord.commands.merge` (via :func:`scoped_review_block_reason`,
+    which builds *gate_entry* from a raw board ``Assignment`` first). Having
+    both call through this one predicate keeps "is this row scoped-review
+    eligible" a single answer rather than two independently-maintained
+    ones (#2096).
+
+    ``None`` — meaning "not this path" — when:
+
+    - Every gate passes (nothing to recover from).
+    - More than one gate fails, or the one failing gate isn't ``review``
+      (a smoke/uat failure needs its own fix, not a scoped re-review).
+    - No prior approval was voided by a bounded fix at all — a fresh
+      review, never approved, still needs a FULL review, not a scoped one.
+    """
+    failures = merge_gate_failures(gate_entry, config, board, gh_ops)
+    if len(failures) != 1 or failures[0].gate != "review":
+        return None
+    prior_review = find_scoped_review_candidate(
+        gate_entry, board, gh_ops,
+        config=config,
+        verdicts=("approve", "request-changes"),
+    )
+    if prior_review is None:
+        return None
+    if not only_bounded_fix_since_review(gate_entry, board, prior_review):
+        return None
+    return failures[0].reason
+
+
+def scoped_review_block_reason(
+    a, config, board, gh_ops: "GhOps | None" = None,
+) -> str | None:
+    """Like :func:`scoped_review_block_reason_for_entry`, but for a raw work
+    ``Assignment`` *a* rather than an already-built ``QueuedMerge`` — builds
+    the live-anchored entry via :func:`live_gate_entry` first (mirroring
+    :func:`enqueue_approved_work`'s own construction) so a caller that only
+    has the board row, not a pre-built gate entry (``coord merge --only``'s
+    retry path), can ask the identical question.
+
+    ``None`` when *a*'s repo isn't configured, in addition to every ``None``
+    case :func:`scoped_review_block_reason_for_entry` covers.
+    """
+    from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+
+    repo_cfg = config.repo(a.repo_name)
+    if repo_cfg is None:
+        return None
+    target_branch = resolve_base_branch_for_issue_number(
+        repo_cfg, repo_cfg.github, getattr(a, "issue_number", 0),
+    )
+    gate_entry = live_gate_entry(a, repo_cfg.github, target_branch, gh_ops)
+    return scoped_review_block_reason_for_entry(gate_entry, config, board, gh_ops)
+
+
 # ── Smoke-verdict outcome kinds (#1640) ─────────────────────────────────────
 # The gate has always been a bool; #1640 splits the *failure* into the two
 # cases an operator has to act on differently:
@@ -6080,8 +6154,33 @@ def enqueue_approved_work(config, board=None) -> list[str]:
         # can still be confirmed via `_gho` (already available in this
         # function for the terminal-state check below).
         gate_entry = live_gate_entry(a, repo_cfg.github, target_branch, _gho)
+        scoped_block_reason: str | None = None
         if not passes_merge_gates(gate_entry, config, board, gh_ops=_gho):
-            continue
+            # #3993: a review-gate failure that is actually a voided
+            # approval — a prior `approve`/`request-changes` the branch's
+            # patch-id has since moved past, under a DONE bounded fix
+            # (conflict-fix rebase, ci-fix, or ordinary fix round) — still
+            # needs an entry, in PENDING state with the block reason
+            # recorded on `entry.error`, so
+            # `coord.review.dispatch_scoped_reviews_for_queue`'s scan (which
+            # only ever looks at PENDING merge-queue entries) has a row to
+            # find and re-review. Without this, a drive whose only recovery
+            # path is `enqueue_approved_work` (the daemon tick, `coord
+            # notify`, the drive-queue tick, and the `--only` retry) can
+            # never create that entry — it refuses every gate-blocked row —
+            # and the voided approval is never re-checked (#1695's scan,
+            # which DOES enqueue a gate-blocked row, is a `coord merge`
+            # no-`--only` pass the drive never runs).
+            #
+            # Any other shape (smoke/uat failing, or a review gate with no
+            # prior approval to scope around) is still a hard skip here —
+            # that row needs a FULL review or a real fix, not an entry this
+            # function has no business creating.
+            scoped_block_reason = scoped_review_block_reason_for_entry(
+                gate_entry, config, board, gh_ops=_gho,
+            )
+            if scoped_block_reason is None:
+                continue
 
         # Gate 3: not already terminal on GitHub (merged / closed).  Fail OPEN
         # on transient gh errors so a network blip never blocks a real enqueue.
@@ -6103,6 +6202,7 @@ def enqueue_approved_work(config, board=None) -> list[str]:
             a,
             repo_github=repo_cfg.github,
             target_branch=target_branch,
+            error=scoped_block_reason,
         ):
             changed.append(aid)
 
@@ -6113,6 +6213,8 @@ def refresh_entry_assignment(
     assignment: Assignment,
     repo_github: str,
     target_branch: str,
+    *,
+    error: str | None = None,
 ) -> bool:
     """Ensure a PENDING queue entry exists for *assignment*'s branch and
     is keyed to *assignment*.
@@ -6130,6 +6232,16 @@ def refresh_entry_assignment(
       updated and any stale ``"review required"`` error is cleared.
     - If the entry is in a terminal state (MERGED, CONFLICT, etc.) it is
       left untouched.
+
+    *error* (#3993), when given, is stamped onto ``entry.error`` whether
+    the entry is freshly created or re-keyed — the block-reason string a
+    caller (:func:`scoped_review_block_reason_for_entry` /
+    :func:`scoped_review_block_reason`) already computed, so an entry
+    created for a row the review gate still blocks visibly records WHY
+    instead of reading as an ordinary clean PENDING row — the same
+    visibility #1695's ``coord merge`` auto-enqueue scan gives a
+    gate-blocked row. ``None`` (the default) preserves the pre-#3993
+    behaviour of an unset error on a fresh entry.
 
     Returns ``True`` when a change was made (entry created or updated).
     """
@@ -6172,6 +6284,7 @@ def refresh_entry_assignment(
             assignment_type=assignment.type,
             # #1213: snapshot the resolved gate list, same as enqueue().
             required_gates=list(assignment.required_gates or []),
+            error=error,
         )
         items.append(entry)
         save_queue(items)
@@ -6198,6 +6311,11 @@ def refresh_entry_assignment(
     # Clear a stale "review required" error now that a fresh approval arrived.
     if existing.error == "review required but not approved":
         existing.error = None
+    # #3993: record the caller-supplied block reason even on a re-key — a
+    # row re-pointed at a new fix assignment can still be blocked (the
+    # scoped-review-eligible shape this function exists to make visible).
+    if error is not None:
+        existing.error = error
     # #3992: this mutation changes the row's own key (assignment_id), not
     # just a field on it — `rekey_entry` updates the row found under its
     # OLD key rather than a plain `save_queue([existing])` upsert, which
