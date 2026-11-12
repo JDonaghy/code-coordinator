@@ -476,18 +476,27 @@ def test_a_genuine_no_pr_stall_with_no_marker_still_classifies_no_pr():
 
 
 def test_needs_decomposition_is_not_auto_or_investigate_eligible():
-    """#3979's whole point: the new cause must never land on the
-    auto-dispatch or investigate tier — `coord.board_doctor_policy.
-    policy_tier_of` must read it as alert-only, the same place an
-    unregistered cause already lands."""
-    from coord import board_doctor_policy as bdp
-    from coord.board_doctor import TIER_ALERT
+    """#3979's whole point: the new cause must never land on the #3760
+    mechanical allowlist or the #3769 investigate tier — those answer to
+    `SAFE_TIER_ACTIONS`, a closed list this cause has no entry on.
 
-    for cause in (
-        qd.CAUSE_NEEDS_DECOMPOSITION,
-        qd.CAUSE_PREMISE_REFUSAL,
-        qd.CAUSE_UPSTREAM_GAP_PARK,
-    ):
+    `premise-refusal`/`upstream-gap-park` stay fully alert-only (no safe
+    act exists for either). `needs-decomposition` itself moved to its OWN
+    `DECOMPOSITION_CAUSES` act tier in #3986 — a read-only decomposition
+    leg followed by the SAME mechanically-gated split filing #3980's
+    auto-split already uses, not a `SAFE_TIER_ACTIONS` action — so
+    `policy_tier_of` now reads it as `TIER_AUTO` via that separate route.
+    See `tests/test_board_doctor.py::TestNeedsDecompositionLegDispatcher`
+    for the real dispatcher end to end."""
+    from coord import board_doctor_policy as bdp
+    from coord.board_doctor import TIER_ALERT, TIER_AUTO
+
+    for cause in (qd.CAUSE_PREMISE_REFUSAL, qd.CAUSE_UPSTREAM_GAP_PARK):
         assert cause not in bdp.ALLOWLIST
         assert cause not in bdp.INVESTIGATE_CAUSES
         assert bdp.policy_tier_of(cause) == TIER_ALERT
+
+    assert qd.CAUSE_NEEDS_DECOMPOSITION not in bdp.ALLOWLIST
+    assert qd.CAUSE_NEEDS_DECOMPOSITION not in bdp.INVESTIGATE_CAUSES
+    assert qd.CAUSE_NEEDS_DECOMPOSITION in bdp.DECOMPOSITION_CAUSES
+    assert bdp.policy_tier_of(qd.CAUSE_NEEDS_DECOMPOSITION) == TIER_AUTO

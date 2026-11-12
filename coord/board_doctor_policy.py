@@ -244,7 +244,7 @@ from coord.queue_diagnose import DiagnosisOption, EnvProbeResult
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
-    from coord.models import Board, Machine
+    from coord.models import Assignment, Board, Machine, Repo
 
 #: A fix-it-leg dispatch is already in flight for this row — both
 #: `coord.board_doctor_permissions.sweep_dispatch_fixit_leg` detail strings
@@ -306,6 +306,20 @@ AUTO_DISPATCHERS: dict[str, Callable[[StuckRow], bool]] = {}
 #: no-ops (#3768's in-flight lock and machine-routing refusal).
 INVESTIGATE_CAUSES: set[str] = set()
 
+#: Causes routed to the #3986 decomposition act tier — a THIRD, separate
+#: bucket from :data:`ALLOWLIST` and :data:`INVESTIGATE_CAUSES`, because the
+#: action it dispatches (a read-only decomposition-followup leg, then a
+#: mechanically-verified split filing) is not on `coord.board_doctor_
+#: permissions.SAFE_TIER_ACTIONS` at all — that closed allow-list governs
+#: actions which mutate a drive-queue/merge-queue ROW; filing a split is a
+#: GitHub-issue-filing primitive with its OWN, already-reviewed mechanical
+#: gate (`coord.preflight_size.verify_split_proposal`), the same one
+#: `coord.dispatch.enforce_preflight_guard` (#3818) and #3980's
+#: `coord.decomposition_chat.auto_split_needs_decomposition` already call
+#: directly with no `SAFE_TIER_ACTIONS` entry of their own. Populated only
+#: via :func:`_register_decomposition_action`.
+DECOMPOSITION_CAUSES: set[str] = set()
+
 
 def _register_auto_action(
     cause: str, action: str, handler: Callable[[StuckRow], bool]
@@ -339,9 +353,11 @@ def policy_tier_of(cause: str) -> str:
     """#3745's C2 (extended by #3769): cause -> tier policy.
 
     Returns :data:`coord.board_doctor.TIER_AUTO` for a *cause* reaching
-    auto-tier by either of two routes, each gated on the same safe-tier
-    check so neither can promote a cause for an action
-    `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` does not permit:
+    auto-tier by any of three routes — the first two gated on the same
+    safe-tier check so neither can promote a cause for an action
+    `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` does not permit;
+    the third answers to its own, separate mechanical gate instead (see
+    :data:`DECOMPOSITION_CAUSES`'s own docstring for why):
 
     * The #3760 mechanical route — *cause* present in BOTH
       :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS`, and the action
@@ -349,6 +365,8 @@ def policy_tier_of(cause: str) -> str:
     * The #3769 investigate route — *cause* present in BOTH
       :data:`INVESTIGATE_CAUSES` and :data:`AUTO_DISPATCHERS`, and
       ``"dispatch_fixit_leg"`` is on ``SAFE_TIER_ACTIONS``.
+    * The #3986 decomposition route — *cause* present in BOTH
+      :data:`DECOMPOSITION_CAUSES` and :data:`AUTO_DISPATCHERS`.
 
     Everything else — including an :data:`ALLOWLIST` entry naming an
     action outside the safe tier, which :func:`_register_auto_action` will
@@ -365,6 +383,8 @@ def policy_tier_of(cause: str) -> str:
         and cause in AUTO_DISPATCHERS
         and _INVESTIGATE_ACTION in SAFE_TIER_ACTIONS
     ):
+        return TIER_AUTO
+    if cause in DECOMPOSITION_CAUSES and cause in AUTO_DISPATCHERS:
         return TIER_AUTO
     return TIER_ALERT
 
@@ -2133,6 +2153,329 @@ for _investigate_cause in (
 ):
     _register_investigate_action(_investigate_cause)
 del _investigate_cause
+
+
+def _decomposition_tier_enabled(repo_name: str, config: "Config") -> bool:
+    """#3986: the ONE gate for the decomposition act tier — NOT a new
+    per-repo ``board_doctor.*`` opt-in (the issue's own instruction), but
+    the exact switch #3985 already gates the identical mechanical filing
+    path with: `coord.config.Config.auto_split_enabled`. A repo that
+    trusts that gate to file a split a WORK leg proposed has already
+    trusted it to file one a read-only decomposition-followup leg
+    proposes — the mechanical verification
+    (`coord.preflight_size.verify_split_proposal`) in between is identical
+    either way.
+    """
+    return config.auto_split_enabled(repo_name)
+
+
+def _decomposition_leg_machine(repo_name: str, config: "Config") -> "Machine | None":
+    """Pick a machine for the #3986 decomposition-followup leg.
+
+    Delegates to `coord.new_issue_chat.pick_new_issue_chat_machine` — ANY
+    unpaused machine with a resolved ``repo_path`` for *repo_name*, no
+    freshness/capacity weighting — rather than inventing a second "which
+    machine" answer here (#2096): that function's own docstring already
+    states the reason this leg shares, verbatim: read-only and
+    short-lived, so any qualified machine works.
+    """
+    from coord.new_issue_chat import pick_new_issue_chat_machine  # noqa: PLC0415
+
+    return pick_new_issue_chat_machine(config, repo_name)
+
+
+def _dispatch_decomposition_leg(
+    row: StuckRow,
+    *,
+    repo: "Repo",
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+) -> bool:
+    """#3986: the "nothing dispatched yet" half of the decomposition act
+    tier — fire the one read-only decomposition-followup leg this issue is
+    ever allowed (the one-shot cap is the board scan in
+    :func:`_decomposition_followthrough`, which never calls this a second
+    time once a matching `review_target` exists on the board).
+    """
+    import click  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        SizeTriageError,
+        board_doctor_decomposition_review_target_for,
+        collect_needs_decomposition_comments,
+        dispatch_size_triage_review,
+    )
+
+    try:
+        issue_data = github_ops.get_issue(repo.github, issue_number)
+    except RuntimeError as exc:
+        click.echo(
+            f"warning: board-doctor could not fetch {repo.name}#{issue_number} "
+            f"to dispatch its decomposition-followup leg: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    # Already closed by some other path (an operator's own split, a
+    # replayed transition) — nothing left to decompose; leave quietly,
+    # same fail-open posture `auto_split_needs_decomposition` takes for a
+    # closed original.
+    if str(issue_data.get("state") or "").upper() == "CLOSED":
+        return False
+
+    machine = _decomposition_leg_machine(repo.name, config)
+    if machine is None:
+        click.echo(
+            f"warning: board-doctor NOT decomposing {repo.name}#{issue_number} "
+            "— no unpaused machine with a resolved repo_path claims this repo",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    prior_proposals = collect_needs_decomposition_comments(repo.github, issue_number)
+
+    try:
+        dispatch_size_triage_review(
+            repo_cfg=repo,
+            machine=machine,
+            issue_number=issue_number,
+            issue_title=issue_data.get("title") or f"issue #{issue_number}",
+            issue_body=issue_data.get("body") or "",
+            board=board,
+            prior_proposals=prior_proposals,
+            review_target=board_doctor_decomposition_review_target_for(issue_number),
+        )
+    except SizeTriageError as exc:
+        click.echo(
+            f"warning: board-doctor decomposition-followup leg not "
+            f"dispatched for {repo.name}#{issue_number}: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+    return True
+
+
+def _consume_decomposition_leg(
+    row: StuckRow,
+    *,
+    repo: "Repo",
+    issue_number: int,
+    terminal: "Assignment",
+    config: "Config",
+) -> bool:
+    """#3986: the "a decomposition-followup leg already ran" half — fetch
+    its raw log and feed it through the SAME `coord.decomposition_chat.
+    consume_split_verdict` chain #3980's own auto-split uses, so a verified
+    SPLIT is filed exactly once and anything else alerts instead of
+    retrying.
+
+    Every failure branch here is terminal for THIS leg — it calls
+    :func:`_alert_fallback` and returns ``False``, never raises. The one
+    decomposition leg this issue is ever allowed is this exact `terminal`
+    assignment (enforced by :func:`_decomposition_followthrough`'s board
+    scan, not by anything in this function), so there is nothing left to
+    retry even on failure — `coord.board_doctor.sweep`'s own convergence
+    counter (`CONVERGENCE_LIMIT`) stops calling this dispatcher at all
+    once it has been observed enough times, falling to the plain alert
+    path for good.
+    """
+    import click  # noqa: PLC0415
+
+    machine = next(
+        (m for m in config.machines if m.name == terminal.machine_name), None
+    )
+    if machine is None or not terminal.assignment_id:
+        _alert_fallback(row)
+        return False
+
+    from coord.notify import _fetch_raw_log_text_by_id  # noqa: PLC0415
+
+    raw_log = _fetch_raw_log_text_by_id(terminal.assignment_id, None, machine.host)
+    if raw_log is None:
+        _alert_fallback(row)
+        return False
+
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        BOARD_DOCTOR_DECOMPOSITION_ORIGIN,
+        SizeTriageError,
+        consume_split_verdict,
+    )
+
+    try:
+        epic_number = consume_split_verdict(
+            raw_log,
+            repo=repo,
+            issue_number=issue_number,
+            issue_title=terminal.issue_title or f"issue #{issue_number}",
+            origin=BOARD_DOCTOR_DECOMPOSITION_ORIGIN,
+        )
+    except SizeTriageError as exc:
+        click.echo(
+            f"warning: board-doctor decomposition-followup leg for "
+            f"{repo.name}#{issue_number} produced no usable split: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+    except Exception as exc:  # noqa: BLE001 — never crash the sweep
+        click.echo(
+            f"warning: board-doctor decomposition-followup leg for "
+            f"{repo.name}#{issue_number} failed while filing its split: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    if epic_number is None:
+        # A clean PROCEED verdict: the followup leg read the issue and
+        # decided no split is warranted after all. Nothing was filed, so
+        # the row stays parked exactly as it was — an operator judgment
+        # call, same as every other #3979 terminal-park cause, so this
+        # alerts rather than silently leaving it with no next step named.
+        _alert_fallback(row)
+        return False
+
+    from coord.state import dequeue_drive_queue  # noqa: PLC0415
+
+    try:
+        dequeue_drive_queue(repo.name, issue_number, operator=False)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(
+            f"warning: board-doctor filed epic #{epic_number} for "
+            f"{repo.name}#{issue_number} but could not dequeue the "
+            f"superseded original: {exc}",
+            err=True,
+        )
+    return True
+
+
+def _decomposition_followthrough(row: StuckRow) -> bool:
+    """#3986's C2/C1-shaped wiring for
+    :data:`queue_diagnose.CAUSE_NEEDS_DECOMPOSITION`: act, don't just
+    alert, on a terminal needs-decomposition park — dispatch ONE read-only
+    decomposition-followup leg per issue, then consume its verdict the
+    next time this fires and the leg has gone terminal.
+
+    The one-shot cap ("at most one decomposition leg per issue") is this
+    function's own scan of `board.active`/`board.completed` for an
+    assignment whose `review_target` is `coord.decomposition_chat.
+    board_doctor_decomposition_review_target_for(issue_number)` — the
+    IDENTICAL "has a matching leg already run" ledger `coord.dispatch.
+    enforce_preflight_guard` (#3818) already relies on for its own
+    size-triage dispatch, scoped to THIS leg's own distinct review_target
+    so the two can never mistake the other's terminal leg for their own.
+    Three outcomes:
+
+    * No matching assignment at all — dispatch one
+      (:func:`_dispatch_decomposition_leg`); a confirmed dispatch returns
+      ``True``.
+    * A matching assignment still non-terminal — the leg is already
+      running; leave it alone, no alert, same as :func:`_investigate`'s
+      own in-flight branch. Returns ``False``.
+    * A matching assignment that has gone terminal — consume its verdict
+      (:func:`_consume_decomposition_leg`): a verified split files +
+      queues the epic, dequeues the superseded original, and returns
+      ``True``; anything else (unparseable, PROCEED, gate-rejected, a
+      filing failure) alerts via :func:`_alert_fallback` and returns
+      ``False`` — "never relaunch the original Work leg" per the issue's
+      own instruction, so there is no third attempt.
+
+    Before any of that, :func:`_decomposition_tier_enabled` gates the
+    whole tier on `decomposition.auto_split` (#3985's own switch, not a
+    new opt-in) — a repo that has not opted in falls back to the alert
+    tier exactly like every other gated tier in this module does when
+    disarmed.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        _alert_fallback(row)
+        return False
+    repo_name, issue_number = parsed
+
+    import click  # noqa: PLC0415
+
+    from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
+
+    try:
+        config = resolve_and_load_config(None)
+    except ConfigError as exc:
+        click.echo(
+            f"warning: board-doctor could not load config to decompose "
+            f"{repo_name}#{issue_number}: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    if not _decomposition_tier_enabled(repo_name, config):
+        click.echo(
+            f"warning: board-doctor NOT decomposing {repo_name}#{issue_number} "
+            "— decomposition.auto_split is disarmed for this repo (#3985); "
+            "falling back to the alert tier instead of dispatching a "
+            "decomposition-followup leg (#3986)",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    repo = config.repo(repo_name)
+    if repo is None:
+        _alert_fallback(row)
+        return False
+
+    from coord.dao import TERMINAL_STATUSES  # noqa: PLC0415
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        board_doctor_decomposition_review_target_for,
+    )
+    from coord.state import build_board  # noqa: PLC0415
+
+    board = build_board()
+    review_target = board_doctor_decomposition_review_target_for(issue_number)
+    matches = [
+        a
+        for a in (*board.active, *board.completed)
+        if a.review_target == review_target and a.repo_name == repo_name
+    ]
+    in_flight = next((a for a in matches if a.status not in TERMINAL_STATUSES), None)
+    if in_flight is not None:
+        return False
+
+    if matches:
+        terminal = max(matches, key=lambda a: a.dispatched_at or 0.0)
+        return _consume_decomposition_leg(
+            row, repo=repo, issue_number=issue_number, terminal=terminal, config=config,
+        )
+
+    return _dispatch_decomposition_leg(
+        row, repo=repo, issue_number=issue_number, board=board, config=config,
+    )
+
+
+def _register_decomposition_action(
+    cause: str, handler: Callable[[StuckRow], bool]
+) -> None:
+    """The only way this module may populate :data:`DECOMPOSITION_CAUSES` /
+    :data:`AUTO_DISPATCHERS` for the #3986 decomposition act tier.
+
+    Deliberately does NOT call `authorize_sweep_action` the way
+    :func:`_register_auto_action`/:func:`_register_investigate_action` do
+    — see :data:`DECOMPOSITION_CAUSES`'s own docstring for why this tier
+    answers to a different, already-reviewed mechanical gate
+    (`coord.preflight_size.verify_split_proposal`) instead of
+    `SAFE_TIER_ACTIONS`.
+    """
+    DECOMPOSITION_CAUSES.add(cause)
+    AUTO_DISPATCHERS[cause] = handler
+
+
+_register_decomposition_action(
+    queue_diagnose.CAUSE_NEEDS_DECOMPOSITION, _decomposition_followthrough
+)
 
 
 def _investigate_repo_capacity(repo_name: str, config: "Config") -> int:
