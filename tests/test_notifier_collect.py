@@ -534,9 +534,11 @@ def test_a_wedged_parked_root_pages_even_with_only_a_benign_queue_alert(monkeypa
     assert drive.issue == 2341
     assert "380 deferrals" in drive.reason
     assert "13 dependent" in drive.reason
-    assert drive.proposed_command == (
-        "coord drive-queue remove quadraui 2341 && coord drive-queue add quadraui 2341"
-    )
+    # #3983 review: a needs-decomposition park is never cleared by a
+    # `remove`+`add` requeue — that just relaunches the drive straight back
+    # into re-emitting the identical split proposal. The remedy is
+    # read-only here; the manual next step is named inline in `reason`.
+    assert drive.proposed_command == "coord drive-queue list --repo quadraui"
 
 
 def test_an_unreachable_wait_root_already_escalated_is_not_duplicated(monkeypatch):

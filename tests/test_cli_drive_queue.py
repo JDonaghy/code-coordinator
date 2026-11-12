@@ -34,7 +34,7 @@ from click.testing import CliRunner
 
 from coord import state
 from coord.cli import main
-from coord.models import Assignment
+from coord.models import NEEDS_DECOMPOSITION_MARKER, Assignment
 from coord.drive import tmux_session_alive as _REAL_TMUX_SESSION_ALIVE
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
@@ -7107,17 +7107,21 @@ def test_status_alert_names_the_root_only_not_the_chained_dependents(cli):
 # so they carry none of #2978's own "pre-req ... it will never satisfy"
 # caption), neither of which the earlier #2944/#2978 regressions above cover.
 
+# Composed from `NEEDS_DECOMPOSITION_MARKER` rather than hand-copied — a row
+# this test builds must keep matching `is_needs_decomposition_reason` if the
+# marker text itself ever changes, the same guarantee the sibling test in
+# tests/test_drive_queue.py already has.
 _NEEDS_DECOMPOSITION_PARK_REASON = (
     "pre-dispatch refusal on assignment claude-coordinator-2341-x (needs_"
     "decomposition, 13h old) — the worker concluded the issue itself needs "
     "epic decomposition rather than one leg of work; the worker did the "
-    "CORRECT thing (#3931). Needs the coordinator: decompose the issue into "
+    "CORRECT thing. Needs the coordinator: decompose the issue into "
     "the proposed sub-issues (posted to the issue — see the worker's own "
     "split proposal) and close or re-scope this one. Once replaced, dispatch "
     "the new sub-issues normally; this row does not auto-resume.\n"
     "   inspect: coord log claude-coordinator-2341-x --machine dellserver\n"
-    "   [needs-decomposition #3931]"
-    " — parking without spending an attempt (#3931); needs the coordinator, "
+    f"   {NEEDS_DECOMPOSITION_MARKER}"
+    " — parking without spending an attempt; needs the coordinator, "
     "not a relaunch — decompose the issue into the proposed sub-issues "
     "(posted to the issue) and close or re-scope this one, then dispatch "
     "the replacements normally."
@@ -7133,7 +7137,6 @@ def test_status_alert_fires_for_a_parked_needs_decomposition_root_with_a_chain(c
     root_key = f"{REPO}#2341"
     for issue in range(3000, 3013):
         cli("add", REPO, str(issue), "--after", "2341")
-    assert len(range(3000, 3013)) == 13
 
     result = cli("status")
     assert result.exit_code == 0, result.output
@@ -7141,6 +7144,20 @@ def test_status_alert_fires_for_a_parked_needs_decomposition_root_with_a_chain(c
     assert root_key in result.output
     assert "380 deferrals" in result.output
     assert "13 dependent" in result.output
+    # #3983 review: names the CAUSE (#3979's classification) and how long
+    # the row has sat this way, not just the bare state/deferral count.
+    assert "needs-decomposition" in result.output
+    assert ", stuck " in result.output
+    # ... and never proposes the one remedy the row's own reason already
+    # says a relaunch cannot satisfy — `remove`+`add` would just re-launch
+    # the drive straight back into the identical park.
+    assert "coord drive-queue remove" not in result.output
+    assert "decompose the issue" in result.output
+
+    result_json = cli("status", "--json")
+    payload = json.loads(result_json.output)
+    assert "remove" not in payload["alert"]["proposed_command"]
+    assert payload["alert"]["proposed_command"] == "coord drive-queue list --repo claude-coordinator"
 
 
 def test_status_alert_fires_for_a_parked_needs_decomposition_root_with_no_dependents(cli):
@@ -7157,12 +7174,12 @@ def test_status_alert_fires_for_a_parked_needs_decomposition_root_with_no_depend
     assert "alert: (none)" not in result.output
     assert f"{REPO}#2341" in result.output
     assert "380 deferrals" in result.output
+    assert "needs-decomposition" in result.output
+    assert "coord drive-queue remove" not in result.output
     # No chain behind this root — the per-entry "N dependent entries chained
-    # behind it will self-heal" note (`unreachable_wait_alert`'s `_name`,
-    # only added when `dependents` is non-zero) must not appear when there
-    # is nothing to self-heal. The generic boilerplate remedy sentence
-    # ("never on a dependent chained behind one") is fine either way — it is
-    # not a claim about THIS entry's own chain.
+    # behind it will self-heal" note (`describe_unreachable_wait`'s own
+    # trailing clause, only added when `dependents` is non-zero) must not
+    # appear when there is nothing to self-heal.
     assert "dependent entr" not in result.output
     assert "self-heal" not in result.output
 
