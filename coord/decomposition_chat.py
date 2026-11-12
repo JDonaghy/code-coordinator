@@ -42,6 +42,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -1047,6 +1048,61 @@ def is_size_triage_review_target(review_target: str | None) -> bool:
     return bool(review_target) and str(review_target).startswith("size-triage-")
 
 
+def board_doctor_decomposition_review_target_for(issue_number: int) -> str:
+    """Non-numeric `review_target` sentinel for the board-doctor's #3986
+    act-tier decomposition-followup leg.
+
+    Deliberately shares :func:`size_triage_review_target_for`'s
+    `"size-triage-"` PREFIX (`is_size_triage_review_target` only ever
+    tests that prefix, never parses what follows it) so this leg reuses,
+    for free, every piece of machinery already keyed off that one boolean
+    check: `coord.notify`'s skip-the-review-comment branch,
+    `coord.gates`'s `"size-triage"` row relabel, `coord.stage_projection`'s
+    stage-count exclusion, and `coord.agent`'s zero-commit-branch /
+    no-push handling. It is still a DISTINCT string from
+    `size_triage_review_target_for(issue_number)` — never the exact same
+    value — so the preflight guard's own pre-dispatch (#3818) and this
+    tier's pre-dispatch (#3986) can never mistake the other's terminal
+    leg for their own "has MY session already run for this issue" check;
+    each only ever matches its own sentinel.
+    """
+    return f"size-triage-boarddoc-{issue_number}"
+
+
+def collect_needs_decomposition_comments(
+    repo_github: str, issue_number: int
+) -> tuple[str, ...]:
+    """Every `coord:event=needs_decomposition` comment body already posted
+    on *issue_number* (#3931's `post_needs_decomposition`), oldest first.
+
+    Reads straight off `github_ops.get_issue_comments` +
+    `coord.comments.parse_marker` — the SAME marker grammar every other
+    reader of a coordinator-authored comment already answers to (#2096) —
+    rather than re-deriving a second "is this a needs-decomposition
+    comment" test. Feeds the board-doctor's #3986 decomposition-followup
+    leg exactly what one or more parked worker legs already proposed in
+    prose, so the agent starts from their reasoning instead of from
+    nothing. Returns an empty tuple (never raises) when the issue has no
+    comments, no needs-decomposition comment, or the fetch itself fails —
+    a best-effort enrichment, not a precondition for dispatching the leg.
+    """
+    from coord import github_ops
+    from coord.comments import parse_marker
+
+    try:
+        raw_comments = github_ops.get_issue_comments(repo_github, issue_number)
+    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        return ()
+
+    out: list[str] = []
+    for comment in raw_comments:
+        body = comment.get("body") or ""
+        marker = parse_marker(body)
+        if marker is not None and marker.event == "needs_decomposition":
+            out.append(body)
+    return tuple(out)
+
+
 # #3971: a TEMPORARY wait, not a permanent pre-dispatch guard refusal
 # (#1844) — unlike `enforce_oracle_readiness`/`enforce_epic_dispatch_guard`'s
 # refusals, `enforce_preflight_guard`'s "a size-triage review is running —
@@ -1095,6 +1151,7 @@ def build_size_triage_briefing(
     repo_github: str,
     graph_context: str | None = None,
     size_signals: list[str] | None = None,
+    prior_proposals: Sequence[str] | None = None,
 ) -> str:
     """Pure function: assemble the size-triage briefing for issue
     `#issue_number` in `repo_github`.
@@ -1110,6 +1167,15 @@ def build_size_triage_briefing(
     already-explained reason strings into the briefing, so it stays
     decoupled from the scorer's internal dataclass shape — the caller is
     responsible for turning a `SizeScore` into the strings it passes here.
+
+    `prior_proposals` (#3986) is the board-doctor's own trigger: the raw
+    `coord:event=needs_decomposition` comment bodies one or more EARLIER
+    worker legs already posted on this issue (`coord.decomposition_chat.
+    collect_needs_decomposition_comments`), each one a prose-only split
+    proposal the auto-split gate in #3980 could not file verbatim. Included
+    in full, oldest first — this agent's job is to turn that prose into the
+    machine-readable block :func:`parse_size_triage_response` can file, not
+    to re-discover from scratch that a split is warranted.
     """
     lines: list[str] = []
     lines.append(f"# Size triage: {repo_github}#{issue_number}")
@@ -1118,6 +1184,22 @@ def build_size_triage_briefing(
     lines.append("")
     lines.append(issue_body.strip() if issue_body else "(issue has no body)")
     lines.append("")
+
+    if prior_proposals:
+        lines.append("## Prior needs-decomposition proposals from worker legs")
+        lines.append(
+            "One or more worker legs already concluded this issue needs "
+            "splitting and proposed a split in prose, oldest first. Your "
+            "job is to turn the best of these (or your own reading of the "
+            "issue, if they disagree or are incomplete) into the "
+            "machine-readable block below — not to re-decide from scratch "
+            "whether a split is warranted."
+        )
+        lines.append("")
+        for i, proposal in enumerate(prior_proposals, start=1):
+            lines.append(f"### Proposal {i}")
+            lines.append(proposal.strip())
+            lines.append("")
 
     if size_signals:
         lines.append("## Why this issue was flagged for triage")
@@ -1555,6 +1637,79 @@ def file_and_queue_split_proposal(
 #: :func:`file_and_queue_split_proposal`.
 NEEDS_DECOMPOSITION_SPLIT_ORIGIN = "work leg's needs-decomposition split proposal"
 
+#: The ``origin`` text the board-doctor's #3986 act tier
+#: (`coord.board_doctor_policy`) passes to :func:`consume_split_verdict`.
+BOARD_DOCTOR_DECOMPOSITION_ORIGIN = "board-doctor decomposition-followup leg"
+
+
+def consume_split_verdict(
+    raw_response: str,
+    *,
+    repo: "Repo",
+    issue_number: int,
+    issue_title: str,
+    origin: str,
+) -> int | None:
+    """Parse an already-terminal size-triage-shaped agent response and, for
+    a verified SPLIT verdict, file + queue it.
+
+    This is the ONE place the `parse_size_triage_response` ->
+    `coord.preflight_size.verify_split_proposal` -> `file_and_queue_split_
+    proposal` chain lives (#2096/#2085 — "one question, one answer"):
+    :func:`auto_split_needs_decomposition` below (#3980, a worker leg's own
+    proposal) and `coord.board_doctor_policy`'s decomposition act tier
+    (#3986, a leg THIS repo's board-doctor dispatched) both call this
+    function rather than keeping two copies of the chain that could
+    silently drift. (`coord.dispatch.enforce_preflight_guard`'s own
+    pre-dispatch consumption, #3818, predates this extraction and is left
+    with its own inline copy — out of this function's scope to touch.)
+
+    Returns the new epic's issue number for a filed split, or ``None`` for
+    a clean PROCEED verdict — the agent read the issue and decided no
+    split is warranted after all. Raises `SizeTriageError` for anything
+    that is NOT a clean PROCEED or a verified SPLIT: an unparseable
+    response (`parse_size_triage_response` itself raising) or a SPLIT
+    verdict `verify_split_proposal` rejects. The three outcomes —
+    "no split needed", "couldn't even parse an answer", "proposed a split
+    but it failed the mechanical gate" — read identically to a caller only
+    interested in "did a split get filed", but a caller that needs to
+    alert differently for "parked, now confirmed proceed-worthy" versus
+    "parked, and the followup leg ALSO couldn't produce anything usable"
+    should catch `SizeTriageError` separately from a bare `None` return.
+
+    A failure *inside* `file_and_queue_split_proposal` itself propagates
+    unchanged (never caught here) — by that point real issues already
+    exist on GitHub, so there is no "fall back to None" left to return.
+    """
+    proposal = parse_size_triage_response(
+        raw_response,
+        repo_name=repo.name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+    )
+    if proposal is None:
+        return None
+    proposal.rationale = (
+        "a worker leg concluded this issue needs decomposition and a "
+        "read-only decomposition-followup leg proposed this split"
+    )
+
+    from coord.preflight_size import verify_split_proposal  # noqa: PLC0415
+
+    verification = verify_split_proposal(proposal)
+    if not verification.ok:
+        raise SizeTriageError(
+            f"split proposal for {repo.name}#{issue_number} rejected by "
+            f"verify_split_proposal: {verification.reason}"
+        )
+
+    return file_and_queue_split_proposal(
+        proposal=proposal,
+        verification=verification,
+        repo=repo,
+        origin=origin,
+    )
+
 
 def auto_split_needs_decomposition(
     final_message: str | None,
@@ -1599,7 +1754,6 @@ def auto_split_needs_decomposition(
         return None
 
     from coord import github_ops
-    from coord.preflight_size import verify_split_proposal
 
     issue_data = github_ops.get_issue(repo.github, issue_number)
     if str(issue_data.get("state") or "").upper() == "CLOSED":
@@ -1607,39 +1761,22 @@ def auto_split_needs_decomposition(
     issue_title = issue_data.get("title") or f"issue #{issue_number}"
 
     try:
-        proposal = parse_size_triage_response(
+        epic_number = consume_split_verdict(
             text,
-            repo_name=repo_name,
+            repo=repo,
             issue_number=issue_number,
             issue_title=issue_title,
+            origin=NEEDS_DECOMPOSITION_SPLIT_ORIGIN,
         )
     except SizeTriageError as exc:
         _log.info(
-            "auto_split_needs_decomposition: %s#%s split block unparseable: %s",
+            "auto_split_needs_decomposition: %s#%s split unparseable or "
+            "rejected: %s",
             repo_name, issue_number, exc,
         )
         return None
-    if proposal is None:
+    if epic_number is None:
         return None
-    proposal.rationale = (
-        "a work leg concluded this issue needs decomposition and proposed "
-        "this split"
-    )
-
-    verification = verify_split_proposal(proposal)
-    if not verification.ok:
-        _log.info(
-            "auto_split_needs_decomposition: %s#%s split rejected: %s",
-            repo_name, issue_number, verification.reason,
-        )
-        return None
-
-    epic_number = file_and_queue_split_proposal(
-        proposal=proposal,
-        verification=verification,
-        repo=repo,
-        origin=NEEDS_DECOMPOSITION_SPLIT_ORIGIN,
-    )
 
     from coord.state import dequeue_drive_queue
 
@@ -1664,6 +1801,8 @@ def dispatch_size_triage_review(
     board: "Board",
     graph_context: str | None = None,
     size_signals: list[str] | None = None,
+    prior_proposals: Sequence[str] | None = None,
+    review_target: str | None = None,
     http_client: Any = None,
     now: float | None = None,
 ) -> "Assignment":
@@ -1684,6 +1823,16 @@ def dispatch_size_triage_review(
     `board.active`; it never calls anything that files an issue or mutates
     the drive-queue. Raises `SizeTriageError` on an unreachable machine, a
     missing repo path, or an HTTP failure, leaving `board.active` untouched.
+
+    `prior_proposals` (#3986) is threaded straight through to
+    :func:`build_size_triage_briefing`. `review_target` defaults to
+    :func:`size_triage_review_target_for` (the preflight guard's own
+    dispatch, #3818) but a caller with a DIFFERENT trigger for the same
+    read-only session shape — the board-doctor act tier
+    (:func:`board_doctor_decomposition_review_target_for`, #3986) — passes
+    its own, so the two dispatch sources never collide on one issue's
+    `review_target` and each can independently tell "has MY leg already
+    run for this issue" apart from the other's.
     """
     import httpx
 
@@ -1704,8 +1853,9 @@ def dispatch_size_triage_review(
         repo_github=repo_cfg.github,
         graph_context=graph_context,
         size_signals=size_signals,
+        prior_proposals=prior_proposals,
     )
-    review_target = size_triage_review_target_for(issue_number)
+    review_target = review_target or size_triage_review_target_for(issue_number)
 
     payload = {
         "repo_name": repo_cfg.name,

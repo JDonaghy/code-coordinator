@@ -167,14 +167,31 @@ class TestPolicyTierOf:
             # #3979: a terminal park has no external verdict to resume it,
             # so it must never auto-dispatch or compete for the shared
             # investigate-tier budget — see TestAlertResolutionTerminalPark
-            # below for the alert text itself.
-            queue_diagnose.CAUSE_NEEDS_DECOMPOSITION,
+            # below for the alert text itself. #3986 moved
+            # `CAUSE_NEEDS_DECOMPOSITION` OFF this list onto its own
+            # `DECOMPOSITION_CAUSES` act tier (a mechanically-gated split
+            # filing, not a fix-it leg) — see `TestNeedsDecomposition
+            # RoutesToTheActTier`/`TestNeedsDecompositionLegDispatcher` in
+            # `tests/test_board_doctor.py`.
             queue_diagnose.CAUSE_PREMISE_REFUSAL,
             queue_diagnose.CAUSE_UPSTREAM_GAP_PARK,
         ):
             assert cause not in ALLOWLIST
             assert cause not in INVESTIGATE_CAUSES
             assert policy_tier_of(cause) == TIER_ALERT
+
+    def test_needs_decomposition_is_auto_tier_via_the_decomposition_act_tier(
+        self,
+    ) -> None:
+        """#3986: NOT the #3760 mechanical allowlist and NOT the #3769
+        investigate tier — its own, separately-gated `DECOMPOSITION_CAUSES`
+        route (see `policy_tier_of`'s own docstring)."""
+        from coord.board_doctor_policy import DECOMPOSITION_CAUSES
+
+        assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION not in ALLOWLIST
+        assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION not in INVESTIGATE_CAUSES
+        assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION in DECOMPOSITION_CAUSES
+        assert policy_tier_of(queue_diagnose.CAUSE_NEEDS_DECOMPOSITION) == TIER_AUTO
 
     def test_registered_3760_causes_are_auto_tier(self) -> None:
         assert policy_tier_of(CAUSE_CEILING_BLOCKED_MERGEABLE) == TIER_AUTO
@@ -783,7 +800,14 @@ class TestTerminalParkAlert:
     """#3979: a row the sweep classifies as a terminal park (needs-
     decomposition/premise-refusal/upstream-gap) must alert with the real
     action named, never the generic ``coord status`` fallback — and must
-    never auto-dispatch or escalate to the investigate tier."""
+    never escalate to the investigate tier. #3986 moved
+    ``CAUSE_NEEDS_DECOMPOSITION`` specifically onto its own decomposition
+    act tier (see ``test_sweep_now_dispatches_through_the_decomposition_
+    act_tier_for_a_needs_decomposition_row`` below) — its own alert text
+    (:func:`_alert_resolution`'s cause-specific action) is now the
+    FALLBACK that tier reaches on a failed/rejected leg, not this row's
+    first-line disposition; `premise-refusal`/`upstream-gap-park` are
+    unaffected and still never auto-dispatch at all."""
 
     @pytest.mark.parametrize(
         ("cause", "expected_fragment"),
@@ -808,15 +832,20 @@ class TestTerminalParkAlert:
         assert expected_fragment in escalation["reason"]
         assert "parked terminal" in escalation["reason"]
 
-    def test_sweep_takes_no_dispatch_action_for_a_needs_decomposition_row(
+    def test_sweep_now_dispatches_through_the_decomposition_act_tier_for_a_needs_decomposition_row(
         self,
     ) -> None:
-        # Not in ALLOWLIST/INVESTIGATE_CAUSES -> policy_tier_of reads
-        # TIER_ALERT, so `coord.board_doctor.sweep` routes it through the
-        # alert dispatcher, never a fix-it leg or a mechanical requeue.
+        # #3986: not in ALLOWLIST/INVESTIGATE_CAUSES (never a fix-it leg or
+        # a mechanical requeue) but now in its OWN DECOMPOSITION_CAUSES
+        # route -> policy_tier_of reads TIER_AUTO. See
+        # `tests/test_board_doctor.py::TestNeedsDecompositionLegDispatcher`
+        # for the real dispatcher end to end.
+        from coord.board_doctor_policy import DECOMPOSITION_CAUSES
+
         assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION not in ALLOWLIST
         assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION not in INVESTIGATE_CAUSES
-        assert policy_tier_of(queue_diagnose.CAUSE_NEEDS_DECOMPOSITION) == TIER_ALERT
+        assert queue_diagnose.CAUSE_NEEDS_DECOMPOSITION in DECOMPOSITION_CAUSES
+        assert policy_tier_of(queue_diagnose.CAUSE_NEEDS_DECOMPOSITION) == TIER_AUTO
 
 
 class TestClassifyEnvProbeOutput:

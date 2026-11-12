@@ -13,6 +13,7 @@ re-acted on, and ``dry_run=True`` mutates nothing.
 from __future__ import annotations
 
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 
@@ -2358,18 +2359,22 @@ class TestNeverDispatchedRowReachesTheSweep:
         assert alert.count == 0
 
 
-class TestNeedsDecompositionRowNeverReDispatches:
+class TestNeedsDecompositionRowClassification:
     """#3979: a row the tick's own parked pre-pass already treats as
     terminal (a `WORK_OUTCOME: needs-decomposition` worker exit, parked by
     `coord.models.NEEDS_DECOMPOSITION_MARKER`) must classify as its own
     cause — never `queue_diagnose.CAUSE_NO_PR`, which IS investigate-
-    eligible — and the sweep must take no auto-dispatch action for it,
-    in a dry run or a real one.
+    eligible.
+
+    #3986 superseded this cause's own tier: see
+    `TestNeedsDecompositionRoutesToTheActTier` and
+    `TestNeedsDecompositionLegDispatcher` below for what the sweep now
+    DOES with it — this class only pins the classification itself, which
+    #3986 does not change.
 
     Same end-to-end shape as `TestNeverDispatchedRowReachesTheSweep` above:
     `queue_diagnose.run_pass` -> `coord.board_doctor.drive_queue_rows` ->
-    `sweep`, with the real `policy_tier_of` — load-bearing evidence the
-    row is actually routed to the alert tier, not a tautology.
+    `sweep`, not a tautology.
     """
 
     def _rows(self) -> list:
@@ -2422,7 +2427,26 @@ class TestNeedsDecompositionRowNeverReDispatches:
         assert auto.count == 0
         assert alert.count == 0
 
-    def test_real_sweep_alerts_but_never_auto_dispatches(self) -> None:
+
+class TestNeedsDecompositionRoutesToTheActTier:
+    """#3986: `CAUSE_NEEDS_DECOMPOSITION` now reaches `TIER_AUTO`, not the
+    #3979 alert-only `TIER_ALERT` — the park #3979 classifies gets ONE
+    read-only decomposition-followup leg dispatched against it before
+    anything pages a human. `policy_tier_of` is the REAL C2 policy under
+    test; only the dispatcher itself is faked here (the real one is
+    exercised end to end by `TestNeedsDecompositionLegDispatcher` below) —
+    this class is purely "does the row reach the right tier."
+    """
+
+    def _rows(self) -> list:
+        return TestNeedsDecompositionRowClassification()._rows()
+
+    def test_policy_tier_of_is_auto(self) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+
+        assert policy_tier_of(queue_diagnose.CAUSE_NEEDS_DECOMPOSITION) == TIER_AUTO
+
+    def test_real_sweep_now_dispatches_through_the_act_tier(self) -> None:
         from coord.board_doctor_policy import policy_tier_of
 
         rows = self._rows()
@@ -2434,8 +2458,296 @@ class TestNeedsDecompositionRowNeverReDispatches:
             auto_dispatchers={queue_diagnose.CAUSE_NEEDS_DECOMPOSITION: auto},
             alert_dispatcher=alert,
         )
-        assert auto.count == 0
-        assert alert.count == 1
+        assert auto.count == 1
+        assert alert.count == 0
+
+
+class TestNeedsDecompositionLegDispatcher:
+    """#3986 end to end through the REAL production dispatcher
+    (`AUTO_DISPATCHERS[CAUSE_NEEDS_DECOMPOSITION]`, i.e.
+    `coord.board_doctor_policy._decomposition_followthrough`) — not a
+    fake. Covers the issue's own acceptance shape: a parked
+    needs-decomposition row whose worker legs left three prose-only
+    proposals (the quadraui#2341 shape) gets exactly one
+    decomposition-followup leg dispatched, then — once that leg goes
+    terminal with a verified split — the epic is filed, its 13 chained
+    dependents are re-pointed off the superseded original, and a SECOND
+    sweep dispatches nothing more because the row itself is gone.
+
+    Only `coord.github_ops`/`coord.decomposition_chat.
+    dispatch_size_triage_review`/`coord.notify._fetch_raw_log_text_by_id`
+    are mocked — the drive-queue reads/writes, `coord.state.build_board`'s
+    board-scan ledger check, `coord.preflight_size.verify_split_proposal`
+    and `coord.decomposition_chat.file_and_queue_split_proposal`/
+    `_repoint_queued_dependents_at_split` all run for real.
+    """
+
+    REPO = "widgets"
+    ISSUE = 3979
+
+    @staticmethod
+    def _config(*, auto_split: bool = True) -> Config:
+        config = Config(
+            repos=[Repo(name="widgets", github="acme/widgets")],
+            machines=[
+                Machine(
+                    name="dell64",
+                    host="dell64.tail",
+                    repos=["widgets"],
+                    repo_paths={"widgets": "/home/dell64/widgets"},
+                ),
+            ],
+        )
+        config.decomposition.auto_split.enabled = auto_split
+        return config
+
+    def _row(self) -> StuckRow:
+        from coord.models import NEEDS_DECOMPOSITION_MARKER
+
+        return StuckRow(
+            queue="drive-queue",
+            key=f"{self.REPO}#{self.ISSUE}",
+            state="parked",
+            cause=queue_diagnose.CAUSE_NEEDS_DECOMPOSITION,
+            confidence="high",
+            evidence=(f"last_reason: {NEEDS_DECOMPOSITION_MARKER} ...",),
+        )
+
+    def _prose_proposals(self, monkeypatch) -> None:
+        """The quadraui#2341 shape's first half: three EARLIER worker legs
+        each posted their own prose-only split proposal — #3980's
+        auto-split could not file any of them verbatim, which is exactly
+        why this row is still parked. `coord.github_ops.get_issue_comments`
+        is the only seam `collect_needs_decomposition_comments` reads."""
+        from coord.comments import format_needs_decomposition
+
+        bodies = [
+            format_needs_decomposition(
+                assignment_id=f"leg-{i}",
+                machine_name="dell64",
+                repo_name=self.REPO,
+                issue_number=self.ISSUE,
+                reason=f"split along boundary {i}",
+            )
+            for i in range(1, 4)
+        ]
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_comments",
+            lambda *a, **k: [{"body": b} for b in bodies],
+        )
+
+    def _chained_dependents(self) -> list[tuple[str, int]]:
+        """The quadraui#2341 shape's second half: 13 already-queued rows
+        chained on the original issue (`coord.drive_queue.entry_key`),
+        the #3984 re-point target."""
+        from coord.drive_queue import entry_key
+        from coord.state import enqueue_drive_queue
+
+        original_key = entry_key(self.REPO, self.ISSUE)
+        dependents = [(self.REPO, 4000 + i) for i in range(13)]
+        for repo_name, issue_number in dependents:
+            enqueue_drive_queue(repo_name, issue_number, after=[original_key])
+        return dependents
+
+    def test_repo_not_opted_into_auto_split_only_alerts(self, monkeypatch) -> None:
+        import coord.commands._common as common
+        from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+        monkeypatch.setattr(
+            common, "resolve_and_load_config", lambda *a, **k: self._config(auto_split=False)
+        )
+        monkeypatch.setattr(
+            "coord.decomposition_chat.dispatch_size_triage_review",
+            lambda **k: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+        )
+
+        dispatched = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+
+        assert dispatched is False
+        assert len(state.list_drive_escalations()) == 1
+
+    def test_dispatches_one_leg_with_the_prior_proposals_then_leaves_an_in_flight_leg_alone(
+        self, monkeypatch,
+    ) -> None:
+        import coord.commands._common as common
+        from coord.board_doctor_policy import AUTO_DISPATCHERS
+        from coord.decomposition_chat import board_doctor_decomposition_review_target_for
+
+        config = self._config()
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"state": "OPEN", "title": "A giant issue", "body": "do it all"},
+        )
+        self._prose_proposals(monkeypatch)
+
+        board = Board(active=[], completed=[])
+        monkeypatch.setattr("coord.state.build_board", lambda: board)
+
+        dispatch_calls: list[dict] = []
+
+        def fake_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return Assignment(
+                machine_name="dell64", repo_name=self.REPO, issue_number=self.ISSUE,
+                issue_title="[size-triage] A giant issue",
+            )
+
+        monkeypatch.setattr(
+            "coord.decomposition_chat.dispatch_size_triage_review", fake_dispatch
+        )
+
+        assert AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row()) is True
+        assert len(dispatch_calls) == 1
+        assert len(dispatch_calls[0]["prior_proposals"]) == 3
+        assert dispatch_calls[0]["review_target"] == (
+            board_doctor_decomposition_review_target_for(self.ISSUE)
+        )
+
+        # A matching leg is now "running" on the board — a second sweep
+        # must leave it alone (#3986: at most one leg per issue), with no
+        # second dispatch and no alert.
+        board.active.append(
+            Assignment(
+                machine_name="dell64", repo_name=self.REPO, issue_number=self.ISSUE,
+                issue_title="[size-triage] A giant issue", status="running",
+                review_target=board_doctor_decomposition_review_target_for(self.ISSUE),
+                assignment_id="asn-decomp-1",
+            )
+        )
+        assert AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row()) is False
+        assert len(dispatch_calls) == 1
+        assert state.list_drive_escalations() == []
+
+    def _terminal_board(self, *, raw_log: str, monkeypatch) -> Board:
+        from coord.decomposition_chat import board_doctor_decomposition_review_target_for
+
+        board = Board(
+            active=[],
+            completed=[
+                Assignment(
+                    machine_name="dell64", repo_name=self.REPO, issue_number=self.ISSUE,
+                    issue_title="[size-triage] A giant issue", status="done",
+                    review_target=board_doctor_decomposition_review_target_for(self.ISSUE),
+                    assignment_id="asn-decomp-1", dispatched_at=1.0,
+                ),
+            ],
+        )
+        monkeypatch.setattr("coord.state.build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.notify._fetch_raw_log_text_by_id", lambda *a, **k: raw_log
+        )
+        return board
+
+    def test_verified_split_files_the_epic_repoints_dependents_and_a_second_sweep_is_quiet(
+        self, monkeypatch,
+    ) -> None:
+        import coord.commands._common as common
+
+        config = self._config()
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+        dependents = self._chained_dependents()
+
+        # Child 2 shares a file with Child 1 (`coord/shared.py`) so
+        # `verify_split_proposal`'s own `predict_overlap` chains it AFTER
+        # Child 1 — a genuine ``C1 -> C2`` chain with ONE sink (C2), the
+        # #3984 re-point target every dependent below must land on.
+        raw_log = (
+            "SIZE_TRIAGE_VERDICT: split\n"
+            "## Child 1: API surface\n"
+            "Do the API half.\n\n"
+            "## Files\n"
+            "- coord/shared.py\n"
+            "- coord/api_part.py\n\n"
+            "## Child 2: CLI wiring\n"
+            "Do the CLI half.\n\n"
+            "## Files\n"
+            "- coord/shared.py\n"
+            "- coord/cli_part.py\n\n"
+            "END_SIZE_TRIAGE\n"
+        )
+        self._terminal_board(raw_log=raw_log, monkeypatch=monkeypatch)
+
+        from coord.drive_queue import entry_key
+        from coord.state import list_drive_queue
+
+        with (
+            patch("coord.github_ops.create_issue") as mock_create,
+            patch("coord.github_ops.update_issue_body"),
+            patch("coord.github_ops.close_issue") as mock_close,
+            patch("coord.github_ops.get_issue_state", return_value="closed"),
+        ):
+            mock_create.side_effect = [
+                {"number": 900, "url": "https://x/900"},  # epic
+                {"number": 901, "url": "https://x/901"},  # Child 1
+                {"number": 902, "url": "https://x/902"},  # Child 2
+            ]
+
+            from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+            result = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+
+            assert result is True
+            mock_close.assert_called_once()
+
+            # All 13 chained dependents are re-pointed off the superseded
+            # original onto the split's sink child (#3984).
+            original_key = entry_key(self.REPO, self.ISSUE)
+            sink_key = entry_key(self.REPO, 902)
+            rows = {(e["repo_name"], e["issue_number"]): e for e in list_drive_queue()}
+            for repo_name, issue_number in dependents:
+                row = rows[(repo_name, issue_number)]
+                assert row["after_json"] == [sink_key]
+                assert original_key not in row["after_json"]
+
+            # The original's own (parked) row is gone from the drive queue
+            # entirely (`dequeue_drive_queue`, inside `AUTO_DISPATCHERS`'s
+            # own success path) — a SECOND sweep's `collect_rows` builds
+            # its row set from exactly this same `list_drive_queue()` read,
+            # so there is nothing left for it to even classify as stuck
+            # for this issue, let alone dispatch a second decomposition-
+            # followup leg or file a second epic against.
+            assert (self.REPO, self.ISSUE) not in rows
+
+    def test_gate_rejected_split_produces_one_alert_and_files_nothing(
+        self, monkeypatch,
+    ) -> None:
+        import coord.commands._common as common
+        from coord.preflight_size import SplitVerification
+
+        config = self._config()
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+        raw_log = (
+            "SIZE_TRIAGE_VERDICT: split\n"
+            "## Child 1: Overlapping half\n"
+            "Do it.\n\n"
+            "## Files\n"
+            "- coord/overlap.py\n\n"
+            "END_SIZE_TRIAGE\n"
+        )
+        self._terminal_board(raw_log=raw_log, monkeypatch=monkeypatch)
+        monkeypatch.setattr(
+            "coord.preflight_size.verify_split_proposal",
+            lambda proposal: SplitVerification(ok=False, reason="overlaps in-flight work"),
+        )
+
+        with patch("coord.github_ops.create_issue") as mock_create:
+            from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+            first = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+            assert first is False
+            mock_create.assert_not_called()
+            assert len(state.list_drive_escalations()) == 1
+
+            # #3986: "never relaunch the original Work leg" — a second
+            # sweep must not file a second epic, and the alert stays a
+            # single row, not a growing pile.
+            second = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+            assert second is False
+            mock_create.assert_not_called()
+            assert len(state.list_drive_escalations()) == 1
 
 
 class TestParseNoProgressMinutes:
