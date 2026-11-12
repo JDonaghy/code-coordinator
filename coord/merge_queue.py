@@ -5601,42 +5601,88 @@ def load_queue() -> list[QueuedMerge]:
     ]
 
 
+_MERGE_QUEUE_UPSERT_COLUMNS = (
+    "assignment_id", "repo_name", "repo_github", "branch",
+    "target_branch", "issue_number", "issue_title", "state",
+    "pr_number", "pr_url", "size", "last_attempt", "error", "enqueued_at",
+    "assignment_type", "required_gates", "ci_infra_reruns",
+    "ci_stale_reruns", "ci_flaky_reruns", "ci_flaky_pending",
+    "ci_unreadable_reruns", "ci_fix_dispatches",
+    "ci_fix_head_sha", "ci_fix_noop_streak",
+    "ci_fix_detail_sha", "ci_fix_detail_json",
+    "ci_seen_checks_sha", "ci_seen_check_names_json",
+    "ci_rerun_budget_sha",
+)
+
+
+def _merge_queue_upsert_params(item: QueuedMerge) -> tuple:
+    return (
+        item.assignment_id, item.repo_name, item.repo_github,
+        item.branch, item.target_branch, item.issue_number,
+        item.issue_title, item.state, item.pr_number, item.pr_url,
+        item.size, item.last_attempt, item.error, item.enqueued_at,
+        item.assignment_type, json.dumps(list(item.required_gates or [])),
+        item.ci_infra_reruns, item.ci_stale_reruns,
+        item.ci_flaky_reruns, item.ci_flaky_pending,
+        item.ci_unreadable_reruns, item.ci_fix_dispatches,
+        item.ci_fix_head_sha, item.ci_fix_noop_streak,
+        item.ci_fix_detail_sha, item.ci_fix_detail_json,
+        item.ci_seen_checks_sha, item.ci_seen_check_names_json,
+        item.ci_rerun_budget_sha,
+    )
+
+
 def save_queue(items: list[QueuedMerge]) -> None:
-    """Replace the entire merge queue in the database."""
+    """Upsert every entry in *items* into the merge queue, keyed on
+    ``assignment_id`` — insert a row that doesn't exist yet, update one that
+    does, never touch any other row.
+
+    #3992: this used to ``DELETE FROM merge_queue`` and re-insert the whole
+    table from *items* on every call — the only thing serializing writers
+    was serve's in-process lock, and most writers (``coord merge --only``,
+    the notify pass, ``reconcile.on_conflict_fix_done``, the drive's inline
+    enqueue) never took it. A writer that loaded its in-memory snapshot
+    *before* a concurrent writer inserted a brand-new row, then saved late,
+    silently deleted that row — the delete-then-reinsert-all left no trace
+    of which row vanished, so the audit log recorded nothing. Upserting by
+    key means a row this call wasn't handed is never touched, concurrent
+    insert or not — a writer with a stale snapshot can still clobber a row
+    it WAS handed back to a stale value (that's a narrower, pre-existing
+    lost-update risk, not this issue's silent-deletion one), but it can
+    never make an entry it never saw simply disappear.
+
+    Removing a row from the table entirely is therefore no longer something
+    a save can do by omission (passing a shorter *items* list leaves the
+    missing rows exactly as they were) — see :func:`drop_entry` /
+    :func:`delete_entries` for the explicit, audited way to do that.
+    """
+    if not items:
+        return
     conn = get_connection()
+    collist = ", ".join(_MERGE_QUEUE_UPSERT_COLUMNS)
+    placeholders = ", ".join(["?"] * len(_MERGE_QUEUE_UPSERT_COLUMNS))
+    update_clause = ", ".join(
+        f"{c} = ?" for c in _MERGE_QUEUE_UPSERT_COLUMNS if c != "assignment_id"
+    )
 
     def _write() -> None:
         with conn:
-            sql.execute(conn, "DELETE FROM merge_queue")
             for item in items:
+                params = _merge_queue_upsert_params(item)
+                # UPDATE first, by key: cheap existence check that doubles as
+                # the write itself, so a pre-existing row is touched exactly
+                # once per save — no separate SELECT-then-branch round trip.
+                cursor = sql.execute(
+                    conn,
+                    f"UPDATE merge_queue SET {update_clause} WHERE assignment_id = ?",  # noqa: S608
+                    (*params[1:], item.assignment_id),
+                )
+                if cursor.rowcount:
+                    continue
                 sql.execute(
                     conn,
-                    """INSERT INTO merge_queue (
-                        assignment_id, repo_name, repo_github, branch,
-                        target_branch, issue_number, issue_title, state,
-                        pr_number, pr_url, size, last_attempt, error, enqueued_at,
-                        assignment_type, required_gates, ci_infra_reruns,
-                        ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
-                        ci_unreadable_reruns, ci_fix_dispatches,
-                        ci_fix_head_sha, ci_fix_noop_streak,
-                        ci_fix_detail_sha, ci_fix_detail_json,
-                        ci_seen_checks_sha, ci_seen_check_names_json,
-                        ci_rerun_budget_sha
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        item.assignment_id, item.repo_name, item.repo_github,
-                        item.branch, item.target_branch, item.issue_number,
-                        item.issue_title, item.state, item.pr_number, item.pr_url,
-                        item.size, item.last_attempt, item.error, item.enqueued_at,
-                        item.assignment_type, json.dumps(list(item.required_gates or [])),
-                        item.ci_infra_reruns, item.ci_stale_reruns,
-                        item.ci_flaky_reruns, item.ci_flaky_pending,
-                        item.ci_unreadable_reruns, item.ci_fix_dispatches,
-                        item.ci_fix_head_sha, item.ci_fix_noop_streak,
-                        item.ci_fix_detail_sha, item.ci_fix_detail_json,
-                        item.ci_seen_checks_sha, item.ci_seen_check_names_json,
-                        item.ci_rerun_budget_sha,
-                    ),
+                    f"INSERT INTO merge_queue ({collist}) VALUES ({placeholders})",  # noqa: S608
+                    params,
                 )
 
     # #2802: ride out transient `database is locked` contention the same way
@@ -5644,6 +5690,103 @@ def save_queue(items: list[QueuedMerge]) -> None:
     # review-dispatch drain aborting mid-flight on lock contention with no
     # retry, stranding downstream queue rows behind it.
     retry_on_locked(_write)
+
+
+def rekey_entry(old_assignment_id: str, entry: "QueuedMerge") -> bool:
+    """Update the merge_queue row currently keyed to *old_assignment_id* so
+    it is keyed to ``entry.assignment_id`` instead, writing every other
+    field on *entry* too. Returns ``True`` when a row was actually renamed.
+
+    #3992: :func:`save_queue` upserts by the item's CURRENT
+    ``assignment_id`` — a caller that changes ``assignment_id`` in place
+    (a re-key, not an ordinary field update) must say so explicitly by
+    naming the row's OLD key, or the upsert can't find the existing row
+    under its old identity and inserts a second one instead of renaming
+    the first. :func:`refresh_entry_assignment` is the one caller that
+    re-keys (a review-bounce fix taking over an entry originally keyed to
+    the pre-bounce work assignment).
+
+    Falls back to an ordinary :func:`save_queue` upsert of *entry* alone
+    when no row matches *old_assignment_id* (it was already renamed, or
+    removed by a concurrent writer) — so the right row still ends up
+    present even though nothing was renamed.
+    """
+    if old_assignment_id == entry.assignment_id:
+        save_queue([entry])
+        return True
+    conn = get_connection()
+    set_clause = ", ".join(f"{c} = ?" for c in _MERGE_QUEUE_UPSERT_COLUMNS)
+    params = _merge_queue_upsert_params(entry)
+
+    def _write() -> bool:
+        with conn:
+            cursor = sql.execute(
+                conn,
+                f"UPDATE merge_queue SET {set_clause} WHERE assignment_id = ?",  # noqa: S608
+                (*params, old_assignment_id),
+            )
+            return cursor.rowcount > 0
+
+    renamed = retry_on_locked(_write)
+    if not renamed:
+        save_queue([entry])
+    return renamed
+
+
+def delete_entries(
+    entries: list["QueuedMerge"], *, reason: str, actor: str = "system"
+) -> int:
+    """Remove exactly the ``merge_queue`` rows for *entries*, by key, inside
+    one transaction — each deleted row gets its own ``queue_entry_removed``
+    audit row naming *reason*.
+
+    #3992: the explicit, audited counterpart to :func:`save_queue`'s
+    upsert-only contract. A caller that genuinely wants rows gone (``coord
+    merge --drop``'s single-entry :func:`drop_entry`, :func:`
+    prune_stale_queue_entries`'s batch) must say so by key here rather than
+    by omitting rows from a ``save_queue`` list — a stale snapshot omits
+    rows it simply never saw, which is exactly the silent-deletion bug this
+    issue is about, not a real removal intent.
+
+    An entry already gone by the time this runs (e.g. removed by a
+    concurrent writer) is not re-added and not double-counted — only rows
+    this call itself deletes are audited and counted in the return value.
+    """
+    if not entries:
+        return 0
+    conn = get_connection()
+    removed: list[QueuedMerge] = []
+
+    def _write() -> None:
+        removed.clear()  # #3992: reset so a retried attempt doesn't double-count
+        with conn:
+            for entry in entries:
+                cursor = sql.execute(
+                    conn,
+                    "DELETE FROM merge_queue WHERE assignment_id = ?",
+                    (entry.assignment_id,),
+                )
+                if cursor.rowcount:
+                    removed.append(entry)
+
+    retry_on_locked(_write)
+
+    for entry in removed:
+        record_audit(
+            tier="business",
+            category="merge_queue",
+            event_type="queue_entry_removed",
+            actor=actor,
+            summary=(
+                f"Removed merge-queue entry for {entry.repo_name}"
+                f"#{entry.issue_number} ({entry.branch}): {reason}"
+            ),
+            repo=entry.repo_name,
+            issue=entry.issue_number,
+            assignment_id=entry.assignment_id,
+            details={"reason": reason, "state": entry.state},
+        )
+    return len(removed)
 
 
 # ── Merged-history lookups (#1107 Part 3) ───────────────────────────────────
@@ -6030,6 +6173,7 @@ def refresh_entry_assignment(
         return False  # already correct
     if existing.state != PENDING:
         return False  # don't touch terminal entries (MERGED, CONFLICT, etc.)
+    old_assignment_id = existing.assignment_id
     existing.assignment_id = assignment.assignment_id
     # #1077 (review round 1): do NOT overwrite existing.assignment_type here.
     # assignment_type is a structural property of the branch/issue pairing,
@@ -6047,7 +6191,12 @@ def refresh_entry_assignment(
     # Clear a stale "review required" error now that a fresh approval arrived.
     if existing.error == "review required but not approved":
         existing.error = None
-    save_queue(items)
+    # #3992: this mutation changes the row's own key (assignment_id), not
+    # just a field on it — `rekey_entry` updates the row found under its
+    # OLD key rather than a plain `save_queue([existing])` upsert, which
+    # would match on the NEW key, find nothing, and insert a second row
+    # instead of renaming this one.
+    rekey_entry(old_assignment_id, existing)
     return True
 
 
@@ -10811,16 +10960,18 @@ def drop_entry(assignment_id: str) -> bool:
     #1477: *assignment_id* is resolved via :func:`resolve_entry_key`, so the
     durable ``repo#issue`` form works here too — not just a raw assignment
     id, which can go stale across a drop + re-enqueue cycle.
+
+    #3992: routed through :func:`delete_entries` so a manual drop gets the
+    same ``queue_entry_removed`` audit row as :func:`prune_stale_queue_
+    entries`'s automatic one, instead of a bare, unaudited ``DELETE``.
     """
-    conn = get_connection()
     entry = resolve_entry_key(load_queue(), assignment_id)
     if entry is None:
         return False
-    with conn:
-        cursor = sql.execute(
-            conn, "DELETE FROM merge_queue WHERE assignment_id = ?", (entry.assignment_id,)
-        )
-    return cursor.rowcount > 0
+    return delete_entries(
+        [entry], reason="manual drop (`coord merge --drop` / TUI drop action)",
+        actor="user",
+    ) > 0
 
 
 def prune_stale_queue_entries(dry_run: bool = False) -> list["QueuedMerge"]:
@@ -10851,28 +11002,31 @@ def prune_stale_queue_entries(dry_run: bool = False) -> list["QueuedMerge"]:
 
     entries = load_queue()
     stale: list[QueuedMerge] = []
-    surviving: list[QueuedMerge] = []
+    closed_issue_stale: list[QueuedMerge] = []
+    merged_pr_stale: list[QueuedMerge] = []
 
     for entry in entries:
         if entry.state == MERGED:
-            surviving.append(entry)
             continue
 
-        is_stale = False
         if trust_issue_closed_for(entry.assignment_type) and github_ops.issue_is_closed(
             entry.repo_github, entry.issue_number
         ):
-            is_stale = True
-        elif entry.branch and github_ops.pr_is_merged(entry.repo_github, entry.branch):
-            is_stale = True
-
-        if is_stale:
             stale.append(entry)
-        else:
-            surviving.append(entry)
+            closed_issue_stale.append(entry)
+        elif entry.branch and github_ops.pr_is_merged(entry.repo_github, entry.branch):
+            stale.append(entry)
+            merged_pr_stale.append(entry)
 
-    if not dry_run and stale:
-        save_queue(surviving)
+    # #3992: removal is explicit and audited, keyed on exactly these rows —
+    # never a `save_queue` of "everything minus the stale ones", which would
+    # silently delete any row a concurrent writer inserted after `entries`
+    # was loaded above too.
+    if not dry_run:
+        if closed_issue_stale:
+            delete_entries(closed_issue_stale, reason="issue is closed")
+        if merged_pr_stale:
+            delete_entries(merged_pr_stale, reason="PR is already merged")
 
     return stale
 
