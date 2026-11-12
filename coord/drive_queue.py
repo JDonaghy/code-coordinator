@@ -1551,6 +1551,20 @@ QUEUE_ALERT_STAGE = "drive-queue"
 #: change — `coord drive-queue status` still reads the record unchanged.
 QUEUE_ALERT_NO_REMEDY_COMMAND = "coord drive-queue list"
 
+
+def is_benign_queue_alert_command(command: object) -> bool:
+    """Is *command* the :data:`QUEUE_ALERT_NO_REMEDY_COMMAND` sentinel?
+
+    One normalization (`str(...).strip()`), shared by `coord drive-queue
+    status` (`coord.commands.drive_queue._queue_alert`'s caller) and the
+    notifier (`coord.notifier.collect.halted_drives`) — before #3983 each
+    wrote its own comparison (one on the raw dict value, the other via
+    `str(...).strip()` plus its own repo/issue check), which happened to
+    agree only because neither had yet drifted; this is the one answer both
+    now ask the identical question of (#2096).
+    """
+    return str(command or "").strip() == QUEUE_ALERT_NO_REMEDY_COMMAND
+
 #: #3413: a DISPLAY hint only — production's `coord-drive-queue.timer` fires
 #: every 3 minutes (`OnUnitActiveSec=3min`, `deploy/coord-drive-queue.timer`),
 #: not a value this module reads from the deployed unit (there is no seam to
@@ -4196,6 +4210,16 @@ class UnreachableWait:
     is accurate even though those dependents themselves never appear in the
     result (see the predicate's own docstring for why). `0` for an entry
     nothing is chained behind.
+
+    `cause` (#3983) is :func:`classify_unreachable_wait_cause`'s verdict —
+    one of :data:`UNREACHABLE_WAIT_CAUSE_NEEDS_DECOMPOSITION`/
+    `_PREMISE_REFUSAL`/`_UPSTREAM_GAP_PARK` for a terminal park, or
+    `_DISPATCH_FAILURE`/`_NEVER_DISPATCHED` for the two shapes
+    :func:`is_unreachable_wait_shape` itself distinguishes. `reason_at` is
+    `entry.reason_at` carried straight through — the wall-clock stamp of
+    when `last_reason` (hence this wait) was written, so a renderer can
+    show how long the row has sat this way instead of a bare, undated
+    reason (#2133's rule, applied here).
     """
 
     key: str
@@ -4203,6 +4227,8 @@ class UnreachableWait:
     deferrals: int
     last_reason: str
     dependents: int = 0
+    cause: str = ""
+    reason_at: float | None = None
 
 
 def is_unreachable_wait_shape(entry: QueueEntry) -> bool:
@@ -4273,6 +4299,135 @@ def is_unreachable_wait_shape(entry: QueueEntry) -> bool:
     return entry.state == STATE_BLOCKED and _is_dispatch_failure_reason(entry.last_reason)
 
 
+# #3983: the cause label `classify_unreachable_wait_cause` assigns a row
+# matching `is_unreachable_wait_shape`. The three terminal-park values are
+# the SAME strings `coord.queue_diagnose` names
+# `CAUSE_NEEDS_DECOMPOSITION`/`CAUSE_PREMISE_REFUSAL`/`CAUSE_UPSTREAM_GAP_PARK`
+# — deliberately not imported from there: `coord.queue_diagnose` imports
+# `QueueEntry`/`is_unreachable_wait_shape` FROM this module, so importing its
+# constants back here would cycle. Keeping the literal text identical is
+# what lets a reader compare `coord drive-queue status`'s alert and `coord
+# drive-queue diagnose`'s verdict for the same row without translating
+# between two vocabularies for the same finding (#2096).
+UNREACHABLE_WAIT_CAUSE_NEEDS_DECOMPOSITION = "needs-decomposition"
+UNREACHABLE_WAIT_CAUSE_PREMISE_REFUSAL = "premise-refusal"
+UNREACHABLE_WAIT_CAUSE_UPSTREAM_GAP_PARK = "upstream-gap-park"
+#: `attempts > 0`, exhausted the retry budget with no #2273 dispatch-layer
+#: assignment ever created — the second `is_unreachable_wait_shape` branch.
+UNREACHABLE_WAIT_CAUSE_DISPATCH_FAILURE = "dispatch-failure"
+#: `attempts == 0`, no terminal-park marker — the original #2944 shape:
+#: nothing has ever tried to dispatch this row at all.
+UNREACHABLE_WAIT_CAUSE_NEVER_DISPATCHED = "never-dispatched"
+
+#: The three causes a worker/park-writer already asserted are terminal —
+#: "no fix-it leg or relaunch can resolve this" is the row's OWN last_reason
+#: text, not a guess this module is making. See
+#: :func:`unreachable_wait_remedy_command` for why that rules out the
+#: blanket `remove && add` requeue for exactly these three.
+_UNREACHABLE_WAIT_TERMINAL_PARK_CAUSES = frozenset(
+    {
+        UNREACHABLE_WAIT_CAUSE_NEEDS_DECOMPOSITION,
+        UNREACHABLE_WAIT_CAUSE_PREMISE_REFUSAL,
+        UNREACHABLE_WAIT_CAUSE_UPSTREAM_GAP_PARK,
+    }
+)
+
+_UNREACHABLE_WAIT_CAUSE_LABEL: dict[str, str] = {
+    UNREACHABLE_WAIT_CAUSE_NEEDS_DECOMPOSITION: "needs-decomposition park (#3931)",
+    UNREACHABLE_WAIT_CAUSE_PREMISE_REFUSAL: "premise-refusal park (#3164)",
+    UNREACHABLE_WAIT_CAUSE_UPSTREAM_GAP_PARK: "upstream-gap park (#3977)",
+    UNREACHABLE_WAIT_CAUSE_DISPATCH_FAILURE: "exhausted dispatch-layer death (#2273)",
+    UNREACHABLE_WAIT_CAUSE_NEVER_DISPATCHED: "never dispatched",
+}
+
+#: The manual next-step for a cause no blind command can fix — embedded
+#: straight into :func:`describe_unreachable_wait` so the reason text stays
+#: self-contained even where :func:`unreachable_wait_remedy_command` can only
+#: offer a read-only fallback (#3983).
+_UNREACHABLE_WAIT_CAUSE_MANUAL_NOTE: dict[str, str] = {
+    UNREACHABLE_WAIT_CAUSE_NEEDS_DECOMPOSITION: (
+        "not fixable by any fix-it leg or relaunch — decompose the issue "
+        "into the proposed sub-issues and clear the row by hand"
+    ),
+    UNREACHABLE_WAIT_CAUSE_PREMISE_REFUSAL: (
+        "not fixable by a requeue alone — run `coord drive-queue "
+        "clear-refusal` once the missing prerequisite is confirmed, THEN "
+        "`coord drive-queue remove` + `add`"
+    ),
+    UNREACHABLE_WAIT_CAUSE_UPSTREAM_GAP_PARK: (
+        "not fixable by any fix-it leg or relaunch — clear the row by hand "
+        "once the release lands or the gap is confirmed"
+    ),
+}
+
+
+def classify_unreachable_wait_cause(entry: QueueEntry) -> str:
+    """Which `is_unreachable_wait_shape` branch explains *entry*'s wedge.
+
+    Read straight off `entry.last_reason` via the same marker predicates
+    `coord.drive_queue`'s own parked pre-pass and
+    `coord.queue_diagnose._rule_terminal_park` already trust for this text
+    — never a live probe, so this is exactly as cheap as the shape check
+    itself (#2096: one question, one answer, asked the same way everywhere).
+    Callers are expected to gate on :func:`is_unreachable_wait_shape` first;
+    called on a row that fails that shape, this still returns a value
+    rather than raising (the two dispatch-shaped labels degrade safely for
+    an unmatched row — see :func:`unreachable_wait_remedy_command`, which
+    treats an unrecognised cause the same as "never dispatched").
+    """
+    reason = entry.last_reason
+    if is_premise_refusal_reason(reason):
+        return UNREACHABLE_WAIT_CAUSE_PREMISE_REFUSAL
+    if is_needs_decomposition_reason(reason):
+        return UNREACHABLE_WAIT_CAUSE_NEEDS_DECOMPOSITION
+    if is_upstream_gap_park_reason(reason):
+        return UNREACHABLE_WAIT_CAUSE_UPSTREAM_GAP_PARK
+    if entry.attempts and _is_dispatch_failure_reason(reason):
+        return UNREACHABLE_WAIT_CAUSE_DISPATCH_FAILURE
+    return UNREACHABLE_WAIT_CAUSE_NEVER_DISPATCHED
+
+
+def unreachable_wait_remedy_command(w: UnreachableWait) -> str:
+    """The one-line fix for *w*, picked by `.cause` (#3983) — never the
+    blanket `coord drive-queue remove && add` requeue for a cause the row's
+    OWN last_reason already asserts no relaunch can resolve.
+
+    Mirrors :func:`merge_gate_remedy_command`'s #3016 rule for the same
+    reason: a wrong "run this" is worse than no recommendation, so a cause
+    with no blind-safe command falls back to the identical read-only
+    inspect pattern (`coord drive-queue list`, scoped to the entry's repo)
+    rather than ever proposing `remove`+`add` for a needs-decomposition,
+    premise-refusal or upstream-gap park — relaunching one of those just
+    re-runs the drive straight back into the identical park (the #3922
+    needs-decomposition incident this guards against).
+    """
+    parsed = parse_key(w.key)
+    repo, issue = parsed if parsed is not None else ("", 0)
+    if w.cause in _UNREACHABLE_WAIT_TERMINAL_PARK_CAUSES:
+        return f"coord drive-queue list --repo {repo}"
+    return (
+        f"coord drive-queue remove {repo} {issue} && "
+        f"coord drive-queue add {repo} {issue}"
+    )
+
+
+def format_coarse_duration(delta_seconds: float) -> str:
+    """``42s`` / ``3h`` / ``5d`` — coarse, single-unit (#2133's ask).
+
+    Shared by :func:`describe_unreachable_wait` and
+    `coord.commands.drive_queue`'s own age renderings (imported from here
+    rather than re-implemented) so "how long has this held" always reads
+    the same shape everywhere it is shown.
+    """
+    if delta_seconds < 60:
+        return f"{int(delta_seconds)}s"
+    if delta_seconds < 3600:
+        return f"{int(delta_seconds // 60)}m"
+    if delta_seconds < 86400:
+        return f"{int(delta_seconds // 3600)}h"
+    return f"{int(delta_seconds // 86400)}d"
+
+
 def is_unreachable_wait(
     entry: QueueEntry,
     *,
@@ -4327,45 +4482,74 @@ def detect_unreachable_waits(
                 deferrals=e.deferrals,
                 last_reason=e.last_reason,
                 dependents=dependents_of.get(e.key, 0),
+                cause=classify_unreachable_wait_cause(e),
+                reason_at=e.reason_at,
             )
         )
     return waits
 
 
-def describe_unreachable_wait(w: UnreachableWait) -> str:
-    """Render one :class:`UnreachableWait` — the entry, the evidence, and
-    (#2978) its dependent count when non-zero, naming WHY those dependents
-    need no remedy of their own (they self-heal on #2756 the moment the
-    root clears, so a reader must not read this as "fix these too").
+def describe_unreachable_wait(w: UnreachableWait, *, now: float | None = None) -> str:
+    """Render one :class:`UnreachableWait` — the entry, its cause (#3983),
+    how long it has sat this way, and (#2978) its dependent count when
+    non-zero, naming WHY those dependents need no remedy of their own (they
+    self-heal on #2756 the moment the root clears, so a reader must not
+    read this as "fix these too").
+
+    *now* is the caller's wall clock: omitted (the default), the age clause
+    is left out rather than guessed — the same degrade `_reason_age_suffix`
+    uses for a row with no `reason_at` at all. Every live caller has a
+    clock available (`time.time()` for the CLI/notifier, `ctx.now` for the
+    health probe) and is expected to pass it; only a clockless test exercises
+    the bare form.
 
     One rendering, shared by :func:`unreachable_wait_alert` (the `coord
-    drive-queue status` `alert:` line and `coord doctor`'s WARN sample —
-    see :mod:`coord.health.checks.wedged_drive_queue`) and (#3983)
+    drive-queue status` `alert:` line), `coord doctor`'s WARN sample
+    (:mod:`coord.health.checks.wedged_drive_queue`) and (#3983)
     :mod:`coord.notifier.collect`'s own per-root ``HaltedDrive`` reason —
     so the CLI, the health probe and the pager phrase the identical finding
     identically rather than drifting apart (#2096).
     """
-    base = f"{w.key} ({w.state}, {w.deferrals} deferrals)"
+    age = ""
+    if now is not None and w.reason_at is not None:
+        age = f", stuck {format_coarse_duration(max(0.0, now - w.reason_at))}"
+    cause_label = _UNREACHABLE_WAIT_CAUSE_LABEL.get(w.cause, w.cause or "unknown cause")
+    base = f"{w.key} ({w.state}, {cause_label}, {w.deferrals} deferrals{age})"
+    notes: list[str] = []
+    manual_note = _UNREACHABLE_WAIT_CAUSE_MANUAL_NOTE.get(w.cause)
+    if manual_note:
+        notes.append(manual_note)
     if w.dependents:
-        plural = "ies" if w.dependents != 1 else "y"
-        base += (
-            f" — {w.dependents} dependent entr{plural} chained behind it "
-            "will self-heal automatically once this clears (#2756), no "
-            "remedy needed on them"
+        plural = "y" if w.dependents == 1 else "ies"
+        notes.append(
+            f"{w.dependents} dependent entr{plural} chained behind it will "
+            "self-heal automatically once this clears (#2756), no remedy "
+            "needed on them"
         )
+    if notes:
+        base += " — " + "; ".join(notes)
     return base
 
 
-def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
+def unreachable_wait_alert(
+    waits: Sequence[UnreachableWait], *, now: float | None = None
+) -> QueueAlert:
     """The queue-level record #2944's predicate raises, in :func:`_hold_alert`'s
     shape — a message naming the entry (or entries), the evidence that
-    qualified it, and the ONE remedy that actually clears it.
+    qualified it, and the remedy that actually clears it.
 
-    ``add`` alone does not clear ``blocked`` (the queue list already
-    documents this as a footgun elsewhere) — only ``remove`` then ``add``
-    does, so that is the command surfaced here rather than the generic
-    ``coord drive-queue list`` other alerts fall back on; naming the wrong
-    remedy on a state this non-obvious defeats the point of alerting at all.
+    #3983: the remedy is picked PER ENTRY by :func:`unreachable_wait_remedy_command`
+    — never the blanket ``remove`` + ``add`` for a needs-decomposition/
+    premise-refusal/upstream-gap park, each of which the row's own
+    last_reason already asserts no relaunch can resolve (see that
+    function's docstring). The top-level ``command`` field mirrors the
+    single entry's remedy when there is exactly one; with several entries
+    of possibly different causes there is no one command that is safe for
+    all of them, so it falls back to the same read-only ``coord
+    drive-queue list`` #3016's ``merge_gate_remedy_command`` falls back to
+    — the per-entry remedy is still named in ``details`` and inline in
+    ``reason`` via :func:`describe_unreachable_wait`.
+
     Named INLINE in ``reason`` (not only in ``command``, which
     ``drive-queue status``'s plain-text rendering never echoes — only its
     ``gate_readings``/``details`` lines are printed) so the remedy is visible
@@ -4382,31 +4566,40 @@ def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     that were never named — but easy to mis-generalize to "the dependents
     too" by an operator who does not already know #2756 self-heals them.
     """
-    names = ", ".join(describe_unreachable_wait(w) for w in waits[:5])
+    names = ", ".join(describe_unreachable_wait(w, now=now) for w in waits[:5])
     more = ", ..." if len(waits) > 5 else ""
     plural = len(waits) != 1
+    if len(waits) == 1:
+        command = unreachable_wait_remedy_command(waits[0])
+    elif waits and all(
+        w.cause not in _UNREACHABLE_WAIT_TERMINAL_PARK_CAUSES for w in waits
+    ):
+        command = (
+            "coord drive-queue remove <repo> <issue> && "
+            "coord drive-queue add <repo> <issue> — for each ROOT entry "
+            "named above; any dependents chained behind it self-heal on "
+            "their own (#2756)"
+        )
+    else:
+        command = "coord drive-queue list  # remedy differs per entry — see above"
     return QueueAlert(
         reason=(
             f"{len(waits)} queue entr{'ies' if plural else 'y'} stuck in a "
             "guaranteed-false wait — blocked/parked with no branch/PR/"
             "merge-queue row any sweep could ever act on (never dispatched, "
             "or every dispatch attempt died before creating an assignment); "
-            f"no sweep can ever clear this on its own: {names}{more}. Fix: "
-            "coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue> for each ROOT entry named "
-            "above — never on a dependent chained behind one."
+            f"no sweep can ever clear this on its own: {names}{more}. Fix "
+            "is named per entry above — a needs-decomposition/"
+            "premise-refusal/upstream-gap park is NEVER cleared by `remove`"
+            "+`add`, only an ordinary never-dispatched/dispatch-failure root is."
         ),
         details=tuple(
-            f"{w.key}: {w.state}, {w.deferrals} deferrals, "
-            f"dependents={w.dependents}, last_reason={w.last_reason!r}"
+            f"{w.key}: {w.state}, cause={w.cause}, {w.deferrals} deferrals, "
+            f"dependents={w.dependents}, last_reason={w.last_reason!r}, "
+            f"fix={unreachable_wait_remedy_command(w)}"
             for w in waits
         ),
-        command=(
-            "coord drive-queue remove <repo> <issue> && "
-            "coord drive-queue add <repo> <issue> — for each ROOT entry "
-            "named above; any dependents chained behind it self-heal on "
-            "their own (#2756)"
-        ),
+        command=command,
     )
 
 

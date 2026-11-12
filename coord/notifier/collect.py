@@ -325,8 +325,8 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
     """
     from coord.drive_queue import (  # noqa: PLC0415
         QUEUE_ALERT_ISSUE,
-        QUEUE_ALERT_NO_REMEDY_COMMAND,
         QUEUE_ALERT_REPO,
+        is_benign_queue_alert_command,
     )
 
     try:
@@ -350,7 +350,7 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
         if (
             repo == QUEUE_ALERT_REPO
             and issue == QUEUE_ALERT_ISSUE
-            and command == QUEUE_ALERT_NO_REMEDY_COMMAND
+            and is_benign_queue_alert_command(command)
         ):
             continue
         if (repo, issue) != (QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE):
@@ -368,15 +368,29 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
         )
 
     out.extend(
-        _unreachable_wait_halted_drives(escalated_keys, urgent=urgent)
+        _unreachable_wait_halted_drives(escalated_keys, urgent=urgent, now=now)
     )
     return out
 
 
 def _unreachable_wait_halted_drives(
-    escalated_keys: set[tuple[str, int]], *, urgent: set[str]
+    escalated_keys: set[tuple[str, int]], *, urgent: set[str], now: float
 ) -> list[HaltedDrive]:
     """#3983: live `detect_unreachable_waits` roots, as `HaltedDrive`s.
+
+    ``proposed_command`` is picked PER ROOT by
+    `coord.drive_queue.unreachable_wait_remedy_command` — never the blanket
+    `remove`+`add` requeue. For the three terminal-park causes (#3979's
+    `needs-decomposition`/`premise-refusal`/`upstream-gap-park`) that
+    requeue is actively wrong: the row's own `last_reason` already asserts
+    no relaunch can resolve it, and a requeue just relaunches the drive
+    straight back into re-emitting the identical park (the #3922
+    needs-decomposition incident `coord.drive_queue.
+    unreachable_wait_remedy_command`'s own docstring names). Those three
+    get the same read-only `coord drive-queue list` fallback #3016's
+    `merge_gate_remedy_command` uses for its own no-safe-command shapes
+    instead — the manual next step is still named inline in ``reason`` via
+    `describe_unreachable_wait`.
 
     Fails open to ``[]`` like every other source in this module — a queue
     read that errors must degrade silently, never take the whole notifier
@@ -387,6 +401,7 @@ def _unreachable_wait_halted_drives(
         detect_unreachable_waits,
         entries_from_rows,
         parse_key,
+        unreachable_wait_remedy_command,
     )
 
     try:
@@ -411,13 +426,10 @@ def _unreachable_wait_halted_drives(
                 issue=issue,
                 reason=(
                     "guaranteed-false wait (#2944/#2978): "
-                    + describe_unreachable_wait(wait)
+                    + describe_unreachable_wait(wait, now=now)
                 ),
                 urgent=urgent_key(repo, issue) in urgent,
-                proposed_command=(
-                    f"coord drive-queue remove {repo} {issue} && "
-                    f"coord drive-queue add {repo} {issue}"
-                ),
+                proposed_command=unreachable_wait_remedy_command(wait),
             )
         )
     return out

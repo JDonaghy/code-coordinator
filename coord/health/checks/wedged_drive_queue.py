@@ -33,9 +33,13 @@ that produced the #2900/#2907 incident) and #2230 (the sweep's origin): both
 are about *why* a row gets wedged this way; this check is about the row
 being wedged *at all*, whatever sweep — present or future — produced it.
 
-WARN, not CRIT: the fix costs an operator ~10 seconds (``coord drive-queue
-remove`` + ``add``) once they know, and this check exists to make sure they
-know — it is not itself an outage.
+WARN, not CRIT: for the never-dispatched/dispatch-failure shapes the fix
+costs an operator ~10 seconds (``coord drive-queue remove`` + ``add``) once
+they know; for the three terminal-park causes (#3983 —
+needs-decomposition/premise-refusal/upstream-gap-park) it costs a human
+decision instead (decompose the issue, confirm the prerequisite, or wait for
+the release), never that requeue — either way this check exists to make
+sure an operator knows, it is not itself an outage.
 
 ``cost=COST_NETWORK``, not ``COST_CHEAP``: ``coord.state.list_drive_queue``
 routes to the daemon over HTTP whenever ``board_service`` is set, which is
@@ -76,10 +80,11 @@ from coord.health.registry import COST_NETWORK, check
     ),
 )
 def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
-    del ctx  # unused: this check reads local queue state directly, not config
     from coord.drive_queue import (  # noqa: PLC0415
+        describe_unreachable_wait,
         detect_unreachable_waits,
         entries_from_rows,
+        unreachable_wait_remedy_command,
     )
     from coord.state import list_drive_queue  # noqa: PLC0415
 
@@ -103,11 +108,12 @@ def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
             headroom="0 wedged drive-queue entries",
         )
 
+    # #3983: `describe_unreachable_wait` — the SAME rendering `coord
+    # drive-queue status`'s `alert:` line and the notifier's pager entry
+    # use — rather than this probe building its own text for the identical
+    # finding (#2096: one question, one answer, three surfaces).
     sample = ", ".join(
-        f"{w.key} ({w.state}, {w.deferrals} deferrals"
-        + (f", {w.dependents} dependents self-heal (#2756)" if w.dependents else "")
-        + ")"
-        for w in waits[:5]
+        describe_unreachable_wait(w, now=ctx.now) for w in waits[:5]
     )
     return CheckResult(
         check_id="wedged_drive_queue",
@@ -119,11 +125,13 @@ def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
         ),
         detail=(
             f"e.g. {sample}" + (", ..." if len(waits) > 5 else "")
-            + " — no branch/PR/merge-queue row any sweep could ever act on "
-            "(never dispatched, or every dispatch attempt died before "
-            "creating an assignment); cannot clear on its own. fix (root "
-            "only — any dependents self-heal, #2756): coord drive-queue "
-            "remove <repo> <issue> && coord drive-queue add <repo> <issue>"
+            + " — fix per entry (never a blanket command — a "
+            "needs-decomposition/premise-refusal/upstream-gap park is NOT "
+            "cleared by `remove`+`add`): "
+            + "; ".join(
+                f"{w.key}: {unreachable_wait_remedy_command(w)}"
+                for w in waits[:5]
+            )
         ),
         threshold=(
             "warn when any entry is blocked/parked with no branch/PR a sweep "
@@ -136,6 +144,7 @@ def probe_wedged_drive_queue(ctx: HealthContext) -> CheckResult:
                 {
                     "key": w.key,
                     "state": w.state,
+                    "cause": w.cause,
                     "deferrals": w.deferrals,
                     "dependents": w.dependents,
                     "last_reason": w.last_reason,

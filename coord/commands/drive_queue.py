@@ -57,7 +57,6 @@ from coord.drive_queue import (
     MAX_BLOCKED_RESUMES,
     PRODUCTION_TICK_INTERVAL_HINT_SECONDS,
     QUEUE_ALERT_ISSUE,
-    QUEUE_ALERT_NO_REMEDY_COMMAND,
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
@@ -94,6 +93,8 @@ from coord.drive_queue import (
     find_cycle,
     fired_holds,
     flag_shadows_config_warning,
+    format_coarse_duration,
+    is_benign_queue_alert_command,
     is_dispatch_failure_reason,
     is_fix_round_ceiling_blocked,
     is_merge_gate_block_reason,
@@ -2070,15 +2071,12 @@ def _reason_age_suffix(entry: QueueEntry, now: float) -> str:
     return f" ({_age_str(max(0.0, now - entry.reason_at))} ago)"
 
 
-def _age_str(delta_seconds: float) -> str:
-    """``42s`` / ``3h`` / ``5d`` — coarse, single-unit, matches #2133's ask."""
-    if delta_seconds < 60:
-        return f"{int(delta_seconds)}s"
-    if delta_seconds < 3600:
-        return f"{int(delta_seconds // 60)}m"
-    if delta_seconds < 86400:
-        return f"{int(delta_seconds // 3600)}h"
-    return f"{int(delta_seconds // 86400)}d"
+# #3983: `coord.drive_queue.format_coarse_duration` — imported under this
+# module's own pre-existing name so every call site below (and the
+# `describe_unreachable_wait`-driven alert text) renders "how long has this
+# held" with the identical single-unit shape, never a second formatter that
+# could drift from it.
+_age_str = format_coarse_duration
 
 
 def _hold_lines(entry: QueueEntry) -> list[str]:
@@ -2567,7 +2565,7 @@ def _unreachable_wait_alert_dict(rows: list[Mapping[str, Any]]) -> dict | None:
     waits = detect_unreachable_waits(entries_from_rows(rows))
     if not waits:
         return None
-    synthetic = unreachable_wait_alert(waits)
+    synthetic = unreachable_wait_alert(waits, now=time.time())
     return {
         "reason": synthetic.reason,
         "gate_readings": " | ".join(synthetic.details),
@@ -2604,9 +2602,8 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
     # tick-raised alert itself the thing, or just noise?"), one answer,
     # shared by both callers.
     tick_alert = _queue_alert()
-    if (
-        tick_alert is not None
-        and tick_alert.get("proposed_command") != QUEUE_ALERT_NO_REMEDY_COMMAND
+    if tick_alert is not None and not is_benign_queue_alert_command(
+        tick_alert.get("proposed_command")
     ):
         alert = tick_alert
     else:
