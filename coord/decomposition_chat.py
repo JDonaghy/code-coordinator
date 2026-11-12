@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from coord.config import Config
+    from coord.milestone_order import WorkOrderNode
     from coord.models import Assignment, Board, Machine, Repo, SplitProposal
     from coord.preflight_size import SplitVerification
 
@@ -1314,6 +1315,98 @@ def parse_size_triage_response(
     )
 
 
+def _repoint_queued_dependents_at_split(
+    *,
+    repo_name: str,
+    original_issue: int,
+    epic_number: int,
+    remapped_nodes: tuple["WorkOrderNode", ...],
+    origin: str,
+) -> None:
+    """Re-point every queued entry whose ``after=`` names *original_issue*
+    onto the split's sink children (#3984).
+
+    Without this, ``drive_queue._resolve_prereqs``'s ``live_prereq_
+    terminal`` recovery (#2602/#2850) reads a prerequisite a live re-check
+    finds CLOSED as satisfied, whatever the reason it closed — so a
+    dependent chained on the original would read it as "done" the instant
+    :func:`file_and_queue_split_proposal` closes it as superseded, and
+    launch before any split child has merged (the quadraui#2341 incident:
+    13 rows would have launched against code the split hadn't landed yet).
+
+    Walks the WHOLE drive queue, not just *repo_name*'s — an ``after=`` key
+    is fully-qualified (``repo#N``) and a dependent can live in a different
+    repo than the original. Every matching row is rewritten with the SAME
+    write path ``coord drive-queue add`` itself uses
+    (:func:`coord.state.enqueue_drive_queue`), carrying forward every
+    OTHER operator-declared field on that row untouched, then confirmed
+    with a readback before moving to the next row — an unconfirmed rewrite
+    is not a rewrite, same discipline the child-queuing loop above already
+    applies. A row's ``last_reason`` also records why its edges changed, so
+    ``coord drive-queue list`` doesn't just show a different ``after=``
+    with no explanation.
+
+    Raises (never swallows) on the first row that doesn't read back the new
+    ``after=`` — propagating straight out of
+    :func:`file_and_queue_split_proposal`, which calls this BEFORE closing
+    the original, so a raise here always aborts before that close.
+    """
+    from coord.drive_queue import entry_key, rewrite_after_for_split, sink_children
+    from coord.state import (
+        enqueue_drive_queue,
+        get_drive_queue_entry,
+        list_drive_queue,
+        update_drive_queue_entry,
+    )
+
+    sink_issue_numbers = sink_children(remapped_nodes)
+    original_key = entry_key(repo_name, original_issue)
+    sink_keys = [entry_key(repo_name, n) for n in sink_issue_numbers]
+
+    for row in list_drive_queue():
+        current_after = [str(a) for a in (row.get("after_json") or [])]
+        if original_key not in current_after:
+            continue
+        dep_repo = str(row.get("repo_name") or "")
+        dep_issue = int(row.get("issue_number") or 0)
+        new_after = rewrite_after_for_split(current_after, original_key, sink_keys)
+
+        enqueue_drive_queue(
+            dep_repo,
+            dep_issue,
+            machine=row.get("machine") or None,
+            after=new_after,
+            hold_after=bool(row.get("hold_after")),
+            hold_reason=str(row.get("hold_reason") or ""),
+            resume_when=str(row.get("resume_when") or ""),
+            hold_scope=str(row.get("hold_scope") or "entry"),
+            max_fix_rounds=row.get("max_fix_rounds"),
+            no_acceptance=bool(row.get("no_acceptance")),
+            plan_destructive=bool(row.get("plan_destructive")),
+        )
+        update_drive_queue_entry(
+            dep_repo,
+            dep_issue,
+            last_reason=(
+                f"re-pointed off superseded {original_key} onto #{epic_number}'s "
+                f"split children ({', '.join(sink_keys)}) by the {origin}"
+            ),
+        )
+
+        confirmed = get_drive_queue_entry(dep_repo, dep_issue)
+        confirmed_after = (
+            [str(a) for a in (confirmed.get("after_json") or [])]
+            if confirmed is not None
+            else None
+        )
+        if confirmed is None or sorted(confirmed_after) != sorted(new_after):
+            raise RuntimeError(
+                f"filed epic #{epic_number} but re-pointing queued dependent "
+                f"{dep_repo}#{dep_issue} off superseded {original_key} did not "
+                f"read back the new after= list"
+            )
+
+
 def file_and_queue_split_proposal(
     *,
     proposal: "SplitProposal",
@@ -1339,8 +1432,13 @@ def file_and_queue_split_proposal(
     ``proposal.chunks`` order, remap the placeholder work order onto the
     real numbers and splice it into the epic body, queue each child
     (confirming every queue write with a readback — an unconfirmed queue
-    insert is not a queued child), then close the original issue pointing
-    at the new epic — forcing past the "open children" guard (the
+    insert is not a queued child), re-point every ALREADY-queued entry
+    whose ``after=`` names the original onto the split's sink children
+    (:func:`_repoint_queued_dependents_at_split`, #3984 — otherwise
+    ``drive_queue._resolve_prereqs``'s ``live_prereq_terminal`` recovery
+    reads the original's close as "pre-req satisfied" and launches every
+    dependent before any child has landed), then close the original issue
+    pointing at the new epic — forcing past the "open children" guard (the
     original's own body is exactly the shape expected to trip it once it
     already carries a ``## Sub-issues``/``## Work order`` block, e.g. from
     a prior triage pass) and confirming the close itself with a readback,
@@ -1409,6 +1507,19 @@ def file_and_queue_split_proposal(
                 f"queued child #{node.issue_number} in {repo.name!r} but it "
                 "did not read back from the drive queue"
             )
+
+    # #3984: before closing the original, re-point every dependent ALREADY
+    # queued against it onto the split's children — a failure here raises
+    # and propagates straight out of this function, same as every other
+    # step above, so the original is never closed with a dependent still
+    # pointing at it.
+    _repoint_queued_dependents_at_split(
+        repo_name=repo.name,
+        original_issue=proposal.issue_number,
+        epic_number=epic_number,
+        remapped_nodes=remapped_nodes,
+        origin=origin,
+    )
 
     # `force=True`: the original being split is likely to already carry a
     # `## Sub-issues`/`## Work order` block of its own (e.g. a prior triage

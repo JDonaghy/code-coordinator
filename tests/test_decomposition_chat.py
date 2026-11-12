@@ -2231,6 +2231,139 @@ class TestFileAndQueueSplitProposal:
         mock_close_issue.assert_not_called()
 
 
+class TestRepointQueuedDependentsAtSplit:
+    """#3984: a dependent already queued with ``after=`` naming the issue
+    being split must be re-pointed at the split's SINK children before the
+    original closes — otherwise #2602/#2850's `live_prereq_terminal`
+    recovery reads the original's close as "pre-req satisfied" and the
+    dependent launches before any child has landed.
+
+    Exercises the real drive-queue read/write path (only `coord.github_ops`
+    is mocked — no real GitHub calls) so the acceptance shape is pinned
+    end to end: split O into `C1 -> C2` plus a parallel `C3`, with
+    dependents D1 (`after=O`) and D2 (`after=O,X`)."""
+
+    def _proposal(self) -> "decomposition_chat.SplitProposal":
+        from coord.models import SplitChunk, SplitProposal
+
+        return SplitProposal(
+            id=0, repo_name="api", issue_number=99, issue_title="A giant issue",
+            rationale="too big for one worker", chunks=[
+                SplitChunk(title="Part 1", scope="do part 1", files_likely=["a.py"]),
+                SplitChunk(title="Part 2", scope="do part 2", files_likely=["b.py"]),
+                SplitChunk(title="Part 3", scope="do part 3", files_likely=["c.py"]),
+            ],
+        )
+
+    def _verification(self) -> "decomposition_chat.SplitVerification":
+        from coord.milestone_order import WorkOrder, WorkOrderNode
+        from coord.preflight_size import SplitVerification
+
+        return SplitVerification(
+            ok=True, reason=None, epic_body="rationale text",
+            work_order=WorkOrder(nodes=(
+                WorkOrderNode(issue_number=1, after=()),
+                WorkOrderNode(issue_number=2, after=(1,)),
+                WorkOrderNode(issue_number=3, after=()),
+            )),
+        )
+
+    @patch("coord.github_ops.get_issue_state")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_dependents_repointed_at_sink_children_and_original_closed(
+        self, mock_create_issue, mock_update_body, mock_close_issue, mock_get_issue_state,
+    ) -> None:
+        from coord.drive_queue import entry_key
+        from coord.models import Repo
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},  # epic
+            {"number": 501, "url": "https://x/501"},  # C1
+            {"number": 502, "url": "https://x/502"},  # C2 (after C1)
+            {"number": 503, "url": "https://x/503"},  # C3
+        ]
+        mock_get_issue_state.return_value = "closed"
+        repo = Repo(name="api", github="acme/api")
+
+        original_key = entry_key("api", 99)
+        enqueue_drive_queue("api", 201, after=[original_key])  # D1: after=O
+        enqueue_drive_queue(
+            "other", 777, after=[original_key, "other#300"]
+        )  # D2: after=O,X (cross-repo dependent)
+
+        epic_number = decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+        assert epic_number == 500
+
+        sink_keys = {entry_key("api", 502), entry_key("api", 503)}
+        rows = {(e["repo_name"], e["issue_number"]): e for e in list_drive_queue()}
+
+        d1 = rows[("api", 201)]
+        assert set(d1["after_json"]) == sink_keys
+        assert original_key not in d1["after_json"]
+        assert "99" in d1["last_reason"]
+
+        d2 = rows[("other", 777)]
+        assert set(d2["after_json"]) == sink_keys | {"other#300"}
+        assert original_key not in d2["after_json"]
+
+        # The original is still force-closed, after the re-point.
+        mock_close_issue.assert_called_once()
+
+    @patch("coord.github_ops.get_issue_state")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_repoint_failure_aborts_before_close_and_leaves_row_untouched(
+        self, mock_create_issue, mock_update_body, mock_close_issue, mock_get_issue_state,
+        monkeypatch,
+    ) -> None:
+        """A failed re-point write must abort BEFORE the original closes,
+        and the dependent's own row must be left exactly as it was — never
+        partially rewritten."""
+        import coord.state as state_mod
+        from coord.drive_queue import entry_key
+        from coord.models import Repo
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},
+            {"number": 501, "url": "https://x/501"},
+            {"number": 502, "url": "https://x/502"},
+            {"number": 503, "url": "https://x/503"},
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        original_key = entry_key("api", 99)
+        enqueue_drive_queue("api", 201, after=[original_key])
+
+        real_enqueue = state_mod.enqueue_drive_queue
+
+        def _boom(repo_name, issue_number, **kwargs):
+            after = kwargs.get("after")
+            if issue_number == 201 and after is not None and original_key not in after:
+                raise RuntimeError("boom: simulated drive-queue write failure")
+            return real_enqueue(repo_name, issue_number, **kwargs)
+
+        monkeypatch.setattr(state_mod, "enqueue_drive_queue", _boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            decomposition_chat.file_and_queue_split_proposal(
+                proposal=self._proposal(), verification=self._verification(), repo=repo,
+            )
+
+        mock_close_issue.assert_not_called()
+        row = next(
+            e for e in list_drive_queue()
+            if e["repo_name"] == "api" and e["issue_number"] == 201
+        )
+        assert row["after_json"] == [original_key]
+
+
 class TestAutoSplitNeedsDecomposition:
     """`auto_split_needs_decomposition` files a needs-decomposition work
     leg's machine-readable split through the same verify + file + queue path
