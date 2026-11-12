@@ -296,6 +296,32 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
     that DOES carry a real ``proposed_command`` (because step 4 found at
     least one genuinely blocked entry) is never a sentinel match here, so it
     pages like any other halted drive.
+
+    #3983: the benign-sentinel skip above is exactly the gap that let
+    quadraui#2341 page nobody for ~13h. That row's own last_reason (a #3931
+    needs-decomposition park) qualifies `coord.drive_queue.
+    detect_unreachable_waits`'s #2944/#2978 guaranteed-false-wait shape, but
+    its 13 `waiting` dependents never reach `blocked` — `_resolve_prereqs`
+    treats a `parked` pre-req as an ordinary unsatisfied deferral, never the
+    unsatisfiable one a `blocked`/`failed` pre-req gets — so step 4 kept
+    re-writing the SAME benign sentinel over the root's own finding, every
+    3-minute tick, for as long as the dependents sat `waiting`. The
+    board-doctor alert tier (#3979's CAUSE_NEEDS_DECOMPOSITION) would also
+    page this root, but ships dry-run by default (#3758) and its own
+    hourly sweep is a separate, operator-armed opt-in — not something this
+    function may assume is on. So this directly re-derives the same live
+    finding `coord drive-queue status`'s `alert:` line and `coord doctor`'s
+    `wedged_drive_queue` WARN already show, straight from the queue, with
+    the REAL (repo, issue) of the root rather than the synthetic
+    `QUEUE_ALERT_REPO`/`QUEUE_ALERT_ISSUE` key step 4 writes to — one
+    detection (`detect_unreachable_waits`), three surfaces that can never
+    say different things (#2096).
+
+    A root already carrying its OWN real escalation record (any stage) is
+    skipped here — that record is richer (board-doctor's cause-specific
+    diagnosis, when it ran) and must not be shadowed by this generic
+    fallback finding the identical row a second time under a different
+    reason string.
     """
     from coord.drive_queue import (  # noqa: PLC0415
         QUEUE_ALERT_ISSUE,
@@ -309,10 +335,11 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
         records = list_drive_escalations()
     except Exception as exc:  # noqa: BLE001
         log.debug("notifier: drive escalations unavailable (%s)", exc)
-        return []
+        records = []
 
     urgent = urgent_keys(notifier_state, now=now)
     out: list[HaltedDrive] = []
+    escalated_keys: set[tuple[str, int]] = set()
     for record in records:
         repo = str(record.get("repo_name") or "")
         try:
@@ -326,6 +353,8 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
             and command == QUEUE_ALERT_NO_REMEDY_COMMAND
         ):
             continue
+        if (repo, issue) != (QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE):
+            escalated_keys.add((repo, issue))
         stage = str(record.get("stage") or "").strip()
         reason = str(record.get("reason") or "").strip()
         out.append(
@@ -335,6 +364,60 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
                 reason=f"{stage + ': ' if stage else ''}{reason}".strip(),
                 urgent=urgent_key(repo, issue) in urgent,
                 proposed_command=command or None,
+            )
+        )
+
+    out.extend(
+        _unreachable_wait_halted_drives(escalated_keys, urgent=urgent)
+    )
+    return out
+
+
+def _unreachable_wait_halted_drives(
+    escalated_keys: set[tuple[str, int]], *, urgent: set[str]
+) -> list[HaltedDrive]:
+    """#3983: live `detect_unreachable_waits` roots, as `HaltedDrive`s.
+
+    Fails open to ``[]`` like every other source in this module — a queue
+    read that errors must degrade silently, never take the whole notifier
+    tick down with it.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        describe_unreachable_wait,
+        detect_unreachable_waits,
+        entries_from_rows,
+        parse_key,
+    )
+
+    try:
+        from coord.state import list_drive_queue  # noqa: PLC0415
+
+        waits = detect_unreachable_waits(entries_from_rows(list_drive_queue()))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("notifier: drive queue unavailable for unreachable-wait check (%s)", exc)
+        return []
+
+    out: list[HaltedDrive] = []
+    for wait in waits:
+        parsed = parse_key(wait.key)
+        if parsed is None:
+            continue
+        repo, issue = parsed
+        if (repo, issue) in escalated_keys:
+            continue
+        out.append(
+            HaltedDrive(
+                repo=repo,
+                issue=issue,
+                reason=(
+                    "guaranteed-false wait (#2944/#2978): "
+                    + describe_unreachable_wait(wait)
+                ),
+                urgent=urgent_key(repo, issue) in urgent,
+                proposed_command=(
+                    f"coord drive-queue remove {repo} {issue} && "
+                    f"coord drive-queue add {repo} {issue}"
+                ),
             )
         )
     return out

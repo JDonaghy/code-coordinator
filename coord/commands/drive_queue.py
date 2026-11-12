@@ -57,6 +57,7 @@ from coord.drive_queue import (
     MAX_BLOCKED_RESUMES,
     PRODUCTION_TICK_INTERVAL_HINT_SECONDS,
     QUEUE_ALERT_ISSUE,
+    QUEUE_ALERT_NO_REMEDY_COMMAND,
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
@@ -2583,13 +2584,33 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
 
     rows = list_drive_queue()
     counts = _counts(rows)
-    # #2944: a tick-raised alert (a HELD gate, "nothing eligible to launch")
+    # #2944: a tick-raised alert (a HELD gate, a real BLOCKED-entry remedy)
     # takes priority when one exists — it is fresher and, on a busy queue,
     # `_unreachable_wait_alert_dict` would silently win-and-hide it every
-    # time a real, actionable alert IS present. Only when the tick has
-    # nothing to say (the common, dangerous case a queue with free slots
-    # sits in for hours) does the guaranteed-false-wait check get to speak.
-    alert = _queue_alert() or _unreachable_wait_alert_dict(rows)
+    # time a real, actionable alert IS present.
+    #
+    # #3983: EXCEPT the one tick-raised shape that is itself a sentinel for
+    # "nothing is actually broken" — `QUEUE_ALERT_NO_REMEDY_COMMAND` (step
+    # 4's "nothing eligible to launch" write when every stalled entry is a
+    # benign deferral, never an actual block). The quadraui#2341 incident: a
+    # root parked `needs_decomposition` with 13 `waiting` dependents chained
+    # on it via `after=` never reaches `blocked` at all — `_resolve_prereqs`
+    # treats a `parked` pre-req as an ordinary unsatisfied deferral, not the
+    # unsatisfiable-and-escalate shape it gives a `blocked`/`failed` one — so
+    # EVERY tick re-wrote this exact no-remedy sentinel over the root's own
+    # #2944/#2978 finding, and `status` never got a chance to name it. Same
+    # benign-sentinel check `coord.notifier.collect.halted_drives` already
+    # uses to keep this shape out of the pager — one question ("is this
+    # tick-raised alert itself the thing, or just noise?"), one answer,
+    # shared by both callers.
+    tick_alert = _queue_alert()
+    if (
+        tick_alert is not None
+        and tick_alert.get("proposed_command") != QUEUE_ALERT_NO_REMEDY_COMMAND
+    ):
+        alert = tick_alert
+    else:
+        alert = _unreachable_wait_alert_dict(rows) or tick_alert
     # #3413: `alert["created_at"]` (present only for a tick-raised record —
     # `_unreachable_wait_alert_dict` is computed fresh on every call and
     # carries no timestamp of its own) now survives an unbroken same-reason

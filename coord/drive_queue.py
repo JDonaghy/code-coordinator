@@ -4332,6 +4332,30 @@ def detect_unreachable_waits(
     return waits
 
 
+def describe_unreachable_wait(w: UnreachableWait) -> str:
+    """Render one :class:`UnreachableWait` — the entry, the evidence, and
+    (#2978) its dependent count when non-zero, naming WHY those dependents
+    need no remedy of their own (they self-heal on #2756 the moment the
+    root clears, so a reader must not read this as "fix these too").
+
+    One rendering, shared by :func:`unreachable_wait_alert` (the `coord
+    drive-queue status` `alert:` line and `coord doctor`'s WARN sample —
+    see :mod:`coord.health.checks.wedged_drive_queue`) and (#3983)
+    :mod:`coord.notifier.collect`'s own per-root ``HaltedDrive`` reason —
+    so the CLI, the health probe and the pager phrase the identical finding
+    identically rather than drifting apart (#2096).
+    """
+    base = f"{w.key} ({w.state}, {w.deferrals} deferrals)"
+    if w.dependents:
+        plural = "ies" if w.dependents != 1 else "y"
+        base += (
+            f" — {w.dependents} dependent entr{plural} chained behind it "
+            "will self-heal automatically once this clears (#2756), no "
+            "remedy needed on them"
+        )
+    return base
+
+
 def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     """The queue-level record #2944's predicate raises, in :func:`_hold_alert`'s
     shape — a message naming the entry (or entries), the evidence that
@@ -4358,18 +4382,7 @@ def unreachable_wait_alert(waits: Sequence[UnreachableWait]) -> QueueAlert:
     that were never named — but easy to mis-generalize to "the dependents
     too" by an operator who does not already know #2756 self-heals them.
     """
-    def _name(w: UnreachableWait) -> str:
-        base = f"{w.key} ({w.state}, {w.deferrals} deferrals)"
-        if w.dependents:
-            plural = "ies" if w.dependents != 1 else "y"
-            base += (
-                f" — {w.dependents} dependent entr{plural} chained behind it "
-                "will self-heal automatically once this clears (#2756), no "
-                "remedy needed on them"
-            )
-        return base
-
-    names = ", ".join(_name(w) for w in waits[:5])
+    names = ", ".join(describe_unreachable_wait(w) for w in waits[:5])
     more = ", ..." if len(waits) > 5 else ""
     plural = len(waits) != 1
     return QueueAlert(
