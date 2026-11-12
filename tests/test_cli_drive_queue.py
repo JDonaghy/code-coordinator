@@ -7098,6 +7098,117 @@ def test_status_alert_names_the_root_only_not_the_chained_dependents(cli):
     assert "self-heal" in result.output
 
 
+# ── #3983: a `parked` needs-decomposition root straining a dependent chain ──
+#
+# The quadraui#2341 incident: a worker parked the row `needs_decomposition`
+# (#3931) with `attempts=0`, and 13 other rows sat `waiting` chained behind it
+# via `after=`. `status` read `alert: (none)` for ~13h — this root is
+# `parked`, not `blocked`, and the dependents are `waiting` (never dispatched,
+# so they carry none of #2978's own "pre-req ... it will never satisfy"
+# caption), neither of which the earlier #2944/#2978 regressions above cover.
+
+_NEEDS_DECOMPOSITION_PARK_REASON = (
+    "pre-dispatch refusal on assignment claude-coordinator-2341-x (needs_"
+    "decomposition, 13h old) — the worker concluded the issue itself needs "
+    "epic decomposition rather than one leg of work; the worker did the "
+    "CORRECT thing (#3931). Needs the coordinator: decompose the issue into "
+    "the proposed sub-issues (posted to the issue — see the worker's own "
+    "split proposal) and close or re-scope this one. Once replaced, dispatch "
+    "the new sub-issues normally; this row does not auto-resume.\n"
+    "   inspect: coord log claude-coordinator-2341-x --machine dellserver\n"
+    "   [needs-decomposition #3931]"
+    " — parking without spending an attempt (#3931); needs the coordinator, "
+    "not a relaunch — decompose the issue into the proposed sub-issues "
+    "(posted to the issue) and close or re-scope this one, then dispatch "
+    "the replacements normally."
+)
+
+
+def test_status_alert_fires_for_a_parked_needs_decomposition_root_with_a_chain(cli):
+    cli("add", REPO, "2341")
+    state._update_drive_queue_entry_local(
+        REPO, 2341, state="parked", attempts=0, deferrals=380,
+        last_reason=_NEEDS_DECOMPOSITION_PARK_REASON,
+    )
+    root_key = f"{REPO}#2341"
+    for issue in range(3000, 3013):
+        cli("add", REPO, str(issue), "--after", "2341")
+    assert len(range(3000, 3013)) == 13
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" not in result.output
+    assert root_key in result.output
+    assert "380 deferrals" in result.output
+    assert "13 dependent" in result.output
+
+
+def test_status_alert_fires_for_a_parked_needs_decomposition_root_with_no_dependents(cli):
+    """Same root, no chain behind it — still alerts, but the line must not
+    claim a blocked chain that does not exist."""
+    cli("add", REPO, "2341")
+    state._update_drive_queue_entry_local(
+        REPO, 2341, state="parked", attempts=0, deferrals=380,
+        last_reason=_NEEDS_DECOMPOSITION_PARK_REASON,
+    )
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" not in result.output
+    assert f"{REPO}#2341" in result.output
+    assert "380 deferrals" in result.output
+    # No chain behind this root — the per-entry "N dependent entries chained
+    # behind it will self-heal" note (`unreachable_wait_alert`'s `_name`,
+    # only added when `dependents` is non-zero) must not appear when there
+    # is nothing to self-heal. The generic boilerplate remedy sentence
+    # ("never on a dependent chained behind one") is fine either way — it is
+    # not a claim about THIS entry's own chain.
+    assert "dependent entr" not in result.output
+    assert "self-heal" not in result.output
+
+
+# ── #3983: a tick's own benign "nothing eligible to launch" write must not ──
+# mask the #2944/#2978 finding underneath it. The quadraui#2341 incident: the
+# 13 dependents above never reach `blocked` (`_resolve_prereqs` treats a
+# `parked` pre-req as an ordinary deferral, not the unsatisfiable shape a
+# `blocked`/`failed` one gets), so every tick re-wrote step 4's no-remedy
+# sentinel over the root's own finding — this is the escalation record a
+# real tick persists in that exact shape, built directly rather than via a
+# real `tick` invocation (no live tmux/gh boundary to stub for this).
+
+
+def test_status_alert_survives_a_benign_per_tick_no_remedy_write(cli):
+    from coord.drive_queue import (
+        QUEUE_ALERT_ISSUE,
+        QUEUE_ALERT_NO_REMEDY_COMMAND,
+        QUEUE_ALERT_REPO,
+        QUEUE_ALERT_STAGE,
+    )
+    from coord.state import record_drive_escalation
+
+    cli("add", REPO, "2341")
+    state._update_drive_queue_entry_local(
+        REPO, 2341, state="parked", attempts=0, deferrals=380,
+        last_reason=_NEEDS_DECOMPOSITION_PARK_REASON,
+    )
+    root_key = f"{REPO}#2341"
+    for issue in range(3000, 3013):
+        cli("add", REPO, str(issue), "--after", "2341")
+    record_drive_escalation(
+        QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE,
+        stage=QUEUE_ALERT_STAGE,
+        reason="nothing eligible to launch: considered 13 waiting entries, 3 free slot(s)",
+        gate_readings="",
+        proposed_command=QUEUE_ALERT_NO_REMEDY_COMMAND,
+    )
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "alert: (none)" not in result.output
+    assert root_key in result.output
+    assert "13 dependent" in result.output
+
+
 # ── deploy gates (#1757) ─────────────────────────────────────────────────────
 #
 # The acceptance bar for `--hold-after`.  `merged != live`: a queue that

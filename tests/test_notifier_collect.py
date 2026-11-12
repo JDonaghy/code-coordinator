@@ -465,6 +465,150 @@ def test_a_genuine_queue_hold_alert_still_becomes_a_halted_drive(monkeypatch):
     assert out[0].proposed_command == "coord drive-queue resume"
 
 
+# ── #3983: a benign per-tick queue alert must not hide a wedged root ───────
+#
+# The quadraui#2341 incident: a `parked` needs-decomposition root
+# (`attempts=0`) with 13 `waiting` dependents chained on it via `after=`.
+# Those dependents never reach `blocked` (`_resolve_prereqs` gives a
+# `parked` pre-req an ordinary deferral, not the unsatisfiable verdict a
+# `blocked`/`failed` one gets), so step 4 kept re-writing the benign
+# no-remedy sentinel over the root's own finding every tick — exactly the
+# shape `test_a_routine_nothing_eligible_queue_alert_is_not_a_halted_drive`
+# above already skips. `halted_drives` must still page on the root by
+# re-deriving the live #2944/#2978 finding directly, independent of
+# whatever (if anything) the escalations table holds.
+
+
+def test_a_wedged_parked_root_pages_even_with_only_a_benign_queue_alert(monkeypatch):
+    import coord.state as state_mod
+    from coord.drive_queue import (
+        QUEUE_ALERT_ISSUE,
+        QUEUE_ALERT_NO_REMEDY_COMMAND,
+        QUEUE_ALERT_REPO,
+    )
+
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": QUEUE_ALERT_REPO,
+                "issue_number": QUEUE_ALERT_ISSUE,
+                "stage": "drive-queue",
+                "reason": "nothing eligible to launch: considered 13 waiting entries, 3 free slot(s)",
+                "proposed_command": QUEUE_ALERT_NO_REMEDY_COMMAND,
+            }
+        ],
+    )
+    root_row = {
+        "repo_name": "quadraui",
+        "issue_number": 2341,
+        "position": 1,
+        "state": "parked",
+        "attempts": 0,
+        "deferrals": 380,
+        "last_reason": "needs_decomposition park [needs-decomposition #3931]",
+        "after_json": [],
+    }
+    dependent_rows = [
+        {
+            "repo_name": "quadraui",
+            "issue_number": 3000 + i,
+            "position": 2 + i,
+            "state": "waiting",
+            "attempts": 0,
+            "deferrals": 40,
+            "last_reason": "",
+            "after_json": ["quadraui#2341"],
+        }
+        for i in range(13)
+    ]
+    monkeypatch.setattr(
+        state_mod, "list_drive_queue",
+        lambda *a, **kw: [root_row, *dependent_rows],
+    )
+
+    out = collect.halted_drives(notifier_state=NotifierState(), now=NOW)
+    assert len(out) == 1
+    drive = out[0]
+    assert drive.repo == "quadraui"
+    assert drive.issue == 2341
+    assert "380 deferrals" in drive.reason
+    assert "13 dependent" in drive.reason
+    assert drive.proposed_command == (
+        "coord drive-queue remove quadraui 2341 && coord drive-queue add quadraui 2341"
+    )
+
+
+def test_an_unreachable_wait_root_already_escalated_is_not_duplicated(monkeypatch):
+    """A root that already has its OWN real escalation (e.g. board-doctor's
+    cause-specific diagnosis) must page once, not twice under two different
+    reason strings."""
+    import coord.state as state_mod
+
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": "quadraui",
+                "issue_number": 2341,
+                "stage": "board-doctor",
+                "reason": "cause=needs_decomposition",
+                "proposed_command": "coord log <aid>",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        state_mod, "list_drive_queue",
+        lambda *a, **kw: [
+            {
+                "repo_name": "quadraui",
+                "issue_number": 2341,
+                "position": 1,
+                "state": "parked",
+                "attempts": 0,
+                "deferrals": 380,
+                "last_reason": "needs_decomposition park [needs-decomposition #3931]",
+                "after_json": [],
+            }
+        ],
+    )
+
+    out = collect.halted_drives(notifier_state=NotifierState(), now=NOW)
+    assert len(out) == 1
+    assert out[0].reason == "board-doctor: cause=needs_decomposition"
+
+
+def test_a_wedged_parked_root_with_no_dependents_pages_without_claiming_a_chain(
+    monkeypatch,
+):
+    import coord.state as state_mod
+
+    monkeypatch.setattr(state_mod, "list_drive_escalations", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        state_mod, "list_drive_queue",
+        lambda *a, **kw: [
+            {
+                "repo_name": "quadraui",
+                "issue_number": 2341,
+                "position": 1,
+                "state": "parked",
+                "attempts": 0,
+                "deferrals": 380,
+                "last_reason": "needs_decomposition park [needs-decomposition #3931]",
+                "after_json": [],
+            }
+        ],
+    )
+
+    out = collect.halted_drives(notifier_state=NotifierState(), now=NOW)
+    assert len(out) == 1
+    assert out[0].repo == "quadraui"
+    assert out[0].issue == 2341
+    assert "380 deferrals" in out[0].reason
+    assert "dependent entr" not in out[0].reason
+    assert "self-heal" not in out[0].reason
+
+
 def test_a_board_doctor_diagnosis_survives_unabridged_into_a_halted_drive():
     """#3883: the rich diagnosis `coord.board_doctor_policy.
     escalation_alert_dispatcher` writes (cause, evidence, attempts,

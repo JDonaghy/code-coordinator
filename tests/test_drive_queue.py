@@ -9081,6 +9081,67 @@ def test_detect_unreachable_waits_reproduces_the_ms5_incident_shape():
     assert "self-heal" in alert.reason
 
 
+# ── #3983: the quadraui#2341 incident — a `parked` needs-decomposition root
+# with `attempts=0` and a chain of `waiting` (never-`blocked`) dependents.
+# Unlike #2978's shape above, the dependents here never reach `blocked` —
+# `_resolve_prereqs` gives a `parked` pre-req an ordinary unsatisfied
+# deferral, not the unsatisfiable-and-escalate verdict a `blocked`/`failed`
+# one gets — so they carry none of the "it will never satisfy" caption and
+# would not exercise the `_is_unsatisfiable_prereq_reason` exclusion at all.
+# This pins that the root itself still qualifies on its own last_reason,
+# with the dependent count read off `after=` regardless of the dependents'
+# own (irrelevant) state.
+
+
+def test_detect_unreachable_waits_reproduces_the_3983_incident_shape():
+    root_key = entry_key(REPO, 2341)
+    root = entry(
+        2341,
+        state=STATE_PARKED,
+        attempts=0,
+        deferrals=380,
+        last_reason=(
+            f"pre-dispatch refusal (needs_decomposition, 13h old) — the "
+            f"worker concluded the issue itself needs epic decomposition. "
+            f"{NEEDS_DECOMPOSITION_MARKER} — parking without spending an "
+            "attempt (#3931); needs the coordinator, not a relaunch."
+        ),
+    )
+    dependents = [
+        entry(issue, state=STATE_WAITING, attempts=0, deferrals=40, after=(root_key,))
+        for issue in range(3000, 3013)
+    ]
+    assert len(dependents) == 13
+
+    waits = detect_unreachable_waits([root, *dependents])
+    assert [w.key for w in waits] == [root_key]
+    assert waits[0].dependents == 13
+
+    alert = unreachable_wait_alert(waits)
+    assert root_key in alert.reason
+    for dep in dependents:
+        assert dep.key not in alert.reason
+    assert "13 dependent entries" in alert.reason
+
+
+def test_detect_unreachable_waits_does_not_claim_a_chain_with_no_dependents():
+    root = entry(
+        2341,
+        state=STATE_PARKED,
+        attempts=0,
+        deferrals=380,
+        last_reason=f"needs_decomposition park. {NEEDS_DECOMPOSITION_MARKER}",
+    )
+    waits = detect_unreachable_waits([root])
+    assert len(waits) == 1
+    assert waits[0].dependents == 0
+
+    alert = unreachable_wait_alert(waits)
+    assert entry_key(REPO, 2341) in alert.reason
+    assert "self-heal" not in alert.reason
+    assert "dependent entr" not in alert.reason
+
+
 # ── #3016: the escalation-time remedy for a merge-gate block must be the ──
 # gate-specific fix, never the blanket `drive-queue remove && add` requeue —
 # a requeue discards a completed Work/Test/Review cycle instead of fixing
