@@ -3401,6 +3401,98 @@ def test_preflight_guard_absent_block_disables_every_repo(tmp_path: Path) -> Non
     assert cfg.preflight_guard_enabled("api") is False
 
 
+# ── #3985: decomposition.auto_split — its own switch, not riding on ────────
+# preflight_guard.enabled ────────────────────────────────────────────────
+
+
+def test_auto_split_defaults_to_enabled_everywhere(tmp_path: Path) -> None:
+    """No `decomposition:` block at all -> auto-split is on fleet-wide,
+    independent of whatever `preflight_guard.enabled` says."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+        "preflight_guard:\n"
+        "  enabled: false\n"
+    )
+    cfg = load(p)
+    assert cfg.decomposition.auto_split.enabled is True
+    assert cfg.auto_split_enabled("api") is True
+    # The preflight guard being paused fleet-wide must not drag auto-split
+    # down with it — the two are independent switches.
+    assert cfg.preflight_guard_enabled("api") is False
+
+
+def test_auto_split_fleet_kill_switch_disables_every_repo(tmp_path: Path) -> None:
+    """`decomposition.auto_split.enabled: false` disables every repo that
+    has not explicitly overridden it back on."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+        "decomposition:\n"
+        "  auto_split:\n"
+        "    enabled: false\n"
+    )
+    cfg = load(p)
+    assert cfg.decomposition.auto_split.enabled is False
+    assert cfg.auto_split_enabled("api") is False
+
+
+def test_auto_split_per_repo_override_wins(tmp_path: Path) -> None:
+    """A per-repo override beats the fleet-wide default in either
+    direction: a repo can opt back in while the fleet default is off, or
+    opt itself out while the fleet default is on."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "  - name: web\n    github: acme/web\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api, web]\n"
+        "decomposition:\n"
+        "  auto_split:\n"
+        "    enabled: false\n"
+        "    api: true\n"
+    )
+    cfg = load(p)
+    assert cfg.auto_split_enabled("api") is True
+    assert cfg.auto_split_enabled("web") is False
+
+
+def test_auto_split_invalid_value_is_config_error(tmp_path: Path) -> None:
+    """A non-boolean `enabled` or per-repo override is a config error, not
+    a silently-ignored value."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+        "decomposition:\n"
+        "  auto_split:\n"
+        "    enabled: 'nope'\n"
+    )
+    with pytest.raises(ConfigError, match="decomposition.auto_split.enabled"):
+        load(p)
+
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+        "decomposition:\n"
+        "  auto_split:\n"
+        "    api: 'nope'\n"
+    )
+    with pytest.raises(ConfigError, match="decomposition.auto_split"):
+        load(p)
+
+
 # ── #3859: board_doctor.stale_race / repos[].board_doctor.stale_race ───────
 
 def test_board_doctor_stale_race_defaults_to_true() -> None:

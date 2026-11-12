@@ -2393,7 +2393,7 @@ class TestAutoSplitNeedsDecomposition:
         def repo(self, name: str):
             return self._repo if name == "api" else None
 
-        def preflight_guard_enabled(self, repo_name: str) -> bool:
+        def auto_split_enabled(self, repo_name: str) -> bool:
             return self._enabled
 
     @patch("coord.state.dequeue_drive_queue")
@@ -2419,6 +2419,32 @@ class TestAutoSplitNeedsDecomposition:
         assert kwargs["repo"].github == "acme/api"
         assert kwargs["origin"] == decomposition_chat.NEEDS_DECOMPOSITION_SPLIT_ORIGIN
         mock_dequeue.assert_called_once_with("api", 99, operator=False)
+
+    @patch("coord.state.dequeue_drive_queue")
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal", return_value=901)
+    @patch("coord.github_ops.get_issue")
+    def test_fires_with_real_config_even_when_preflight_guard_is_paused_fleet_wide(
+        self, mock_get_issue, mock_file, mock_dequeue,
+    ) -> None:
+        """#3985: `auto_split_needs_decomposition` is gated on
+        `decomposition.auto_split` alone — a real :class:`Config` with
+        `preflight_guard.enabled: false` (the fleet-wide pause) must not
+        disable auto-split, since auto-split defaults on independently."""
+        mock_get_issue.return_value = {"state": "OPEN", "title": "Big issue"}
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="dell64", host="dell64.tail", repos=["api"])],
+        )
+        config.preflight_guard.enabled = False
+        assert config.preflight_guard_enabled("api") is False
+        assert config.decomposition.auto_split.enabled is True
+
+        epic = decomposition_chat.auto_split_needs_decomposition(
+            self._SPLIT, config=config, repo_name="api", issue_number=99,
+        )
+
+        assert epic == 901
+        mock_file.assert_called_once()
 
     @patch("coord.decomposition_chat.file_and_queue_split_proposal")
     @patch("coord.github_ops.get_issue")

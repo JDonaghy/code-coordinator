@@ -1578,20 +1578,24 @@ def auto_split_needs_decomposition(
     queue row is then removed, since the issue it tracks is closed.
 
     Returns the new epic's issue number, or ``None`` when nothing was filed:
-    the repo has not opted into the preflight decomposition guard
-    (:meth:`coord.config.Config.preflight_guard_enabled` — the same opt-in
-    that governs every other automatic split), the message carries no
-    complete split block (prose-only proposals stay with the coordinator,
-    exactly as before), the original issue is already closed (a replayed
-    transition, or someone already decomposed it), or the proposal fails the
-    verification gate — a broken epic is never filed. A failure *inside*
-    the filer propagates: by then real issues exist on GitHub.
+    the repo has not opted into auto-split
+    (:meth:`coord.config.Config.auto_split_enabled` — its own switch,
+    independent of the preflight decomposition guard: that guard decides
+    whether an issue is worth a size-triage leg *before* Work runs, while
+    this only acts on a split a Work leg already proposed and the
+    mechanical verification gate below already passed), the message
+    carries no complete split block (prose-only proposals stay with the
+    coordinator, exactly as before), the original issue is already closed
+    (a replayed transition, or someone already decomposed it), or the
+    proposal fails the verification gate — a broken epic is never filed.
+    A failure *inside* the filer propagates: by then real issues exist on
+    GitHub.
     """
     text = final_message or ""
     if not _SIZE_TRIAGE_VERDICT_RE.search(text):
         return None
     repo = config.repo(repo_name)
-    if repo is None or not config.preflight_guard_enabled(repo_name):
+    if repo is None or not config.auto_split_enabled(repo_name):
         return None
 
     from coord import github_ops

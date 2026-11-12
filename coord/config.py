@@ -965,6 +965,44 @@ class PreflightGuardConfig:
         return self.repos.get(repo_name, PreflightGuardRepoConfig())
 
 
+@dataclass
+class AutoSplitConfig:
+    """``decomposition.auto_split:`` (#3985) — the fleet-wide kill switch
+    for :func:`coord.decomposition_chat.auto_split_needs_decomposition`,
+    plus an optional per-repo override.
+
+    This is deliberately its own switch, independent of
+    :attr:`PreflightGuardConfig.enabled`. The preflight guard spends a
+    (paid) triage leg *before* Work decides whether an issue is worth
+    decomposing; the auto-split only acts on a split a Work leg already
+    proposed unprompted, after the issue's own mechanical
+    :func:`coord.preflight_size.verify_split_proposal` gate has passed it.
+    Those are two separate decisions — a repo (or the whole fleet) can
+    have one on without the other.
+
+    Defaults ``enabled=True`` fleet-wide: a needs-decomposition split a
+    Work leg proposes and the mechanical gate verifies files and queues
+    automatically unless an operator opts a repo (or the whole fleet) out.
+    """
+
+    enabled: bool = True
+    repo_overrides: dict[str, bool] = field(default_factory=dict)
+
+    def for_repo(self, repo_name: str) -> bool:
+        """Whether auto-split may fire for *repo_name*: the per-repo
+        override wins when set, otherwise the fleet-wide default."""
+        return self.repo_overrides.get(repo_name, self.enabled)
+
+
+@dataclass
+class DecompositionConfig:
+    """``decomposition:`` — currently just :attr:`auto_split`, its own
+    top-level key so future decomposition-related switches (preflight
+    guard thresholds, etc.) do not have to cram into this one block."""
+
+    auto_split: AutoSplitConfig = field(default_factory=AutoSplitConfig)
+
+
 # #1430: plan-worker ESTIMATE -> escalation rung (see ModelsConfig.model_for_estimate).
 _ESTIMATE_RUNG: dict[str, int] = {"trivial": 0, "small": 0, "medium": 1, "large": 2}
 
@@ -3259,6 +3297,9 @@ class Config:
     # says nothing behaves exactly as it did before the investigate tier
     # existed (stuck rows fall through to the alert tier).
     board_doctor: BoardDoctorConfig = field(default_factory=BoardDoctorConfig)
+    # #3985 — absent block == auto_split.enabled=True fleet-wide (its own
+    # switch, independent of preflight_guard.enabled).
+    decomposition: DecompositionConfig = field(default_factory=DecompositionConfig)
     path: Path | None = None
     # #2783 — non-fatal parse-time warnings (e.g. an unrecognised repos[] key)
     # surfaced to an operator via `coord config` / `coord diagnose`. Never
@@ -3289,6 +3330,24 @@ class Config:
         if not self.preflight_guard.enabled:
             return False
         return self.preflight_guard.for_repo(repo_name).enabled
+
+    def auto_split_enabled(self, repo_name: str) -> bool:
+        """Whether :func:`coord.decomposition_chat.auto_split_needs_decomposition`
+        may act on a needs-decomposition split for *repo_name* (#3985) —
+        a switch of its own, deliberately independent of
+        :meth:`preflight_guard_enabled`. The preflight guard decides
+        whether an issue is worth a (paid) size-triage leg *before* Work;
+        the auto-split only acts on a split a Work leg already proposed
+        and the mechanical :func:`coord.preflight_size.verify_split_proposal`
+        gate already passed — a repo can have either, both, or neither.
+
+        :attr:`decomposition.auto_split.enabled` defaults ``True``
+        fleet-wide; ``decomposition.auto_split.<repo_name>`` overrides it
+        per repo when present, same "override wins, otherwise fall back
+        to the fleet default" shape as every other per-repo knob in this
+        file.
+        """
+        return self.decomposition.auto_split.for_repo(repo_name)
 
 
 def _local_short_hostname() -> str:
@@ -3533,6 +3592,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     acceptance = _parse_acceptance(raw.get("acceptance"))
     prereview_gate = _parse_prereview_gate(raw.get("prereview_gate"))
     preflight_guard = _parse_preflight_guard(raw.get("preflight_guard"))
+    decomposition = _parse_decomposition(raw.get("decomposition"))
     models = _parse_models(raw.get("models"), set(providers.definitions))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
@@ -3563,6 +3623,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         acceptance=acceptance,
         prereview_gate=prereview_gate,
         preflight_guard=preflight_guard,
+        decomposition=decomposition,
         models=models,
         pipeline=pipeline,
         dispatch=dispatch,
@@ -4865,6 +4926,53 @@ def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
         repos[repo_name] = cfg
 
     return PreflightGuardConfig(enabled=fleet_enabled, repos=repos)
+
+
+def _parse_decomposition(raw: Any) -> DecompositionConfig:
+    """Parse the ``decomposition:`` block (#3985).
+
+    Currently just ``decomposition.auto_split`` — the kill switch for
+    :func:`coord.decomposition_chat.auto_split_needs_decomposition`,
+    deliberately its own switch rather than riding on
+    ``preflight_guard.enabled`` (see :class:`AutoSplitConfig`'s docstring
+    for why those are two independent decisions).
+
+    ``auto_split.enabled`` is the fleet-wide default (``True`` when
+    absent). Every other key under ``auto_split`` is a repo name mapping
+    to a bare boolean override — unlike ``preflight_guard.<repo_name>``,
+    there is nothing else to configure per repo here, so the override is
+    the value itself rather than a nested mapping.
+    """
+    if raw is None:
+        return DecompositionConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'decomposition' must be a mapping")
+
+    auto_split_raw = raw.get("auto_split")
+    if auto_split_raw is None:
+        return DecompositionConfig()
+    if not isinstance(auto_split_raw, dict):
+        raise ConfigError("'decomposition.auto_split' must be a mapping")
+
+    fleet_enabled = True
+    entries = dict(auto_split_raw)
+    if "enabled" in entries:
+        value = entries.pop("enabled")
+        if not isinstance(value, bool):
+            raise ConfigError("decomposition.auto_split.enabled must be a boolean")
+        fleet_enabled = value
+
+    repo_overrides: dict[str, bool] = {}
+    for repo_name, value in entries.items():
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"decomposition.auto_split[{repo_name!r}] must be a boolean"
+            )
+        repo_overrides[repo_name] = value
+
+    return DecompositionConfig(
+        auto_split=AutoSplitConfig(enabled=fleet_enabled, repo_overrides=repo_overrides)
+    )
 
 
 def _parse_acceptance(raw: Any) -> AcceptanceConfig:
