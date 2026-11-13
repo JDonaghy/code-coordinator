@@ -3415,22 +3415,27 @@ def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple
     return ("", "coord status")
 
 
-#: #3999: a covering escalation's own ``proposed_command`` naming a
-#: ``remove``-shaped relaunch (the #2972 "give up the row a fresh budget"
-#: remedy every ceiling/terminal-park cause in this module points at —
-#: see `_alert_resolution`'s own `CAUSE_NEEDS_DECOMPOSITION`/
-#: `CAUSE_PREMISE_REFUSAL`/`CAUSE_UPSTREAM_GAP_PARK` branches and
-#: `coord.drive_queue`'s own ceiling give-up reason) is a dead end the
-#: instant `coord.drive_queue.existing_pr_relaunch_remedy` would itself
-#: refuse the matching ``add`` — "its checks are not all green — fix it
-#: forward … before relaunching". `_is_relaunch_shaped_remedy` is the
-#: cheap, local half of that check: a textual match on the covering
-#: escalation's own recorded command, never a second live `gh` probe —
-#: :func:`_covering_escalation_remedy_refused_now` below pairs it with
-#: live evidence this sweep already has for the opposite half.
+#: #3999: a covering escalation's own ``proposed_command`` naming a full
+#: ``remove`` + ``add`` relaunch — the exact two-command string
+#: `coord.commands.drive_queue._requeue_command` builds
+#: (``coord drive-queue remove <repo> <issue> && coord drive-queue add
+#: <repo> <issue>``) — is a dead end the instant
+#: `coord.drive_queue.existing_pr_relaunch_remedy` would itself refuse the
+#: ``add`` half — "its checks are not all green — fix it forward … before
+#: relaunching". A command naming only ``remove`` (e.g.
+#: `coord.review.needs_redesign_escalation`'s park, which tells the
+#: operator to drop the row and make a human-judgment call, never to
+#: re-add it unattended) is a different, human-decision remedy that
+#: `coord drive-queue remove` always succeeds at regardless of check
+#: state — it must NOT be treated as refused here.
+#: `_is_relaunch_shaped_remedy` is the cheap, local half of that check: a
+#: textual match on the covering escalation's own recorded command, never
+#: a second live `gh` probe — :func:`_covering_escalation_remedy_refused_now`
+#: below pairs it with live evidence this sweep already has for the
+#: opposite half.
 def _is_relaunch_shaped_remedy(proposed_command: str) -> bool:
     command = proposed_command.lower()
-    return "remove" in command
+    return "drive-queue remove" in command and "drive-queue add" in command
 
 
 def _covering_escalation_remedy_refused_now(
