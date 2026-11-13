@@ -10824,8 +10824,45 @@ def enqueue_drive_queue(
     )
 
 
+# #3998: a WORK_LIKE assignment row counts toward the #2972 fix-round
+# ceiling only if a worker session actually started for it. A worktree-setup
+# failure, a pre-session API/HTTP error, or a launch refused for a live
+# conflicting worktree (#3912) all land here: the agent sets `status =
+# 'failed'` directly without ever reaching `_reap` (or `_reap` runs but the
+# underlying `claude -p` process never emitted even its `system.init`
+# stream-json event), so `claude_session_id` — populated by `_reap` parsing
+# the worker's own log for that event the moment output starts — stays NULL
+# forever. A `failed` row WITH a session id (the worker started, then
+# crashed or was killed) is a real attempt and must still count: `status`
+# alone cannot tell the two apart. Every OTHER terminal status (`done`,
+# `merged`, `advisory`, `refused_policy`, `refused_premise`,
+# `needs_decomposition`) always implies a session ran to completion
+# regardless of whether `claude_session_id` happens to be populated, so this
+# condition is scoped to `status = 'failed'` alone — a currently-running leg
+# and a pre-#315 row predating the `claude_session_id` column are both never
+# miscounted.
+#
+# Expressed once here as a SQL fragment (reused verbatim by
+# `_work_leg_count_for_issue_local`'s aggregate `COUNT(*)`) and mirrored by
+# :func:`_is_infra_failed_launch` for `_leg_counts_local`, which needs the
+# same decision per already-fetched row rather than as a SQL predicate.
+_NOT_INFRA_FAILED_LAUNCH_SQL = (
+    "NOT (COALESCE(status, '') = 'failed' "
+    "AND COALESCE(claude_session_id, '') = '')"
+)
+
+
+def _is_infra_failed_launch(status: str | None, claude_session_id: str | None) -> bool:
+    """True iff an assignment row ended WITHOUT a worker session ever
+    starting (#3998) — see :data:`_NOT_INFRA_FAILED_LAUNCH_SQL`'s comment
+    for the exact reasoning this mirrors in SQL form."""
+    return (status or "") == "failed" and not (claude_session_id or "")
+
+
 def _work_leg_count_for_issue_local(conn, repo_name: str, issue_number: int) -> int:
-    """All-time WORK_LIKE assignment count for ONE issue, right now (#3463).
+    """All-time WORK_LIKE assignment count for ONE issue, right now (#3463),
+    EXCLUDING a leg that never started a worker session (#3998 —
+    :data:`_NOT_INFRA_FAILED_LAUNCH_SQL`).
 
     Same scope as :func:`_leg_counts_local` (both ``assignments`` and
     ``assignments_archive``, so a long-lived issue's early legs don't drop
@@ -10839,6 +10876,13 @@ def _work_leg_count_for_issue_local(conn, repo_name: str, issue_number: int) -> 
     :func:`coord.drive_queue.compute_leg_counts` uses (``t = assignment_type
     or "work"``) — which is always in ``WORK_LIKE_TYPES``, so a bare
     ``type IS NULL`` row is counted, never silently dropped.
+
+    #3998: without the infra exclusion, a brand-new row's
+    ``legs_at_enqueue`` baseline could be stamped with a leg that never
+    actually ran (a 403 from the provider, a worktree-setup error) — the
+    exact same over-count :attr:`coord.drive_queue.IssueFacts.
+    work_leg_count` must also exclude, via ``_leg_counts_local`` below,
+    for ``remaining_fix_rounds`` to read the identical figure at both ends.
     """
     placeholders = ",".join("?" for _ in WORK_LIKE_TYPES)
     total = 0
@@ -10846,7 +10890,8 @@ def _work_leg_count_for_issue_local(conn, repo_name: str, issue_number: int) -> 
         try:
             row = sql.execute(conn,
                 f"SELECT COUNT(*) AS n FROM {table} WHERE repo_name = ? "  # noqa: S608 — constant
-                f"AND issue_number = ? AND (type IS NULL OR type IN ({placeholders}))",
+                f"AND issue_number = ? AND (type IS NULL OR type IN ({placeholders})) "
+                f"AND {_NOT_INFRA_FAILED_LAUNCH_SQL}",
                 (repo_name, issue_number, *WORK_LIKE_TYPES),
             ).fetchone()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
@@ -11529,14 +11574,26 @@ def leg_counts() -> dict[str, dict[str, int]]:
 
 
 def _leg_counts_local() -> dict[str, dict[str, int]]:
-    from coord.drive_queue import compute_leg_counts  # noqa: PLC0415
+    from coord.drive_queue import (  # noqa: PLC0415
+        INFRA_FAILED_LAUNCH_KEY,
+        compute_leg_counts,
+    )
 
     conn = get_connection()
     rows: list[tuple[str, int, str]] = []
+    # #3998: a WORK_LIKE row that never started a worker session goes into
+    # its OWN bucket, counted separately below — see
+    # `_is_infra_failed_launch`'s docstring. Scoped to WORK_LIKE types only
+    # (matching `_work_leg_count_for_issue_local`'s own scope): a
+    # `review`/`smoke`/other non-WORK_LIKE row keeps counting exactly as
+    # before this issue, since only the #2972 WORK-leg ceiling is wrong
+    # about never-started launches.
+    infra_rows: list[tuple[str, int, str]] = []
     for table in ("assignments", "assignments_archive"):
         try:
             result = sql.execute(conn,
-                f"SELECT repo_name, issue_number, type FROM {table}",  # noqa: S608 — constant
+                f"SELECT repo_name, issue_number, type, status, "  # noqa: S608 — constant
+                f"claude_session_id FROM {table}",
             ).fetchall()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
             # Mirrors `_list_issue_numbers_with_assignments_local`: `continue`
@@ -11546,8 +11603,23 @@ def _leg_counts_local() -> dict[str, dict[str, int]]:
             # later query on this connection (#2983).
             rollback_after_driver_error(conn, exc)
             continue  # assignments_archive may not exist yet (housekeeping never ran)
-        rows.extend((r[0], r[1], r[2]) for r in result)
-    return compute_leg_counts(rows)
+        for r in result:
+            repo_name, issue_number, assignment_type = r[0], r[1], r[2]
+            is_work_like = (assignment_type or "work") in WORK_LIKE_TYPES
+            if is_work_like and _is_infra_failed_launch(r[3], r[4]):
+                infra_rows.append((repo_name, issue_number, assignment_type))
+            else:
+                rows.append((repo_name, issue_number, assignment_type))
+    counts = compute_leg_counts(rows)
+    # #3998: fold the infra-failed-launch rows in too, under the reserved
+    # `INFRA_FAILED_LAUNCH_KEY` pseudo-type — never a real `AssignmentType`,
+    # so every `kind in WORK_LIKE` consumer (`build_board_view`'s
+    # `work_leg_count` fold, `coord.commands.drive_queue`'s `lifetime_legs`
+    # display) excludes it automatically, while `IssueFacts.
+    # infra_failed_leg_count` still has a count to read.
+    for key, by_type in compute_leg_counts(infra_rows).items():
+        counts.setdefault(key, {})[INFRA_FAILED_LAUNCH_KEY] = sum(by_type.values())
+    return counts
 
 
 def list_audit_log(

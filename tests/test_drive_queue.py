@@ -67,6 +67,7 @@ from coord.drive_queue import (
     find_cycle,
     is_empty_branch_death_reason,
     is_merge_gate_block_reason,
+    INFRA_FAILED_LAUNCH_KEY,
     merge_gate_remedy_command,
     merge_plan_inspect_command,
     parse_after_spec,
@@ -1494,6 +1495,34 @@ def test_build_board_view_leg_counts_default_leaves_work_leg_count_at_zero():
     assert view.facts(entry_key(REPO, 1650)).work_leg_count == 0
 
 
+# ── #3998: a leg that never started a worker session is not a fix round ────
+#
+# `coord.state._leg_counts_local` folds a WORK_LIKE issue's infra-failed-
+# launch count (a worktree-setup failure, a pre-session API/HTTP error, a
+# #3912 conflicting-worktree refusal) under the reserved
+# `INFRA_FAILED_LAUNCH_KEY` pseudo-type rather than under the leg's own real
+# type — these tests pin what `build_board_view` does with that key.
+
+
+def test_build_board_view_excludes_infra_failed_launches_from_work_leg_count():
+    """`INFRA_FAILED_LAUNCH_KEY` is never a member of `WORK_LIKE`, so it must
+    not inflate `work_leg_count` the way a real `"work"` count would."""
+    key = entry_key(REPO, 1650)
+    view = build_board_view(
+        {},
+        leg_counts={key: {"work": 2, INFRA_FAILED_LAUNCH_KEY: 2}},
+    )
+    facts = view.facts(key)
+    assert facts.work_leg_count == 2
+    assert facts.infra_failed_leg_count == 2
+
+
+def test_build_board_view_infra_failed_leg_count_defaults_to_zero():
+    key = entry_key(REPO, 1650)
+    view = build_board_view({}, leg_counts={key: {"work": 2}})
+    assert view.facts(key).infra_failed_leg_count == 0
+
+
 def test_build_board_view_leg_counts_covers_an_issue_absent_from_the_rest_of_the_payload():
     """An issue whose entire history has aged into `assignments_archive`
     (#3060) — nothing about it in `issues`/`assignments`/`merge_plan` — still
@@ -1549,6 +1578,46 @@ def test_a_relaunch_at_the_ceiling_blocks_instead_of_retrying():
     assert "budget of 3" in blocked.reason
 
 
+def test_ceiling_block_reason_reports_infra_failed_launches_separately():
+    """#3998: quadraui#2347's exact shape — a worktree-setup failure and a
+    #3912 conflicting-worktree refusal, neither of which ever started a
+    worker session. `facts.infra_failed_leg_count` must be named in the
+    block reason, visibly separate from the real `work_leg_count`, so an
+    operator reading the ceiling message is never left to wonder whether a
+    never-started launch is hiding inside the "work leg(s)" figure."""
+    facts = IssueFacts(
+        known=True, issue_state="open", work_leg_count=3, infra_failed_leg_count=2,
+    )
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        [_dead_running_entry(attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+    )
+    assert len(plan.blocked) == 1
+    reason = plan.blocked[0].reason
+    assert "3 work leg(s)" in reason
+    assert "2 infra-failed launch(es)" in reason
+    assert "not counted against this budget" in reason
+
+
+def test_ceiling_block_reason_omits_the_infra_note_when_there_are_none():
+    """The common case (`infra_failed_leg_count == 0`) must not grow a
+    dangling "+ 0 infra-failed launch(es)" clause."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        [_dead_running_entry(attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+    )
+    assert "infra-failed" not in plan.blocked[0].reason
+
+
 def test_a_relaunch_past_the_ceiling_also_blocks():
     """Comfortably over budget (a stale re-add, a hand-edited count) still
     blocks — the check is `<=`, not `==`."""
@@ -1556,6 +1625,105 @@ def test_a_relaunch_past_the_ceiling_also_blocks():
     view = BoardView(issues={entry_key(REPO, 1650): facts})
     plan = plan_tick([_dead_running_entry()], view, capacity=1, now=NOW)
     assert plan.reconciles[0].outcome == "exhausted"
+
+
+# ── #3998: coord.state's own split of real vs infra-failed launches ────────
+#
+# `build_board_view`'s fold (pinned above) trusts whatever `coord.state.
+# leg_counts()`/`_leg_counts_local()` hand it — these exercise THAT split
+# against a real DB, the quadraui#2347 evidence table itself: a worktree-
+# setup failure and a `#3912` conflicting-worktree refusal, both status
+# `failed` with no `claude_session_id` ever captured, alongside the two
+# real `done` legs that actually ran.
+
+
+def _insert_assignment_leg(
+    conn,
+    *,
+    assignment_id: str,
+    issue_number: int = 1650,
+    status: str = "done",
+    assignment_type: str = "work",
+    claude_session_id: str | None = "a-real-session-id",
+) -> None:
+    conn.execute(
+        """INSERT INTO assignments
+           (assignment_id, machine_name, repo_name, repo_github,
+            issue_number, issue_title, status, type, claude_session_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            assignment_id,
+            "dell64",
+            REPO,
+            "acme/" + REPO,
+            issue_number,
+            "Some issue",
+            status,
+            assignment_type,
+            claude_session_id,
+        ),
+    )
+    conn.commit()
+
+
+def test_leg_counts_local_excludes_a_never_started_launch(coord_db):
+    """quadraui#2347's exact shape: a worktree-setup failure
+    (`a367583a5247`) and a #3912 conflicting-worktree refusal
+    (`704ee7e88fd9`) — both `status='failed'`, neither ever captured a
+    `claude_session_id` — must not count as real work legs, while the two
+    `done` legs that actually ran (`fbc1554e1abd`, `74b7a803cbdf`) still do."""
+    from coord.state import _leg_counts_local
+
+    _insert_assignment_leg(
+        coord_db, assignment_id="a367583a5247", status="failed",
+        claude_session_id=None,
+    )
+    _insert_assignment_leg(
+        coord_db, assignment_id="704ee7e88fd9", status="failed",
+        claude_session_id=None,
+    )
+    _insert_assignment_leg(coord_db, assignment_id="fbc1554e1abd", status="done")
+    _insert_assignment_leg(coord_db, assignment_id="74b7a803cbdf", status="done")
+
+    counts = _leg_counts_local()
+    by_type = counts[entry_key(REPO, 1650)]
+    assert by_type["work"] == 2
+    assert by_type[INFRA_FAILED_LAUNCH_KEY] == 2
+
+
+def test_leg_counts_local_counts_a_failed_leg_with_a_session_as_real(coord_db):
+    """A `failed` leg that DID capture a session id (the worker started,
+    then crashed) is a real attempt and must count as a normal `work` leg,
+    not an infra-failed launch — `status` alone must never decide this."""
+    from coord.state import _leg_counts_local
+
+    _insert_assignment_leg(
+        coord_db, assignment_id="crashed-mid-run", status="failed",
+        claude_session_id="sess-123",
+    )
+
+    counts = _leg_counts_local()
+    by_type = counts[entry_key(REPO, 1650)]
+    assert by_type["work"] == 1
+    assert INFRA_FAILED_LAUNCH_KEY not in by_type
+
+
+def test_work_leg_count_for_issue_local_excludes_infra_failed_launches(coord_db):
+    """`_enqueue_drive_queue_local`'s `legs_at_enqueue` baseline must use the
+    SAME real-leg-only definition `_leg_counts_local` does, or a freshly
+    re-added row's budget would be computed against two different
+    counts."""
+    from coord.db import get_connection
+    from coord.state import _work_leg_count_for_issue_local
+
+    _insert_assignment_leg(
+        coord_db, assignment_id="a367583a5247", status="failed",
+        claude_session_id=None,
+    )
+    _insert_assignment_leg(coord_db, assignment_id="fbc1554e1abd", status="done")
+
+    conn = get_connection()
+    assert _work_leg_count_for_issue_local(conn, REPO, 1650) == 1
 
 
 # ── #3577: a merge-stage exit must not be charged to the fix-round budget ───

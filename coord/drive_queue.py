@@ -2216,6 +2216,16 @@ def summarize_drive_queue(
 # `assignments` + `assignments_archive` on the daemon, or from a fixture's
 # seeded board), this just counts them.
 
+#: #3998: reserved pseudo-type key `coord.state._leg_counts_local` folds a
+#: WORK_LIKE issue's infra-failed-launch count under, in the SAME per-issue
+#: ``by_type`` map every real :data:`~coord.models.AssignmentType` string is
+#: counted under. Deliberately never a real assignment type (``in WORK_LIKE``
+#: is always ``False`` for it), so every existing ``kind in WORK_LIKE``
+#: filter — this module's own `build_board_view` fold into `work_leg_count`,
+#: `coord.commands.drive_queue`'s `lifetime_legs` display — excludes it
+#: automatically, with no change needed at either call site.
+INFRA_FAILED_LAUNCH_KEY = "infra_failed_launch"
+
 
 def compute_leg_counts(
     rows: Iterable[tuple[str, int, str]],
@@ -2409,6 +2419,19 @@ class IssueFacts:
     # this issue (never dispatched) — reads as "budget untouched", never as a
     # false ceiling trip.
     work_leg_count: int = 0
+    # #3998: ALL-TIME count, same scope as `work_leg_count` above, of
+    # WORK_LIKE assignments for this issue that ended WITHOUT a worker
+    # session ever starting — a worktree-setup failure, a pre-session
+    # API/HTTP error, or a launch refused for a live conflicting worktree
+    # (#3912). `work_leg_count` above EXCLUDES these by construction (see
+    # `coord.state._leg_counts_local`'s split of real vs infra-failed rows
+    # before folding into `leg_counts`'s per-type map) — this field is pure
+    # diagnostics, carried so a ceiling block's reason can report "N work
+    # legs + M infra-failed launches" instead of silently losing the infra
+    # count, never consulted by `remaining_fix_rounds` itself. `0` when
+    # *leg_counts* is omitted or names nothing for this issue, same as
+    # `work_leg_count`.
+    infra_failed_leg_count: int = 0
     # #3502: the worker's (and reviewer's, when it overrode) own
     # self-reported `ISSUE_RESOLUTION:` judgment for the merged work-like
     # assignment behind `merged` — one of
@@ -2614,6 +2637,13 @@ def build_board_view(
     every pre-#2972 caller) leaves every :attr:`IssueFacts.work_leg_count` at
     its ``0`` default, which reads as "budget untouched" — the exact
     pre-#2972 behaviour for a caller that never learned about this field.
+
+    #3998: *leg_counts* may also carry each key's count under
+    :data:`INFRA_FAILED_LAUNCH_KEY` — a WORK_LIKE leg that never started a
+    worker session. That count is folded into
+    :attr:`IssueFacts.infra_failed_leg_count` instead of
+    ``work_leg_count``: it is never a member of ``WORK_LIKE``, so it was
+    already excluded from the sum above before this field existed.
     """
     facts: dict[str, dict[str, Any]] = {}
 
@@ -2934,6 +2964,11 @@ def build_board_view(
         got["work_leg_count"] = sum(
             count for kind, count in by_type.items() if kind in WORK_LIKE
         )
+        # #3998: the sibling diagnostic count, folded separately from
+        # `work_leg_count` above — `INFRA_FAILED_LAUNCH_KEY` is never a
+        # member of `WORK_LIKE`, so the sum above already excludes it; this
+        # just surfaces the number it excluded rather than discarding it.
+        got["infra_failed_leg_count"] = int(by_type.get(INFRA_FAILED_LAUNCH_KEY, 0))
 
     return BoardView(
         issues={key: IssueFacts(**value) for key, value in facts.items()},
@@ -6670,13 +6705,27 @@ def _reconcile_running(
             else None
         )
         gate_note = f" (merge gate: {live_merge_reason})" if live_merge_reason else ""
+        # #3998: `facts.infra_failed_leg_count` is a LIFETIME figure (like
+        # `facts.work_leg_count` itself — unlike `row_legs` above, there is
+        # no per-row baseline to subtract it against — see `IssueFacts.
+        # infra_failed_leg_count`'s docstring), so this is reported as its
+        # own, separately-labelled count rather than folded into `row_legs`:
+        # an operator reading "N work legs" must never have to wonder
+        # whether a never-started launch is hiding inside that number.
+        infra_legs = facts.infra_failed_leg_count
+        infra_note = (
+            f", plus {infra_legs} infra-failed launch(es) that never "
+            f"started a worker session (not counted against this budget)"
+            if infra_legs
+            else ""
+        )
         reason = (
             f"fix-round ceiling reached across relaunches (#2972): "
             f"{row_legs} work leg(s) already run against this row's own "
             f"budget of {budget} (1 work dispatch + "
             f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
-            f"round(s)) — giving up rather than relaunching with a fresh "
-            f"budget{dispatch_note}{gate_note}. Stopped (#3454): no further "
+            f"round(s)){infra_note} — giving up rather than relaunching with "
+            f"a fresh budget{dispatch_note}{gate_note}. Stopped (#3454): no further "
             f"relaunch, gate-clear resume, or auto-dispatched stale-rebase "
             f"conflict-fix "
             f"(from any of this fleet's independent dispatchers) will fire "
