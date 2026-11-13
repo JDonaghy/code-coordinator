@@ -6193,17 +6193,25 @@ def _reconcile_running(
     # worker concluded the issue itself needs epic decomposition rather than
     # one leg of work. Parks with no attempt spent, same as the other two —
     # relaunching reproduces the identical split proposal (#3922's
-    # incident), so there is nothing a retry could discover that this leg
-    # did not already report. The remediation text names the operator
-    # action (decompose + close/re-scope) rather than a retarget or a
-    # `clear-refusal`-style recheck — unlike a premise refusal, there is no
-    # "the prerequisite has since landed" escape hatch here.
+    # incident) UNLESS the row has gone stale since.
+    #
+    # #3996: this park is no longer a dead end — `coord.drive.decide`'s own
+    # `needs_decomposition` branch now carries the SAME two escape hatches
+    # `refused_policy`/`refused_premise` already have (an automatic
+    # retarget-staleness check, or `clear-refusal`'s manual recheck), so a
+    # relaunch after the coordinator actually decomposes/re-scopes the
+    # issue dispatches fresh work instead of re-parking on this fossil row.
+    # The remediation text here names both.
     if own_reason and is_needs_decomposition_reason(own_reason):
         reason = (
             f"{own_reason} — parking without spending an attempt (#3931); "
             "needs the coordinator, not a relaunch — decompose the issue "
             "into the proposed sub-issues (posted to the issue) and close "
-            "or re-scope this one, then dispatch the replacements normally."
+            "or re-scope this one. Retargeting (rewriting the issue's "
+            "title) makes the next relaunch detect the re-scope and "
+            "dispatch fresh work automatically (#3996); otherwise `coord "
+            "drive-queue clear-refusal` (#3339) records the recheck "
+            "explicitly, then `remove` + `add` dispatches fresh work."
         )
         return (
             Reconcile(

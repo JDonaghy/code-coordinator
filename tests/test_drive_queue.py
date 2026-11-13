@@ -4800,9 +4800,13 @@ def test_a_premise_refusal_and_a_policy_refusal_are_never_conflated():
 # `coord.agent.NEEDS_DECOMPOSITION` (clean exit, 0 commits, its own final
 # message or `WORK_OUTCOME:` marker concludes the issue needs epic
 # decomposition) — parks exactly like a premise refusal above: same
-# no-attempt-spent accounting, same "never auto-resumes" posture. The remedy
-# text differs again: decompose + close/re-scope, no retarget and no
-# `clear-refusal`-style recheck.
+# no-attempt-spent accounting, same "never auto-resumes" posture. #3996:
+# unlike the original #3931 cut, this park is no longer a dead end — the
+# remedy text names decompose + close/re-scope AND the same two escape
+# hatches `refused_policy`/`refused_premise` already have (an automatic
+# retarget-staleness check in `coord.drive.decide()`, or `clear-refusal`'s
+# manual recheck) — see tests/test_drive.py's `needs_decomposition` section
+# for the `decide()` half of this.
 # ═══════════════════════════════════════════════════════════════════════════
 
 NEEDS_DECOMPOSITION_REASON = (
@@ -4829,15 +4833,19 @@ def test_a_needs_decomposition_leg_parks_without_spending_an_attempt():
     assert NEEDS_DECOMPOSITION_REASON in reconcile.updates["last_reason"]
 
 
-def test_a_needs_decomposition_park_reason_names_decomposition_not_retarget_or_recheck():
+def test_a_needs_decomposition_park_reason_names_both_escape_hatches():
+    """#3996: the park is no longer a dead end — the reason text must name
+    BOTH ways the coordinator can clear it once the issue is actually
+    decomposed/re-scoped: an automatic retarget (title rewrite) or the
+    manual `clear-refusal`."""
     entries = [entry(3922, position=3, state=STATE_RUNNING, attempts=0)]
     plan = plan_tick(
         entries, board(), capacity=1,
         exit_reasons={entry_key(REPO, 3922): NEEDS_DECOMPOSITION_REASON},
     )
     reason = plan.reconciles[0].reason
-    assert "retarget" not in reason
-    assert "clear-refusal" not in reason
+    assert "retarget" in reason.lower()
+    assert "clear-refusal" in reason
     assert "decompose" in reason
 
 

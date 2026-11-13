@@ -2334,19 +2334,136 @@ def test_needs_decomposition_still_blocking_names_the_assignment_and_age():
     assert NEEDS_DECOMPOSITION_MARKER in action.message
 
 
-def test_needs_decomposition_remedy_names_decomposition_not_retarget_or_recheck():
-    """Unlike refused_policy, the remedy must never suggest a title
-    retarget. Unlike refused_premise, it must never suggest `clear-refusal`
-    — there is no "the prerequisite has since landed" escape hatch for an
-    issue that still needs decomposing; the only remedy is to decompose it."""
+def test_needs_decomposition_remedy_names_both_retarget_and_clear_refusal():
+    """#3996: unlike the original #3931 cut, a `needs_decomposition` park is
+    no longer a dead end — the still-blocking remedy must name BOTH escape
+    hatches it now has: retargeting (automatic) and `clear-refusal`
+    (manual), alongside the original "decompose" instruction."""
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    title = "Exactly the title this branch was named from"
     action = step(
-        state(work_aid="w1", work_status="needs_decomposition", work_finished_at=1000.0)
+        state(
+            work_aid="w1",
+            work_status="needs_decomposition",
+            work_branch=f"issue-{ISSUE}-{_slugify(title)}",
+            issue_title=title,
+            work_finished_at=1000.0,
+        )
     )
     assert action.is_exit
     message_lower = action.message.lower()
-    assert "retarget" not in message_lower
-    assert "clear-refusal" not in message_lower
+    assert "retarget" in message_lower
+    assert "clear-refusal" in message_lower
     assert "decompose" in message_lower
+    assert action.audit_event is None
+
+
+def test_needs_decomposition_is_bypassed_when_the_issue_was_retargeted():
+    """#3996: mirrors `test_refused_policy_is_bypassed_when_the_issue_was_
+    retargeted` exactly — the SAME `_refused_policy_staleness` check, reused
+    rather than reimplemented (#2096's "one question, one answer"). A
+    re-scope that rewrites the issue's title makes the next `coord drive`
+    detect it and dispatch fresh work instead of re-parking on the fossil
+    row — the #3996 incident shape (quadraui#2341 re-scoped and requeued,
+    but every relaunch re-read the stale decomposition verdict)."""
+    s = state(
+        work_aid="w1",
+        work_status="needs_decomposition",
+        work_branch="issue-1392-old-pre-rescope-title",
+        issue_title="A completely different re-scoped deliverable",
+        work_finished_at=1000.0,
+    )
+    action = step(s)
+    assert action.kind == RUN
+    assert action.command[0] == "assign"
+    assert action.audit_event is not None
+    event_type, summary, details = action.audit_event
+    assert event_type == "needs_decomposition_stale"
+    assert "w1" in summary
+    assert details["stale_assignment_id"] == "w1"
+    assert details["stale_branch"] == "issue-1392-old-pre-rescope-title"
+
+
+def test_needs_decomposition_is_not_bypassed_when_the_title_is_unchanged():
+    """The inverse of the retarget test above: the branch still matches
+    `issue-{N}-{slugify(current title)}`, so the issue was NOT edited — this
+    must still die rather than silently re-dispatch into the identical
+    split proposal the worker already reported (#3922's incident)."""
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    title = "Exactly the title this branch was named from"
+    s = state(
+        work_aid="w1",
+        work_status="needs_decomposition",
+        work_branch=f"issue-{ISSUE}-{_slugify(title)}",
+        issue_title=title,
+        work_finished_at=1000.0,
+    )
+    action = step(s)
+    assert action.is_exit
+    assert NEEDS_DECOMPOSITION_MARKER in action.message
+    assert action.audit_event is None
+
+
+def test_needs_decomposition_still_blocking_distinguishes_uncertain_from_confident():
+    """#2881 pattern, applied to #3996: when the retarget check genuinely
+    can't be performed (no branch recorded on this row — the default test
+    state), the remedy must say so plainly instead of confidently claiming
+    the title is unchanged, and must point at the manual `clear-refusal`
+    bypass as the only remaining option."""
+    uncertain = step(
+        state(
+            work_aid="w1", work_status="needs_decomposition", work_finished_at=1000.0,
+        )
+    )
+    assert uncertain.is_exit
+    assert "could not confirm" in uncertain.message.lower()
+    assert "clear-refusal" in uncertain.message
+
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    title = "Exactly the title this branch was named from"
+    confident = step(
+        state(
+            work_aid="w1",
+            work_status="needs_decomposition",
+            work_branch=f"issue-{ISSUE}-{_slugify(title)}",
+            issue_title=title,
+            work_finished_at=1000.0,
+        )
+    )
+    assert confident.is_exit
+    assert "could not confirm" not in confident.message.lower()
+    assert "retarget" in confident.message.lower()
+
+
+def test_needs_decomposition_is_bypassed_when_clear_refusal_was_recorded():
+    """#3339/#3996: `coord drive-queue clear-refusal` now also accepts a
+    `needs_decomposition` assignment, writing the SAME
+    `work_premise_rechecked_at`/`_reason` columns a premise recheck does —
+    read back here identically, so a body-only re-scope (no title change,
+    nothing the automatic check above can see) still gets to dispatch fresh
+    work once the operator has explicitly asserted it was handled."""
+    s = state(
+        work_aid="w1",
+        work_status="needs_decomposition",
+        work_finished_at=1000.0,
+        work_premise_rechecked_at=2000.0,
+        work_premise_rechecked_reason="split into quadraui#2408-2410, re-scoped to part 4",
+    )
+    action = step(s)
+    assert action.kind == RUN
+    assert action.command[0] == "assign"
+    assert action.audit_event is not None
+    event_type, summary, details = action.audit_event
+    assert event_type == "needs_decomposition_rechecked"
+    assert "w1" in summary
+    assert "re-scoped to part 4" in summary
+    assert details["stale_assignment_id"] == "w1"
+    assert details["premise_rechecked_reason"] == (
+        "split into quadraui#2408-2410, re-scoped to part 4"
+    )
 
 
 def test_an_unknown_terminal_status_refuses_to_guess():
