@@ -2397,7 +2397,7 @@ def test_clear_refusal_records_the_recheck_on_the_refused_assignment(cli, seed, 
         "clear-refusal", REPO, "1650", "--reason", "quadraui#971 landed",
     )
     assert result.exit_code == 0, result.output
-    assert "recorded premise recheck" in result.output
+    assert "recorded recheck" in result.output
     assert "a-claude-coordinator-0" in result.output
     row = coord_db.execute(
         "SELECT premise_rechecked_at, premise_rechecked_reason, status "
@@ -2411,11 +2411,36 @@ def test_clear_refusal_records_the_recheck_on_the_refused_assignment(cli, seed, 
     assert row["status"] == "refused_premise"
 
 
+def test_clear_refusal_accepts_a_needs_decomposition_assignment(cli, seed, coord_db):
+    """#3996: `clear-refusal` is no longer `refused_premise`-only — a
+    `needs_decomposition` row records the identical columns, which
+    `coord.drive.decide()`'s `needs_decomposition` branch reads back as
+    license to dispatch fresh work."""
+    seed(assignments=[{"issue_number": 1650, "status": "needs_decomposition"}])
+    result = cli(
+        "clear-refusal", REPO, "1650", "--reason",
+        "split into quadraui#2408-2410, re-scoped to part 4",
+    )
+    assert result.exit_code == 0, result.output
+    assert "recorded recheck" in result.output
+    row = coord_db.execute(
+        "SELECT premise_rechecked_at, premise_rechecked_reason, status "
+        "FROM assignments WHERE assignment_id = ?",
+        ("a-claude-coordinator-0",),
+    ).fetchone()
+    assert row["premise_rechecked_at"] is not None
+    assert row["premise_rechecked_reason"] == (
+        "split into quadraui#2408-2410, re-scoped to part 4"
+    )
+    assert row["status"] == "needs_decomposition"
+
+
 def test_clear_refusal_of_a_non_refused_assignment_exits_non_zero(cli, seed):
     seed(assignments=[{"issue_number": 1650, "status": "done"}])
     result = cli("clear-refusal", REPO, "1650", "--reason", "landed")
     assert result.exit_code != 0
-    assert "not 'refused_premise'" in result.output
+    assert "not one of" in result.output
+    assert "'done'" in result.output
 
 
 def test_clear_refusal_of_an_issue_with_no_work_row_exits_non_zero(cli):

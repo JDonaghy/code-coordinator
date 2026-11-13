@@ -2430,45 +2430,63 @@ def _is_templated_reason(reason: str) -> bool:
     return bool(_TEMPLATED_REASON_RE.search(reason))
 
 
+#: Terminal work statuses `clear-refusal` can record a recheck against —
+#: `coord.drive.decide()`'s `refused_premise` (#3339) and `needs_decomposition`
+#: (#3996) branches both read `work_premise_rechecked_at`/`_reason` back as
+#: license to dispatch fresh work; see each branch's own docstring for why
+#: neither has a mechanical way to notice its remedy landed on its own.
+_CLEARABLE_REFUSAL_STATUSES = frozenset({"refused_premise", "needs_decomposition"})
+
+
 @drive_queue_group.command("clear-refusal")
 @click.argument("repo")
 @click.argument("issue", type=int)
 @click.option(
     "--reason", required=True,
-    help="Why the premise now holds (e.g. \"quadraui#971 landed, re-scoped "
-    "to a pin move\") — recorded on the assignment for the audit trail.",
+    help="Why the premise now holds, or how the issue was decomposed/"
+    're-scoped (e.g. "quadraui#971 landed, re-scoped to a pin move") — '
+    "recorded on the assignment for the audit trail.",
 )
 @_CONFIG_OPTION
 def drive_queue_clear_refusal(
     repo: str, issue: int, reason: str, config_path: Path
 ) -> None:
-    """Clear a terminal `refused_premise` verdict on REPO#ISSUE (#3339).
+    """Clear a terminal `refused_premise`/`needs_decomposition` verdict on
+    REPO#ISSUE (#3339, #3996).
 
     A `refused_premise` row (`coord.agent.REFUSED_PREMISE`, #3164) is a
     worker's correct, investigated finding that the issue's prerequisite did
-    not exist yet — but that prerequisite CAN land later, and unlike
-    `refused_policy` there is no mechanical way for `coord drive` to notice:
-    a title rewrite cannot make a missing prerequisite exist, so the row
-    blocks forever with no way to clear it. This command is that way: it
-    records your explicit assertion — "I rechecked, the premise holds now" —
-    on the refused assignment, which `coord drive`'s pre-dispatch check
-    (`coord/drive.py`'s `decide()`) reads back and treats as license to
-    dispatch fresh work instead of dying again on the same old verdict.
+    not exist yet — but that prerequisite CAN land later. A
+    `needs_decomposition` row (`coord.agent.NEEDS_DECOMPOSITION`, #3931) is a
+    worker's correct conclusion that the issue itself needs epic
+    decomposition — but the issue CAN be decomposed and re-scoped under the
+    same number. Unlike `refused_policy`, neither has a fully mechanical way
+    for `coord drive` to notice the remedy landed: a title rewrite cannot
+    make a missing prerequisite exist, and (for `needs_decomposition`) a
+    body-only re-scope that keeps the same title leaves no mechanical
+    signal either (`coord/drive.py`'s `decide()` DOES auto-detect a title
+    rewrite for `needs_decomposition`, same as it already does for
+    `refused_policy` — this command is for everything else). This command
+    records your explicit assertion instead — on the refused assignment,
+    which `coord drive`'s pre-dispatch check (`coord/drive.py`'s `decide()`)
+    reads back and treats as license to dispatch fresh work instead of
+    dying again on the same old verdict.
 
     This does NOT by itself make anything run: a `parked` drive-queue entry
-    never resumes on its own (`coord.drive_queue`'s premise-refusal pre-pass
-    — same as a `refused_policy` park), so after clearing here you still
-    need `coord drive-queue remove REPO ISSUE` + `add` to get a fresh queue
-    row that will actually tick. Re-scope the issue FIRST if the remaining
-    work has changed — this command only unblocks dispatch, it does not
-    touch the issue body.
+    never resumes on its own (`coord.drive_queue`'s refusal pre-pass — same
+    for `refused_policy`/`refused_premise`/`needs_decomposition`), so after
+    clearing here you still need `coord drive-queue remove REPO ISSUE` +
+    `add` to get a fresh queue row that will actually tick. Re-scope the
+    issue FIRST if the remaining work has changed — this command only
+    unblocks dispatch, it does not touch the issue body.
 
     `--reason` must be your own words. A still-templated placeholder — the
     `<...>`/`"..."` text the remediation chains printed by `coord diagnose`,
-    the premise park reason and the #3719 refusal-park escalation all carry
-    — is rejected, so running one of those chains verbatim (including blind,
-    via `coord escalate run`) fails here rather than fabricating the
-    assertion and redispatching paid work at an unverified premise.
+    the premise/decomposition park reasons and the #3719 refusal-park
+    escalation all carry — is rejected, so running one of those chains
+    verbatim (including blind, via `coord escalate run`) fails here rather
+    than fabricating the assertion and redispatching paid work at an
+    unverified premise.
     """
     from coord.drive_state import WORK_LIKE  # noqa: PLC0415
     from coord.state import mark_premise_rechecked  # noqa: PLC0415
@@ -2479,10 +2497,10 @@ def drive_queue_clear_refusal(
     if _is_templated_reason(reason):
         raise click.ClickException(
             f"--reason is still the placeholder text ({reason!r}) — it must be "
-            "your own assertion of why the premise now holds (e.g. "
-            '--reason "quadraui#971 landed, re-scoped to a pin move"). This '
-            "is recorded as a human's explicit, auditable claim that the "
-            "prerequisite exists now, and `coord drive` dispatches fresh "
+            "your own assertion of why the premise now holds or how the "
+            'issue was re-scoped (e.g. --reason "quadraui#971 landed, '
+            're-scoped to a pin move"). This is recorded as a human\'s '
+            "explicit, auditable claim, and `coord drive` dispatches fresh "
             "paid work off its mere presence, so it is never inferred and "
             "never filled in from a template."
         )
@@ -2493,16 +2511,17 @@ def drive_queue_clear_refusal(
             f"no work assignment found for {entry_key(repo, issue)} — "
             f"nothing to clear (checked the latest {'/'.join(sorted(WORK_LIKE))} row)"
         )
-    if status != "refused_premise":
+    if status not in _CLEARABLE_REFUSAL_STATUSES:
         raise click.ClickException(
             f"the latest work assignment for {entry_key(repo, issue)} "
-            f"({aid}) is {status!r}, not 'refused_premise' — nothing to "
-            "clear. (`coord gates` shows the current work row.)"
+            f"({aid}) is {status!r}, not one of "
+            f"{sorted(_CLEARABLE_REFUSAL_STATUSES)} — nothing to clear. "
+            "(`coord gates` shows the current work row.)"
         )
 
     mark_premise_rechecked(aid, reason)
     click.echo(
-        f"recorded premise recheck on {aid} ({entry_key(repo, issue)}): {reason!r}"
+        f"recorded recheck on {aid} ({entry_key(repo, issue)}): {reason!r}"
     )
     click.echo(
         "the assignment itself is unchanged — this only clears `coord "

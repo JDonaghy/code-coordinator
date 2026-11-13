@@ -870,8 +870,8 @@ class RefusedPolicyStaleness(NamedTuple):
 
 
 def _refused_policy_is_stale(state: IssueState) -> bool:
-    """True when a terminal ``refused_policy`` work row no longer describes
-    the issue as it stands now (#2871). Thin bool wrapper around
+    """True when a terminal work row no longer describes the issue as it
+    stands now (#2871). Thin bool wrapper around
     :func:`_refused_policy_staleness` — see that function for the reasoning
     and for the ``uncertain``/``detail`` distinction #2881 added.
     """
@@ -879,17 +879,28 @@ def _refused_policy_is_stale(state: IssueState) -> bool:
 
 
 def _refused_policy_staleness(state: IssueState) -> RefusedPolicyStaleness:
-    """Does a terminal ``refused_policy`` work row still describe the issue
-    as it stands now (#2871), and how confident is that answer (#2881)?
+    """Does a terminal work row still describe the issue as it stands now
+    (#2871), and how confident is that answer (#2881)?
 
-    A worker refuses pre-dispatch work exactly once, correctly, for the ask
-    it was shown — the refusal says nothing about a DIFFERENT ask on the same
-    issue number. If the issue was retargeted (title rewritten) after that
-    row finished, the branch it would have produced (workers name branches
-    ``issue-{N}-{slugify(title)}`` at dispatch time, see
+    Named for its original caller (the ``refused_policy`` branch) but not
+    specific to that status — #3996 reuses it verbatim for
+    ``needs_decomposition`` too, since both ask the identical question
+    ("was this issue retargeted since this row finished?") and #2096's
+    "one question, one answer" says that must be one function, not two
+    independently-maintained copies.
+
+    A worker refuses/parks pre-dispatch work exactly once, correctly, for
+    the ask it was shown — that says nothing about a DIFFERENT ask on the
+    same issue number. If the issue was retargeted (title rewritten) after
+    that row finished, the branch it would have produced (workers name
+    branches ``issue-{N}-{slugify(title)}`` at dispatch time, see
     ``coord.agent``'s ``branch_name`` construction) no longer matches what a
     fresh dispatch would name — that mismatch is the signal a retarget
-    happened.
+    happened. It only ever detects a TITLE rewrite: there is no persisted
+    snapshot of the issue BODY at dispatch time to diff against, so a
+    body-only edit reads identically to "unchanged" here — callers that
+    need to cover that case too (``needs_decomposition``'s manual
+    ``clear-refusal`` bypass) provide their own second path.
 
     Conservative on every uncertainty (no branch recorded, no title
     resolved): ``is_stale=False`` — i.e. still treated as blocking — rather
@@ -906,8 +917,8 @@ def _refused_policy_staleness(state: IssueState) -> RefusedPolicyStaleness:
             is_stale=False,
             uncertain=True,
             detail=(
-                "no branch was recorded on the refused_policy row, so "
-                "whether the issue was retargeted since could not be checked"
+                "no branch was recorded on this row, so whether the issue "
+                "was retargeted since could not be checked"
             ),
         )
     if not state.issue_title:
@@ -926,12 +937,12 @@ def _refused_policy_staleness(state: IssueState) -> RefusedPolicyStaleness:
     expected_branch = f"issue-{state.issue}-{_slugify(state.issue_title)}"
     if state.work_branch != expected_branch:
         return RefusedPolicyStaleness(
-            is_stale=True, uncertain=False, detail="retargeted since the refusal",
+            is_stale=True, uncertain=False, detail="retargeted since this row finished",
         )
     return RefusedPolicyStaleness(
         is_stale=False,
         uncertain=False,
-        detail="the issue's title is unchanged since the refusal",
+        detail="the issue's title is unchanged since this row finished",
     )
 
 
@@ -3115,29 +3126,118 @@ def decide(
         # `WORK_OUTCOME: needs-decomposition` marker, or an
         # `ISSUE_RESOLUTION: investigation` 0-commit exit with no other
         # marker (`coord.agent.NEEDS_DECOMPOSITION` — see
-        # `coord.worker_events.classify_zero_commit_outcome`). Like
-        # `refused_premise` immediately above there is no #2871-style
-        # staleness/retarget bypass: a title rewrite does not make an issue
-        # smaller, so a fresh dispatch on the same row would just reproduce
-        # the identical split proposal (#3922's incident — three legs, same
-        # proposal, no new information). This is terminal after ONE leg;
-        # `_die()` here, like `refused_policy`/`refused_premise` above,
-        # embeds `NEEDS_DECOMPOSITION_MARKER` so `coord/drive_queue.py`'s
-        # `_reconcile_running` parks the queue entry without spending an
-        # attempt rather than relaunching into the same answer.
+        # `coord.worker_events.classify_zero_commit_outcome`).
+        #
+        # #3996: unlike the original #3931 cut, this is no longer
+        # unconditionally terminal — the park message itself tells the
+        # coordinator to "decompose … and close or **re-scope** this one",
+        # and before this fix there was no way for a fresh `coord drive` to
+        # ever notice that the re-scope happened. It now gets the SAME two
+        # escape hatches its siblings above already have, reusing their
+        # exact mechanisms rather than inventing a third ("one question,
+        # one answer", #2096):
+        #
+        #   - automatic: `_refused_policy_staleness` — the IDENTICAL
+        #     retarget check `refused_policy` uses — detects a title
+        #     rewrite since this row finished (the #3996 incident re-scoped
+        #     quadraui#2341 with "new title + body" together, so the title
+        #     half of that is exactly what this already catches). A
+        #     body-only edit with the title unchanged is NOT detectable
+        #     this way — there is no persisted snapshot of the issue body
+        #     at dispatch time to diff against — so it falls through to
+        #     the manual bypass below instead of a false "unchanged".
+        #   - manual: `coord drive-queue clear-refusal` (#3339) now also
+        #     accepts a `needs_decomposition` assignment and writes the
+        #     SAME `work_premise_rechecked_at`/`_reason` columns a premise
+        #     recheck does — read back here identically to that branch.
         age_seconds = (
             time.time() - state.work_finished_at
             if state.work_finished_at is not None
             else None
         )
         age = _format_age(age_seconds) if age_seconds is not None else "unknown age"
-        remedy = (
-            "Needs the coordinator: decompose the issue into the proposed "
-            "sub-issues (posted to the issue — see the worker's own split "
-            "proposal) and close or re-scope this one. Once replaced, "
-            "dispatch the new sub-issues normally; this row does not "
-            "auto-resume."
-        )
+        staleness = _refused_policy_staleness(state)
+        if staleness.is_stale:
+            bypass_summary = (
+                f"pre-dispatch: bypassing stale needs_decomposition assignment "
+                f"{state.work_aid} ({age} old) on issue {state.repo}#{state.issue} "
+                f"— retargeted since (branch {state.work_branch!r} no longer "
+                "matches the issue's current title); dispatching fresh work (#3996)"
+            )
+            dispatch = _dispatch_work_stage(
+                state, opts, counters, machine, oracle, gate_checker, verifier
+            )
+            return replace(
+                dispatch,
+                audit_event=(
+                    "needs_decomposition_stale",
+                    bypass_summary,
+                    {
+                        "stale_assignment_id": state.work_aid,
+                        "stale_branch": state.work_branch,
+                        "age_seconds": age_seconds,
+                    },
+                ),
+            )
+        if state.work_premise_rechecked_at:
+            recheck_age_seconds = time.time() - state.work_premise_rechecked_at
+            recheck_age = _format_age(recheck_age_seconds)
+            bypass_summary = (
+                f"pre-dispatch: bypassing needs_decomposition assignment "
+                f"{state.work_aid} ({age} old) on issue {state.repo}#{state.issue} "
+                f"— operator asserted {recheck_age} ago that it was "
+                f"decomposed/re-scoped ({state.work_premise_rechecked_reason!r}); "
+                "dispatching fresh work (#3996)"
+            )
+            dispatch = _dispatch_work_stage(
+                state, opts, counters, machine, oracle, gate_checker, verifier
+            )
+            return replace(
+                dispatch,
+                audit_event=(
+                    "needs_decomposition_rechecked",
+                    bypass_summary,
+                    {
+                        "stale_assignment_id": state.work_aid,
+                        "age_seconds": age_seconds,
+                        "premise_rechecked_reason": state.work_premise_rechecked_reason,
+                    },
+                ),
+            )
+        # Still genuinely blocking — name both escape hatches, and (#2881
+        # pattern) say plainly when the automatic one could not even be
+        # checked rather than confidently claiming "unchanged".
+        if staleness.uncertain:
+            remedy = (
+                "Needs the coordinator: decompose the issue into the "
+                "proposed sub-issues (posted to the issue) and close or "
+                f"re-scope this one. Retargeting SHOULD make the next "
+                f"`coord drive` dispatch fresh work automatically (#3996), "
+                f"but {staleness.detail} — so THIS run could not confirm "
+                "that either way; use the manual bypass instead: `coord "
+                f"drive-queue clear-refusal {state.repo} {state.issue} "
+                '--reason "..."` records that it was decomposed/re-scoped, '
+                f"then `coord drive-queue remove {state.repo} {state.issue}` "
+                "+ `add` dispatches fresh work — a parked entry never "
+                "resumes on its own, so both steps are required."
+            )
+        else:
+            remedy = (
+                "Needs the coordinator: decompose the issue into the "
+                "proposed sub-issues (posted to the issue — see the "
+                "worker's own split proposal) and close or re-scope this "
+                "one. Retargeting (rewriting the issue's title) makes the "
+                "next `coord drive` detect the re-scope and dispatch fresh "
+                "work automatically (#3996) — the same bypass "
+                "`refused_policy` already has (#2871). If the re-scope "
+                "kept the title, or only the body changed, assert it "
+                'directly: `coord drive-queue clear-refusal '
+                f'{state.repo} {state.issue} --reason "..."` records the '
+                f"recheck on THIS assignment, then `coord drive-queue "
+                f"remove {state.repo} {state.issue}` + `add` dispatches "
+                "fresh work (#3339/#3996) — a parked entry never resumes "
+                "on its own, so both steps are required."
+            )
         return _die(
             f"pre-dispatch refusal on assignment {state.work_aid} "
             f"(needs_decomposition, {age} old) — the worker concluded the "

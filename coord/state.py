@@ -6931,6 +6931,14 @@ def mark_premise_rechecked(assignment_id: str, reason: str) -> None:
     only — a fresh dispatch that refuses again produces a new assignment id
     with this column unset, so the bypass never becomes a standing override.
 
+    #3996: `coord.drive.decide()`'s `needs_decomposition` branch reads the
+    identical column back the same way, for the identical reason — a
+    body-only re-scope that keeps the issue's title leaves no mechanical
+    signal either (its title-rewrite half IS auto-detected, mirroring
+    `refused_policy`'s #2871 check). `clear-refusal` now accepts either
+    terminal status; this function itself does not care which one it is
+    writing against.
+
     *reason* is required (the CLI enforces non-empty) so the audit trail
     always carries the operator's own justification, not just a timestamp.
     Overwrite-idempotent (unlike `update_assignment_stop_reason`'s
