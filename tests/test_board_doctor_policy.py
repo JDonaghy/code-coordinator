@@ -57,6 +57,7 @@ from coord.board_doctor_policy import (
     escalation_alert_dispatcher,
     make_investigate_capacity_check,
     policy_tier_of,
+    write_drive_escalation,
 )
 from coord.config import Config
 from coord.drive_queue import parse_key
@@ -392,19 +393,24 @@ class TestEscalationAlertDispatcher:
     def test_a_relaunch_shaped_covering_escalation_is_overridden_by_fresh_ci_red_evidence(
         self,
     ) -> None:
-        # #3999: the covering escalation's own remedy is a `remove`-shaped
-        # relaunch — exactly the dead end `coord drive-queue add` itself
-        # refuses while the PR's checks are red. This row's fresh
+        # #3999: the covering escalation's own remedy is a full `remove` +
+        # `add` relaunch — the exact two-command string
+        # `coord.commands.drive_queue._requeue_command` builds, and
+        # exactly the dead end `coord drive-queue add` itself refuses
+        # while the PR's checks are red. This row's fresh
         # CAUSE_INTEGRATION_RED evidence proves checks are red RIGHT NOW,
         # so that remedy is refused by current state and must not be left
         # standing as "cover" forever.
         state.record_drive_escalation(
             "acme/widgets",
             2347,
-            stage="needs-redesign",
-            reason="needs-redesign: hit the same mechanical gate 3 times",
+            stage="work",
+            reason="per-leg spend ceiling breached",
             gate_readings="",
-            proposed_command="coord drive-queue remove acme/widgets 2347",
+            proposed_command=(
+                "coord drive-queue remove acme/widgets 2347 && "
+                "coord drive-queue add acme/widgets 2347"
+            ),
         )
         row = _row(
             "acme/widgets#2347",
@@ -421,6 +427,42 @@ class TestEscalationAlertDispatcher:
         assert escalation["stage"] == "board-doctor:drive-queue"
         assert "integration-red" in escalation["reason"]
         assert "Wire types staleness" in escalation["gate_readings"]
+
+    def test_a_remove_only_covering_escalation_is_never_treated_as_refused(
+        self,
+    ) -> None:
+        # #3999 blocking finding: `coord drive-queue remove <repo> <issue>`
+        # ALONE (no paired `add`) — the shape
+        # `coord.review.needs_redesign_escalation` actually writes for a
+        # needs-redesign park — always succeeds regardless of check
+        # state; only the `add` half of a full relaunch is ever refused
+        # by `existing_pr_relaunch_remedy`. A remove-only remedy must
+        # therefore never be second-guessed here, no matter how fresh or
+        # check-shaped this row's own evidence is — overriding it would
+        # destroy the needs-redesign record for a "fix" that was never
+        # actually refused.
+        state.record_drive_escalation(
+            "acme/widgets",
+            2350,
+            stage="needs-redesign",
+            reason="needs-redesign: hit the same mechanical gate 3 times",
+            gate_readings="",
+            proposed_command="coord drive-queue remove acme/widgets 2350",
+        )
+        row = _row(
+            "acme/widgets#2350",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            evidence=("gh pr checks: failing — Wire types staleness",),
+            fresh=True,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+        )
+
+        assert escalation_alert_dispatcher(row) == ALERT_SKIPPED
+
+        escalation = state.get_drive_escalation("acme/widgets", 2350)
+        assert escalation is not None
+        assert escalation["stage"] == "needs-redesign"
+        assert escalation["proposed_command"] == "coord drive-queue remove acme/widgets 2350"
 
     def test_a_non_relaunch_shaped_covering_escalation_is_still_left_untouched(
         self,
@@ -479,6 +521,42 @@ class TestEscalationAlertDispatcher:
         escalation = state.get_drive_escalation("acme/widgets", 2349)
         assert escalation is not None
         assert escalation["stage"] == "needs-redesign"
+
+    def test_write_drive_escalation_with_no_row_keeps_skip_only_behavior(
+        self,
+    ) -> None:
+        # `coord.board_doctor._followthrough_notify` calls
+        # `write_drive_escalation` with no `StuckRow` to check fresh
+        # evidence against — a covering escalation must stay in place
+        # exactly as it did before #3999's override existed, even one
+        # whose own remedy IS relaunch-shaped, since there is no fresh
+        # evidence here to prove that remedy refused right now.
+        state.record_drive_escalation(
+            "acme/widgets",
+            2351,
+            stage="work",
+            reason="per-leg spend ceiling breached",
+            gate_readings="",
+            proposed_command=(
+                "coord drive-queue remove acme/widgets 2351 && "
+                "coord drive-queue add acme/widgets 2351"
+            ),
+        )
+
+        result = write_drive_escalation(
+            "acme/widgets",
+            2351,
+            stage="board-doctor:drive-queue",
+            reason="board-doctor: drive-queue row stuck",
+            gate_readings="queue=drive-queue | cause=integration_red",
+            proposed_command="coord drive-queue diagnose --json",
+            row=None,
+        )
+
+        assert result == ALERT_SKIPPED
+        escalation = state.get_drive_escalation("acme/widgets", 2351)
+        assert escalation is not None
+        assert escalation["stage"] == "work"
 
     def test_a_write_failure_is_reported_as_not_delivered(self, monkeypatch) -> None:
         # The DB being unavailable must read as a failed alert, not as a
