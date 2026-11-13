@@ -389,6 +389,97 @@ class TestEscalationAlertDispatcher:
         assert escalation is not None
         assert escalation["stage"] == "board-doctor:drive-queue"
 
+    def test_a_relaunch_shaped_covering_escalation_is_overridden_by_fresh_ci_red_evidence(
+        self,
+    ) -> None:
+        # #3999: the covering escalation's own remedy is a `remove`-shaped
+        # relaunch — exactly the dead end `coord drive-queue add` itself
+        # refuses while the PR's checks are red. This row's fresh
+        # CAUSE_INTEGRATION_RED evidence proves checks are red RIGHT NOW,
+        # so that remedy is refused by current state and must not be left
+        # standing as "cover" forever.
+        state.record_drive_escalation(
+            "acme/widgets",
+            2347,
+            stage="needs-redesign",
+            reason="needs-redesign: hit the same mechanical gate 3 times",
+            gate_readings="",
+            proposed_command="coord drive-queue remove acme/widgets 2347",
+        )
+        row = _row(
+            "acme/widgets#2347",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            evidence=("gh pr checks: failing — Wire types staleness",),
+            fresh=True,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+        )
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 2347)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+        assert "integration-red" in escalation["reason"]
+        assert "Wire types staleness" in escalation["gate_readings"]
+
+    def test_a_non_relaunch_shaped_covering_escalation_is_still_left_untouched(
+        self,
+    ) -> None:
+        # The override is narrow: a covering escalation whose remedy is
+        # NOT a relaunch (nothing to do with checks being red) must not be
+        # second-guessed just because this row also happens to read
+        # CAUSE_INTEGRATION_RED — e.g. a spend-ceiling kill's own
+        # "acknowledge the cost and retry" remedy is orthogonal to whether
+        # the PR's checks are currently red.
+        state.record_drive_escalation(
+            "acme/widgets",
+            2348,
+            stage="work",
+            reason="per-leg spend ceiling breached",
+            gate_readings="",
+            proposed_command="coord retry aid-1 --acknowledge-cost",
+        )
+        row = _row(
+            "acme/widgets#2348",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            fresh=True,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+        )
+
+        assert escalation_alert_dispatcher(row) == ALERT_SKIPPED
+
+        escalation = state.get_drive_escalation("acme/widgets", 2348)
+        assert escalation is not None
+        assert escalation["stage"] == "work"
+
+    def test_a_relaunch_shaped_covering_escalation_is_left_untouched_for_a_stale_row(
+        self,
+    ) -> None:
+        # #3777's same "new evidence only" bar: a row rebuilt from a
+        # possibly arbitrarily old `block_log` entry proves nothing about
+        # whether checks are red RIGHT NOW, so it must not override a
+        # covering escalation either.
+        state.record_drive_escalation(
+            "acme/widgets",
+            2349,
+            stage="needs-redesign",
+            reason="needs-redesign: hit the same mechanical gate 3 times",
+            gate_readings="",
+            proposed_command="coord drive-queue remove acme/widgets 2349",
+        )
+        row = _row(
+            "acme/widgets#2349",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            fresh=False,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+        )
+
+        assert escalation_alert_dispatcher(row) == ALERT_SKIPPED
+
+        escalation = state.get_drive_escalation("acme/widgets", 2349)
+        assert escalation is not None
+        assert escalation["stage"] == "needs-redesign"
+
     def test_a_write_failure_is_reported_as_not_delivered(self, monkeypatch) -> None:
         # The DB being unavailable must read as a failed alert, not as a
         # silently-swallowed success — `sweep` keys the "escalate exactly
@@ -1309,6 +1400,50 @@ class TestInvestigate:
         assert _investigate(row) is True
         assert state.list_drive_escalations() == []
 
+    def test_ceiling_bypass_dispatches_a_fixit_leg_for_a_fresh_integration_red_row(
+        self, monkeypatch
+    ) -> None:
+        # #3999 (quadraui#2347): a ceiling-blocked row whose live checks
+        # are red, but whose own branch Test-gate verdict already read
+        # green, is exactly the "fresh, narrow, evidence-bearing"
+        # diagnosis #3777's bypass exists for, not the blind-relaunch
+        # shape the ceiling guards against — board-doctor must not
+        # dead-end on `auto-dispatch-noop` while this leg is still
+        # available.
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[],
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: config)
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "acme/widgets#40 fix-it leg dispatched to mac1 (iteration 1)",
+            },
+        )
+        row = _row(
+            "acme/widgets#40",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            evidence=(
+                "gh pr checks: failing — Wire types staleness — but this "
+                "branch's own latest Test-gate verdict is 'passed'",
+            ),
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            fresh=True,
+        )
+
+        assert _investigate(row) is True
+        assert state.list_drive_escalations() == []
+
     def test_ceiling_still_blocks_a_merge_conflict_row(self, monkeypatch) -> None:
         # #3918: `CAUSE_MERGE_CONFLICT` is not in `INVESTIGATE_CAUSES`
         # anymore, so `_fixit_rebudget_environmental` never admits it — a
@@ -1467,6 +1602,38 @@ class TestFixitRebudgetEnvironmental:
             "acme/widgets#40",
             queue_diagnose.CAUSE_CI_GREEN,
             confidence=queue_diagnose.CONFIDENCE_LOW,
+            fresh=True,
+        )
+
+        assert _fixit_rebudget_environmental(row) is False
+
+    def test_integration_red_at_high_confidence_is_environmental(self) -> None:
+        # #3999: by definition the branch's own latest Test-gate verdict
+        # already read green — the live-red check is a property of the
+        # merge-ref combination, not a flailing retry on an unresolved
+        # local regression. `queue_diagnose` only ever mints this cause at
+        # CONFIDENCE_HIGH (`_rule_integration_red`), so this is the one
+        # real-world confidence it is ever observed at.
+        row = _row(
+            "acme/widgets#40",
+            queue_diagnose.CAUSE_INTEGRATION_RED,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            fresh=True,
+        )
+
+        assert _fixit_rebudget_environmental(row) is True
+
+    def test_plain_ci_red_stays_flailing_even_though_integration_red_is_admitted(
+        self,
+    ) -> None:
+        # CAUSE_CI_RED (unlike CAUSE_INTEGRATION_RED) covers the shape
+        # where the branch's OWN diff is also broken, not just the merge-
+        # ref combination — admitting it here would rebudget a blind
+        # relaunch on a genuinely still-broken branch.
+        row = _row(
+            "acme/widgets#40",
+            queue_diagnose.CAUSE_CI_RED,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
             fresh=True,
         )
 
