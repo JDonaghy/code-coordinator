@@ -114,6 +114,45 @@ def fake_graphify(monkeypatch):
     return calls
 
 
+def _health_after_refresh(server: AgentServer, timeout: float = 5.0) -> dict:
+    """Trigger one `_refresh_base_checkouts` pass via ``health()``, wait
+    for it to actually finish, and return a settled snapshot.
+
+    Pre-#4005 this suite read the result straight off `server.health()`'s
+    return value because the pass ran inline on the calling thread; it now
+    runs on its own background thread (`AgentServer._kick_off_base_checkout_refresh`),
+    so a bare `server.health()` only sees whatever the LAST completed pass
+    left behind, racing the one this call just kicked off.
+
+    Every `health()` call unconditionally kicks off another pass — that's
+    fine in production (an already-synced checkout with nothing pending is
+    a near-instant no-op), but it means a second `health()` call made just
+    to *read* the settled result would itself race a fresh "due" pass under
+    these tests' zero-second ``refresh_interval`` and overwrite the very
+    entry being asserted on (every due-triggered pass unconditionally
+    overwrites ``outcome``, even to ``up_to_date``). Parking the interval
+    at a day for the read call — then restoring it — makes that second
+    kickoff a due=False no-op without suppressing a still-pending deferred
+    rebuild retry, which `_refresh_base_checkouts` runs regardless of
+    `due`.
+    """
+    server.health()
+    assert server._base_checkout_refresh_ran.wait(timeout=timeout), (
+        "base checkout refresh pass never completed"
+    )
+    original_interval = server._graph_refresh_interval
+    server._graph_refresh_interval = max(original_interval, 86400.0)
+    server._base_checkout_refresh_ran.clear()
+    try:
+        health = server.health()
+        assert server._base_checkout_refresh_ran.wait(timeout=timeout), (
+            "base checkout refresh read-back pass never completed"
+        )
+    finally:
+        server._graph_refresh_interval = original_interval
+    return health
+
+
 def _refresh_entry(health: dict) -> dict:
     (entry,) = health["graph_refresh"]["checkouts"]
     return entry
@@ -140,7 +179,7 @@ def test_clean_base_behind_origin_is_fast_forwarded_and_graph_refreshed(
     origin_head = _git("rev-parse", "HEAD", cwd=pusher)
     server = make_server(base)
 
-    health = server.health()
+    health = _health_after_refresh(server)
 
     assert _git("rev-parse", "HEAD", cwd=base) == origin_head
     assert fake_graphify == [base]
@@ -165,7 +204,7 @@ def test_dirty_base_is_left_untouched_and_reported(
     (base / "README").write_text("operator edit\n")
     server = make_server(base)
 
-    entry = _refresh_entry(server.health())
+    entry = _refresh_entry(_health_after_refresh(server))
 
     assert _git("rev-parse", "HEAD", cwd=base) == before
     assert (base / "README").read_text() == "operator edit\n"
@@ -182,7 +221,7 @@ def test_off_branch_base_is_left_untouched_and_reported(
     before = _git("rev-parse", "HEAD", cwd=base)
     server = make_server(base)
 
-    entry = _refresh_entry(server.health())
+    entry = _refresh_entry(_health_after_refresh(server))
 
     assert _git("rev-parse", "HEAD", cwd=base) == before
     assert _git("symbolic-ref", "--short", "HEAD", cwd=base) == "parked"
@@ -199,7 +238,7 @@ def test_busy_machine_fast_forwards_but_defers_the_rebuild(
     server = make_server(base)
     _add_running(server, base)
 
-    entry = _refresh_entry(server.health())
+    entry = _refresh_entry(_health_after_refresh(server))
     assert _git("rev-parse", "HEAD", cwd=base) == origin_head
     assert entry["outcome"] == "fast_forwarded"
     assert entry["graph_detail"] == "rebuild deferred: machine busy"
@@ -208,7 +247,7 @@ def test_busy_machine_fast_forwards_but_defers_the_rebuild(
 
     with server._lock:
         server._assignments.clear()
-    entry = _refresh_entry(server.health())
+    entry = _refresh_entry(_health_after_refresh(server))
     assert fake_graphify == [base]
     assert entry["graph_current"] is True
     assert origin_head.startswith(entry["graph_built_sha"])
@@ -231,7 +270,11 @@ def test_refresh_interval_is_honoured(
 
     monkeypatch.setattr(gh, "fast_forward_base_checkout", _counting)
 
-    server.health()
+    # Wait for the first kicked-off pass to finish before triggering the
+    # second — otherwise both could race to claim `_graph_refresh_last_run_at`
+    # (#4005 moved the pass off the request thread, so two `health()` calls
+    # no longer serialize it for free the way they used to).
+    _health_after_refresh(server)
     server.health()
     assert calls == [base]
     assert server.health()["graph_refresh"]["interval_s"] == 3600.0
@@ -250,7 +293,7 @@ def test_rebuild_failure_is_recorded_once_and_reported(
     monkeypatch.setattr("coord.agent._graphify_update", _failing)
     server = make_server(base)
 
-    entry = _refresh_entry(server.health())
+    entry = _refresh_entry(_health_after_refresh(server))
     assert entry["outcome"] == "fast_forwarded"
     assert entry["graph_rebuild_ok"] is False
     assert "node count" in entry["graph_detail"]
