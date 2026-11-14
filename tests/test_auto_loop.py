@@ -1286,6 +1286,40 @@ class TestBuildFixBriefing:
         briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
         assert "do not change the branch name" in briefing.lower()
 
+    def test_requires_only_blocking_findings(self) -> None:
+        work = _work_assignment()
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "Fix **every** item under the reviewer's *Blocking findings*" in briefing
+        assert "Fix **every** issue identified by the reviewer" not in briefing
+        assert "Address all findings completely" not in briefing
+
+    def test_findings_without_a_blocking_section_are_all_blocking(self) -> None:
+        work = _work_assignment()
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "treat every finding as blocking" in briefing
+
+    def test_non_blocking_items_are_optional_and_confined(self) -> None:
+        work = _work_assignment()
+        findings = ReviewFindings(
+            verdict="request-changes",
+            body=(
+                "## Blocking findings\n- Missing dependency in CI install\n\n"
+                "## Non-blocking concerns\n- Export the new module in __all__\n\n"
+                "## Nits\n- Docstring describes a call the example never makes"
+            ),
+        )
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        lowered = briefing.lower()
+        assert "*non-blocking concerns* and *nits* are optional" in lowered
+        assert "inside a file this branch already changes" in lowered
+        assert "do **not** add a new file" in lowered
+        assert "public api" in lowered
+        assert "list each non-blocking concern or nit" in lowered
+        assert "Missing dependency in CI install" in briefing
+        assert "Export the new module in __all__" in briefing
+
 
 class TestBuildFixBriefingTestAuthor:
     """#1176: a type="test-author" source row gets test-authoring-flavored

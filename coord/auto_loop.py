@@ -1507,6 +1507,11 @@ def _build_fix_briefing(
     variant for the same reason one level up the pipeline — the diff is a
     specification (``contract.md`` + rendered mocks), not an
     implementation, so "run tests, make them pass" is equally wrong there.
+
+    For a plain work row, only the reviewer's blocking findings are required.
+    Non-blocking concerns and nits are optional and limited to small edits in
+    files the branch already changes, so a fix round stays close to the size
+    of what actually blocked the merge.
     """
     if work.type == "test-author":
         return _build_test_author_fix_briefing(work, findings, iteration, max_iter)
@@ -1529,12 +1534,27 @@ def _build_fix_briefing(
         "## Instructions",
         "",
         "1. Read the review findings above carefully.",
-        "2. Fix **every** issue identified by the reviewer.",
-        "3. Stay on the **same branch** — push your fixes to the existing branch.",
-        "4. Run the project test suite and ensure all tests pass before pushing.",
         (
-            f"5. This is fix iteration {iteration} of {max_iter} allowed. "
-            "Address all findings completely so the next review can approve."
+            "2. Fix **every** item under the reviewer's *Blocking findings*. "
+            "If the findings have no separate *Blocking findings* section, "
+            "treat every finding as blocking."
+        ),
+        (
+            "3. *Non-blocking concerns* and *Nits* are optional. Fix one only "
+            "when it is a small edit inside a file this branch already "
+            "changes. For a non-blocking item, do **not** add a new file, add "
+            "or change public API, or edit a crate, package or language this "
+            "branch does not already touch — leave it unfixed instead."
+        ),
+        (
+            "4. In your final message, list each non-blocking concern or nit "
+            "you did not fix, with one line on why."
+        ),
+        "5. Stay on the **same branch** — push your fixes to the existing branch.",
+        "6. Run the project test suite and ensure all tests pass before pushing.",
+        (
+            f"7. This is fix iteration {iteration} of {max_iter} allowed. "
+            "Fix every blocking finding completely so the next review can approve."
         ),
         "",
         "STATUS: reading review findings → implementing fixes → confidence: high",
