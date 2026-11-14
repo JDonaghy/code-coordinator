@@ -3536,6 +3536,9 @@ def drive_queue_sweep(
                             "issue": f.issue_number,
                             "action": f.action,
                             "follow_ups": list(f.follow_ups),
+                            "follow_up_keys": {
+                                str(k): v for k, v in f.follow_up_keys.items()
+                            },
                             "reasons": list(f.reasons),
                             "rendered_plan": f.rendered_plan,
                         }
@@ -3570,9 +3573,16 @@ def drive_queue_sweep(
         if f.rendered_plan:
             for line in f.rendered_plan.splitlines():
                 click.echo(f"  {line}")
-        if f.action == board_doctor_followthrough.ACTION_FILED and f.follow_ups:
+        # `follow_up_keys` over `follow_ups` when both are populated: it
+        # covers a resumed attempt's reused child issues and an
+        # `already_covered_by` dedupe too, not just one freshly created
+        # THIS run. Falls back to `follow_ups` so a caller that only sets
+        # that list (every real `run_followthrough` call sets both) still
+        # prints.
+        filed_numbers = list(f.follow_up_keys.values()) or list(f.follow_ups)
+        if f.action == board_doctor_followthrough.ACTION_FILED and filed_numbers:
             click.echo(
-                "  filed: " + ", ".join(f"#{n}" for n in f.follow_ups)
+                "  filed: " + ", ".join(f"#{n}" for n in filed_numbers)
             )
         for reason in f.reasons:
             click.echo(f"  reason: {reason}")

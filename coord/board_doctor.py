@@ -874,13 +874,15 @@ def _milestone_exists(repo_name: str, title: str) -> bool:
     return any(m.get("title") == title for m in milestones)
 
 
-def _covering_open_pr(github_repo: str, issue_number: int) -> int | None:
-    """An open PR in *github_repo* whose body already carries a GitHub
-    closing keyword for *issue_number* (#4007) — remediation for the
-    parent is already in flight, so :func:`run_followthrough_sweep` must
-    file nothing for it (the quadraui#2419 incident: quadraui#2439 already
-    read ``Closes #2419`` while the follow-through kept treating #2419 as
-    unclaimed and filed two duplicate successors for it).
+def _covering_prs_by_issue(github_repo: str) -> dict[int, int]:
+    """Every issue number ANY open PR in *github_repo* already carries a
+    GitHub closing keyword for, mapped to that PR's number — one scan of
+    every open PR's body, not one scan per issue:
+    `github_ops.list_open_prs` returns only `number`/`title`/`headRefName`,
+    so answering even a single issue needs one `get_pr_body` subprocess
+    per open PR; without batching this per repo, a sweep with several
+    eligible rows in the same repo repeats that whole scan from scratch
+    for each one.
 
     Reuses :func:`coord.pr_body_lint.find_closing_references` — the same
     closing-keyword scan `coord.merge_queue.process` runs pre-merge — so
@@ -891,10 +893,11 @@ def _covering_open_pr(github_repo: str, issue_number: int) -> int | None:
     from coord import github_ops  # noqa: PLC0415
     from coord.pr_body_lint import find_closing_references  # noqa: PLC0415
 
+    index: dict[int, int] = {}
     try:
         prs = github_ops.list_open_prs(github_repo)
     except Exception:  # noqa: BLE001 — unreachable reads as "no covering PR"
-        return None
+        return index
     for pr in prs:
         number = pr.get("number")
         if number is None:
@@ -903,38 +906,75 @@ def _covering_open_pr(github_repo: str, issue_number: int) -> int | None:
             body = github_ops.get_pr_body(github_repo, int(number))
         except Exception:  # noqa: BLE001 — one bad PR body must not sink the sweep
             continue
-        if issue_number in find_closing_references(body):
-            return int(number)
-    return None
+        for closed_issue in find_closing_references(body):
+            index.setdefault(closed_issue, int(number))
+    return index
+
+
+def _covering_open_pr(github_repo: str, issue_number: int) -> int | None:
+    """An open PR in *github_repo* whose body already carries a GitHub
+    closing keyword for *issue_number* — remediation for the parent is
+    already in flight, so :func:`run_followthrough_sweep` must file
+    nothing for it. A single-issue convenience over
+    :func:`_covering_prs_by_issue`; :func:`_default_covering_pr_check`
+    is what :func:`run_followthrough_sweep` actually uses by default, so
+    that one scan is shared across every row in the same sweep that
+    shares a `github_repo`, rather than repeated per row the way a direct
+    call to this function would.
+    """
+    return _covering_prs_by_issue(github_repo).get(issue_number)
+
+
+def _default_covering_pr_check() -> Callable[[str, int], int | None]:
+    """Default *covering_pr_check* for :func:`run_followthrough_sweep`: a
+    fresh per-sweep-call cache of :func:`_covering_prs_by_issue`, keyed by
+    `github_repo`, so a repo with several eligible rows pays for that scan
+    once rather than once per row.
+    """
+    cache: dict[str, dict[int, int]] = {}
+
+    def _check(github_repo: str, issue_number: int) -> int | None:
+        if github_repo not in cache:
+            cache[github_repo] = _covering_prs_by_issue(github_repo)
+        return cache[github_repo].get(issue_number)
+
+    return _check
 
 
 def _load_pending_followthrough(
     repo_name: str, issue_number: int,
 ) -> board_doctor_followthrough.PendingFollowThrough | None:
     """The most recent unfinished follow-through attempt recorded for
-    *repo_name*#*issue_number*, if any (#4007).
+    *repo_name*#*issue_number*, if any.
 
     Reads the durable decision log (:func:`coord.state.
-    board_doctor_decisions`) for the latest
-    :data:`~coord.board_doctor_followthrough.ACTION_WRITE_FAILED` entry and
-    decodes the resumable plan/follow-up-number state
-    :func:`~coord.board_doctor_followthrough.Disposition.as_record` folded
-    into its ``evidence`` list (see
+    board_doctor_decisions`) for every disposition recorded against this
+    key and looks only at the LATEST one overall — not the latest filtered
+    to :data:`~coord.board_doctor_followthrough.ACTION_WRITE_FAILED`. A
+    resumed attempt that is re-validated and rejected (or any other
+    disposition) records a newer, different-action entry for the same
+    key; filtering by action first would skip straight past that and keep
+    resurfacing the OLD write-failed entry's frozen plan forever, with no
+    way for a later sweep to ever notice the resume path gave up on it.
+    Only when the latest entry IS itself a write failure is its resumable
+    plan/follow-up-number state — :func:`~coord.board_doctor_followthrough.
+    Disposition.as_record` folded it into ``evidence`` (see
     :data:`~coord.board_doctor_followthrough.PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX`'s
-    docstring for why there, rather than a new column). ``None`` when there
-    is no such entry, or its evidence carries no resumable payload (an
-    older write-failed row recorded before this existed).
+    docstring for why there, rather than a new column) — decoded and
+    returned. ``None`` otherwise: no recorded decision at all, the latest
+    one is not a write failure, or its evidence carries no resumable
+    payload (an older write-failed row recorded before this existed).
     """
     from coord.state import board_doctor_decisions  # noqa: PLC0415
 
-    decisions = board_doctor_decisions(
-        repo=repo_name, issue=issue_number,
-        action=board_doctor_followthrough.ACTION_WRITE_FAILED,
-    )
+    decisions = board_doctor_decisions(repo=repo_name, issue=issue_number)
     if not decisions:
         return None
+    latest = decisions[-1]
+    if latest.get("action") != board_doctor_followthrough.ACTION_WRITE_FAILED:
+        return None
     prefix = board_doctor_followthrough.PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX
-    for item in reversed(decisions[-1].get("evidence") or []):
+    for item in reversed(latest.get("evidence") or []):
         if not (isinstance(item, str) and item.startswith(prefix)):
             continue
         try:
@@ -1000,16 +1040,19 @@ def run_followthrough_sweep(
     :class:`~coord.board_doctor_followthrough.GitHubFollowThroughWriter`.
 
     Every GitHub-side read this function itself performs (*issue_open*'s
-    default, ``epic_exists``, ``milestone_exists``) is addressed by the
-    repo's GitHub ``owner/repo`` slug (:func:`_github_slug`), never the
-    local `coordinator.yml` name *repo_name* — :func:`build_partial_merge`
-    resolves the same slug for everything it reads/writes, and the two
-    must agree on which repo they are each talking to GitHub about.
+    default, ``epic_exists``, ``milestone_exists``, and the
+    ``covering_issue_open`` check on a plan's own ``already_covered_by``
+    claim) is addressed by the repo's GitHub ``owner/repo`` slug
+    (:func:`_github_slug`), never the local `coordinator.yml` name
+    *repo_name* — :func:`build_partial_merge` resolves the same slug for
+    everything it reads/writes, and the two must agree on which repo they
+    are each talking to GitHub about.
 
-    Before dispatching anything, each row's existing coverage is checked
-    (#4007): *covering_pr_check* (default :func:`_covering_open_pr`) for an
-    open PR that already carries a GitHub closing keyword for the parent,
-    and — only when that finds none — *pending_loader* (default
+    Before dispatching anything, each row's existing coverage is checked:
+    *covering_pr_check* (default :func:`_default_covering_pr_check`, a
+    per-repo-cached :func:`_covering_prs_by_issue`) for an open PR that
+    already carries a GitHub closing keyword for the parent, and — only
+    when that finds none — *pending_loader* (default
     :func:`_load_pending_followthrough`) for a previously-recorded,
     unfinished attempt to resume. Both feed
     :func:`~coord.board_doctor_followthrough.run_followthrough` as its
@@ -1017,7 +1060,14 @@ def run_followthrough_sweep(
     `create_issue` idempotent across sweeps rather than re-planned and
     re-filed from scratch. Injectable the same way *issue_open*/*writer*
     already are, so a caller can fake either GitHub-side read without a
-    live `gh` call.
+    live `gh` call. Both calls are guarded the same way as *issue_open*'s:
+    a read that raises (an injected fake, or `_load_pending_followthrough`
+    under `COORD_STRICT_LOCAL_BOARD=1`) reads as "no coverage" for this row
+    rather than aborting the whole sweep.
+
+    A row resolved as :data:`~coord.board_doctor_followthrough.
+    ACTION_ALREADY_COVERED` does not consume one of *max_rows*' slots —
+    see the loop's own comment for why.
     """
     from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
 
@@ -1027,7 +1077,7 @@ def run_followthrough_sweep(
         board = build_board()
 
     is_open = issue_open or _issue_open
-    check_covering_pr = covering_pr_check or _covering_open_pr
+    check_covering_pr = covering_pr_check or _default_covering_pr_check()
     load_pending = pending_loader or _load_pending_followthrough
     row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
     cap = getattr(
@@ -1036,8 +1086,17 @@ def run_followthrough_sweep(
     )
 
     dispositions: list[board_doctor_followthrough.Disposition] = []
+    # Counts only rows that actually dispatch a plan leg or resume a
+    # pending write — NOT one resolved as `ACTION_ALREADY_COVERED` before
+    # any of that: the cap's rationale (see its own docstring) is bounding
+    # how many 20-minute plan legs one sweep call blocks on, and a covered
+    # row dispatches none. Counting it anyway would let up to `max_rows`
+    # already-covered rows — which never resolve until their covering PR
+    # merges, so they recur every sweep — starve the follow-through pass
+    # of its real budget indefinitely.
+    dispatched = 0
     for row in rows:
-        if len(dispositions) >= max_rows:
+        if dispatched >= max_rows:
             break
         if row.cause != CAUSE_MERGED_PARTIAL or row.suppressed:
             continue
@@ -1054,11 +1113,17 @@ def run_followthrough_sweep(
         except Exception:  # noqa: BLE001 — a flaky open-check must not sink the sweep
             continue
 
-        covering_pr = check_covering_pr(github_repo, issue_number)
-        pending = (
-            None if covering_pr is not None
-            else load_pending(repo_name, issue_number)
-        )
+        try:
+            covering_pr = check_covering_pr(github_repo, issue_number)
+        except Exception:  # noqa: BLE001 — a flaky coverage read must not sink the sweep
+            covering_pr = None
+        try:
+            pending = (
+                None if covering_pr is not None
+                else load_pending(repo_name, issue_number)
+            )
+        except Exception:  # noqa: BLE001 — a flaky resume read must not sink the sweep
+            pending = None
         coverage = board_doctor_followthrough.FollowThroughCoverage(
             covering_pr=covering_pr, pending=pending,
         )
@@ -1090,11 +1155,14 @@ def run_followthrough_sweep(
             backends=backends,
             epic_exists=lambda epic_number, _r=github_repo: _issue_exists(_r, epic_number),
             milestone_exists=lambda title, _r=github_repo: _milestone_exists(_r, title),
+            covering_issue_open=lambda number, _r=github_repo: _issue_open(_r, number),
             dry_run=dry_run,
             auto_queue=auto_queue,
             coverage=coverage,
         )
         dispositions.append(disposition)
+        if disposition.action != board_doctor_followthrough.ACTION_ALREADY_COVERED:
+            dispatched += 1
     return dispositions
 
 
