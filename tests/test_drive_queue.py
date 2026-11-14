@@ -8125,6 +8125,182 @@ def test_a_parked_triage_pending_entry_resumes_once_the_verdict_posts():
     assert reconcile.updates["attempts"] == 0
 
 
+# ── #4004: a Work dispatch refused by the live credential/health probe is
+# RE-EVALUABLE, not permanent (#1844) ────────────────────────────────────────
+#
+# quadraui#2361 (2026-11-14): precision's `/health` was intermittently slow
+# enough that `coord.dispatch_liveness.check_dispatch_liveness`'s
+# `PREDICATE_MACHINE_UNHEALTHY` refused the dispatch, which reaches `coord
+# drive`'s subprocess boundary with the SAME `EXIT_DISPATCH_REFUSED` code
+# every OTHER `DispatchRefused` carries (#1844) — but `claude -p` on
+# precision worked fine minutes later. Before this, it fell into the
+# generic `exit_refused` → `blocked` branch and stayed blocked forever
+# (and #2362 cascaded `blocked` onto every `after=` dependent), requiring
+# `coord drive-queue doctor-act requeue` by hand.
+
+CREDENTIAL_REFUSAL = (
+    "drive exited for claude-coordinator#2361 (exit_code=5): dispatch "
+    "failed: machine 'precision' failed a live health/credential probe — "
+    "not routable (#3371/#3376): re-authenticate (`claude` or `claude "
+    "setup-token`) on that host, or approve/assign this to a different "
+    "machine. [credential-probe-refusal #4004]"
+)
+
+
+def test_a_credential_probe_refusal_blocks_as_re_evaluable_not_permanent():
+    """The acceptance bar: NOT the generic `refused` outcome — a distinct
+    `credential_blocked` one, with NONE of `_PERMANENT_BLOCK_MARKERS`' own
+    text in the stored reason, so a later tick's `is_permanent_block_
+    reason` reads `False` for this row."""
+    from coord.drive_queue import is_permanent_block_reason
+
+    entries = [entry(2361, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 2361): CREDENTIAL_REFUSAL},
+        exit_refused={entry_key(REPO, 2361): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "credential_blocked"
+    assert reconcile.occupies is False
+    assert "attempts" not in reconcile.updates
+    blocked = plan.blocked[0]
+    assert blocked.updates["state"] == STATE_BLOCKED
+    assert CREDENTIAL_REFUSAL in blocked.updates["last_reason"]
+    assert not is_permanent_block_reason(blocked.updates["last_reason"])
+    assert "(#1844)" not in blocked.updates["last_reason"]
+
+
+def test_a_credential_probe_refusal_stays_blocked_while_still_unroutable():
+    """No live evidence, or still-refused evidence, leaves the row
+    untouched — the no-opinion convention every other live recheck in this
+    module shares."""
+    entries = [
+        entry(
+            2361, position=3, state=STATE_BLOCKED,
+            last_reason=CREDENTIAL_REFUSAL,
+        )
+    ]
+    plan_no_evidence = plan_tick(
+        entries, board(), capacity=1, live_credential_routing_clear={},
+    )
+    assert plan_no_evidence.reconciles == ()
+    assert plan_no_evidence.launch is None
+
+    plan_still_refused = plan_tick(
+        entries, board(), capacity=1,
+        live_credential_routing_clear={entry_key(REPO, 2361): False},
+    )
+    assert plan_still_refused.reconciles == ()
+    assert plan_still_refused.launch is None
+
+
+def test_a_credential_probe_refusal_resumes_when_a_machine_probes_routable():
+    """Scenario (a): the shell's live re-check confirms a capable machine
+    now probes routable — the row returns to `waiting` with its attempt
+    budget reset, no operator action, falling straight into this tick's
+    launch selection."""
+    entries = [
+        entry(
+            2361, position=3, state=STATE_BLOCKED,
+            last_reason=CREDENTIAL_REFUSAL,
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        live_credential_routing_clear={entry_key(REPO, 2361): True},
+        live_credential_routing_reason={
+            entry_key(REPO, 2361): "macmini now probes routable"
+        },
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "credential_routing_recovered"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    assert "macmini now probes routable" in reconcile.reason
+    assert plan.launch is not None and plan.launch.issue == 2361
+
+
+def test_a_credential_probe_refusal_inside_its_grace_window_is_not_resumed_yet():
+    """#3536-style anti-flap, same as the Test-stage routing sibling: a
+    row whose `last_reason` was recorded less than
+    `CREDENTIAL_ROUTING_RECHECK_GRACE_SECONDS` ago must not be bounced back
+    to `waiting` on this same tick."""
+    from coord.drive_queue import CREDENTIAL_ROUTING_RECHECK_GRACE_SECONDS
+
+    entries = [
+        entry(
+            2361, position=3, state=STATE_BLOCKED,
+            last_reason=CREDENTIAL_REFUSAL,
+            reason_at=NOW - (CREDENTIAL_ROUTING_RECHECK_GRACE_SECONDS / 2),
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_credential_routing_clear={entry_key(REPO, 2361): True},
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_credential_probe_refusal_past_max_resumes_reports_oscillating():
+    """#2230's churn bound applies here too, layering the note on top of
+    the original cause rather than replacing it wholesale — a wholesale
+    replacement would strip `CREDENTIAL_PROBE_REFUSAL_MARKER` and make the
+    row fall out of `is_credential_probe_refusal_reason` on the very next
+    tick."""
+    from coord.drive_queue import MAX_BLOCKED_RESUMES, is_permanent_block_reason
+    from coord.dispatch_liveness import is_credential_probe_refusal_reason
+
+    entries = [
+        entry(
+            2361, position=3, state=STATE_BLOCKED,
+            last_reason=CREDENTIAL_REFUSAL, resumes=MAX_BLOCKED_RESUMES,
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        live_credential_routing_clear={entry_key(REPO, 2361): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "oscillating"
+    assert reconcile.updates.get("state") != STATE_WAITING
+    assert str(MAX_BLOCKED_RESUMES) in reconcile.reason
+    assert plan.launch is None
+
+    noted_reason = reconcile.updates["last_reason"]
+    assert is_credential_probe_refusal_reason(noted_reason)
+    assert not is_permanent_block_reason(noted_reason)
+
+    entries_again = [
+        entry(
+            2361, position=3, state=STATE_BLOCKED,
+            last_reason=noted_reason, resumes=MAX_BLOCKED_RESUMES,
+        )
+    ]
+    plan_again = plan_tick(
+        entries_again, board(), capacity=1,
+        live_credential_routing_clear={entry_key(REPO, 2361): True},
+    )
+    assert plan_again.reconciles == ()
+    assert plan_again.launch is None
+
+
+def test_an_unrelated_1844_refusal_never_gets_the_credential_treatment():
+    """`is_credential_probe_refusal_reason` is marker-based — an ordinary
+    oracle-readiness/epic-guard refusal (no `CREDENTIAL_PROBE_REFUSAL_
+    MARKER`) must still get the generic PERMANENT `refused` treatment,
+    unchanged by this issue."""
+    entries = [entry(1817, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1817): REFUSAL},
+        exit_refused={entry_key(REPO, 1817): True},
+    )
+    assert plan.reconciles[0].outcome == "refused"
+
+
 # ── plan_tick: a dead-end exit blocks the entry (#2019) ──────────────────────
 #
 # The second PERMANENT cause, sharing #1844's branch. Before #2019 this shape

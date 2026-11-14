@@ -2256,6 +2256,139 @@ def test_an_unconfirmed_test_state_reset_never_reports_a_self_clear(
     assert "not confirmed" in result.output
 
 
+# ── #4004: a Work-dispatch credential-probe refusal self-clears the moment
+# a capable machine probes routable again, tick-level. ──────────────────────
+
+_CREDENTIAL_REFUSAL_REASON = (
+    "drive exited for claude-coordinator#3700 (exit_code=5): dispatch "
+    "failed: machine 'precision' failed a live health/credential probe — "
+    "not routable (#3371/#3376): re-authenticate (`claude` or `claude "
+    "setup-token`) on that host, or approve/assign this to a different "
+    "machine. [credential-probe-refusal #4004]"
+)
+
+
+def test_a_credential_probe_refusal_self_clears_and_launches(
+    cli, seed, launches, coord_db, monkeypatch,
+):
+    """Tick-level wiring: `_fetch_live_credential_routing_clear`'s reading
+    reaches `plan_tick` and resumes the row straight into a fresh launch —
+    the quadraui#2361 incident, fixed."""
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={3700: "open"})
+    cli("add", REPO, "3700")
+    state._update_drive_queue_entry_local(
+        REPO, 3700, state="blocked", last_reason=_CREDENTIAL_REFUSAL_REASON,
+        attempts=2,
+    )
+    _backdate_reason(coord_db, 3700, 3600)
+
+    key = f"{REPO}#3700"
+    monkeypatch.setattr(
+        drive_queue_cmd,
+        "_fetch_live_credential_routing_clear",
+        lambda entries, config_path: (
+            {key: True}, {key: "'macmini' now probes routable"},
+        ),
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+
+    entry = queued(3700)
+    assert entry["state"] == "running"  # resumed straight into a fresh launch
+    assert entry["attempts"] == 0
+    assert len(launches) == 1, launches
+
+    audit_row = coord_db.execute(
+        "SELECT event_type, repo, issue FROM audit_log "
+        "WHERE event_type = 'credential_routing_recovered'"
+    ).fetchone()
+    assert audit_row is not None, "the auto self-clear must leave an audit trail"
+    assert audit_row["repo"] == REPO
+    assert audit_row["issue"] == 3700
+
+
+def test_a_credential_probe_refusal_stays_blocked_with_no_live_opinion(
+    cli, seed, launches, coord_db,
+):
+    """No shell wiring opinion (the default, un-monkeypatched fetcher
+    probing a fleet with no machines configured for this repo) leaves the
+    row blocked — "no live opinion" never means "assume clear"."""
+    seed(issues={3701: "open"})
+    cli("add", REPO, "3701")
+    state._update_drive_queue_entry_local(
+        REPO, 3701, state="blocked",
+        last_reason=_CREDENTIAL_REFUSAL_REASON.replace("3700", "3701"),
+        attempts=2,
+    )
+    _backdate_reason(coord_db, 3701, 3600)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+
+    entry = queued(3701)
+    assert entry["state"] == "blocked"
+    assert entry["attempts"] == 2
+    assert launches == [], launches
+
+
+def test_fetch_live_credential_routing_clear_probes_capable_machines_only(
+    monkeypatch,
+):
+    """Unit-level pin of the shell fetcher's own candidate filter and
+    short-circuit-on-first-pass behaviour, independent of the CLI/tick
+    plumbing above."""
+    from coord.commands import drive_queue as drive_queue_cmd
+    from coord.config import Config
+    from coord.drive_queue import QueueEntry
+    from coord.models import Machine
+
+    entries = [
+        QueueEntry(
+            repo=REPO, issue=3702, position=1, state="blocked",
+            last_reason=_CREDENTIAL_REFUSAL_REASON.replace("3700", "3702"),
+        )
+    ]
+
+    cfg = Config(
+        repos=[],
+        machines=[
+            Machine(
+                name="precision", host="precision.tailnet", repos=[REPO],
+                repo_paths={REPO: "/home/user/src/claude-coordinator"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=[REPO],
+                repo_paths={REPO: "/home/user/src/claude-coordinator"},
+            ),
+            Machine(name="other-repo-only", host="oro.tailnet", repos=["other"]),
+        ],
+    )
+    monkeypatch.setattr(
+        "coord.commands._common._load_config", lambda config_path: cfg,
+    )
+
+    probed: list[str] = []
+
+    def fake_reachable(machine):
+        probed.append(machine.name)
+        return machine.name == "macmini"
+
+    monkeypatch.setattr(
+        "coord.network.claude_credential_reachable", fake_reachable,
+    )
+
+    clear, reasons = drive_queue_cmd._fetch_live_credential_routing_clear(
+        entries, None,
+    )
+    key = f"{REPO}#3702"
+    assert clear == {key: True}
+    assert "macmini" in reasons[key]
+    assert "other-repo-only" not in probed
+
+
 def test_a_dependent_is_released_when_its_prereq_is_wrongly_stuck_running(
     cli, seed, launches, monkeypatch,
 ):

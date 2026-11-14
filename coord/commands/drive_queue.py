@@ -43,6 +43,7 @@ import click
 
 from coord.block_log import INTERVENTION_CATEGORIES, STALL_STATES
 from coord.commands._common import _CONFIG_OPTION, apply_pipeline_track_labels_best_effort
+from coord.dispatch_liveness import is_credential_probe_refusal_reason
 from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
     APPLY_APPLIED,
@@ -6596,6 +6597,114 @@ def _fetch_live_test_routing_clear(
     return clear, reasons
 
 
+def _fetch_live_credential_routing_clear(
+    entries: list, config_path: Path | None
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """``({entry_key: now_routable}, {entry_key: human_reason})`` for every
+    ``blocked`` entry whose cause is a Work-dispatch credential-probe
+    refusal (#4004) — the Work-dispatch sibling of
+    :func:`_fetch_live_test_routing_clear` immediately above.
+
+    THE GAP THIS CLOSES. `coord.dispatch_liveness.check_dispatch_liveness`'s
+    `PREDICATE_MACHINE_UNHEALTHY` refusal is a LIVE `/health`/credential
+    probe reading — quadraui#2361 (2026-11-14): precision's probe read
+    broken for ~90 minutes while `claude -p` itself worked fine throughout.
+    `coord.drive_queue._reconcile_running`'s own early branch (#4004)
+    already stops treating this ONE `(#1844)`-shaped refusal as permanent,
+    but nothing fed it live evidence to actually self-clear on — this is
+    that feed.
+
+    THE CHEAP RE-CHECK, the SAME question dispatch-time routing already
+    asks (#2096/#2085 "one question, one answer"): for each qualifying
+    entry's repo, every machine that `can_work_on(repo_name)`, has a
+    configured `repo_path`, and is not in the cordon-inclusive
+    `paused_set()` — same candidate filter `coord.dispatch.
+    route_work_by_credential` uses at dispatch time — probed with
+    `coord.network.claude_credential_reachable`. Clear the moment ANY ONE
+    of them passes; this does not need to know which machine was
+    originally refused (unlike the Test-stage routing sibling's capability
+    recovery, a credential probe has nothing to do with WHICH machine
+    failed, only whether ANY capable one is healthy now).
+
+    NOT EVERY BLOCKED ENTRY QUALIFIES. `is_credential_probe_refusal_reason`
+    returns `False` — and this function then skips the entry — for every
+    other `(#1844)`-shaped refusal (an oracle-readiness/epic-target/TOS
+    guard, the other two `check_dispatch_liveness` predicates) — none of
+    those self-clear on a machine becoming routable.
+
+    Same fail-open-per-entry, fail-closed-overall contract as
+    `_fetch_live_test_routing_clear`: any exception while loading
+    config/board, or while probing one entry's candidates, leaves that
+    entry (or all of them) absent from both returned dicts — `_reconcile_
+    blocked_credential_routing` then does nothing for it, exactly as "no
+    live opinion" already means everywhere else in this sweep.
+    """
+    targets = [
+        e for e in entries
+        if e.state == STATE_BLOCKED
+        and is_credential_probe_refusal_reason(getattr(e, "last_reason", "") or "")
+    ]
+    if not targets:
+        return {}, {}
+
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}, {}
+
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.machine_pause import paused_set  # noqa: PLC0415
+        from coord.network import claude_credential_reachable  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+    except Exception as exc:  # noqa: BLE001 — see the fail-soft note above
+        log.warning(
+            "credential-routing sweep (#4004): could not load config for "
+            "this tick's %d qualifying blocked entr%s — every one is left "
+            "alone: %r",
+            len(targets), "y" if len(targets) == 1 else "ies", exc,
+        )
+        return {}, {}
+
+    paused = paused_set(cfg.machines)
+    clear: dict[str, bool] = {}
+    reasons: dict[str, str] = {}
+    for e in targets:
+        parsed = parse_key(e.key)
+        if parsed is None:
+            log.warning(
+                "credential-routing sweep (#4004): %s — key does not parse "
+                "as repo#issue, skipping", e.key,
+            )
+            continue
+        repo_name, _issue_num = parsed
+        candidates = [
+            m for m in cfg.machines
+            if m.can_work_on(repo_name)
+            and m.repo_path(repo_name) is not None
+            and m.name not in paused
+        ]
+        routable = False
+        routable_machine = None
+        for m in candidates:
+            try:
+                if claude_credential_reachable(m):
+                    routable = True
+                    routable_machine = m.name
+                    break
+            except Exception as exc:  # noqa: BLE001 — one bad probe skips, not aborts
+                log.warning(
+                    "credential-routing sweep (#4004): %s — probing %r "
+                    "raised: %r", e.key, m.name, exc,
+                )
+                continue
+        clear[e.key] = routable
+        if routable:
+            reasons[e.key] = f"{routable_machine!r} now probes routable"
+    return clear, reasons
+
+
 def _fetch_live_running_merge_gate(
     entries: list, exit_reasons: Mapping[str, str], config_path: Path | None
 ) -> tuple[dict[str, bool], dict[str, str]]:
@@ -8649,6 +8758,16 @@ def drive_queue_tick(
             _fetch_live_test_routing_clear(entries, config_path)
         )
 
+        # #4004: the Work-dispatch sibling of the #3695 recheck just above
+        # — a credential-probe refusal is also fleet state (a live
+        # `/health`/credential probe reading), not a permanent cause. See
+        # `_fetch_live_credential_routing_clear`'s docstring for the gap
+        # this closes (quadraui#2361 sat `blocked` until an operator ran
+        # `doctor-act requeue` by hand).
+        live_credential_routing_clear, live_credential_routing_reason = (
+            _fetch_live_credential_routing_clear(entries, config_path)
+        )
+
         # #3577: the same live re-derivation, for `running` entries whose
         # OWN exit this tick already named a merge-gate block — see
         # `_fetch_live_running_merge_gate`'s docstring for the gap this
@@ -8745,6 +8864,8 @@ def drive_queue_tick(
             live_running_merge_gate_reason=live_running_merge_gate_reason,
             live_test_routing_clear=live_test_routing_clear,
             live_test_routing_reason=live_test_routing_reason,
+            live_credential_routing_clear=live_credential_routing_clear,
+            live_credential_routing_reason=live_credential_routing_reason,
         )
 
         if roll_pending is not None:
@@ -9301,6 +9422,40 @@ def drive_queue_tick(
             click.echo(
                 f"self-clear not confirmed for {item.key}: {unconfirmed} "
                 "— left blocked (#3695)"
+            )
+
+        # #4004: the Work-dispatch sibling of `test_routing_recovered`'s
+        # audit recording just above — but with no second table to confirm.
+        # A credential-probe-refusal self-clear only ever touches the drive
+        # queue row itself (`state`/`attempts`/`resumes`/`last_reason`, all
+        # applied by `_apply_writes(plan)` above, same as every other
+        # reconcile outcome) — unlike `test_routing_recovered`, there is no
+        # parent assignment `test_state` to reset and re-confirm, so this is
+        # unconditional, not gated behind an observe-then-record dance.
+        # "RECORDING, NOT SILENCE" (`coord.dispatch_liveness`'s own framing):
+        # a suppressed, permanent-looking block quietly turning routable
+        # again is exactly the kind of recovery an operator needs visible in
+        # `coord audit`, not just inferred from the row flipping back to
+        # `waiting`.
+        for item in plan.reconciles:
+            if item.outcome != "credential_routing_recovered":
+                continue
+            parsed = parse_key(item.key)
+            if parsed is None:
+                continue
+            repo_name, issue_number = parsed
+            record_audit(
+                tier="business",
+                category="drive",
+                event_type="credential_routing_recovered",
+                actor="drive-queue-tick",
+                summary=(
+                    f"Work-dispatch credential-probe refusal self-cleared: "
+                    f"{repo_name}#{issue_number}"
+                ),
+                repo=repo_name,
+                issue=issue_number,
+                details={"reason": item.reason},
             )
 
         if plan.alert is not None:

@@ -8548,6 +8548,43 @@ def test_a_dispatch_refusal_raises_a_drive_error_with_the_distinct_exit_code(
     assert refusal_text.strip() in str(exc.value)
 
 
+def test_a_dispatch_refusal_leads_with_the_cause_not_the_banner(
+    driver_factory, monkeypatch,
+):
+    """#4004 (quadraui#2361, 2026-11-14): `coord assign`'s subprocess
+    prints its own dispatch banner to stdout FIRST and the real cause
+    ("  dispatch failed: ...") to stderr LAST. `Driver._spawn` concatenates
+    `stdout + stderr` in that order, so the raw captured output reads
+    banner-first — `coord drive-queue list`/the TUI render `last_reason` as
+    a single line/short prefix, which showed only the banner in the
+    incident, no error anywhere visible. The `DriveError` message must
+    LEAD with the "dispatch failed:" line instead."""
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    banner = "precision → quadraui #2361: Python asyncio runner: fix the thing"
+    dispatch_failed_line = (
+        "  dispatch failed: machine 'precision' failed a live "
+        "health/credential probe — not routable (#3371/#3376): "
+        "re-authenticate (`claude` or `claude setup-token`) on that host, "
+        "or approve/assign this to a different machine. "
+        "[credential-probe-refusal #4004]"
+    )
+
+    def refused_run(argv, **kw):
+        return subprocess.CompletedProcess(
+            argv, EXIT_DISPATCH_REFUSED, banner + "\n", dispatch_failed_line
+        )
+
+    monkeypatch.setattr("coord.drive.subprocess.run", refused_run)
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    message = str(exc.value)
+    assert message.strip().startswith("dispatch failed:")
+    assert "machine 'precision'" in message
+    # Nothing is discarded — the banner is still present, just no longer
+    # leading.
+    assert banner in message
+
+
 def test_a_dispatch_refusals_reason_reaches_the_drive_exited_audit_row(
     driver_factory, monkeypatch, coord_db,
 ):
