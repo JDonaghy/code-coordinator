@@ -2077,7 +2077,11 @@ def _investigate(row: StuckRow) -> bool:
     flag) and the per-repo ``repos[].board_doctor.investigate`` opt-in
     (#3771) — a repo that has not opted in, or a sweep run with the tier
     disarmed fleet-wide, falls back to the alert tier exactly like a
-    ceiling-blocked or config-load failure does.
+    ceiling-blocked or config-load failure does. The leaked-review-claim
+    release below is gated behind this same check, even though it mutates
+    ``review_claims`` rather than dispatching a leg — a repo that opted out
+    of the investigate tier must see NO mutation from this function, not
+    just no fix-it leg.
 
     This function's return value answers exactly one question — "was a
     fix-it leg dispatched?" — never "was the alert fallback delivered?".
@@ -2097,26 +2101,6 @@ def _investigate(row: StuckRow) -> bool:
 
     from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
     from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
-    from coord.state import build_board  # noqa: PLC0415
-
-    board = build_board()
-
-    # #4003: a `gate-blocked` drive-queue row whose live gate reads
-    # "not ready" can mean the review this row's work leg is waiting on
-    # never actually got dispatched, because the `review_claims` row that
-    # claimed its dispatch leaked (a `database is locked` collision right
-    # after the claim landed, or on the deny-path release — see
-    # `coord.state.release_review_dispatch_claim`'s own #4003 note).
-    # `sweep_dispatch_fixit_leg` below has no idea any of that happened —
-    # it would just dispatch a brand new WORK leg for already-completed
-    # work, which fixes nothing. Checked and released here, BEFORE that
-    # generic path runs, as its own confirmed auto-tier action: the
-    # claude-coordinator#3998 incident this closes never got past
-    # `auto-dispatch-noop` x2 -> `alert` -> `converged-noop` precisely
-    # because nothing in this tier ever looked at the claim.
-    if row.queue == "drive-queue" and row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
-        if _release_leaked_review_claim_for_row(repo_name, issue_number, board):
-            return True
 
     ceiling_bypassed = False
     if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
@@ -2179,6 +2163,28 @@ def _investigate(row: StuckRow) -> bool:
         )
         _alert_fallback(row)
         return False
+
+    from coord.state import build_board  # noqa: PLC0415
+
+    board = build_board()
+
+    # #4003: a `gate-blocked` drive-queue row whose live gate reads
+    # "not ready" can mean the review this row's work leg is waiting on
+    # never actually got dispatched, because the `review_claims` row that
+    # claimed its dispatch leaked (a `database is locked` collision right
+    # after the claim landed, or on the deny-path release — see
+    # `coord.state.release_review_dispatch_claim`'s own #4003 note).
+    # `sweep_dispatch_fixit_leg` below has no idea any of that happened —
+    # it would just dispatch a brand new WORK leg for already-completed
+    # work, which fixes nothing. Checked and released here, as its own
+    # confirmed auto-tier action, only once every fallback gate above
+    # (ceiling, config, tier opt-in, sealed-confined) has already passed —
+    # this mutates `review_claims`, so a repo that opted out of the
+    # investigate tier must see no mutation at all, not merely no fix-it
+    # leg.
+    if row.queue == "drive-queue" and row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
+        if _release_leaked_review_claim_for_row(repo_name, issue_number, board):
+            return True
 
     evidence = row.evidence
     if row.cause in _CI_SHAPED_INVESTIGATE_CAUSES:

@@ -4213,13 +4213,33 @@ def review_claim_is_leaked(of_assignment_id: str) -> bool:
       has not yet reached ``record_dispatched_assignment``", the same
       false-positive window :func:`coord.diagnose.review_claim_age_secs`'s
       own docstring documents for the read-only diagnostic path (#3383);
-    * no ``review``/``test-author``/``mock-author`` assignment with
-      ``review_of_assignment_id`` equal to *of_assignment_id* is sitting in
-      a non-terminal status — i.e. a review genuinely IS in flight,
-      however slowly; checked against :data:`_TERMINAL_ASSIGNMENT_STATUSES`,
-      the SAME terminal set every other assignment-status reader in this
-      module uses, never a second, narrower terminal list just for this
-      check.
+    * nothing live is backing it — what counts as "backing it" depends on
+      *of_assignment_id*'s own shape:
+
+      * an ordinary per-assignment claim (any other string): no
+        ``review``/``test-author``/``mock-author`` assignment with
+        ``review_of_assignment_id`` equal to *of_assignment_id* is sitting
+        in a non-terminal status — i.e. a review genuinely IS in flight,
+        however slowly;
+      * a #4002 per-item lease (:func:`_review_item_lease_key`'s
+        ``item-lease:{repo}:{issue}`` shape, recognized via
+        :func:`_parse_review_item_lease_key`): no ``assignments`` row EVER
+        carries ``review_of_assignment_id`` equal to a lease key — the
+        lease is claimed in ADDITION to, not instead of, a dispatcher's own
+        per-assignment claim — so the FK lookup above can never find a
+        live row for one and would read every lease as leaked the instant
+        it clears the grace window, even though
+        :func:`claim_review_item_dispatch_gate`'s own docstring says it is
+        held for the dispatched review leg's entire (often much longer)
+        life. Liveness for a lease is instead "does a non-terminal
+        ``type='review'`` assignment exist for this same
+        ``(repo_name, effective_issue_number)``" — the exact condition
+        :func:`release_review_claim_if_row_is_review` releases the lease
+        on, so the two sides agree on what "still in flight" means.
+
+      Both checked against :data:`_TERMINAL_ASSIGNMENT_STATUSES`, the SAME
+      terminal set every other assignment-status reader in this module
+      uses, never a second, narrower terminal list just for this check.
 
     Local-DB read only, same documented caveat as :func:`has_review_claim`/
     :func:`review_claim_age_secs`: correct on the daemon host (where the
@@ -4230,6 +4250,31 @@ def review_claim_is_leaked(of_assignment_id: str) -> bool:
     if age is None or age < REVIEW_CLAIM_LEAK_GRACE_SECS:
         return False
     conn = get_connection()
+    lease = _parse_review_item_lease_key(of_assignment_id)
+    if lease is not None:
+        from coord.models import effective_issue_number  # noqa: PLC0415
+
+        lease_repo, lease_issue = lease
+        rows = sql.execute(
+            conn,
+            "SELECT issue_number, for_issue_number FROM assignments "
+            "WHERE repo_name=? AND type='review' "
+            "AND status NOT IN ({placeholders})".format(
+                placeholders=",".join("?" for _ in _TERMINAL_ASSIGNMENT_STATUSES)
+            ),
+            (lease_repo, *_TERMINAL_ASSIGNMENT_STATUSES),
+        ).fetchall()
+        for row in rows:
+            if hasattr(row, "keys"):
+                row_issue, row_for_issue = row["issue_number"], row["for_issue_number"]
+            else:
+                row_issue, row_for_issue = row
+            effective_issue = effective_issue_number(
+                {"issue_number": row_issue, "for_issue_number": row_for_issue}
+            )
+            if effective_issue == lease_issue:
+                return False  # a review for this item is genuinely in flight
+        return True
     live = sql.execute(
         conn,
         "SELECT 1 FROM assignments WHERE review_of_assignment_id=? "
@@ -4266,16 +4311,42 @@ def _reclaim_leaked_review_claim(conn, of_assignment_id: str, stamp: float) -> b
     own claim) only when :func:`review_claim_is_leaked` says the existing
     row has leaked.
 
-    Re-reads the row immediately after the ``UPDATE`` rather than trusting
-    ``cursor.rowcount`` — the exact reason :func:`_claim_review_dispatch_local`
-    itself does not trust it on the shared SQLite connection (see that
-    function's own comment): a concurrent write on another thread can
-    misreport it in either direction. The ``WHERE ... AND claimed_at=?``
-    clause still protects the write itself — if some OTHER caller's own
-    claim attempt mutated the row between our read and this write, the
-    ``UPDATE`` matches zero rows and the read-back below reports that
-    honestly as "not reclaimed", rather than overwriting a claim that
-    turned out to be live after all.
+    A claim is reclaimable :data:`REVIEW_CLAIM_LEAK_GRACE_SECS` after it is
+    taken even when the original dispatcher is merely slow (branch SHA
+    fetch + PR lookup + briefing render + agent POST, all before its own
+    ``record_dispatched_assignment`` lands the review row this claim is
+    waiting on) rather than genuinely dead — permitting a duplicate review
+    in that tail. Accepted trade-off per the issue this closes: a bounded
+    chance of one extra review is far cheaper than a claim stuck for hours
+    with no automatic recovery.
+
+    Confirms the ``UPDATE`` with the SAME dialect split
+    :func:`_claim_review_dispatch_local`'s sibling insert already uses, for
+    the SAME two reasons, in the SAME direction on each:
+
+    * on SQLite, re-reads the row rather than trusting ``cursor.rowcount``
+      on the shared connection — a concurrent write on another thread can
+      misreport it in either direction, and SQLite's ``REAL`` (an 8-byte
+      IEEE double) round-trips *stamp* exactly, so the read-back compare is
+      trustworthy there.
+    * on Postgres, trusts ``cursor.rowcount`` instead — each thread gets
+      its own connection there, so the count is accurate, and the read-back
+      compare is NOT: ``review_claims.claimed_at`` is declared ``REAL``,
+      which Postgres maps to a 4-byte ``float4`` that cannot round-trip a
+      sub-second Unix timestamp (needs more significant digits than
+      ``float4`` carries). Without this split the ``UPDATE`` would commit
+      correctly but the read-back would still compare unequal, so this
+      function would report "not reclaimed" on every Postgres call — the
+      self-heal silently never firing on that backend, with the `claimed_at`
+      reset to *stamp* already landed regardless (resetting the age clock
+      on a claim this function is about to tell its caller is still denied).
+
+    The ``WHERE ... AND claimed_at=?`` clause still protects the write
+    itself either way — if some OTHER caller's own claim attempt mutated
+    the row between our read and this write, the ``UPDATE`` matches zero
+    rows and is confirmed as "not reclaimed" without having touched
+    anything, rather than overwriting a claim that turned out to be live
+    after all.
     """
     row = sql.execute(
         conn,
@@ -4290,18 +4361,21 @@ def _reclaim_leaked_review_claim(conn, of_assignment_id: str, stamp: float) -> b
     if not review_claim_is_leaked(of_assignment_id):
         return False
     age = max(0.0, time.time() - held_claimed_at)
-    sql.execute(
+    cur = sql.execute(
         conn,
         "UPDATE review_claims SET claimed_at=? "
         "WHERE of_assignment_id=? AND claimed_at=?",
         (stamp, of_assignment_id, held_claimed_at),
     )
-    check = sql.execute(
-        conn,
-        "SELECT claimed_at FROM review_claims WHERE of_assignment_id=?",
-        (of_assignment_id,),
-    ).fetchone()
-    reclaimed = bool(check is not None and check[0] == stamp)
+    if sql.detect_dialect(conn) == sql.DIALECT_SQLITE:
+        check = sql.execute(
+            conn,
+            "SELECT claimed_at FROM review_claims WHERE of_assignment_id=?",
+            (of_assignment_id,),
+        ).fetchone()
+        reclaimed = bool(check is not None and check[0] == stamp)
+    else:
+        reclaimed = bool((cur.rowcount or 0) > 0)
     if reclaimed:
         _log.warning(
             "review-dispatch claim for %s was leaked (held %.1fs with no "
@@ -4546,23 +4620,38 @@ def release_review_dispatch_claim(of_assignment_id: str) -> None:
     actually clear (a purely-local delete on the thin client would touch a
     different, likely-empty, DB and silently no-op).
 
-    #4003: **best-effort — never raises.** Every call site is itself a
-    deny/failure path (``dispatch_review``'s own ``_deny`` and the
-    terminal-status write in ``release_review_claim_if_row_is_review``) —
-    code already reacting to something having gone wrong, which must not
-    be made worse by a SECOND failure (a `database is locked` collision
-    that outlasts ``_release_review_dispatch_claim_local``'s own
-    :func:`retry_on_locked` budget, or a daemon round trip that times out)
-    crashing the caller outright and leaving whatever cleanup it was
-    mid-way through undone. Before this, the claude-coordinator#3998
-    incident: this call raised `database is locked` on the deny path, and
-    the work assignment's review-dispatch claim stayed held for ~8h and 91
-    refusals — recoverable only by a human running ``coord diagnose
-    --stage review --reset``. A release that fails here now just logs and
-    leaves the row behind; :func:`claim_review_dispatch`'s own #4003
-    self-heal (:func:`_reclaim_leaked_review_claim`) is the backstop that
-    recovers it once the grace window passes, rather than this function
-    pretending a failed release succeeded.
+    #4003: **best-effort — never raises.** Most call sites are themselves a
+    deny/failure path (``dispatch_review``'s own ``_deny``, the
+    terminal-status write in ``release_review_claim_if_row_is_review``, and
+    ``coord.diagnose``'s own ``--reset`` cleanups) — code already reacting
+    to something having gone wrong, which must not be made worse by a
+    SECOND failure (a `database is locked` collision that outlasts
+    ``_release_review_dispatch_claim_local``'s own :func:`retry_on_locked`
+    budget, or a daemon round trip that times out) crashing the caller
+    outright and leaving whatever cleanup it was mid-way through undone.
+    Before this, the claude-coordinator#3998 incident: this call raised
+    `database is locked` on the deny path, and the work assignment's
+    review-dispatch claim stayed held for ~8h and 91 refusals — recoverable
+    only by a human running ``coord diagnose --stage review --reset``. A
+    release that fails here now just logs and leaves the row behind;
+    :func:`claim_review_dispatch`'s own #4003 self-heal
+    (:func:`_reclaim_leaked_review_claim`) is the backstop that recovers it
+    once the grace window passes, rather than this function pretending a
+    failed release succeeded.
+
+    Because this never raises AND never confirms, it tells a caller
+    NOTHING about whether the release actually landed — a caller that
+    needs to know (unlike the deny paths above, which are calling this
+    purely for its best-effort side effect on their way to reporting
+    failure anyway) must re-read with :func:`has_review_claim` itself, the
+    way ``coord.diagnose``'s own ``--reset`` actions do. Every call site
+    today: ``dispatch_review``'s ``_deny``,
+    ``release_review_claim_if_row_is_review``,
+    :func:`release_review_item_lease`, three in ``coord.diagnose`` (its
+    #3383 leaked-claim reset, the superseded-leg reset, and the terminal
+    review-row reset), and :mod:`coord.board_doctor_policy`'s
+    ``_release_leaked_review_claim_for_row`` (which confirms with
+    :func:`has_review_claim` itself, same as ``coord.diagnose``).
     """
     if not of_assignment_id:
         return
@@ -4634,6 +4723,11 @@ def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:
     retry_on_locked(_write)
 
 
+#: Prefix identifying a :func:`_review_item_lease_key` key, shared with
+#: :func:`_parse_review_item_lease_key` so the two stay in lock-step.
+_REVIEW_ITEM_LEASE_PREFIX = "item-lease:"
+
+
 def _review_item_lease_key(repo_name: str, issue_number: int) -> str:
     """The ``review_claims`` key for the #4002 per-item lease.
 
@@ -4645,7 +4739,29 @@ def _review_item_lease_key(repo_name: str, issue_number: int) -> str:
     ``claim.py``'s ``adopted-{repo}-{issue}`` — so an item-lease key can
     never collide with a real per-assignment claim's key.
     """
-    return f"item-lease:{repo_name}:{issue_number}"
+    return f"{_REVIEW_ITEM_LEASE_PREFIX}{repo_name}:{issue_number}"
+
+
+def _parse_review_item_lease_key(of_assignment_id: str) -> tuple[str, int] | None:
+    """Reverse of :func:`_review_item_lease_key` — ``None`` when
+    *of_assignment_id* is not shaped like one of its keys.
+
+    Needed by :func:`review_claim_is_leaked`: a lease's liveness can't be
+    answered by looking for an ``assignments`` row whose
+    ``review_of_assignment_id`` equals the lease key, because no row ever
+    carries that FK value — the lease is a per-``(repo, issue)`` gate
+    claimed in ADDITION to, not instead of, the per-assignment claim the FK
+    tracks (see :func:`claim_review_item_lease`'s docstring). Repo names
+    never contain ``:`` (GitHub disallows it), so splitting the issue number
+    off the end with :meth:`str.rpartition` is unambiguous.
+    """
+    if not of_assignment_id.startswith(_REVIEW_ITEM_LEASE_PREFIX):
+        return None
+    rest = of_assignment_id[len(_REVIEW_ITEM_LEASE_PREFIX):]
+    repo_name, sep, issue_str = rest.rpartition(":")
+    if not sep or not repo_name or not issue_str.isdigit():
+        return None
+    return repo_name, int(issue_str)
 
 
 def claim_review_item_lease(repo_name: str, issue_number: int) -> bool:

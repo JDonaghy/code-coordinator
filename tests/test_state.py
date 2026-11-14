@@ -5501,6 +5501,36 @@ class TestReviewClaimIsLeaked:
         )
         assert state.review_claim_is_leaked("w1") is False
 
+    def test_old_lease_with_no_live_review_for_the_issue_is_leaked(
+        self, coord_db,
+    ) -> None:
+        """A #4002 per-item lease's key (``item-lease:{repo}:{issue}``)
+        never appears as any row's ``review_of_assignment_id`` -- the FK
+        lookup the per-assignment branch uses can never find one, so this
+        must resolve liveness against ``(repo_name, issue_number)`` instead
+        of reading the structural absence as "leaked" regardless of age."""
+        assert state.claim_review_item_lease("api", 7) is True
+        self._backdate_claim(
+            "item-lease:api:7", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.review_claim_is_leaked("item-lease:api:7") is True
+
+    def test_old_lease_backed_by_a_live_review_for_the_issue_is_not_leaked(
+        self, coord_db,
+    ) -> None:
+        """The exact shape `claim_review_item_dispatch_gate`'s docstring
+        describes: the lease is held for the dispatched review leg's whole
+        (often long) life -- a non-terminal `type="review"` row for the
+        SAME (repo_name, issue_number) must keep it alive however old it
+        gets, the same way a live review keeps a per-assignment claim
+        alive."""
+        assert state.claim_review_item_lease("api", 7) is True
+        _seed_review_row("r1", review_of_assignment_id="w1", status="running")
+        self._backdate_claim(
+            "item-lease:api:7", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.review_claim_is_leaked("item-lease:api:7") is False
+
 
 class TestLeakedReviewClaimSelfHeal:
     """#4003: `claim_review_dispatch` self-heals a `review_claims` row that
@@ -5569,6 +5599,59 @@ class TestLeakedReviewClaimSelfHeal:
             "w1", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
         )
         assert state.claim_review_dispatch("w1") is True
+
+    def test_live_item_lease_is_never_reclaimed(self, coord_db) -> None:
+        """#4002's per-item lease is held for the dispatched review leg's
+        entire life, routinely far longer than
+        `REVIEW_CLAIM_LEAK_GRACE_SECS` — a second dispatcher losing the
+        lease race must keep denying rather than reclaiming it out from
+        under the live review, which would silently re-open the duplicate-
+        metered-review failure #4002 exists to prevent."""
+        assert state.claim_review_item_lease("api", 7) is True
+        _seed_review_row("r1", review_of_assignment_id="w1", status="running")
+        self._backdate_claim(
+            "item-lease:api:7", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.claim_review_item_lease("api", 7) is False
+
+
+class TestReclaimLeakedReviewClaimOnRealPostgres:
+    """`_reclaim_leaked_review_claim`'s confirmation against an actual
+    Postgres server, when one is reachable. `review_claims.claimed_at` is
+    declared ``REAL`` — SQLite's 8-byte double round-trips *stamp* exactly,
+    which the in-memory ``coord_db`` fixture above can't tell apart from
+    Postgres's 4-byte ``float4``, which can't."""
+
+    def test_self_heal_reclaims_despite_float4_precision_loss(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        unavailable = backends.postgres_available()
+        if unavailable:
+            pytest.skip(f"no Postgres backend available: {unavailable}")
+
+        session = backends.open_named_session(backends.BACKEND_POSTGRES)
+        try:
+            db_mod._ensure_schema(session.conn)
+            monkeypatch.setattr(db_mod, "_conn", session.conn)
+
+            assert state.claim_review_dispatch("w1") is True
+            conn = state.get_connection()
+            sql.execute(
+                conn,
+                "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+                (time.time() - state.REVIEW_CLAIM_LEAK_GRACE_SECS - 1.0, "w1"),
+            )
+            conn.commit()
+
+            # Before the dialect split, the UPDATE above committed
+            # correctly but the read-back confirmation always compared
+            # unequal on `float4`, so this returned `False` forever and
+            # also reset `claimed_at` to a fresh stamp on every attempt —
+            # the age clock never advancing far enough to retry.
+            assert state.claim_review_dispatch("w1") is True
+        finally:
+            monkeypatch.undo()
+            session.close()
 
 
 class TestReleaseReviewDispatchClaimBestEffort:
