@@ -22,6 +22,7 @@ from click.testing import CliRunner
 
 from coord import milestone_gate as mg
 from coord import state as state_mod
+from tests import backends
 from coord.cli import main
 from coord.models import Board
 
@@ -245,6 +246,60 @@ class TestMilestoneDispatchBulk:
         rows = state_mod.list_drive_queue()
         assert [r["issue_number"] for r in rows] == [762, 765]
         assert rows[1]["after_json"] == ["api#762"]
+
+    def test_node_declaring_a_coordinator_owned_doc_warns_but_still_queues(
+        self, config_file: Path, coord_db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#4008: a bulk enqueue surfaces the same coordinator-owned-doc
+        warning a manual `coord drive-queue add` does — the node whose own
+        `## Files` names `CLAUDE.md` is flagged, the one that doesn't is
+        not, and both still queue (order/advise, never refuse)."""
+        body = "## Work order\n- [ ] #762\n- [ ] #763\n"
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+        ]
+        declarations = {
+            762: "## Files\n- `coord/review.py`\n- `CLAUDE.md`\n",
+            763: "## Files\n- `coord/dispatch.py`\n",
+        }
+        for number, decl in declarations.items():
+            backends.upsert_issue(
+                coord_db, repo_name="api", number=number,
+                title=f"issue {number}", body=decl, state="open",
+            )
+        coord_db.commit()
+        # The candidate's live re-read is the one process boundary the
+        # predictor crosses for a declaring issue; answer it from the same
+        # declarations instead of shelling out to `gh`.
+        monkeypatch.setattr(
+            "coord.commands.drive_queue._live_issue_body",
+            lambda repo_github, number: declarations.get(number),
+        )
+
+        def get_issue(repo, number):
+            return _get_issue(repo, number, bodies={100: body, **declarations})
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()
+
+        queued_762 = result.output.split("queued api#762")[1].split("queued api#763")[0]
+        assert "coordinator-owned doc" in queued_762
+        assert "`CLAUDE.md`" in queued_762
+        queued_763 = result.output.split("queued api#763")[1]
+        assert "coordinator-owned doc" not in queued_763
+
+        # Advisory only — both nodes are in the queue.
+        rows = state_mod.list_drive_queue()
+        assert [r["issue_number"] for r in rows] == [762, 763]
 
     def test_already_complete_milestone_queues_nothing_and_does_not_register(
         self, config_file: Path
