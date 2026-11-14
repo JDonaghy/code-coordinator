@@ -570,16 +570,6 @@ def drive_queue_add(
         prediction, staleness_note, malformed_note, candidate_body = _predict_overlap(
             config_path, repo, issue, existing_entries
         )
-        # #4008: this candidate's OWN `## Files` naming a coordinator-owned
-        # doc is guaranteed to merge partial — the mechanical review gate
-        # (coord.review's COORDINATOR-OWNED DOC EDITED check) will reject
-        # any diff that edits it, no matter how correct the rest looks.
-        # Flagging it here, at enqueue, is what lets the Work briefing
-        # (`coord.dispatch.post_briefing`) strip it into do-not-touch BEFORE
-        # the worker ever sees it as something to edit.
-        coordinator_doc_note = _coordinator_doc_declared_warning(cfg, repo, candidate_body)
-        if coordinator_doc_note:
-            _record_coordinator_doc_declared(repo, issue, coordinator_doc_note)
         effective_position = _resolve_effective_new_position(position, previous)
         forward_keys, all_reverse = _partition_overlap_after(
             existing_entries,
@@ -608,6 +598,23 @@ def drive_queue_add(
         auto_after = [k for k in candidate_after if k not in reject_after]
         rejected_after = [k for k in candidate_after if k in reject_after]
         after = [*after, *auto_after]
+    else:
+        candidate_body = _candidate_body_only(config_path, repo, issue)
+
+    # #4008: this candidate's OWN `## Files` naming a coordinator-owned doc
+    # is guaranteed to merge partial — the mechanical review gate
+    # (coord.review's COORDINATOR-OWNED DOC EDITED check) will reject any
+    # diff that edits it, no matter how correct the rest looks. Flagging it
+    # here, at enqueue, is what lets the Work briefing
+    # (`coord.dispatch.post_briefing`) strip it into do-not-touch BEFORE the
+    # worker ever sees it as something to edit. Deliberately OUTSIDE the
+    # `no_predict_overlap` branch above: `--no-predict-overlap`'s own help
+    # text promises only to skip #2247's file-overlap ORDERING, nothing
+    # about this unrelated doc-ownership signal, so passing it must not also
+    # silence this warning.
+    coordinator_doc_note = _coordinator_doc_declared_warning(cfg, repo, candidate_body)
+    if coordinator_doc_note:
+        _record_coordinator_doc_declared(repo, issue, coordinator_doc_note)
 
     enqueue_drive_queue(
         repo,
@@ -1009,6 +1016,25 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
     return str(repo_cfg.github or ""), str(getattr(repo_cfg, "default_branch", "") or "main")
 
 
+def _candidate_body_only(config_path: Path, repo: str, issue: int) -> str:
+    """This candidate issue's own body, for a caller that needs its declared
+    files text but not #2247's overlap prediction (#4008).
+
+    `drive_queue_add` skips `_predict_overlap` entirely under
+    `--no-predict-overlap`, but that flag's own help text promises only to
+    skip the predicted file-overlap ORDERING — the coordinator-owned-doc
+    enqueue warning is unrelated and must still see the candidate's body.
+    Fail-open to ``""`` exactly like `_predict_overlap`'s own fallback for
+    the same inputs (unresolvable repo, or no live read available).
+    """
+    coordinates = _repo_coordinates(config_path, repo)
+    if coordinates is None:
+        return ""
+    repo_github, _base_branch = coordinates
+    body, _staleness_note = _candidate_body(repo, issue, repo_github)
+    return body
+
+
 def _existing_pr_match(
     config_path: Path, repo: str, issue: int,
 ) -> "ExistingPrMatch | None":
@@ -1158,15 +1184,20 @@ def _coordinator_doc_declared_warning(
     round if nothing catches it earlier.
 
     Fail-open like every other `## Files` check in this module (#2247's
-    "order/advise, never refuse" posture): an unloadable config, a repo
-    `coordinator.yml` has never heard of, or no declared files at all all
-    yield ``""``.
+    "order/advise, never refuse" posture): an unloadable config or no
+    declared files at all yield ``""``. A repo `coordinator.yml` has never
+    heard of does NOT fail open here — `coordinator_owned_docs(None)`
+    deliberately still returns the fleet-wide `("CLAUDE.md",)` default
+    (its own #1388-style fail-open docstring), and the review gate this
+    warning mirrors applies that same default regardless of whether the
+    repo resolves. Returning early on an unresolved repo would leave this
+    enqueue-time warning silent in exactly the case where the gate would
+    still reject — pass `repo_cfg` through as `None` instead, since
+    `coordinator_owned_docs` already tolerates that.
     """
     if cfg is None:
         return ""
     repo_cfg = cfg.repo(repo)
-    if repo_cfg is None:
-        return ""
     declared = parse_declared_files(candidate_body)
     if not declared:
         return ""
@@ -1183,14 +1214,19 @@ def _coordinator_doc_declared_warning(
 
 
 def _record_coordinator_doc_declared(repo: str, issue: int, note: str) -> None:
-    """Record the stripped coordinator-doc slice as a known, planned
-    remainder (#4008) — best-effort, audit-log only.
+    """Record the stripped coordinator-doc slice at enqueue time (#4008) —
+    best-effort, audit-log only.
 
-    Mirrors `_record_overlap_prediction`'s posture: this is a record of WHY
-    the issue is expected to merge partial, discovered at enqueue rather
-    than at review time, so the #3945 merged-partial follow-through has the
-    doc slice to pick up directly instead of discovering it from a reverted
-    hunk in a review transcript.
+    Unlike `_record_overlap_prediction`'s two-sink posture, this has exactly
+    one sink: the queue row's `last_reason` is tick-owned and gets
+    overwritten on the entry's first attempt (and, within this same `add`
+    call, by `_record_overlap_prediction` itself), so writing it here would
+    just be clobbered — there is nowhere durable on the row to put it. This
+    is observability only (`coord drive-queue overlap-report`-style
+    after-the-fact scoring of the enqueue-time signal against what review
+    actually rejected); #3945's board-doctor follow-through
+    (`coord/board_doctor_followthrough.py`) does not read the audit log and
+    gets no benefit from this call.
     """
     try:
         from coord.audit import record_audit  # noqa: PLC0415

@@ -1124,23 +1124,32 @@ def test_path_is_sealed_is_the_shared_models_predicate() -> None:
 
 
 @pytest.mark.parametrize(
-    "paths",
+    "paths, coordinator_doc_paths",
     [
-        ["CLAUDE.md"],
-        ["docs/README.md"],
-        ["CLAUDE.md", "coord/dispatch.py"],
-        ["docs/", "CLAUDE.md"],
-        [],
+        (["CLAUDE.md"], ["CLAUDE.md"]),
+        (["docs/README.md"], ["CLAUDE.md"]),
+        (["CLAUDE.md", "coord/dispatch.py"], ["CLAUDE.md"]),
+        (["docs/", "CLAUDE.md"], ["CLAUDE.md"]),
+        ([], ["CLAUDE.md"]),
+        # #4008 review: a near-miss exact-match must NOT count as touching
+        # the sealed file — a bare `startswith` would wrongly swallow this.
+        (["CLAUDE.md.bak"], ["CLAUDE.md"]),
+        # #4008 review: a directory-prefix entry (sealed ending in `/`) —
+        # everything beneath it counts as touched, a sibling path with the
+        # same string prefix but no separator does not.
+        (["tests/acceptance/ms-1/mock.py"], ["tests/acceptance/"]),
+        (["tests/acceptance-other.py"], ["tests/acceptance/"]),
     ],
 )
-def test_coordinator_doc_overlap_matches_review_gate(paths: list[str]) -> None:
+def test_coordinator_doc_overlap_matches_review_gate(
+    paths: list[str], coordinator_doc_paths: list[str],
+) -> None:
     """``coord.models.coordinator_doc_overlap`` (the briefing/enqueue
     strip-set) agrees with ``coord.review``'s own mandatory gate (the
     reject-set) for the same declared paths, for every sample here."""
     from coord.models import coordinator_doc_overlap
     from coord.review import _coordinator_doc_violation_lines
 
-    coordinator_doc_paths = ["CLAUDE.md"]
     diff_text = "".join(
         f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1,2 @@\n+x\n"
         for p in paths
