@@ -10831,16 +10831,41 @@ def enqueue_drive_queue(
 # 'failed'` directly without ever reaching `_reap` (or `_reap` runs but the
 # underlying `claude -p` process never emitted even its `system.init`
 # stream-json event), so `claude_session_id` — populated by `_reap` parsing
-# the worker's own log for that event the moment output starts — stays NULL
-# forever. A `failed` row WITH a session id (the worker started, then
-# crashed or was killed) is a real attempt and must still count: `status`
-# alone cannot tell the two apart. Every OTHER terminal status (`done`,
+# the worker's own log for that event the moment output starts — stays NULL.
+#
+# `claude_session_id` alone is NOT a reliable witness, though: it is also
+# NULL for a leg that DID run, if `_capture_claude_session_id` simply missed
+# its one look at the agent's `/status` entry (the #3314 race —
+# `list_assignments_missing_claude_session_id` / `retry_pending_
+# claude_session_id_captures` exist to retry that capture, but only within
+# `CLAUDE_SESSION_ID_RETRY_WINDOW_SECONDS` and only while the agent is
+# reachable), or if the leg's host went unreachable mid-run and
+# `coord.reconcile`'s stale-leg sweep terminated it via
+# `mark_failed_by_id` with no `/status` entry to capture from at all. Either
+# way the leg may have run for an hour and pushed real commits. So this
+# predicate requires a NULL `claude_session_id` to be CORROBORATED by every
+# other signal the board has of a session never starting, before excluding
+# the row — any one of them being non-empty means a session ran and the row
+# counts:
+#   - `failure_reason` empty: all seven reasons `coord.reconcile` stamps
+#     (usage-limit, API-error, push-failure, spend-ceiling, truncation,
+#     runtime-ceiling, host-sleep) imply a reaped transcript, i.e. a session
+#     that started. A pre-session 403 (quadraui#2347) or the #3912
+#     worktree-setup refusal stamp none of these.
+#   - `unreachable_count` zero/NULL: this is the direct witness against the
+#     reconcile-sweep path above — a leg terminated for host unreachability
+#     has this at or above `stale_threshold`, never zero.
+#   - `cost_usd` NULL: stamped once at completion (#208) only once `claude
+#     -p` actually billed tokens, so any non-NULL value means it ran.
+# A `failed` row WITH a session id (the worker started, then crashed or was
+# killed) is a real attempt and must still count regardless of these other
+# fields: `status` alone cannot tell the two apart, so the condition stays
+# scoped to `status = 'failed'`. Every OTHER terminal status (`done`,
 # `merged`, `advisory`, `refused_policy`, `refused_premise`,
 # `needs_decomposition`) always implies a session ran to completion
-# regardless of whether `claude_session_id` happens to be populated, so this
-# condition is scoped to `status = 'failed'` alone — a currently-running leg
-# and a pre-#315 row predating the `claude_session_id` column are both never
-# miscounted.
+# regardless of whether `claude_session_id` happens to be populated, so a
+# currently-running leg and a pre-#315 row predating the
+# `claude_session_id` column are both never miscounted.
 #
 # Expressed once here as a SQL fragment (reused verbatim by
 # `_work_leg_count_for_issue_local`'s aggregate `COUNT(*)`) and mirrored by
@@ -10848,15 +10873,31 @@ def enqueue_drive_queue(
 # same decision per already-fetched row rather than as a SQL predicate.
 _NOT_INFRA_FAILED_LAUNCH_SQL = (
     "NOT (COALESCE(status, '') = 'failed' "
-    "AND COALESCE(claude_session_id, '') = '')"
+    "AND COALESCE(claude_session_id, '') = '' "
+    "AND COALESCE(failure_reason, '') = '' "
+    "AND COALESCE(unreachable_count, 0) = 0 "
+    "AND cost_usd IS NULL)"
 )
 
 
-def _is_infra_failed_launch(status: str | None, claude_session_id: str | None) -> bool:
+def _is_infra_failed_launch(
+    status: str | None,
+    claude_session_id: str | None,
+    failure_reason: str | None,
+    unreachable_count: int | None,
+    cost_usd: float | None,
+) -> bool:
     """True iff an assignment row ended WITHOUT a worker session ever
     starting (#3998) — see :data:`_NOT_INFRA_FAILED_LAUNCH_SQL`'s comment
-    for the exact reasoning this mirrors in SQL form."""
-    return (status or "") == "failed" and not (claude_session_id or "")
+    for the exact reasoning this mirrors in SQL form, including why a NULL
+    ``claude_session_id`` alone is not sufficient."""
+    return (
+        (status or "") == "failed"
+        and not (claude_session_id or "")
+        and not (failure_reason or "")
+        and not (unreachable_count or 0)
+        and cost_usd is None
+    )
 
 
 def _work_leg_count_for_issue_local(conn, repo_name: str, issue_number: int) -> int:
@@ -11593,7 +11634,8 @@ def _leg_counts_local() -> dict[str, dict[str, int]]:
         try:
             result = sql.execute(conn,
                 f"SELECT repo_name, issue_number, type, status, "  # noqa: S608 — constant
-                f"claude_session_id FROM {table}",
+                f"claude_session_id, failure_reason, unreachable_count, "
+                f"cost_usd FROM {table}",
             ).fetchall()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
             # Mirrors `_list_issue_numbers_with_assignments_local`: `continue`
@@ -11606,7 +11648,9 @@ def _leg_counts_local() -> dict[str, dict[str, int]]:
         for r in result:
             repo_name, issue_number, assignment_type = r[0], r[1], r[2]
             is_work_like = (assignment_type or "work") in WORK_LIKE_TYPES
-            if is_work_like and _is_infra_failed_launch(r[3], r[4]):
+            if is_work_like and _is_infra_failed_launch(
+                r[3], r[4], r[5], r[6], r[7]
+            ):
                 infra_rows.append((repo_name, issue_number, assignment_type))
             else:
                 rows.append((repo_name, issue_number, assignment_type))

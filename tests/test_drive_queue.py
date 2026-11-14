@@ -1599,8 +1599,8 @@ def test_ceiling_block_reason_reports_infra_failed_launches_separately():
     assert len(plan.blocked) == 1
     reason = plan.blocked[0].reason
     assert "3 work leg(s)" in reason
-    assert "2 infra-failed launch(es)" in reason
-    assert "not counted against this budget" in reason
+    assert "2 lifetime infra-failed launch(es)" in reason
+    assert "not counted against this row's budget" in reason
 
 
 def test_ceiling_block_reason_omits_the_infra_note_when_there_are_none():
@@ -1635,6 +1635,14 @@ def test_a_relaunch_past_the_ceiling_also_blocks():
 # setup failure and a `#3912` conflicting-worktree refusal, both status
 # `failed` with no `claude_session_id` ever captured, alongside the two
 # real `done` legs that actually ran.
+#
+# These are `coord.state`-internal, DB-backed tests, which this module's own
+# docstring scopes to "the pure half" — they live here rather than in
+# `tests/test_state.py` because #3998's briefing named only this file for
+# test changes; they hit `coord_db` directly (unlike this module's usual
+# `coord.state`-patching style) for the same reason the functions under
+# test do: `_leg_counts_local`/`_work_leg_count_for_issue_local` only make
+# sense against real `assignments`/`assignments_archive` rows.
 
 
 def _insert_assignment_leg(
@@ -1645,12 +1653,16 @@ def _insert_assignment_leg(
     status: str = "done",
     assignment_type: str = "work",
     claude_session_id: str | None = "a-real-session-id",
+    failure_reason: str | None = None,
+    unreachable_count: int = 0,
+    cost_usd: float | None = None,
 ) -> None:
     conn.execute(
         """INSERT INTO assignments
            (assignment_id, machine_name, repo_name, repo_github,
-            issue_number, issue_title, status, type, claude_session_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            issue_number, issue_title, status, type, claude_session_id,
+            failure_reason, unreachable_count, cost_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             assignment_id,
             "dell64",
@@ -1661,6 +1673,9 @@ def _insert_assignment_leg(
             status,
             assignment_type,
             claude_session_id,
+            failure_reason,
+            unreachable_count,
+            cost_usd,
         ),
     )
     conn.commit()
@@ -1708,6 +1723,39 @@ def test_leg_counts_local_counts_a_failed_leg_with_a_session_as_real(coord_db):
     assert INFRA_FAILED_LAUNCH_KEY not in by_type
 
 
+@pytest.mark.parametrize(
+    "witness_kwargs",
+    [
+        pytest.param({"failure_reason": "usage-limit"}, id="failure_reason"),
+        pytest.param({"unreachable_count": 3}, id="unreachable_count"),
+        pytest.param({"cost_usd": 1.23}, id="cost_usd"),
+    ],
+)
+def test_leg_counts_local_counts_a_failed_leg_with_run_evidence_as_real(
+    coord_db, witness_kwargs
+):
+    """`status='failed'` with no `claude_session_id` is NOT sufficient on
+    its own to exclude a leg: the #3314 capture race drops a session id
+    for a leg that DID run, and `coord.reconcile`'s stale-host sweep
+    terminates a leg via `mark_failed_by_id` with no `/status` entry to
+    capture a session id from at all — both land in this exact shape. Any
+    ONE positive witness that a session actually ran (a `failure_reason`
+    `coord.reconcile` stamps, a nonzero `unreachable_count` from the
+    stale-host sweep, or a billed `cost_usd`) must be enough to still
+    count the leg as real work, never as an infra-failed launch."""
+    from coord.state import _leg_counts_local
+
+    _insert_assignment_leg(
+        coord_db, assignment_id="ran-but-no-session-id", status="failed",
+        claude_session_id=None, **witness_kwargs,
+    )
+
+    counts = _leg_counts_local()
+    by_type = counts[entry_key(REPO, 1650)]
+    assert by_type["work"] == 1
+    assert INFRA_FAILED_LAUNCH_KEY not in by_type
+
+
 def test_work_leg_count_for_issue_local_excludes_infra_failed_launches(coord_db):
     """`_enqueue_drive_queue_local`'s `legs_at_enqueue` baseline must use the
     SAME real-leg-only definition `_leg_counts_local` does, or a freshly
@@ -1721,6 +1769,27 @@ def test_work_leg_count_for_issue_local_excludes_infra_failed_launches(coord_db)
         claude_session_id=None,
     )
     _insert_assignment_leg(coord_db, assignment_id="fbc1554e1abd", status="done")
+
+    conn = get_connection()
+    assert _work_leg_count_for_issue_local(conn, REPO, 1650) == 1
+
+
+def test_work_leg_count_for_issue_local_counts_a_failed_leg_with_run_evidence(
+    coord_db,
+):
+    """Same inverse shape as `test_leg_counts_local_counts_a_failed_leg_
+    with_run_evidence_as_real`, pinned against the SQL-predicate path
+    (`_NOT_INFRA_FAILED_LAUNCH_SQL`) rather than the Python mirror
+    (`_is_infra_failed_launch`) — a `failed` leg with no `claude_session_id`
+    but a nonzero `unreachable_count` (the stale-host reconcile sweep)
+    still counts toward the budget baseline."""
+    from coord.db import get_connection
+    from coord.state import _work_leg_count_for_issue_local
+
+    _insert_assignment_leg(
+        coord_db, assignment_id="host-went-unreachable-mid-run", status="failed",
+        claude_session_id=None, unreachable_count=5,
+    )
 
     conn = get_connection()
     assert _work_leg_count_for_issue_local(conn, REPO, 1650) == 1

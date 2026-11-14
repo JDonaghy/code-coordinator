@@ -2028,6 +2028,17 @@ def remaining_fix_rounds(
     :func:`total_fix_round_budget` reads ``0`` (no more fix rounds), the
     signal `_reconcile_running` uses to stop relaunching altogether rather
     than pass a session a budget it cannot spend down further.
+
+    #3998 deploy skew: a row's ``legs_at_enqueue`` baseline was stamped at
+    `add`/relaunch time under WHATEVER definition of "work leg" was live
+    then. A row added before this change landed has infra-failed launches
+    baked into that baseline; ``facts.work_leg_count`` now excludes them
+    going forward, so ``fix_rounds_spent`` under-counts by up to that many
+    legs until the row is next re-added (`remove` + `add` re-stamps the
+    baseline fresh). Harmless in the direction that matters — it can only
+    hand out a few EXTRA rounds to a pre-existing row, never fewer — and
+    `entry.attempts` / `max_attempts` remains an independent bound on that
+    same row regardless.
     """
     fix_rounds_spent = max(
         facts.work_leg_count - entry.legs_at_enqueue - 1, 0
@@ -5837,7 +5848,12 @@ def _reconcile_running(
     more budget appear). *fix_round_config_default* is ``pipeline.
     max_fix_rounds`` — the same value :func:`effective_max_fix_rounds`
     resolves against for the entry actually being launched, so this check
-    and the launch it gates read the identical number.
+    and the launch it gates read the identical number. #3998:
+    ``facts.work_leg_count`` itself excludes a leg that never started a
+    worker session (a worktree-setup failure, a pre-session API/HTTP
+    error) — those are bounded instead by the ordinary
+    ``attempts``/``max_attempts`` relaunch ceiling this same function
+    enforces, never by this fix-round budget.
 
     #3577: the ceiling above is a WORK budget — it must never fire for a
     death whose own evidence shows no further work/fix leg would even be
@@ -6714,8 +6730,9 @@ def _reconcile_running(
         # whether a never-started launch is hiding inside that number.
         infra_legs = facts.infra_failed_leg_count
         infra_note = (
-            f", plus {infra_legs} infra-failed launch(es) that never "
-            f"started a worker session (not counted against this budget)"
+            f", plus {infra_legs} lifetime infra-failed launch(es) that "
+            f"never started a worker session (not counted against this "
+            f"row's budget)"
             if infra_legs
             else ""
         )
