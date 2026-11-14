@@ -10,11 +10,13 @@ from unittest.mock import MagicMock, patch
 
 from coord.config import Config
 from coord.dispatch_liveness import (
+    CREDENTIAL_PROBE_REFUSAL_MARKER,
     PREDICATE_BRANCH_MERGED,
     PREDICATE_ISSUE_CLOSED,
     PREDICATE_MACHINE_UNHEALTHY,
     check_dispatch_liveness,
     github_issue_liveness_fetcher,
+    is_credential_probe_refusal_reason,
     record_dispatch_refusal,
 )
 from coord.models import Repo
@@ -90,6 +92,87 @@ class TestCheckDispatchLiveness:
         )
         assert refusal is not None
         assert refusal.predicate == PREDICATE_BRANCH_MERGED
+
+    def test_unhealthy_machine_reason_carries_the_credential_probe_marker(
+        self,
+    ) -> None:
+        """#4004: `coord.drive_queue.is_credential_probe_refusal_reason`
+        recognises this ONE predicate by this marker, independent of the
+        exit-code bookkeeping every `DispatchRefused` shares — pin that
+        the marker is actually in the default (non-timeout) message."""
+        refusal = check_dispatch_liveness(
+            repo_name="api", issue_number=1, machine_name="dead-box",
+            machine_healthy=False,
+        )
+        assert refusal is not None
+        assert CREDENTIAL_PROBE_REFUSAL_MARKER in refusal.reason
+        assert is_credential_probe_refusal_reason(refusal.reason)
+
+    def test_timed_out_probe_gets_a_different_message_without_re_authenticate(
+        self,
+    ) -> None:
+        """#4004: a probe TIMEOUT is not evidence the credential is dead —
+        the message must say so distinctly, and must NOT tell the operator
+        to re-authenticate on that evidence."""
+        refusal = check_dispatch_liveness(
+            repo_name="api", issue_number=1, machine_name="precision",
+            machine_healthy=False, machine_health_timed_out=True,
+        )
+        assert refusal is not None
+        assert refusal.predicate == PREDICATE_MACHINE_UNHEALTHY
+        assert "TIMED OUT" in refusal.reason
+        assert "re-authenticate" not in refusal.reason
+        # Still recognisable as the SAME predicate/marker as the
+        # confirmed-dead wording — #4004's re-evaluable classification in
+        # `coord.drive_queue` must catch both shapes identically.
+        assert CREDENTIAL_PROBE_REFUSAL_MARKER in refusal.reason
+        assert is_credential_probe_refusal_reason(refusal.reason)
+
+    def test_confirmed_dead_probe_still_says_re_authenticate(self) -> None:
+        """The default (`machine_health_timed_out=False`, every pre-#4004
+        caller) must be byte-for-byte unchanged — a REAL dead credential
+        still gets told to re-authenticate."""
+        refusal = check_dispatch_liveness(
+            repo_name="api", issue_number=1, machine_name="dead-box",
+            machine_healthy=False, machine_health_timed_out=False,
+        )
+        assert refusal is not None
+        assert "re-authenticate" in refusal.reason
+        assert "TIMED OUT" not in refusal.reason
+
+
+class TestIsCredentialProbeRefusalReason:
+    def test_none_and_empty_are_false(self) -> None:
+        assert is_credential_probe_refusal_reason(None) is False
+        assert is_credential_probe_refusal_reason("") is False
+
+    def test_unrelated_refusal_reason_is_false(self) -> None:
+        """A `(#1844)`-shaped guard refusal or either of the OTHER two
+        `check_dispatch_liveness` predicates must not be mistaken for this
+        one — the whole point of a marker-based classifier."""
+        closed = check_dispatch_liveness(
+            repo_name="api", issue_number=1, machine_name="laptop",
+            issue_closed=True,
+        )
+        assert closed is not None
+        assert is_credential_probe_refusal_reason(closed.reason) is False
+        assert is_credential_probe_refusal_reason(
+            "drive refused to launch api#1: the diff touches a sealed "
+            "acceptance path (#1844)"
+        ) is False
+
+    def test_marked_reason_is_true_even_with_extra_text_appended(self) -> None:
+        """`coord.drive_queue` layers its OWN explanation onto the raw
+        `own_reason` text (same convention every other `is_*_reason`
+        classifier in this codebase relies on) — the marker must still be
+        found after that."""
+        refusal = check_dispatch_liveness(
+            repo_name="api", issue_number=1, machine_name="dead-box",
+            machine_healthy=False,
+        )
+        assert refusal is not None
+        decorated = f"{refusal.reason} — blocking as RE-EVALUABLE (#4004)"
+        assert is_credential_probe_refusal_reason(decorated)
 
 
 class TestRecordDispatchRefusal:

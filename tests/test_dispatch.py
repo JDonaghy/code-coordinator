@@ -26,6 +26,7 @@ from coord.dispatch import (
     UPSTREAM_GAP_BRIEFING_NOTE,
     WRONG_REPO_BRIEFING_NOTE,
     CapabilityRouting,
+    CredentialRouting,
     DispatchRefused,
     dispatch,
     enforce_epic_dispatch_guard,
@@ -39,6 +40,7 @@ from coord.dispatch import (
     apply_liveness_reroute,
     caching_status_fetcher,
     route_work_by_capability,
+    route_work_by_credential,
     route_work_by_liveness,
 )
 from coord.decomposition_chat import (
@@ -5093,6 +5095,249 @@ class TestDispatchLivenessRouting:
             # headless is reachable, but the capability gate ahead of the
             # liveness gate has already moved this proposal onto gtkbox.
             dispatch(p, cfg, status_fetcher=_status_fetcher({"headless"}))
+        mock_post.assert_not_called()
+
+
+# ── #4004: re-route a work dispatch around a machine whose live credential/
+# health probe refuses it, onto any other capable, routable machine, before
+# giving up — the credential-probe sibling of `route_work_by_liveness`'s
+# reachability reroute just above. Before this, quadraui#2361 (2026-11-14)
+# burned a `DispatchRefused`/EXIT_DISPATCH_REFUSED on precision's
+# intermittently-slow `/health` even though a second capable machine was
+# idle and routable the whole time. ─────────────────────────────────────────
+
+
+def _credential_fetcher(healthy: set[str]):
+    """Fake `credential_fetcher`: passes for every machine in *healthy*,
+    refuses (probe reads broken/dead) for everyone else."""
+
+    def _fetch(machine):
+        return machine.name in healthy
+
+    return _fetch
+
+
+class TestRouteWorkByCredential:
+    def test_no_credential_fetcher_returns_none(self) -> None:
+        machines = [
+            Machine(name="precision", host="precision.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="precision",
+            repo_name="quadraui",
+            machines=machines,
+        )
+        assert result is None
+
+    def test_healthy_proposed_machine_returns_none(self) -> None:
+        machines = [
+            Machine(name="precision", host="precision.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="precision",
+            repo_name="quadraui",
+            machines=machines,
+            credential_fetcher=_credential_fetcher({"precision"}),
+        )
+        assert result is None
+
+    def test_refused_proposed_machine_reroutes_to_a_healthy_fallback(self) -> None:
+        """The quadraui#2361 shape: precision's probe reads broken, a
+        second capable machine (macmini) passes — selection must move
+        there rather than staying pinned on the refused machine."""
+        machines = [
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="precision",
+            repo_name="quadraui",
+            machines=machines,
+            credential_fetcher=_credential_fetcher({"macmini"}),
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+        assert result.rerouted is True
+        assert ("precision", "failed live credential/health probe") in result.tried
+
+    def test_all_candidates_refused_signals_none_machine_name(self) -> None:
+        machines = [
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="precision",
+            repo_name="quadraui",
+            machines=machines,
+            credential_fetcher=_credential_fetcher(set()),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        assert {name for name, _ in result.tried} == {"precision", "macmini"}
+
+    def test_unknown_proposed_machine_returns_none(self) -> None:
+        machines = [
+            Machine(name="precision", host="precision.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="ghost",
+            repo_name="quadraui",
+            machines=machines,
+            credential_fetcher=_credential_fetcher(set()),
+        )
+        assert result is None
+
+    def test_incapable_and_paused_machines_are_never_probed_as_fallbacks(self) -> None:
+        from coord.machine_pause import local_pause
+
+        local_pause("macmini")
+        machines = [
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(name="other-repo-only", host="oro.tailnet", repos=["other"]),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="precision",
+            repo_name="quadraui",
+            machines=machines,
+            credential_fetcher=_credential_fetcher(set()),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert {name for name, _ in result.tried} == {"precision"}
+
+
+class TestDispatchCredentialRouting:
+    """#4004 end to end: `dispatch()` itself reroutes a `type="work"`
+    dispatch around a machine refused by the live credential/health probe,
+    landing on a different capable, healthy machine in the SAME call —
+    `coord drive` never sees `EXIT_DISPATCH_REFUSED` at all when a fallback
+    exists."""
+
+    def _config(self, machines: list[Machine]) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=machines,
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_reroutes_to_healthy_machine_and_updates_proposal(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config([
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="precision", repo_name="quadraui",
+            issue_number=2361, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        dispatch(p, cfg, credential_fetcher=_credential_fetcher({"macmini"}))
+
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        assert p.machine_name == "macmini"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_all_candidates_refused_still_refuses_with_the_real_reason(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """No fallback exists — falls through to the ordinary
+        `check_dispatch_liveness` gate, which refuses with the SAME
+        predicate/message as before this issue (preserving #1844's
+        existing `DispatchRefused` contract for `coord.drive_queue` to
+        classify)."""
+        cfg = self._config([
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="precision", repo_name="quadraui",
+            issue_number=2361, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        with pytest.raises(DispatchRefused, match="not routable"):
+            dispatch(p, cfg, credential_fetcher=_credential_fetcher(set()))
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_credential_fetcher_never_probes_and_dispatches_unchanged(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)  # credential_fetcher defaults to None
+        assert "laptop.tailnet" in mock_post.call_args.args[0]
+        assert proposal.machine_name == "laptop"
+
+
+class TestDispatchLivenessTimeoutDetail:
+    """#4004: a credential probe TIMEOUT must not produce the
+    "re-authenticate" wording a confirmed-dead probe gets — see
+    `coord.dispatch_liveness.check_dispatch_liveness`'s
+    *machine_health_timed_out* parameter."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_timeout_detail_swaps_the_message_but_still_refuses(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(DispatchRefused) as exc_info:
+            dispatch(
+                proposal, config,
+                credential_fetcher=lambda m: False,
+                credential_timeout_fetcher=lambda m: True,
+            )
+        message = str(exc_info.value)
+        assert "TIMED OUT" in message
+        assert "re-authenticate" not in message
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_timeout_detail_keeps_the_re_authenticate_wording(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(DispatchRefused) as exc_info:
+            dispatch(
+                proposal, config,
+                credential_fetcher=lambda m: False,
+                credential_timeout_fetcher=lambda m: False,
+            )
+        assert "re-authenticate" in str(exc_info.value)
         mock_post.assert_not_called()
 
 

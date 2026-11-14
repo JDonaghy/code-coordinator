@@ -72,9 +72,11 @@ __all__ = [
     "check_dispatch_liveness",
     "record_dispatch_refusal",
     "github_issue_liveness_fetcher",
+    "is_credential_probe_refusal_reason",
     "PREDICATE_ISSUE_CLOSED",
     "PREDICATE_BRANCH_MERGED",
     "PREDICATE_MACHINE_UNHEALTHY",
+    "CREDENTIAL_PROBE_REFUSAL_MARKER",
 ]
 
 PREDICATE_ISSUE_CLOSED = "issue_closed"
@@ -82,6 +84,19 @@ PREDICATE_BRANCH_MERGED = "branch_merged"
 PREDICATE_MACHINE_UNHEALTHY = "machine_unhealthy"
 
 EVENT_DISPATCH_REFUSED = "dispatch_refused_liveness"
+
+# #4004: embedded verbatim in EVERY `PREDICATE_MACHINE_UNHEALTHY` reason
+# (both the timeout and the confirmed-broken wording below) so
+# `coord.drive_queue.is_credential_probe_refusal_reason` can recognise this
+# ONE predicate by its own text, independent of the `exit_refused` exit-code
+# bookkeeping every `DispatchRefused` shares regardless of predicate — the
+# same "recognise this refusal by its own marker, not by the exit code"
+# posture `coord.models.PREMISE_REFUSAL_MARKER`/`NEEDS_DECOMPOSITION_MARKER`
+# already established. Unlike those two, this predicate is NOT a standing,
+# permanent refusal (#1844) — the live probe that produced it can read
+# differently on the very next tick — so it deliberately carries none of
+# `coord.drive_queue._PERMANENT_BLOCK_MARKERS`' own text.
+CREDENTIAL_PROBE_REFUSAL_MARKER = "[credential-probe-refusal #4004]"
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,7 @@ def check_dispatch_liveness(
     issue_closed: bool | None = None,
     branch_merged: bool | None = None,
     machine_healthy: bool | None = None,
+    machine_health_timed_out: bool = False,
 ) -> LivenessRefusal | None:
     """The one function, three predicates. Returns a refusal, or `None`
     when dispatch may proceed.
@@ -115,6 +131,17 @@ def check_dispatch_liveness(
     then machine health — the first true predicate wins and is reported;
     this function does not try to report more than one cause at a time,
     matching every other structural gate in `coord.dispatch.dispatch()`.
+
+    *machine_health_timed_out* (#4004) distinguishes WHY `machine_healthy`
+    read `False`: a probe that could not get an answer in time (the
+    quadraui#2361 incident — precision's `/health` spiking to 10.9s/115.9s
+    against a 3s budget) is NOT evidence the credential is dead, only that
+    this one probe couldn't tell. Telling the operator to re-authenticate
+    on THAT evidence sends them chasing a problem that doesn't exist.
+    Default `False` keeps every existing caller's message byte-identical —
+    only a caller that actually distinguishes timeout from a confirmed-dead
+    probe result (none do yet; see `coord.dispatch.dispatch`'s
+    *credential_timeout_fetcher*) opts into the different wording.
     """
     if issue_closed:
         return LivenessRefusal(
@@ -134,16 +161,50 @@ def check_dispatch_liveness(
             ),
         )
     if machine_healthy is False:
+        if machine_health_timed_out:
+            return LivenessRefusal(
+                predicate=PREDICATE_MACHINE_UNHEALTHY,
+                reason=(
+                    f"machine {machine_name!r}'s live health/credential "
+                    "probe TIMED OUT (#3371/#3376/#4004) — unknown, not "
+                    "confirmed broken: this says nothing about whether the "
+                    "credential is actually dead, only that this one probe "
+                    "couldn't get an answer in time; re-authenticating "
+                    "would not fix a slow machine. Retry, or approve/assign "
+                    f"this to a different machine. {CREDENTIAL_PROBE_REFUSAL_MARKER}"
+                ),
+            )
         return LivenessRefusal(
             predicate=PREDICATE_MACHINE_UNHEALTHY,
             reason=(
                 f"machine {machine_name!r} failed a live health/credential "
                 "probe — not routable (#3371/#3376): re-authenticate "
                 "(`claude` or `claude setup-token`) on that host, or "
-                "approve/assign this to a different machine"
+                "approve/assign this to a different machine. "
+                f"{CREDENTIAL_PROBE_REFUSAL_MARKER}"
             ),
         )
     return None
+
+
+def is_credential_probe_refusal_reason(text: str | None) -> bool:
+    """Does *text* (a stored `last_reason`/exit message) name THIS
+    predicate — :data:`PREDICATE_MACHINE_UNHEALTHY` — specifically, as
+    opposed to the other two `check_dispatch_liveness` predicates (issue
+    closed / branch merged) or any unrelated `(#1844)` guard refusal that
+    also exits `EXIT_DISPATCH_REFUSED`?
+
+    Marker-based (:data:`CREDENTIAL_PROBE_REFUSAL_MARKER`), not a prose
+    substring match — the same "recognise this refusal by its own text"
+    posture every other `is_*_refusal_reason` classifier in this codebase
+    uses (`coord.models.is_premise_refusal_reason`,
+    `coord.drive_queue.is_test_stage_routing_dead_end_reason`, …). Used by
+    `coord.drive_queue` to route this ONE `(#1844)`-shaped exit to a
+    RE-EVALUABLE block instead of the generic permanent one (#4004).
+    """
+    if not text:
+        return False
+    return CREDENTIAL_PROBE_REFUSAL_MARKER in text
 
 
 def github_issue_liveness_fetcher(
