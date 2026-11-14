@@ -38,6 +38,14 @@ work. "Not yet dispatched" means zero work-like legs on the issue so far
 drive queue's fix budget uses): an in-flight sibling already has its own
 briefing and its own reviews.
 
+#3998 narrowed that count to exclude a leg that never started a worker
+session (a worktree-setup failure, a pre-session API/HTTP error) — so a
+sibling whose only leg(s) so far are all like that now reads as
+"not yet dispatched" again here too, the same as it would never have been
+sent out at all. That is the intended read for THIS consumer: a lesson is
+only useful ahead of a briefing nobody has written yet, and a never-started
+leg never saw one.
+
 Everything here is best-effort: a lesson that fails to record costs at worst
 the fix round this feature exists to save, never a review verdict or a
 dispatch.

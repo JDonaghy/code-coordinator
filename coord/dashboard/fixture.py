@@ -296,6 +296,14 @@ class FixtureServer:
         stands in for "the whole history", exactly as it does for every
         other board-derived fixture accessor (``GET /api/machines/stats``'s
         docstring makes the same call).
+
+        #3998: unlike the real ``coord.state._leg_counts_local`` this does
+        NOT split out infra-failed launches (a worktree-setup failure, a
+        pre-session API/HTTP error) into their own
+        ``INFRA_FAILED_LAUNCH_KEY`` bucket — every seeded row counts under
+        its own ``type`` regardless of whether a worker session ever
+        started. A fixture consumer asserting on the fix-round ceiling
+        should not read this as "the whole history" in that one respect.
         """
         from coord.drive_queue import compute_leg_counts  # noqa: PLC0415
 
