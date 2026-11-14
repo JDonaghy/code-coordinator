@@ -59,6 +59,7 @@ from coord.models import (
     Repo,
     SplitChunk,
     SplitProposal,
+    path_is_sealed_entry,
 )
 from coord.preflight_size import SplitVerification
 from coord.network import StatusResult
@@ -2510,31 +2511,72 @@ class TestPostBriefing:
         assert "`CLAUDE.md`" in body.split("**Do not touch:**")[1].splitlines()[0]
 
     @patch("coord.dispatch.github_ops.post_issue_comment")
+    def test_do_not_touch_lists_coordinator_doc_even_with_empty_files_likely(
+        self, mock_comment: MagicMock, config: Config,
+    ) -> None:
+        """#4008 review: `proposal.files_likely` is only ever populated by the
+        `brain.py` planner route — every DRIVE-QUEUE dispatch (`coord assign`,
+        `coord milestone dispatch`, the board daemon's drive tick) builds its
+        `Proposal` with `files_likely=[]`. The incident this issue is about
+        happened on exactly that path: the issue's own `## Files` named
+        `CLAUDE.md`, but the posted briefing showed neither "Files" nor "do
+        not touch" for it, so the worker edited it straight off the issue
+        body and tripped review's mandatory COORDINATOR-OWNED DOC EDITED
+        gate. `CLAUDE.md` must land under "do not touch" regardless of
+        whether `files_likely` was ever populated."""
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=10,
+            issue_title="Fix auth", rationale="best fit",
+            files_likely=[], briefing="Fix the auth module",
+        )
+        post_briefing(proposal, config)
+        body = mock_comment.call_args.args[2]
+        assert "**Files:** (unspecified)" in body
+        assert "**Do not touch:**" in body
+        assert "`CLAUDE.md`" in body.split("**Do not touch:**")[1].splitlines()[0]
+
+    @patch("coord.dispatch.github_ops.post_issue_comment")
     def test_coordinator_doc_strip_matches_review_gate_reject_set(
         self, mock_comment: MagicMock, config: Config,
     ) -> None:
         """#4008: the briefing's strip-set and the review gate's reject-set
         must be the same answer for the same declared paths — computed by
-        the one shared predicate, `coord.models.coordinator_doc_overlap`."""
+        the one shared predicate, `coord.models.coordinator_doc_overlap`.
+
+        Uses a repo with a `coordinator_only_files` DIRECTORY entry
+        (`docs/`) alongside the fleet-wide `CLAUDE.md` default, so a
+        declared path (e.g. `docs/README.md`) and the coordinator-doc
+        ENTRY it matches (`docs/`) are two different strings — a test that
+        only ever used exact-match files (where the two happen to be
+        byte-identical) couldn't tell `coordinator_doc_overlap`'s actual
+        return value (matched entries) from the declared paths apart."""
         from coord.models import coordinator_doc_overlap, coordinator_owned_docs
 
+        api_with_doc_dir = Config(
+            repos=[Repo(name="api", github="acme/api", coordinator_only_files=["docs/"])],
+            machines=config.machines,
+        )
         declared = ["auth.py", "CLAUDE.md", "docs/README.md"]
         proposal = Proposal(
             id=1, machine_name="laptop", repo_name="api", issue_number=10,
             issue_title="Fix auth", rationale="best fit",
             files_likely=declared, briefing="Fix the auth module",
         )
-        post_briefing(proposal, config)
+        post_briefing(proposal, api_with_doc_dir)
         body = mock_comment.call_args.args[2]
         files_line = body.splitlines()[4]
         assert files_line.startswith("**Files:**")
 
-        expected_stripped = set(
-            coordinator_doc_overlap(declared, coordinator_owned_docs(config.repo("api")))
-        )
+        coordinator_doc_paths = coordinator_owned_docs(api_with_doc_dir.repo("api"))
+        matched_entries = set(coordinator_doc_overlap(declared, coordinator_doc_paths))
+        assert matched_entries == {"CLAUDE.md", "docs/"}
+
         for path in declared:
             edited = f"`{path}`" in files_line
-            assert edited == (path not in expected_stripped)
+            is_touched = any(
+                path_is_sealed_entry(path, entry) for entry in matched_entries
+            )
+            assert edited == (not is_touched), path
 
 
 class TestResumeSessionId:

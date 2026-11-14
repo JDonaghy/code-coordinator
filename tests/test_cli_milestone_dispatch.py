@@ -22,9 +22,9 @@ from click.testing import CliRunner
 
 from coord import milestone_gate as mg
 from coord import state as state_mod
-from tests import backends
 from coord.cli import main
 from coord.models import Board
+from tests import backends
 
 
 CONFIG_YAML = """\

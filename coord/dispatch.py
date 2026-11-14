@@ -2850,11 +2850,23 @@ def post_briefing(
     # COORDINATOR-OWNED DOC EDITED gate), regardless of anything else in the
     # diff. Listing it under "files to edit" here would hand the worker a
     # briefing that is guaranteed to merge partial after a wasted fix round.
-    # Strip it out of the files to edit and surface it under "do not touch"
-    # instead, with a one-line note that the doc slice is coordinator work —
-    # `coordinator_doc_overlap` is the exact same predicate coord.review's
-    # gate uses, so this split can never disagree with what the gate would
-    # actually reject (#4008).
+    #
+    # `proposal.files_likely` is only ever populated by the `brain.py`
+    # planner route (`coord plan`/`approve`/`coord dispatch`) — a
+    # drive-queue dispatch (`coord assign`, `coord milestone dispatch`, the
+    # board daemon's drive tick) builds its `Proposal` with no
+    # `files_likely` at all, so stripping a match out of that empty list
+    # would never surface anything. Rather than depend on `files_likely`
+    # being populated, always surface every coordinator-owned doc path
+    # under "do not touch", unconditionally — this mirrors `dispatch` itself,
+    # which already puts the exact same `coordinator_owned_docs(repo)` list
+    # into the wire payload's `files_forbidden` unconditionally (not gated
+    # on `proposal.type`, since `coord.review`'s gate never inverts by
+    # assignment type either), so the briefing is never less informative
+    # than what the worker's sandbox already enforces. `coordinator_doc_
+    # overlap` (the same predicate coord.review's gate uses) still strips a
+    # match out of `files_likely` when that list happens to be populated,
+    # so the doc never appears under both headings at once.
     files_likely = list(proposal.files_likely)
     coordinator_doc_paths = coordinator_owned_docs(repo)
     touched_docs = coordinator_doc_overlap(files_likely, coordinator_doc_paths)
@@ -2863,13 +2875,13 @@ def post_briefing(
             f for f in files_likely
             if not any(path_is_sealed_entry(f, doc) for doc in touched_docs)
         ]
-        do_not_touch = [
-            *do_not_touch,
-            *(
-                (doc, "coordinator-owned doc — only the coordinator writes docs (#2966)")
-                for doc in touched_docs
-            ),
-        ]
+    do_not_touch = [
+        *do_not_touch,
+        *(
+            (doc, "coordinator-owned doc — only the coordinator writes docs (#2966)")
+            for doc in coordinator_doc_paths
+        ),
+    ]
 
     body = format_briefing(
         assignment_id=assignment_id,
