@@ -87,7 +87,7 @@ EVENT_DISPATCH_REFUSED = "dispatch_refused_liveness"
 
 # #4004: embedded verbatim in EVERY `PREDICATE_MACHINE_UNHEALTHY` reason
 # (both the timeout and the confirmed-broken wording below) so
-# `coord.drive_queue.is_credential_probe_refusal_reason` can recognise this
+# `is_credential_probe_refusal_reason` (this module) can recognise this
 # ONE predicate by its own text, independent of the `exit_refused` exit-code
 # bookkeeping every `DispatchRefused` shares regardless of predicate — the
 # same "recognise this refusal by its own marker, not by the exit code"

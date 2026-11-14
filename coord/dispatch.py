@@ -1074,9 +1074,9 @@ def dispatch(
 
     *credential_timeout_fetcher* (#4004) is `(machine: Machine) -> bool`,
     consulted ONLY when *credential_fetcher* above already read `False` for
-    the FINAL chosen machine (after the reroute search just below has
-    already exhausted every fallback): `True` means that refusal was a
-    probe TIMEOUT rather than a confirmed-dead credential, which
+    the FINAL chosen machine (after the credential-routing reroute search
+    below has already exhausted every fallback): `True` means that refusal
+    was a probe TIMEOUT rather than a confirmed-dead credential, which
     `coord.dispatch_liveness.check_dispatch_liveness` turns into a
     distinctly-worded, still-refused-but-not-"re-authenticate" message (see
     its *machine_health_timed_out* parameter). `None` (the default)
@@ -1206,6 +1206,70 @@ def dispatch(
                         "under machines[].repo_paths."
                     )
 
+    # #4004: wrap *credential_fetcher* once, before the reroute search just
+    # below, so every later probe of the same machine within this ONE
+    # dispatch call reuses the first answer instead of asking twice — see
+    # `caching_credential_fetcher`'s docstring for the double-probe/
+    # flapping-disagreement failure this closes. No-op (`None`) when the
+    # caller hasn't wired a fetcher in, same opt-in shape as every other
+    # fetcher here.
+    if credential_fetcher is not None:
+        credential_fetcher = caching_credential_fetcher(credential_fetcher)
+
+    # #4004: STRUCTURAL CREDENTIAL-ROUTING GATE — re-route BEFORE giving
+    # up, the same way the liveness gate just above already does for an
+    # unreachable machine, and placed here (before the provider-
+    # availability, preflight-size and TOS gates below) for the identical
+    # reason those gates grade/target `machine`: a credential-probe
+    # refusal on the proposed machine must not be terminal while a
+    # different capable machine is routable right now, and every gate that
+    # reads `machine` after this point must see the machine the dispatch
+    # will actually land on, not the one the probe just rejected. Review
+    # round 1: this used to run AFTER those gates, so a reroute silently
+    # invalidated `guard_provider_machine_capability`'s already-computed
+    # verdict and the `enforce_preflight_guard` call below, and the
+    # unmet-capabilities briefing note named the pre-reroute machine.
+    #
+    # `route_work_by_credential` only ever moves `proposal.machine_name`
+    # onto a machine that has ALREADY passed the SAME probe the final
+    # `machine_healthy` check below would otherwise fail on; when every
+    # candidate fails (or no fetcher is wired), nothing changes here and
+    # the ordinary gate below still refuses, with the real reason, exactly
+    # as before this issue.
+    if proposal.type == "work" and credential_fetcher is not None:
+        credential_routing = route_work_by_credential(
+            proposed_machine_name=proposal.machine_name,
+            repo_name=proposal.repo_name,
+            machines=config.machines,
+            # Same reasoning as `route_work_by_liveness`'s own
+            # *files_likely*/*capability_rules* forwarding just above: by
+            # this point `proposal.machine_name` may already be the
+            # capability- and/or liveness-chosen machine, so the fallback
+            # search here must not drop coverage either already secured.
+            files_likely=proposal.files_likely,
+            capability_rules=config.smoke_tests.capability_rules,
+            credential_fetcher=credential_fetcher,
+        )
+        if credential_routing is not None and credential_routing.rerouted:
+            proposal.machine_name = credential_routing.machine_name
+            machine = next(
+                (m for m in config.machines if m.name == credential_routing.machine_name),
+                None,
+            )
+            if machine is None:  # pragma: no cover — route_work_by_credential
+                # only ever names a machine it drew from config.machines.
+                raise ValueError(
+                    f"Unknown machine: {credential_routing.machine_name!r}"
+                )
+            repo_path = machine.repo_path(proposal.repo_name)
+            if repo_path is None:  # pragma: no cover — route_work_by_credential's
+                # candidate filter already requires a configured repo_path.
+                raise ValueError(
+                    f"No repo_path configured for {proposal.repo_name!r} on "
+                    f"machine {machine.name!r}. Add it to coordinator.yml "
+                    "under machines[].repo_paths."
+                )
+
     # Resolve deny-list from the repo's worker_permissions config.
     repo = config.repo(proposal.repo_name)
 
@@ -1318,42 +1382,14 @@ def dispatch(
             proposal.repo_name, proposal.issue_number, proposal.target_branch
         )
 
-    # #4004: re-route BEFORE giving up, the same way the liveness gate just
-    # above already does for an unreachable machine — a credential/health
-    # probe refusal on the proposed machine must not be terminal while a
-    # different capable machine is routable right now. `route_work_by_
-    # credential` only ever moves `proposal.machine_name` onto a machine
-    # that has ALREADY passed the SAME probe `machine_healthy` below would
-    # otherwise fail on; when every candidate fails (or no fetcher is
-    # wired), nothing changes here and the ordinary gate below still
-    # refuses, with the real reason, exactly as before this issue.
-    if proposal.type == "work" and credential_fetcher is not None:
-        credential_routing = route_work_by_credential(
-            proposed_machine_name=proposal.machine_name,
-            repo_name=proposal.repo_name,
-            machines=config.machines,
-            credential_fetcher=credential_fetcher,
-        )
-        if credential_routing is not None and credential_routing.rerouted:
-            proposal.machine_name = credential_routing.machine_name
-            machine = next(
-                (m for m in config.machines if m.name == credential_routing.machine_name),
-                None,
-            )
-            if machine is None:  # pragma: no cover — route_work_by_credential
-                # only ever names a machine it drew from config.machines.
-                raise ValueError(
-                    f"Unknown machine: {credential_routing.machine_name!r}"
-                )
-            repo_path = machine.repo_path(proposal.repo_name)
-            if repo_path is None:  # pragma: no cover — route_work_by_credential's
-                # candidate filter already requires a configured repo_path.
-                raise ValueError(
-                    f"No repo_path configured for {proposal.repo_name!r} on "
-                    f"machine {machine.name!r}. Add it to coordinator.yml "
-                    "under machines[].repo_paths."
-                )
-
+    # #4004 review: `machine` here is already the FINAL machine — the
+    # credential reroute above runs before this point precisely so every
+    # gate between it and here (provider-availability, preflight-size, TOS)
+    # grades the same machine the dispatch will land on. `credential_
+    # fetcher` is the cached wrapper installed above, so this reuses the
+    # answer `route_work_by_credential` already got for `machine` (the
+    # reroute target, or the untouched proposed machine when every
+    # candidate failed) instead of probing it again.
     machine_healthy: bool | None = None
     machine_health_timed_out = False
     if credential_fetcher is not None:
@@ -2140,6 +2176,37 @@ class LivenessRouting:
     tried: tuple[tuple[str, str], ...] = ()
 
 
+def repo_capable_unpaused_candidates(
+    repo_name: str,
+    machines: list[Machine],
+    paused: "set[str]",
+    *,
+    exclude: str | None = None,
+) -> list[Machine]:
+    """Every machine in *machines* that `can_work_on(repo_name)`, has a
+    configured `repo_path`, and is not in *paused* — the ONE candidate
+    filter `route_work_by_liveness` and `route_work_by_credential` both
+    apply to their fallback search (#4004 review: previously two
+    hand-copied inline list comprehensions, same filter, same bug surface
+    if one ever drifted from the other). *exclude*, when given, additionally
+    drops that one machine name (the proposed machine itself, which the
+    caller already probed separately).
+
+    *paused* is the caller's own `paused_set(machines, now=...)` result —
+    this function does not call it itself, so a caller juggling several
+    repos in one pass (e.g. `coord.commands.drive_queue`'s credential-
+    routing sweep) computes it once and reuses it across repos instead of
+    paying `paused_set`'s own machine-scan cost per repo.
+    """
+    return [
+        m for m in machines
+        if m.name != exclude
+        and m.can_work_on(repo_name)
+        and m.repo_path(repo_name) is not None
+        and m.name not in paused
+    ]
+
+
 def route_work_by_liveness(
     *,
     proposed_machine_name: str,
@@ -2226,13 +2293,9 @@ def route_work_by_liveness(
         return sum(1 for cap in required if cap in m.capabilities)
 
     paused = paused_set(machines, now=now)
-    fallbacks = [
-        m for m in machines
-        if m.name != proposed_machine_name
-        and m.can_work_on(repo_name)
-        and m.repo_path(repo_name) is not None
-        and m.name not in paused
-    ]
+    fallbacks = repo_capable_unpaused_candidates(
+        repo_name, machines, paused, exclude=proposed_machine_name,
+    )
 
     skipped: list[tuple[str, str]] = []
     if required:
@@ -2304,6 +2367,8 @@ def route_work_by_credential(
     proposed_machine_name: str,
     repo_name: str,
     machines: list[Machine],
+    files_likely: "list[str] | None" = None,
+    capability_rules: "list[SmokeRule] | None" = None,
     credential_fetcher=None,
     now: "datetime | None" = None,
 ) -> CredentialRouting | None:
@@ -2327,10 +2392,20 @@ def route_work_by_credential(
 
     Candidate filter mirrors `route_work_by_liveness`'s own (#3241/#3353
     review): `can_work_on(repo_name)`, a configured `repo_path`, and not in
-    the FULL cordon-inclusive `paused_set()`. No capability-floor logic
-    here — a credential probe has nothing to do with which `## Files`
-    capability a diff needs, unlike the liveness-vs-capability interaction
-    `route_work_by_liveness` has to preserve.
+    the FULL cordon-inclusive `paused_set()`.
+
+    *files_likely* / *capability_rules* apply the SAME coverage floor
+    `route_work_by_liveness` applies (review round 1): the credential probe
+    itself has nothing to do with `## Files` capabilities, but this
+    function is called BEFORE `dispatch()`'s capability/liveness-chosen
+    `proposal.machine_name` is handed to the provider-availability and
+    preflight gates — a capability-blind fallback here would silently undo
+    the capability routing the instant the capability-matched machine also
+    failed its credential probe, the same regression
+    `route_work_by_liveness`'s own floor exists to prevent. A fallback is
+    eligible only if it covers at least as many of the matched capabilities
+    as the proposed machine does; passing neither argument (the default)
+    keeps the floor off for callers with no diff to match.
     """
     if credential_fetcher is None:
         return None
@@ -2348,23 +2423,80 @@ def route_work_by_credential(
         (proposed_machine_name, "failed live credential/health probe")
     ]
 
-    paused = paused_set(machines, now=now)
-    fallbacks = [
-        m for m in machines
-        if m.name != proposed_machine_name
-        and m.can_work_on(repo_name)
-        and m.repo_path(repo_name) is not None
-        and m.name not in paused
-    ]
+    required: tuple[str, ...] = ()
+    if capability_rules:
+        from coord.smoke import match_rules  # noqa: PLC0415
 
-    for m in fallbacks:
+        required = tuple(match_rules(list(files_likely or []), capability_rules))
+
+    def _coverage(m: Machine) -> int:
+        return sum(1 for cap in required if cap in m.capabilities)
+
+    paused = paused_set(machines, now=now)
+    fallbacks = repo_capable_unpaused_candidates(
+        repo_name, machines, paused, exclude=proposed_machine_name,
+    )
+
+    skipped: list[tuple[str, str]] = []
+    if required:
+        floor = _coverage(proposed)
+        eligible = [m for m in fallbacks if _coverage(m) >= floor]
+        for m in fallbacks:
+            if _coverage(m) < floor:
+                missing = ", ".join(c for c in required if c not in m.capabilities)
+                skipped.append(
+                    (m.name, f"capability shortfall (does not cover: {missing})")
+                )
+        # Stable sort: better coverage first, `machines` declaration order
+        # preserved within a tier — same determinism rule as
+        # `route_work_by_capability`'s tie-break, never dict/set order.
+        eligible.sort(key=_coverage, reverse=True)
+    else:
+        eligible = fallbacks
+
+    for m in eligible:
         if bool(credential_fetcher(m)):
             return CredentialRouting(
                 machine_name=m.name, rerouted=True, tried=tuple(tried),
             )
         tried.append((m.name, "failed live credential/health probe"))
 
+    tried.extend(skipped)
     return CredentialRouting(machine_name=None, rerouted=False, tried=tuple(tried))
+
+
+def caching_credential_fetcher(fetcher):
+    """Wrap a credential/health fetcher so each machine is probed at most
+    ONCE per returned callable (#4004 review).
+
+    `dispatch()` asks "is this machine still routable" twice for the same
+    machine: once inside `route_work_by_credential`'s own candidate search
+    and again for whichever machine the search settles on (the final
+    `machine_healthy` check feeding `check_dispatch_liveness`). Probing
+    twice is a real second `/health` GET per dispatch, and in the FLAPPING
+    case this issue is about — a probe that passes, then fails, within the
+    same dispatch — the two calls can disagree: the routing search sees a
+    pass and declines to reroute, then the second call sees a fail and
+    refuses outright, skipping the fallback search entirely even though a
+    healthy candidate was available.
+
+    Mirrors `caching_status_fetcher` exactly (same per-call, per-machine
+    cache; same "construct a fresh one per dispatch, never module-global"
+    rule — liveness is the thing being measured). `dispatch()` wraps
+    *credential_fetcher* in one of these once, before calling
+    `route_work_by_credential`, so every later read of the same machine
+    within that one dispatch reuses the first answer instead of probing
+    again.
+    """
+    cache: dict[str, bool] = {}
+
+    def _cached(machine):
+        key = machine.name
+        if key not in cache:
+            cache[key] = bool(fetcher(machine))
+        return cache[key]
+
+    return _cached
 
 
 @dataclass(frozen=True)

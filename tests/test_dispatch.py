@@ -5225,6 +5225,74 @@ class TestRouteWorkByCredential:
         assert result.machine_name is None
         assert {name for name, _ in result.tried} == {"precision"}
 
+    # ── #4004 review round 1: capability-aware fallbacks ─────────────────
+    #
+    # `dispatch()` now runs this reroute BEFORE the provider-availability
+    # and preflight-size gates, so the machine it hands back must not drop
+    # `## Files` capability coverage the #3241 capability gate already
+    # secured — the same regression `route_work_by_liveness`'s own floor
+    # guards against.
+
+    def _capability_machines(self) -> list[Machine]:
+        return [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="headless", host="headless.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+
+    def test_refuses_rather_than_dropping_a_required_capability(self) -> None:
+        """The only GTK machine fails its credential probe, and the only
+        other candidate cannot build the diff's own suite — rerouting there
+        would reopen the UNCONFIRMED-verdict hole (#2217/#2464), so this
+        must refuse (`machine_name is None`) instead."""
+        result = route_work_by_credential(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            credential_fetcher=_credential_fetcher({"headless"}),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        reasons = dict(result.tried)
+        assert "capability shortfall" in reasons["headless"]
+        assert "gtk" in reasons["headless"]
+
+    def test_reroutes_when_fallback_covers_the_same_capability(self) -> None:
+        """A fallback that covers the SAME capabilities as the proposed
+        machine is still eligible — the floor is "at least as much
+        coverage", not "identical machine"."""
+        machines = self._capability_machines() + [
+            Machine(
+                name="gtkbox2", host="gtkbox2.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+        ]
+        result = route_work_by_credential(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=machines,
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            credential_fetcher=_credential_fetcher({"gtkbox2"}),
+        )
+        assert result is not None
+        assert result.machine_name == "gtkbox2"
+        assert result.rerouted is True
+
 
 class TestDispatchCredentialRouting:
     """#4004 end to end: `dispatch()` itself reroutes a `type="work"`
@@ -5304,6 +5372,101 @@ class TestDispatchCredentialRouting:
         dispatch(proposal, config)  # credential_fetcher defaults to None
         assert "laptop.tailnet" in mock_post.call_args.args[0]
         assert proposal.machine_name == "laptop"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_rerouted_machine_still_gets_the_provider_capability_gate(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#4004 review round 1 (blocking): the credential reroute must run
+        BEFORE the #1711 provider-availability gate, not after it — a
+        reroute onto a machine that never declared `provider:opencode`
+        must still be caught here, not surface later as an ENOENT-shaped
+        subprocess error on the agent after the assignment row and
+        worktree already exist."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+            machines=[
+                Machine(
+                    name="precision", host="precision.tailnet", repos=["api"],
+                    repo_paths={"api": "/home/user/src/api"},
+                    capabilities=["provider:opencode"],
+                ),
+                Machine(
+                    # Capable of the repo, routable, but never declared the
+                    # provider capability — the exact gap #1711 exists to
+                    # catch, now reachable only via the #4004 reroute.
+                    name="macmini", host="macmini.tailnet", repos=["api"],
+                    repo_paths={"api": "/home/user/src/api"},
+                ),
+            ],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "opencode": ProviderDef(type="opencode"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="precision", repo_name="api",
+            issue_number=2361, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        with pytest.raises(ValueError, match="provider:opencode"):
+            dispatch(p, cfg, credential_fetcher=_credential_fetcher({"macmini"}))
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_a_pass_then_fail_probe_still_reroutes_instead_of_refusing(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#4004 review round 1 (non-blocking, fixed): a FLAPPING probe —
+        healthy when `route_work_by_credential` checks the proposed
+        machine, dead by the time the old second, independent probe ran —
+        used to make the reroute search decline (nothing to reroute) and
+        then have the later check refuse outright, skipping the fallback
+        search even though a healthy candidate existed the whole time.
+        The cached fetcher below answers 'unhealthy' for precision on
+        every call, so the ONLY way this test passes is if `dispatch()`
+        reuses one verdict per machine rather than probing precision twice
+        with different answers."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config([
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="precision", repo_name="quadraui",
+            issue_number=2361, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+        calls: list[str] = []
+
+        def _flapping(machine):
+            calls.append(machine.name)
+            if machine.name == "precision":
+                return False
+            return True
+
+        dispatch(p, cfg, credential_fetcher=_flapping)
+
+        assert p.machine_name == "macmini"
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        # precision is probed exactly once for the whole dispatch call —
+        # the caching wrapper, not a second live probe, answers the later
+        # `machine_healthy` check (moot here since macmini won, but this
+        # pins the "probed at most once per machine" contract directly).
+        assert calls.count("precision") == 1
 
 
 class TestDispatchLivenessTimeoutDetail:

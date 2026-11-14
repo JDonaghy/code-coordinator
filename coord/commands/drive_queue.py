@@ -6616,10 +6616,10 @@ def _fetch_live_credential_routing_clear(
 
     THE CHEAP RE-CHECK, the SAME question dispatch-time routing already
     asks (#2096/#2085 "one question, one answer"): for each qualifying
-    entry's repo, every machine that `can_work_on(repo_name)`, has a
-    configured `repo_path`, and is not in the cordon-inclusive
-    `paused_set()` — same candidate filter `coord.dispatch.
-    route_work_by_credential` uses at dispatch time — probed with
+    entry's repo, every machine `coord.dispatch.
+    repo_capable_unpaused_candidates` returns — the SAME candidate filter
+    `coord.dispatch.route_work_by_credential` calls at dispatch time, not a
+    second hand-copied one — probed with
     `coord.network.claude_credential_reachable`. Clear the moment ANY ONE
     of them passes; this does not need to know which machine was
     originally refused (unlike the Test-stage routing sibling's capability
@@ -6654,6 +6654,7 @@ def _fetch_live_credential_routing_clear(
 
     try:
         from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.dispatch import repo_capable_unpaused_candidates  # noqa: PLC0415
         from coord.machine_pause import paused_set  # noqa: PLC0415
         from coord.network import claude_credential_reachable  # noqa: PLC0415
 
@@ -6679,12 +6680,7 @@ def _fetch_live_credential_routing_clear(
             )
             continue
         repo_name, _issue_num = parsed
-        candidates = [
-            m for m in cfg.machines
-            if m.can_work_on(repo_name)
-            and m.repo_path(repo_name) is not None
-            and m.name not in paused
-        ]
+        candidates = repo_capable_unpaused_candidates(repo_name, cfg.machines, paused)
         routable = False
         routable_machine = None
         for m in candidates:
