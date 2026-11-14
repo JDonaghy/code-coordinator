@@ -1145,7 +1145,9 @@ def milestone_dispatch_cmd(
     # same upsert semantics for an issue already queued.
     from coord.commands.drive_queue import (  # noqa: PLC0415
         _applicable_auto_after,
+        _coordinator_doc_declared_warning,
         _predict_overlap,
+        _record_coordinator_doc_declared,
         _record_overlap_prediction,
     )
     from coord.overlap_predict import fanout_warnings  # noqa: PLC0415
@@ -1172,9 +1174,20 @@ def milestone_dispatch_cmd(
             click.echo(f"  {key}: not queued: {exc}", err=True)
             failures += 1
             continue
-        prediction, staleness_note, malformed_note = _predict_overlap(
+        prediction, staleness_note, malformed_note, candidate_body = _predict_overlap(
             config_path, repo_entry.name, qe.issue_number, existing
         )
+        # #4008: a milestone node whose own `## Files` names a coordinator-
+        # owned doc is guaranteed to merge partial, exactly as it would via a
+        # manual `add` — same helper, same wording, same audit record, so a
+        # bulk enqueue is not the one path that stays silent about it.
+        coordinator_doc_note = _coordinator_doc_declared_warning(
+            cfg, repo_entry.name, candidate_body
+        )
+        if coordinator_doc_note:
+            _record_coordinator_doc_declared(
+                repo_entry.name, qe.issue_number, coordinator_doc_note
+            )
         auto_after = _applicable_auto_after(
             existing, repo_entry.name, qe.issue_number, after, prediction
         )
@@ -1190,13 +1203,16 @@ def milestone_dispatch_cmd(
         # this entry's own body could only be read from cache. #3258: plus
         # the same warning when this entry's own `## Files` heading parsed to
         # zero paths — the whole point of reusing `_predict_overlap` here is
-        # byte-identical behaviour to a manual `add`.
+        # byte-identical behaviour to a manual `add`. #4008: plus the
+        # coordinator-owned-doc warning, for the same reason.
         notes = []
         if auto_after:
             notes.append(prediction.reason)
         notes.extend(fanout_warnings(prediction))
         if malformed_note:
             notes.append(malformed_note)
+        if coordinator_doc_note:
+            notes.append(coordinator_doc_note)
         if staleness_note:
             notes.append(staleness_note)
         overlap_note = ("\n     " + "\n     ".join(notes)) if notes else ""
