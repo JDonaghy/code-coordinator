@@ -96,7 +96,7 @@ class TestCheckDispatchLiveness:
     def test_unhealthy_machine_reason_carries_the_credential_probe_marker(
         self,
     ) -> None:
-        """#4004: `coord.drive_queue.is_credential_probe_refusal_reason`
+        """#4004: `is_credential_probe_refusal_reason` (this module)
         recognises this ONE predicate by this marker, independent of the
         exit-code bookkeeping every `DispatchRefused` shares — pin that
         the marker is actually in the default (non-timeout) message."""

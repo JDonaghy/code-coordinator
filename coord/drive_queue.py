@@ -8953,16 +8953,24 @@ def plan_tick(
             # only `_reconcile_blocked`'s gate-clear path, leaving the
             # `after=` cascade above unstaggered even though a many-rows-
             # chained-on-one-prereq clear is the identical synchronized-poll
-            # shape). Stagger it: only the first
-            # `max_resumes_per_tick_per_repo` CONFIRMED-CLEAR resumes per
-            # repo actually release this tick, from EITHER path; the rest
-            # stay `blocked` (no state write, so they re-enter this exact
-            # branch next tick and get first refusal then) with a reason
-            # explaining why, instead of all firing at once.
+            # shape). `credential_routing_recovered` (#4004) is the SAME
+            # shape again: one host's credential/health probe coming back
+            # clears every row that was blocked on it, each driving its own
+            # live `gh` re-checks on this tick's next poll — so it staggers
+            # through the same cap, not a fourth unthrottled path. Stagger
+            # it: only the first `max_resumes_per_tick_per_repo` CONFIRMED-
+            # CLEAR resumes per repo actually release this tick, from ANY
+            # of these paths; the rest stay `blocked` (no state write, so
+            # they re-enter this exact branch next tick and get first
+            # refusal then) with a reason explaining why, instead of all
+            # firing at once.
             if (
                 blocked_reconcile is not None
                 and blocked_reconcile.outcome
-                in ("resumed", "merge_only", "test_routing_recovered")
+                in (
+                    "resumed", "merge_only", "test_routing_recovered",
+                    "credential_routing_recovered",
+                )
                 and max_resumes_per_tick_per_repo is not None
                 and max_resumes_per_tick_per_repo > 0
             ):

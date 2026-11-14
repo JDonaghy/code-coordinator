@@ -2310,12 +2310,27 @@ def test_a_credential_probe_refusal_self_clears_and_launches(
     assert audit_row["issue"] == 3700
 
 
-def test_a_credential_probe_refusal_stays_blocked_with_no_live_opinion(
-    cli, seed, launches, coord_db,
+def test_a_credential_probe_refusal_stays_blocked_while_still_unroutable(
+    cli, seed, launches, coord_db, config_file, monkeypatch,
 ):
-    """No shell wiring opinion (the default, un-monkeypatched fetcher
-    probing a fleet with no machines configured for this repo) leaves the
-    row blocked — "no live opinion" never means "assume clear"."""
+    """A live re-check that actually RUNS (a capable machine with a
+    configured `repo_path` exists) but reports every candidate still
+    refused leaves the row blocked — "no live opinion" (and "still
+    refused") never means "assume clear."
+
+    The shared `_CONFIG_YAML` fixture declares `dellserver` for this repo
+    but configures no `repo_paths` at all, which would exclude it from
+    `_fetch_live_credential_routing_clear`'s own candidate filter before a
+    single probe ever runs and leave this test asserting on an empty
+    candidate list rather than a genuine "probed and still refused"
+    reading. Overriding the config with a real `repo_paths` entry, and
+    monkeypatching the actual probe to refuse, makes the candidate filter
+    find a real machine and the live probe genuinely run and say no."""
+    config_file.write_text(
+        _CONFIG_YAML + f"    repo_paths: {{{REPO}: /tmp/{REPO}}}\n"
+    )
+    monkeypatch.setattr("coord.network.claude_credential_reachable", lambda m: False)
+
     seed(issues={3701: "open"})
     cli("add", REPO, "3701")
     state._update_drive_queue_entry_local(

@@ -8301,6 +8301,45 @@ def test_an_unrelated_1844_refusal_never_gets_the_credential_treatment():
     assert plan.reconciles[0].outcome == "refused"
 
 
+def test_a_mass_credential_routing_recovery_is_also_staggered():
+    """#3536 review (round 1 of #4004): one host's credential/health probe
+    coming back routable is the SAME many-rows-one-latch clear shape as a
+    merge-gate latch (#2230) or an `after=` prereq cascade (#2362) — one
+    `coord drive-queue` tick's live re-check can confirm EVERY row blocked
+    on that host at once, each then driving its own live `gh` re-checks on
+    the very next poll. `credential_routing_recovered` must count against
+    the SAME per-repo `max_resumes_per_tick_per_repo` stagger cap, not
+    release unthrottled as a fourth, uncapped path."""
+    entries = [
+        entry(
+            2361 + i, position=i, state=STATE_BLOCKED,
+            last_reason=CREDENTIAL_REFUSAL, resumes=0,
+        )
+        for i in range(3)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=4,
+        live_credential_routing_clear={
+            entry_key(REPO, 2361 + i): True for i in range(3)
+        },
+    )
+    by_key = {r.key: r for r in plan.reconciles}
+    resumed = [k for k, r in by_key.items() if r.outcome == "credential_routing_recovered"]
+    staggered = [k for k, r in by_key.items() if r.outcome == "resume_staggered"]
+    # Default cap is 2 — the two earliest-positioned rows recover this
+    # tick; the third is staggered exactly like a #2230/#2362 mass clear
+    # would be.
+    assert sorted(resumed) == sorted(
+        [entry_key(REPO, 2361), entry_key(REPO, 2362)]
+    )
+    assert staggered == [entry_key(REPO, 2363)]
+
+    staggered_reconcile = by_key[entry_key(REPO, 2363)]
+    assert "state" not in staggered_reconcile.updates  # stays blocked
+    assert "resumes" not in staggered_reconcile.updates  # budget not spent
+    assert "#3536" in staggered_reconcile.reason
+
+
 # ── plan_tick: a dead-end exit blocks the entry (#2019) ──────────────────────
 #
 # The second PERMANENT cause, sharing #1844's branch. Before #2019 this shape

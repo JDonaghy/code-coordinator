@@ -8644,6 +8644,42 @@ def test_a_non_refusal_run_failure_carries_the_childs_captured_output(
     assert failure_text in message
 
 
+def test_a_non_refusal_failures_exit_code_survives_a_dispatch_failed_hoist(
+    driver_factory, monkeypatch,
+):
+    """#4004 review round 1: `_lead_with_dispatch_failure` hoists the FIRST
+    "dispatch failed:" line to the front whenever the captured output
+    contains one — including a non-refusal exit whose cause happens to be
+    a `dispatch failed:` line printed for some OTHER reason than
+    `EXIT_DISPATCH_REFUSED` (e.g. a flaky subprocess that both printed that
+    text and exited non-deterministically). Before this fix, hoisting
+    discarded `base_msg` (`action.error_message` or the `coord ... exited
+    {rc}` fallback) entirely on that path — the exit-code context an
+    operator needs to tell THIS failure apart from any other non-zero
+    exit vanished the moment a `dispatch failed:` line was also present."""
+    rc = 7
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    failure_text = "some preamble\n  dispatch failed: something broke on the agent side"
+
+    def failing_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, rc, "", failure_text)
+
+    monkeypatch.setattr("coord.drive.subprocess.run", failing_run)
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    message = str(exc.value)
+    # The hoisted cause leads...
+    assert message.strip().startswith("dispatch failed:")
+    # ...but the action's own `base_msg` (here `action.error_message`,
+    # which for this board state is "coord retry failed for w1") is NOT
+    # silently dropped just because a `dispatch failed:` line was also
+    # present in the captured output.
+    assert "coord retry failed for w1" in message
+    # Nothing discarded — the full captured output still follows.
+    assert failure_text in message
+    assert rc not in (0, EXIT_DISPATCH_REFUSED)  # a genuinely distinct exit
+
+
 def test_a_non_refusal_run_failures_output_reaches_the_drive_exited_audit_row(
     driver_factory, monkeypatch, coord_db,
 ):
