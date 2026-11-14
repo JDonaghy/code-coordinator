@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import warnings
 from pathlib import Path
 from unittest.mock import patch
@@ -601,18 +602,26 @@ def test_post_review_claim_honours_client_stamp_and_release_own(
     """#3668: /review-claim stores the client-minted `claimed_at`, so a
     client whose claim call failed can release exactly its own row via
     /review-claim-release-own — and a release carrying any other stamp
-    (a different dispatcher's attempt) leaves the claim held."""
+    (a different dispatcher's attempt) leaves the claim held.
+
+    The stamp is minted from the current clock, like a real dispatcher's is:
+    a claim far enough in the past reads as leaked to
+    `state.review_claim_is_leaked` and a later claim attempt reclaims it
+    rather than being denied, which is a different behaviour than the one
+    under test here.
+    """
+    stamp = time.time()
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
     with TestClient(app) as cli:
         won = cli.post(
             "/review-claim",
-            json={"of_assignment_id": "work-own", "claimed_at": 1234.5},
+            json={"of_assignment_id": "work-own", "claimed_at": stamp},
         )
         assert won.json()["claimed"] is True
 
         foreign = cli.post(
             "/review-claim-release-own",
-            json={"of_assignment_id": "work-own", "claimed_at": 999.0},
+            json={"of_assignment_id": "work-own", "claimed_at": stamp - 1.0},
         )
         assert foreign.status_code == 200 and foreign.json()["released"] is False
         still_held = cli.post("/review-claim", json={"of_assignment_id": "work-own"})
@@ -620,7 +629,7 @@ def test_post_review_claim_honours_client_stamp_and_release_own(
 
         own = cli.post(
             "/review-claim-release-own",
-            json={"of_assignment_id": "work-own", "claimed_at": 1234.5},
+            json={"of_assignment_id": "work-own", "claimed_at": stamp},
         )
         assert own.status_code == 200 and own.json()["released"] is True
         reclaimed = cli.post("/review-claim", json={"of_assignment_id": "work-own"})

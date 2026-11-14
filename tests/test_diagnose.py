@@ -1436,8 +1436,15 @@ def test_diagnose_review_detects_leaked_claim_with_no_review_rows(
     assert res.recovered is False
     assert res.needs_reset is True
     assert any("review_claims" in f or "review-dispatch claim" in f for f in res.findings)
-    # A dry-run must not touch the claim.
-    assert state.claim_review_dispatch("w1") is False
+    # A dry-run must not touch the claim — probed through the read-only
+    # `review_claims` accessors, not `claim_review_dispatch`. The claim this
+    # test builds IS leaked by `state.review_claim_is_leaked`'s definition, so
+    # a claim attempt would legitimately reclaim it and could never observe
+    # "still held"; the row's survival AND its untouched `claimed_at` stamp
+    # are what "the dry-run changed nothing" actually means.
+    assert state.has_review_claim("w1") is True
+    age = state.review_claim_age_secs("w1")
+    assert age is not None and age >= 3600.0
 
 
 def test_reset_review_releases_leaked_claim_with_no_review_rows(
@@ -1463,8 +1470,14 @@ def test_reset_review_releases_leaked_claim_with_no_review_rows(
 
     assert res.reset_performed is True
     assert res.recovered is True
-    # The claim is gone — a fresh claim attempt for "w1" must succeed again,
-    # exactly like `dispatch_review` would need for a real re-dispatch.
+    # The claim row is gone — asserted on the row itself, because a claim
+    # attempt alone no longer distinguishes "released" from "still held but
+    # reclaimable": `claim_review_dispatch` would also return True against a
+    # surviving leaked row (see `state.review_claim_is_leaked`), making that
+    # probe unable to fail here.
+    assert state.has_review_claim("w1") is False
+    # And it is dispatchable again, exactly like `dispatch_review` would need
+    # for a real re-dispatch.
     assert state.claim_review_dispatch("w1") is True
 
 
@@ -1505,8 +1518,11 @@ def test_reset_review_reports_leaked_claim_delete_failure_when_row_survives(
         "did NOT persist" in f
         for f in res.findings
     )
-    # Still held — the release never actually took.
-    assert state.claim_review_dispatch("w1") is False
+    # Still present — the release never actually took. Read the row, not a
+    # claim attempt: a surviving leaked row is reclaimable by design, so
+    # `claim_review_dispatch` returning True here would say nothing about
+    # whether the delete persisted.
+    assert state.has_review_claim("w1") is True
 
 
 def test_diagnose_review_fresh_claim_without_row_not_treated_as_leaked(
