@@ -1104,6 +1104,52 @@ def test_briefing_coordinator_doc_tamper_does_not_invert_for_test_author() -> No
     assert "request-changes is mandatory" in briefing
 
 
+# ── #4008: one shared coordinator-owned-doc predicate ───────────────────────
+#
+# An issue whose own `## Files` declares a coordinator-owned doc is
+# guaranteed to merge partial unless something strips it out of the Work
+# briefing BEFORE the worker edits it. The strip-set (coord.dispatch /
+# coord.commands.drive_queue) and the reject-set (this gate) must be
+# computed by the SAME function — two independent implementations that
+# agree today are a split-brain waiting to happen.
+
+
+def test_path_is_sealed_is_the_shared_models_predicate() -> None:
+    """``coord.review._path_is_sealed`` is not a second copy of
+    ``coord.models.path_is_sealed_entry`` — it IS that function."""
+    from coord.models import path_is_sealed_entry
+    from coord.review import _path_is_sealed
+
+    assert _path_is_sealed is path_is_sealed_entry
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        ["CLAUDE.md"],
+        ["docs/README.md"],
+        ["CLAUDE.md", "coord/dispatch.py"],
+        ["docs/", "CLAUDE.md"],
+        [],
+    ],
+)
+def test_coordinator_doc_overlap_matches_review_gate(paths: list[str]) -> None:
+    """``coord.models.coordinator_doc_overlap`` (the briefing/enqueue
+    strip-set) agrees with ``coord.review``'s own mandatory gate (the
+    reject-set) for the same declared paths, for every sample here."""
+    from coord.models import coordinator_doc_overlap
+    from coord.review import _coordinator_doc_violation_lines
+
+    coordinator_doc_paths = ["CLAUDE.md"]
+    diff_text = "".join(
+        f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1,2 @@\n+x\n"
+        for p in paths
+    )
+    touched_by_gate, _ = _coordinator_doc_violation_lines(diff_text, coordinator_doc_paths)
+    touched_by_predicate = coordinator_doc_overlap(paths, coordinator_doc_paths)
+    assert sorted(touched_by_gate or []) == sorted(touched_by_predicate)
+
+
 # ── #1175: test-author/mock-author inverse tamper check ────────────────────
 
 

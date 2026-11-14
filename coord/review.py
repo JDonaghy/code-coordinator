@@ -65,6 +65,7 @@ from coord.models import (
     Repo,
     coordinator_owned_docs,
     parse_issue_resolution,
+    path_is_sealed_entry,
     trust_issue_closed_for,
 )
 from coord.refine_chat import MAX_CLAUDE_MD_CHARS
@@ -2001,20 +2002,13 @@ def read_repo_claude_md(repo_path: Path) -> str | None:
         return None
 
 
-def _path_is_sealed(path: str, sealed: str) -> bool:
-    """Does *path* fall under the sealed entry *sealed*?
-
-    #1552: the sealed set is no longer uniformly directory prefixes. An
-    entry ending in ``/`` (``tests/acceptance/``) is a prefix — everything
-    beneath it is sealed. Anything else is a driver ``entrypoint:`` naming
-    exactly one FILE (``tui/tests/acceptance.rs``), and must match exactly:
-    a bare ``startswith`` would also swallow ``tui/tests/acceptance.rs.bak``
-    and ``tui/tests/acceptance.rs.orig``, quietly widening the one narrow
-    allowance a `test-author` gets.
-    """
-    if sealed.endswith("/"):
-        return path.startswith(sealed)
-    return path == sealed
+# #4008: the matching rule itself ("is this path covered by that declared
+# prefix/file") lives once, in `coord.models.path_is_sealed_entry`, so this
+# module's sealed-acceptance-path check and `coordinator_doc_overlap`'s
+# coordinator-owned-doc check (used outside this module, at enqueue/briefing
+# time) can never drift onto different answers for the same path. Aliased
+# under the module-local name every call site here already uses.
+_path_is_sealed = path_is_sealed_entry
 
 
 def _sealed_to_sealed_rename_exemptions(

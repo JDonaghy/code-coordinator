@@ -7,6 +7,7 @@ import string
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from coord.uat_checks import UatCheckConfig
@@ -918,6 +919,50 @@ def coordinator_owned_docs(repo: "Repo | None") -> list[str]:
             if f not in result:
                 result.append(f)
     return result
+
+
+def path_is_sealed_entry(path: str, sealed: str) -> bool:
+    """Does *path* fall under the sealed/coordinator-owned entry *sealed*?
+
+    The ONE matching rule for "is this path covered by that declared
+    prefix/file" — shared by :func:`coord.review`'s sealed-acceptance-path
+    check (``test-author``/``mock-author`` tamper detection, #944/#1552) and
+    :func:`coordinator_doc_overlap` below (#2966/#4008), so the two can never
+    drift onto different answers for the same path (#4008's "one question,
+    one answer" requirement). ``coord.review`` imports this directly as its
+    own ``_path_is_sealed`` rather than keeping a second copy.
+
+    An entry ending in ``/`` (``tests/acceptance/``) is a directory prefix —
+    everything beneath it matches. Anything else names exactly one FILE
+    (``CLAUDE.md``, ``tui/tests/acceptance.rs``) and must match exactly: a
+    bare ``startswith`` would also swallow ``CLAUDE.md.bak``.
+    """
+    if sealed.endswith("/"):
+        return path.startswith(sealed)
+    return path == sealed
+
+
+def coordinator_doc_overlap(
+    paths: Iterable[str], coordinator_doc_paths: Iterable[str],
+) -> list[str]:
+    """Entries of *coordinator_doc_paths* that any of *paths* falls under.
+
+    (#4008) The shared predicate for "would ``coord.review``'s mandatory
+    COORDINATOR-OWNED DOC EDITED gate reject a diff touching this path?" —
+    used both by that gate itself (``coord.review._coordinator_doc_
+    violation_lines``, fed paths parsed out of a real diff) and by callers
+    that only ever see a declared path string, never a diff:
+    ``coord.commands.drive_queue``'s enqueue-time warning and
+    ``coord.dispatch``'s Work-briefing do-not-touch split. One function
+    answering the question for both sides means an edit to the matching rule
+    can't update one copy and silently leave the other stale.
+    """
+    touched: list[str] = []
+    paths = list(paths)
+    for doc in coordinator_doc_paths:
+        if any(path_is_sealed_entry(p, doc) for p in paths):
+            touched.append(doc)
+    return touched
 
 
 def trust_issue_closed_for(assignment_type: str | None) -> bool:
