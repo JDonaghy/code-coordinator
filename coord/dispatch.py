@@ -27,7 +27,15 @@ from coord.comments import (
 )
 from coord.config import Config, SmokeRule
 from coord.dispatch_liveness import check_dispatch_liveness, record_dispatch_refusal
-from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo, coordinator_owned_docs
+from coord.models import (
+    EPIC_DECOMPOSE_TYPE,
+    Machine,
+    Proposal,
+    Repo,
+    coordinator_doc_overlap,
+    coordinator_owned_docs,
+    path_is_sealed_entry,
+)
 
 AGENT_PORT = 7433
 
@@ -2836,13 +2844,40 @@ def post_briefing(
     if repo is None:
         raise ValueError(f"Unknown repo: {proposal.repo_name!r}")
 
+    # #4008: an issue's own `## Files` can name a coordinator-owned doc
+    # (CLAUDE.md, or anything `coordinator_only_files` adds) — editing it is
+    # ALWAYS a mandatory request-changes at review (coord.review's
+    # COORDINATOR-OWNED DOC EDITED gate), regardless of anything else in the
+    # diff. Listing it under "files to edit" here would hand the worker a
+    # briefing that is guaranteed to merge partial after a wasted fix round.
+    # Strip it out of the files to edit and surface it under "do not touch"
+    # instead, with a one-line note that the doc slice is coordinator work —
+    # `coordinator_doc_overlap` is the exact same predicate coord.review's
+    # gate uses, so this split can never disagree with what the gate would
+    # actually reject (#4008).
+    files_likely = list(proposal.files_likely)
+    coordinator_doc_paths = coordinator_owned_docs(repo)
+    touched_docs = coordinator_doc_overlap(files_likely, coordinator_doc_paths)
+    if touched_docs:
+        files_likely = [
+            f for f in files_likely
+            if not any(path_is_sealed_entry(f, doc) for doc in touched_docs)
+        ]
+        do_not_touch = [
+            *do_not_touch,
+            *(
+                (doc, "coordinator-owned doc — only the coordinator writes docs (#2966)")
+                for doc in touched_docs
+            ),
+        ]
+
     body = format_briefing(
         assignment_id=assignment_id,
         machine_name=proposal.machine_name,
         repo_name=proposal.repo_name,
         issue_number=proposal.issue_number,
         briefing=proposal.briefing,
-        files_likely=proposal.files_likely,
+        files_likely=files_likely,
         do_not_touch=do_not_touch,
     )
     github_ops.post_issue_comment(repo.github, proposal.issue_number, body)

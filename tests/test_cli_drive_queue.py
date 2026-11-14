@@ -1499,6 +1499,32 @@ def test_a_well_formed_files_heading_does_not_trigger_the_malformed_warning(
     assert "#3258" not in result.output
 
 
+# ── #4008: `## Files` naming a coordinator-owned doc warns at enqueue ───────
+
+
+def test_declaring_claude_md_in_files_warns_at_enqueue(cli, declare):
+    declare(430, "coord/review.py", "CLAUDE.md")
+
+    result = cli("add", REPO, "430")
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" in result.output
+    assert "coordinator-owned doc" in result.output
+    assert "`CLAUDE.md`" in result.output
+    assert "#2966" in result.output
+    # ORDER/ADVISE, never REFUSE — the entry still queues.
+    assert queued(430) is not None
+
+
+def test_a_files_heading_with_no_coordinator_doc_does_not_warn(cli, declare):
+    declare(431, "coord/review.py", "coord/dispatch.py")
+
+    result = cli("add", REPO, "431")
+
+    assert result.exit_code == 0, result.output
+    assert "coordinator-owned doc" not in result.output
+
+
 def test_editing_the_issue_live_narrows_a_stale_bare_directory_declaration(
     cli, declare, monkeypatch,
 ):

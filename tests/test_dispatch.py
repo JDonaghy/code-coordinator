@@ -2488,6 +2488,54 @@ class TestPostBriefing:
         mock_comment.assert_called_once()
         mock_add_labels.assert_called_once()
 
+    @patch("coord.dispatch.github_ops.post_issue_comment")
+    def test_strips_coordinator_owned_doc_into_do_not_touch(
+        self, mock_comment: MagicMock, config: Config,
+    ) -> None:
+        """#4008: an issue's own `## Files` naming a coordinator-owned doc
+        (CLAUDE.md, the fleet-wide default) must never show up as a file
+        to EDIT in the posted briefing — only under "do not touch". Posting
+        it as editable hands the worker a diff guaranteed to trip review's
+        mandatory COORDINATOR-OWNED DOC EDITED gate."""
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=10,
+            issue_title="Fix auth", rationale="best fit",
+            files_likely=["auth.py", "CLAUDE.md"], briefing="Fix the auth module",
+        )
+        post_briefing(proposal, config)
+        body = mock_comment.call_args.args[2]
+        assert "**Files:** `auth.py`" in body
+        assert "`CLAUDE.md`" not in body.split("**Do not touch:**")[0]
+        assert "**Do not touch:**" in body
+        assert "`CLAUDE.md`" in body.split("**Do not touch:**")[1].splitlines()[0]
+
+    @patch("coord.dispatch.github_ops.post_issue_comment")
+    def test_coordinator_doc_strip_matches_review_gate_reject_set(
+        self, mock_comment: MagicMock, config: Config,
+    ) -> None:
+        """#4008: the briefing's strip-set and the review gate's reject-set
+        must be the same answer for the same declared paths — computed by
+        the one shared predicate, `coord.models.coordinator_doc_overlap`."""
+        from coord.models import coordinator_doc_overlap, coordinator_owned_docs
+
+        declared = ["auth.py", "CLAUDE.md", "docs/README.md"]
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=10,
+            issue_title="Fix auth", rationale="best fit",
+            files_likely=declared, briefing="Fix the auth module",
+        )
+        post_briefing(proposal, config)
+        body = mock_comment.call_args.args[2]
+        files_line = body.splitlines()[4]
+        assert files_line.startswith("**Files:**")
+
+        expected_stripped = set(
+            coordinator_doc_overlap(declared, coordinator_owned_docs(config.repo("api")))
+        )
+        for path in declared:
+            edited = f"`{path}`" in files_line
+            assert edited == (path not in expected_stripped)
+
 
 class TestResumeSessionId:
     """#315: resume_session_id flows from Proposal through dispatch payload."""
