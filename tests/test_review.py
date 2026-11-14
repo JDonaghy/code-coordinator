@@ -2255,6 +2255,56 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     assert "# Project rules" in payload["briefing"]
 
 
+def test_dispatch_review_reclaims_a_leaked_claim_and_dispatches(
+    two_machine_config: Config,
+) -> None:
+    """#4003: a `review_claims` row that outlived the dispatch that took
+    it (no review row behind it, older than the grace window) must not
+    deny forever with the misleading "lost the atomic dispatch-claim
+    race — #3113" reason — the very next `dispatch_review` call reclaims
+    it and a review actually gets dispatched.
+    """
+    import time as time_mod
+
+    from coord.state import REVIEW_CLAIM_LEAK_GRACE_SECS, claim_review_dispatch, get_connection
+    from coord import sql as sql_mod
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    # Simulate a prior dispatcher that claimed the dispatch and then died
+    # (a `database is locked` collision right after the claim landed) —
+    # the row leaked, with no review assignment ever created behind it.
+    assert claim_review_dispatch(completed.assignment_id) is True
+    conn = get_connection()
+    sql_mod.execute(
+        conn,
+        "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+        (time_mod.time() - REVIEW_CLAIM_LEAK_GRACE_SECS - 1.0, completed.assignment_id),
+    )
+    conn.commit()
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42,
+            "url": "https://github.com/acme/api/pull/42",
+            "existed": True,
+        },
+        claude_md_reader=lambda p: "# Project rules\n",
+        issue_body_fetcher=lambda repo, num: "issue body text",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.type == "review"
+    assert result.review_of_assignment_id == completed.assignment_id
+    assert len(client.calls) == 1
+
+
 def test_dispatch_review_pins_first_review_to_configured_model(
     two_machine_config: Config,
 ) -> None:

@@ -1949,6 +1949,80 @@ def _design_decision_options(sealed_lines: tuple[str, ...]) -> tuple[DiagnosisOp
     )
 
 
+def _release_leaked_review_claim_for_row(
+    repo_name: str, issue_number: int, board: "Board",
+) -> bool:
+    """#4003: release a leaked review-dispatch claim behind *repo_name*#
+    *issue_number*'s own work leg, if one is sitting there.
+
+    "Which work leg" is resolved the SAME way `coord.board_doctor_
+    permissions.sweep_dispatch_fixit_leg` resolves it for the very row
+    this pre-empts (`coord.gates._select_winning_work_assignment` over
+    every `WORK_LIKE_TYPES` assignment for the issue, #2096 — never a
+    second, independently-derived "which leg is this row about").
+    "Leaked" is answered by :func:`coord.state.review_claim_is_leaked`,
+    the SAME predicate :func:`coord.state._claim_review_dispatch_local`'s
+    own self-heal uses.
+
+    Returns ``True`` only once the release is confirmed — the claim is
+    gone on re-read (:func:`coord.state.has_review_claim`) — so a release
+    that silently failed (the exact #3998 incident shape: a `database is
+    locked` collision on the release write itself) is reported as a
+    no-op, not a false success, letting the sweep fall through to the
+    alert tier rather than claiming a fix that did not land. ``False``
+    with nothing released (no work leg, no claim, the claim is too fresh
+    to tell apart from an in-flight dispatch, or a review genuinely is
+    still running) leaves the row for the ordinary fix-it-leg dispatch
+    exactly as before #4003.
+    """
+    from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        has_review_claim,
+        release_review_dispatch_claim,
+        review_claim_is_leaked,
+    )
+
+    work_like = [
+        a for a in assignments_for_issue(board, repo_name, issue_number)
+        if a.type in WORK_LIKE_TYPES
+    ]
+    if not work_like:
+        return False
+    work_id = _select_winning_work_assignment(work_like).assignment_id
+    if not work_id or not review_claim_is_leaked(work_id):
+        return False
+
+    release_review_dispatch_claim(work_id)
+    released = not has_review_claim(work_id)
+    if released:
+        import click  # noqa: PLC0415
+
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="operational",
+            category="board_doctor",
+            event_type="leaked_review_claim_released",
+            actor="daemon",
+            summary=(
+                f"board-doctor released a leaked review-dispatch claim for "
+                f"{repo_name}#{issue_number} (work assignment {work_id})"
+            ),
+            repo=repo_name,
+            issue=issue_number,
+            assignment_id=work_id,
+            details={"work_assignment_id": work_id},
+        )
+        click.echo(
+            f"board-doctor released a leaked review-dispatch claim for "
+            f"{repo_name}#{issue_number} (work assignment {work_id}) — "
+            "a review is dispatchable again",
+            err=True,
+        )
+    return released
+
+
 def _investigate(row: StuckRow) -> bool:
     """#3769's C1 wiring: dispatch a fix-it leg for an alert-eligible
     cause instead of paging a human outright.
@@ -2024,6 +2098,25 @@ def _investigate(row: StuckRow) -> bool:
     from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
     from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
     from coord.state import build_board  # noqa: PLC0415
+
+    board = build_board()
+
+    # #4003: a `gate-blocked` drive-queue row whose live gate reads
+    # "not ready" can mean the review this row's work leg is waiting on
+    # never actually got dispatched, because the `review_claims` row that
+    # claimed its dispatch leaked (a `database is locked` collision right
+    # after the claim landed, or on the deny-path release — see
+    # `coord.state.release_review_dispatch_claim`'s own #4003 note).
+    # `sweep_dispatch_fixit_leg` below has no idea any of that happened —
+    # it would just dispatch a brand new WORK leg for already-completed
+    # work, which fixes nothing. Checked and released here, BEFORE that
+    # generic path runs, as its own confirmed auto-tier action: the
+    # claude-coordinator#3998 incident this closes never got past
+    # `auto-dispatch-noop` x2 -> `alert` -> `converged-noop` precisely
+    # because nothing in this tier ever looked at the claim.
+    if row.queue == "drive-queue" and row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
+        if _release_leaked_review_claim_for_row(repo_name, issue_number, board):
+            return True
 
     ceiling_bypassed = False
     if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
@@ -2101,7 +2194,6 @@ def _investigate(row: StuckRow) -> bool:
         if instruction:
             evidence = (*evidence, instruction)
 
-    board = build_board()
     result = dispatch_sweep_action(
         _INVESTIGATE_ACTION,
         repo_name,
