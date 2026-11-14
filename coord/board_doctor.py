@@ -1884,6 +1884,119 @@ def _reclassify_after_prereqs_landed(
     return reclassified
 
 
+#: #4003: the complement of :data:`CAUSE_AFTER_PREREQS_LANDED` — a `blocked`/
+#: `parked` row whose `after=` pre-req is NOT every-dep-landed but is
+#: instead itself stuck (`blocked`/`failed` in the queue right now). Before
+#: this cause existed, a row this shape fell straight through to
+#: ``queue_diagnose.CAUSE_UNKNOWN`` (nothing else names it) and the
+#: investigate tier then tried a fix-it leg against THIS row's own,
+#: already-completed work — the claude-coordinator#4002 shape in the #4003
+#: incident: "has no originating work assignment on the board" was the
+#: wrong diagnosis for a row that was never missing a leg, only waiting on
+#: a different one. Never auto-dispatched — see this cause's absence from
+#: every :mod:`coord.board_doctor_policy` registration list (ALLOWLIST,
+#: AUTO_DISPATCHERS, INVESTIGATE_CAUSES, DECOMPOSITION_CAUSES): fixing THIS
+#: row means fixing the NAMED pre-req, not this one, so ``policy_tier_of``
+#: falls through to the alert tier by construction, the same as
+#: :data:`CAUSE_STRANDED_PREREQ_BLOCKED`.
+CAUSE_BLOCKED_ON_PREREQ = "blocked-on-prereq"
+
+
+def blocked_on_prereq_dep_for_entry(
+    entry: Any, entries_by_key: Mapping[str, Any],
+) -> str | None:
+    """The ``after=`` pre-req responsible for *entry* staying permanently
+    blocked, when at least one such pre-req is ITSELF stuck (#4003) — the
+    complement of :func:`after_prereqs_landed_for_entry`'s "every pre-req
+    now reads terminal" check: this looks for one that is neither terminal
+    nor landed, but is sitting `blocked`/`failed` in the queue right now.
+
+    Returns ``None`` when *entry* does not match the shape at all (not
+    `blocked`/`parked`, no ``after=``, a permanent block unrelated to its
+    `after=` graph, or every named pre-req reads terminal/landed instead —
+    see :func:`after_prereqs_landed_for_entry`, the shape this is the
+    deliberate complement of), or when it matches but none of the named
+    pre-reqs is itself in a locally-queued `blocked`/`failed` state (e.g.
+    it is simply still `waiting`/`running`, or it left the queue entirely —
+    neither is this shape).
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        STATE_BLOCKED,
+        STATE_FAILED,
+        STATE_PARKED,
+        is_permanent_block_reason,
+        is_unsatisfiable_prereq_reason,
+    )
+
+    if entry.state not in (STATE_BLOCKED, STATE_PARKED):
+        return None
+    if not entry.after or is_permanent_block_reason(entry.last_reason):
+        return None
+    if not is_unsatisfiable_prereq_reason(entry.last_reason):
+        return None
+    for dep in entry.after:
+        dep_entry = entries_by_key.get(dep)
+        if dep_entry is not None and dep_entry.state in (STATE_BLOCKED, STATE_FAILED):
+            return dep
+    return None
+
+
+def _reclassify_blocked_on_prereq(
+    rows: list[StuckRow], entries_by_key: Mapping[str, Any],
+) -> list[StuckRow]:
+    """Relabel a `blocked`/`parked` drive-queue row whose own ``after=``
+    pre-req is itself stuck, rather than merely not-yet-landed (#4003).
+
+    Runs strictly AFTER :func:`_reclassify_after_prereqs_landed` (same
+    "classify first, reclassify a narrow confirmed subset second" shape
+    every reclassifier in this module uses) and over the SAME incoming
+    cause set (:data:`_AFTER_PREREQS_LANDED_SAFE_CAUSES`) — the two
+    reclassifiers answer mutually exclusive verdicts for the same question
+    ("does this row's `after=` graph, which is all `queue_diagnose` could
+    ever say about it, still explain the block"), so whichever runs second
+    only ever sees rows the first one declined to promote.
+
+    Before this reclassifier existed, a row matching this shape stayed at
+    ``queue_diagnose.CAUSE_UNKNOWN`` — registered on the investigate tier
+    — and the sweep tried a fix-it leg against THIS row's own (already-
+    completed) work, which fixes nothing: the real blocker is the NAMED
+    pre-req, not this issue. :data:`CAUSE_BLOCKED_ON_PREREQ` is
+    deliberately unregistered in every :mod:`coord.board_doctor_policy`
+    tier list, so it falls to the alert tier by construction and names
+    the pre-req instead of attempting a fix-it leg against the wrong row
+    (claude-coordinator#4002 in the #4003 incident).
+    """
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        if (
+            row.queue == "drive-queue"
+            and row.fresh
+            and row.cause in _AFTER_PREREQS_LANDED_SAFE_CAUSES
+        ):
+            entry = entries_by_key.get(row.key)
+            dep = (
+                blocked_on_prereq_dep_for_entry(entry, entries_by_key)
+                if entry is not None
+                else None
+            )
+            if dep is not None:
+                dep_entry = entries_by_key.get(dep)
+                dep_state = dep_entry.state if dep_entry is not None else "unknown"
+                row = replace(
+                    row,
+                    cause=CAUSE_BLOCKED_ON_PREREQ,
+                    evidence=row.evidence
+                    + (
+                        f"drive_queue: this row's own --after prereq ({dep}) "
+                        f"is itself {dep_state} — fixing this row means "
+                        f"fixing {dep}, not dispatching another leg here "
+                        "(#4003)",
+                    ),
+                )
+        reclassified.append(row)
+    return reclassified
+
+
 #: #3929 (#3918 gap 1, second half): a merge-queue entry that has NEVER been
 #: attempted at all (``entry.last_attempt is None``) is invisible to both
 #: :func:`merge_queue_rows` (its own #3918-review carve-out: a `pending`
@@ -2850,6 +2963,7 @@ def _collect_rows_with_board(
     rows = _reclassify_after_prereqs_landed(
         rows, entries_by_key, board=board, board_view=board_view,
     )
+    rows = _reclassify_blocked_on_prereq(rows, entries_by_key)
     rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
     rows = _reclassify_merge_never_attempted(rows, merge_entries, board=board, config=config)
     rows.extend(smoke_no_verdict_rows(board))

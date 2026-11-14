@@ -5464,6 +5464,136 @@ class TestReviewDispatchClaim:
         assert state.claim_review_dispatch("") is True
 
 
+class TestReviewClaimIsLeaked:
+    """#4003: `review_claim_is_leaked` — the ONE predicate both
+    `claim_review_dispatch`'s own self-heal and `coord.board_doctor`'s
+    proactive gate-blocked/review_required action answer to."""
+
+    @staticmethod
+    def _backdate_claim(assignment_id: str, *, age_secs: float) -> None:
+        conn = state.get_connection()
+        sql.execute(
+            conn,
+            "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+            (time.time() - age_secs, assignment_id),
+        )
+        conn.commit()
+
+    def test_no_claim_at_all_is_not_leaked(self, coord_db) -> None:
+        assert state.review_claim_is_leaked("never-claimed") is False
+
+    def test_fresh_claim_is_not_leaked(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        assert state.review_claim_is_leaked("w1") is False
+
+    def test_old_claim_with_no_review_row_is_leaked(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        self._backdate_claim(
+            "w1", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.review_claim_is_leaked("w1") is True
+
+    def test_old_claim_backed_by_a_live_review_is_not_leaked(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        _seed_review_row("r1", review_of_assignment_id="w1", status="running")
+        self._backdate_claim(
+            "w1", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.review_claim_is_leaked("w1") is False
+
+
+class TestLeakedReviewClaimSelfHeal:
+    """#4003: `claim_review_dispatch` self-heals a `review_claims` row that
+    outlived the dispatch that took it, instead of denying forever with the
+    misleading "lost the atomic dispatch-claim race — #3113" reason.
+    """
+
+    @staticmethod
+    def _backdate_claim(assignment_id: str, *, age_secs: float) -> None:
+        conn = state.get_connection()
+        sql.execute(
+            conn,
+            "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+            (time.time() - age_secs, assignment_id),
+        )
+        conn.commit()
+
+    def test_fresh_claim_with_no_review_row_still_denies(self, coord_db) -> None:
+        """Inside the grace window, a claim with no review row yet is
+        indistinguishable from an in-flight `claim_review_dispatch` call
+        that has not yet reached `record_dispatched_assignment` — must
+        still deny, not reclaim."""
+        assert state.claim_review_dispatch("w1") is True
+        self._backdate_claim("w1", age_secs=1.0)
+        assert state.claim_review_dispatch("w1") is False
+
+    def test_old_claim_with_no_review_row_is_reclaimed(self, coord_db) -> None:
+        """Past the grace window, with no review row behind it, the claim
+        has leaked — the next caller wins it instead of being denied
+        forever."""
+        assert state.claim_review_dispatch("w1") is True
+        self._backdate_claim(
+            "w1", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.claim_review_dispatch("w1") is True
+        # The reclaim actually rewrote the row to this caller's own stamp —
+        # a THIRD caller now loses to it immediately (fresh, no reclaim).
+        assert state.claim_review_dispatch("w1") is False
+
+    def test_old_claim_backed_by_a_live_review_still_denies(self, coord_db) -> None:
+        """A claim can be old and still entirely legitimate — a review
+        genuinely dispatched and still running. Must never be reclaimed out
+        from under it."""
+        assert state.claim_review_dispatch("w1") is True
+        _seed_review_row("r1", review_of_assignment_id="w1", status="running")
+        self._backdate_claim(
+            "w1", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.claim_review_dispatch("w1") is False
+
+    def test_old_claim_backed_by_a_terminal_review_is_reclaimed(self, coord_db) -> None:
+        """A review that already reached a terminal status no longer makes
+        this a live claim — `release_review_claim_if_row_is_review` is
+        supposed to have released it already; if that release itself
+        failed (the #3998 incident: `database is locked` on the deny
+        path), this is the backstop that still recovers it."""
+        assert state.claim_review_dispatch("w1") is True
+        _seed_review_row("r1", review_of_assignment_id="w1", status="running")
+        conn = state.get_connection()
+        sql.execute(
+            conn, "UPDATE assignments SET status=? WHERE assignment_id=?",
+            ("done", "r1"),
+        )
+        conn.commit()
+        self._backdate_claim(
+            "w1", age_secs=state.REVIEW_CLAIM_LEAK_GRACE_SECS + 1.0
+        )
+        assert state.claim_review_dispatch("w1") is True
+
+
+class TestReleaseReviewDispatchClaimBestEffort:
+    """#4003: `release_review_dispatch_claim` must never raise — every call
+    site is itself a deny/failure path, and a release failure there must
+    not crash the caller on top of whatever already went wrong. The #4003
+    self-heal (`claim_review_dispatch` reclaiming a leaked row) is the
+    backstop once the grace window passes."""
+
+    def test_local_write_failure_is_swallowed_not_raised(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        assert state.claim_review_dispatch("w1") is True
+
+        def _boom(_assignment_id: str) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(state, "_release_review_dispatch_claim_local", _boom)
+        state.release_review_dispatch_claim("w1")  # must not raise
+
+        # The claim is still held — the release genuinely failed — but the
+        # caller completed instead of crashing.
+        assert state.has_review_claim("w1") is True
+
+
 class TestReviewDispatchClaimLockContention:
     """#3382: `_claim_review_dispatch_local` had neither `retry_on_locked`
     nor any undo. Unlike a plain failed statement (SQLite's SQLITE_BUSY,
@@ -5673,7 +5803,13 @@ class TestReviewDispatchClaimLockContention:
         release of `w-b` lands mid-flight and its own commit follows. B's
         delete must stand — B never failed and never asked for anything to
         be undone — while A's must be undone, because A's caller was told
-        (correctly) that its release did not land."""
+        (correctly) that its release did not land.
+
+        Exercises `_release_review_dispatch_claim_local` directly rather
+        than the public, #4003-best-effort `release_review_dispatch_claim`
+        wrapper — this test is about the LOCAL write's own row-scoped undo,
+        which still raises; the wrapper's own "never raises" contract has
+        its own coverage in `TestReleaseReviewDispatchClaimBestEffort`."""
         monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
         assert state.claim_review_dispatch("w-a") is True
         assert state.claim_review_dispatch("w-b") is True
@@ -5690,7 +5826,7 @@ class TestReviewDispatchClaimLockContention:
         monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
 
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-            state.release_review_dispatch_claim("w-a")
+            state._release_review_dispatch_claim_local("w-a")
 
         coord_db.commit()  # thread B's own commit
 

@@ -4081,6 +4081,20 @@ def claim_review_dispatch(of_assignment_id: str) -> bool:
     --stage review --reset`` released it by hand. Scoping the release to the
     stamp is what makes it safe: a claim another dispatcher legitimately
     holds carries a different stamp and is never touched.
+
+    #4003: **a claim that outlives its dispatcher is self-healing.** When
+    this call's own ``INSERT`` loses to an existing row, that row is no
+    longer assumed to be a live competing claim just because it exists —
+    see :func:`_reclaim_leaked_review_claim`. A claim is reclaimed (and
+    this call then returns ``True``, exactly as if it had won outright)
+    only once it is both older than the grace window and has no
+    review/test-author/mock-author assignment in flight behind it; a
+    fresher claim, or one a real dispatch is still working, still denies.
+    This is what keeps a `database is locked` collision in
+    ``record_dispatched_assignment`` (the caller's own next write after a
+    successful claim) or in the deny-path
+    :func:`release_review_dispatch_claim` from stranding the claim
+    forever — see that function's own #4003 note.
     """
     if not of_assignment_id:
         return True
@@ -4162,6 +4176,143 @@ def _release_own_review_claim_local(of_assignment_id: str, claimed_at: float) ->
     return retry_on_locked(_write)
 
 
+#: #4003: grace window before an unmatched ``review_claims`` row is treated
+#: as leaked by :func:`_claim_review_dispatch_local` itself, rather than a
+#: legitimate in-flight claim. Same value, and the same reasoning, as
+#: :mod:`coord.diagnose`'s ``_REVIEW_CLAIM_LEAK_GRACE_SECS`` — this module
+#: has no business importing that one (``coord.diagnose`` imports
+#: ``coord.state``, not the reverse), so each side names the shared
+#: constant locally rather than one deriving it from the other, but both
+#: answer the SAME question ("how old before a claim with no review row
+#: behind it stops being a plausible in-flight dispatch") with the SAME
+#: number (#2096) — see that module's own docstring for the full accounting
+#: of what has to clear (candidate-machine POSTs, GitHub API calls, ...)
+#: before ``record_dispatched_assignment`` lands the review row this claim
+#: is waiting on.
+REVIEW_CLAIM_LEAK_GRACE_SECS = 600.0
+
+
+def review_claim_is_leaked(of_assignment_id: str) -> bool:
+    """#4003: True when *of_assignment_id*'s ``review_claims`` row has, in
+    fact, leaked — held with nothing left to release it.
+
+    The ONE predicate for "is this claim actually dead", answered the same
+    way by every caller that needs it (#2096):
+    :func:`_claim_review_dispatch_local`'s own self-heal
+    (:func:`_reclaim_leaked_review_claim`, below) when a losing insert
+    needs to decide whether to deny or reclaim, and
+    :mod:`coord.board_doctor`'s proactive auto-tier action for a
+    ``gate-blocked``/``review_required`` row whose own review auto-dispatch
+    came back a no-op — never two independently-tuned judgments of the
+    same question.
+
+    ``True`` only when BOTH:
+
+    * the claim is older than :data:`REVIEW_CLAIM_LEAK_GRACE_SECS` — long
+      enough to rule out "an in-flight ``claim_review_dispatch`` call that
+      has not yet reached ``record_dispatched_assignment``", the same
+      false-positive window :func:`coord.diagnose.review_claim_age_secs`'s
+      own docstring documents for the read-only diagnostic path (#3383);
+    * no ``review``/``test-author``/``mock-author`` assignment with
+      ``review_of_assignment_id`` equal to *of_assignment_id* is sitting in
+      a non-terminal status — i.e. a review genuinely IS in flight,
+      however slowly; checked against :data:`_TERMINAL_ASSIGNMENT_STATUSES`,
+      the SAME terminal set every other assignment-status reader in this
+      module uses, never a second, narrower terminal list just for this
+      check.
+
+    Local-DB read only, same documented caveat as :func:`has_review_claim`/
+    :func:`review_claim_age_secs`: correct on the daemon host (where the
+    local DB is canonical), undercounts on a thin client reading its own
+    stale copy.
+    """
+    age = review_claim_age_secs(of_assignment_id)
+    if age is None or age < REVIEW_CLAIM_LEAK_GRACE_SECS:
+        return False
+    conn = get_connection()
+    live = sql.execute(
+        conn,
+        "SELECT 1 FROM assignments WHERE review_of_assignment_id=? "
+        "AND type IN ('review', 'test-author', 'mock-author') "
+        "AND status NOT IN ({placeholders})".format(
+            placeholders=",".join("?" for _ in _TERMINAL_ASSIGNMENT_STATUSES)
+        ),
+        (of_assignment_id, *_TERMINAL_ASSIGNMENT_STATUSES),
+    ).fetchone()
+    return live is None
+
+
+def _reclaim_leaked_review_claim(conn, of_assignment_id: str, stamp: float) -> bool:
+    """#4003: self-heal the chokepoint :func:`_claim_review_dispatch_local`
+    hits when its own ``INSERT ... OR IGNORE`` loses to an existing
+    ``review_claims`` row.
+
+    Before #4003 a lost race was always treated as a live competing
+    dispatch — correct when it is one, but a claim can also outlive the
+    dispatch that took it (a `database is locked` collision in the
+    caller's own ``record_dispatched_assignment`` right after the claim
+    landed, or in the deny-path ``release_review_dispatch_claim`` when the
+    dispatch declines further down — see this module's
+    ``_release_review_dispatch_claim_local``, already wrapped in
+    :func:`retry_on_locked`, but a release that exhausts even that retry
+    budget still leaves the row behind). Every LATER ``dispatch_review``
+    for the same work assignment then lost this exact race forever and
+    denied with the misleading "lost the atomic dispatch-claim race —
+    #3113" reason — the claude-coordinator#3998 incident this closes: 91
+    refusals over ~8h, recovered only by a human running ``coord diagnose
+    --stage review --reset``.
+
+    Returns ``True`` (and rewrites the row to carry *stamp*, THIS caller's
+    own claim) only when :func:`review_claim_is_leaked` says the existing
+    row has leaked.
+
+    Re-reads the row immediately after the ``UPDATE`` rather than trusting
+    ``cursor.rowcount`` — the exact reason :func:`_claim_review_dispatch_local`
+    itself does not trust it on the shared SQLite connection (see that
+    function's own comment): a concurrent write on another thread can
+    misreport it in either direction. The ``WHERE ... AND claimed_at=?``
+    clause still protects the write itself — if some OTHER caller's own
+    claim attempt mutated the row between our read and this write, the
+    ``UPDATE`` matches zero rows and the read-back below reports that
+    honestly as "not reclaimed", rather than overwriting a claim that
+    turned out to be live after all.
+    """
+    row = sql.execute(
+        conn,
+        "SELECT claimed_at FROM review_claims WHERE of_assignment_id=?",
+        (of_assignment_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return False
+    held_claimed_at = row[0]
+    if held_claimed_at == stamp:
+        return False  # our own just-written row — nothing to reclaim
+    if not review_claim_is_leaked(of_assignment_id):
+        return False
+    age = max(0.0, time.time() - held_claimed_at)
+    sql.execute(
+        conn,
+        "UPDATE review_claims SET claimed_at=? "
+        "WHERE of_assignment_id=? AND claimed_at=?",
+        (stamp, of_assignment_id, held_claimed_at),
+    )
+    check = sql.execute(
+        conn,
+        "SELECT claimed_at FROM review_claims WHERE of_assignment_id=?",
+        (of_assignment_id,),
+    ).fetchone()
+    reclaimed = bool(check is not None and check[0] == stamp)
+    if reclaimed:
+        _log.warning(
+            "review-dispatch claim for %s was leaked (held %.1fs with no "
+            "live review/test-author/mock-author row) — reclaimed instead "
+            "of denying with the misleading #3113 'lost the atomic "
+            "dispatch-claim race' reason (#4003)",
+            of_assignment_id, age,
+        )
+    return reclaimed
+
+
 def _claim_review_dispatch_local(
     of_assignment_id: str, *, claimed_at: float | None = None
 ) -> bool:
@@ -4192,6 +4343,11 @@ def _claim_review_dispatch_local(
     durably persist later — the incident this issue reports, a
     `review_claims` row held by neither of the two calls that raced for it,
     wedging vimcode#1086's review for ~13.5h.
+
+    #4003: when the `INSERT OR IGNORE` loses, the losing attempt no longer
+    assumes the existing row is a live competing claim — see
+    :func:`_reclaim_leaked_review_claim`, called right here before the
+    loss is accepted.
     """
 
     stamp = claimed_at if claimed_at is not None else _new_review_claim_stamp()
@@ -4224,6 +4380,16 @@ def _claim_review_dispatch_local(
                     (of_assignment_id,),
                 ).fetchone()
                 inserted = int(row is not None and row[0] == stamp)
+            if not inserted:
+                # #4003: the insert lost — before denying with the
+                # misleading #3113 "lost the atomic dispatch-claim race"
+                # reason, check whether the existing row has, in fact,
+                # leaked (see `_reclaim_leaked_review_claim`'s own
+                # docstring for the two conditions). A claim still inside
+                # the grace window, or one backed by a live review row,
+                # is untouched and this still denies exactly as before.
+                if _reclaim_leaked_review_claim(conn, of_assignment_id, stamp):
+                    inserted = 1
             conn.commit()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
             # Only this call's own row: `stamp` is unique to THIS attempt,
@@ -4379,16 +4545,43 @@ def release_review_dispatch_claim(of_assignment_id: str) -> None:
     same seam, or the claim it took on the daemon's canonical DB would never
     actually clear (a purely-local delete on the thin client would touch a
     different, likely-empty, DB and silently no-op).
+
+    #4003: **best-effort — never raises.** Every call site is itself a
+    deny/failure path (``dispatch_review``'s own ``_deny`` and the
+    terminal-status write in ``release_review_claim_if_row_is_review``) —
+    code already reacting to something having gone wrong, which must not
+    be made worse by a SECOND failure (a `database is locked` collision
+    that outlasts ``_release_review_dispatch_claim_local``'s own
+    :func:`retry_on_locked` budget, or a daemon round trip that times out)
+    crashing the caller outright and leaving whatever cleanup it was
+    mid-way through undone. Before this, the claude-coordinator#3998
+    incident: this call raised `database is locked` on the deny path, and
+    the work assignment's review-dispatch claim stayed held for ~8h and 91
+    refusals — recoverable only by a human running ``coord diagnose
+    --stage review --reset``. A release that fails here now just logs and
+    leaves the row behind; :func:`claim_review_dispatch`'s own #4003
+    self-heal (:func:`_reclaim_leaked_review_claim`) is the backstop that
+    recovers it once the grace window passes, rather than this function
+    pretending a failed release succeeded.
     """
     if not of_assignment_id:
         return
-    svc = _board_service()
-    resp = _route_write(
-        svc, "/review-claim-release", {"of_assignment_id": of_assignment_id}
-    )
-    if resp is not None:
-        return
-    _release_review_dispatch_claim_local(of_assignment_id)
+    try:
+        svc = _board_service()
+        resp = _route_write(
+            svc, "/review-claim-release", {"of_assignment_id": of_assignment_id}
+        )
+        if resp is not None:
+            return
+        _release_review_dispatch_claim_local(of_assignment_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+        _log.warning(
+            "review-dispatch claim release for %s failed (%s) — the row may "
+            "still be held; a later dispatch_review reclaims it once "
+            "REVIEW_CLAIM_LEAK_GRACE_SECS has passed and no review row has "
+            "landed (#4003)",
+            of_assignment_id, exc,
+        )
 
 
 def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:

@@ -18,6 +18,7 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_AFTER_PREREQS_LANDED,
     CAUSE_BASELINE_RED,
+    CAUSE_BLOCKED_ON_PREREQ,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CONFLICT_FIX_HEAD_UNMOVED,
     CAUSE_LATCH_STALE_MERGEABLE,
@@ -31,8 +32,10 @@ from coord.board_doctor import (
     StuckRow,
     _confirm_merge_pending_stuck,
     _reclassify_after_prereqs_landed,
+    _reclassify_blocked_on_prereq,
     _reclassify_stale_latch,
     after_prereqs_landed_for_entry,
+    blocked_on_prereq_dep_for_entry,
     merge_queue_rows,
     sweep,
 )
@@ -1614,6 +1617,122 @@ class TestInvestigate:
 
         assert _investigate(row) is False
         assert state.list_drive_escalations() == []
+
+
+class TestInvestigateLeakedReviewClaim:
+    """#4003: a `gate-blocked` drive-queue row releases a leaked
+    review-dispatch claim behind its own work leg BEFORE falling through
+    to the generic fix-it-leg dispatch — dispatching a brand new WORK leg
+    for already-completed work fixes nothing when the real blocker is a
+    review that never got (re-)dispatched because its own claim leaked.
+    The claude-coordinator#3998 incident this closes never got past
+    `auto-dispatch-noop` x2 -> `alert` -> `converged-noop`, because
+    nothing in this tier ever looked at the claim.
+    """
+
+    @staticmethod
+    def _work(repo_name="acme/widgets", issue_number=40, assignment_id="w1"):
+        return Assignment(
+            machine_name="mac1",
+            repo_name=repo_name,
+            issue_number=issue_number,
+            issue_title="Some work",
+            assignment_id=assignment_id,
+            type="work",
+            status="done",
+        )
+
+    @staticmethod
+    def _backdate_claim(assignment_id: str) -> None:
+        from coord import sql
+
+        conn = state.get_connection()
+        sql.execute(
+            conn,
+            "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+            (state.time.time() - state.REVIEW_CLAIM_LEAK_GRACE_SECS - 1.0, assignment_id),
+        )
+        conn.commit()
+
+    def test_releases_a_leaked_claim_instead_of_dispatching_a_fixit_leg(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(state, "build_board", lambda: Board(completed=[self._work()]))
+        assert state.claim_review_dispatch("w1") is True
+        self._backdate_claim("w1")
+
+        def dispatch_must_not_be_called(*a, **k):
+            raise AssertionError(
+                "dispatch_sweep_action must not run once the leaked claim "
+                "is released"
+            )
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_GATE_BLOCKED)
+
+        assert _investigate(row) is True
+        assert state.has_review_claim("w1") is False
+        # A confirmed release is not alert-worthy.
+        assert state.list_drive_escalations() == []
+
+    def test_fresh_claim_falls_through_to_the_fixit_leg_dispatch(
+        self, monkeypatch,
+    ) -> None:
+        """Inside the grace window — or backed by a live review — this
+        must not touch the claim; the row falls through to the ordinary
+        investigate-tier dispatch exactly as before #4003."""
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: Board(completed=[self._work()]))
+        assert state.claim_review_dispatch("w1") is True  # fresh — no backdate
+
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": True, "assignment_id": "asn-1", "machine": "mac1",
+                "detail": "dispatched",
+            },
+        )
+
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_GATE_BLOCKED)
+
+        assert _investigate(row) is True
+        # The claim is untouched — still held, by the "live" dispatch this
+        # fresh claim stands in for.
+        assert state.has_review_claim("w1") is True
+
+    def test_merge_queue_row_is_left_to_the_ordinary_path(
+        self, monkeypatch,
+    ) -> None:
+        """Only a drive-queue `gate-blocked` row is this shape — a
+        merge-queue `gate-blocked` row means a required CI check is red
+        (`_MERGE_QUEUE_STUCK_CAUSE`), an unrelated question this check
+        must not answer."""
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: Board(completed=[self._work()]))
+        assert state.claim_review_dispatch("w1") is True
+        self._backdate_claim("w1")
+
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": True, "assignment_id": "asn-1", "machine": "mac1",
+                "detail": "dispatched",
+            },
+        )
+
+        row = _row(
+            "acme/widgets#40", queue_diagnose.CAUSE_GATE_BLOCKED, queue="merge-queue",
+        )
+
+        assert _investigate(row) is True
+        assert state.has_review_claim("w1") is True
 
 
 class TestFixitRebudgetEnvironmental:
@@ -4099,6 +4218,129 @@ class TestReclassifyAfterPrereqsLanded:
         )
 
         assert reclassified[0].cause == queue_diagnose.CAUSE_UNKNOWN
+
+
+class TestBlockedOnPrereqDepForEntry:
+    """The ONE predicate :func:`_reclassify_blocked_on_prereq` uses —
+    the deliberate complement of :func:`after_prereqs_landed_for_entry`:
+    this looks for a named pre-req that is itself stuck, not landed
+    (#4003)."""
+
+    def test_names_the_dep_when_it_is_itself_blocked(self) -> None:
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="blocked", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) == dep.key
+
+    def test_names_the_dep_when_it_is_itself_failed(self) -> None:
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="failed", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) == dep.key
+
+    def test_none_when_the_dep_has_landed(self) -> None:
+        # The complement shape — `after_prereqs_landed_for_entry`'s own
+        # case — must never also match here.
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="done", last_reason="")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) is None
+
+    def test_none_when_the_dep_is_merely_in_flight(self) -> None:
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="waiting", last_reason="")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) is None
+
+    def test_none_when_the_dep_left_the_queue(self) -> None:
+        entry = _after_entry()
+        entries_by_key = {entry.key: entry}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) is None
+
+    def test_none_for_a_row_blocked_on_an_unrelated_reason(self) -> None:
+        entry = _after_entry(last_reason="merge conflict detected on this branch")
+        dep = _after_entry(issue=39, position=0, after=(), state="blocked", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) is None
+
+    def test_none_once_an_operator_already_resumed_the_row(self) -> None:
+        entry = _after_entry(state="waiting")
+        dep = _after_entry(issue=39, position=0, after=(), state="blocked", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        assert blocked_on_prereq_dep_for_entry(entry, entries_by_key) is None
+
+
+class TestReclassifyBlockedOnPrereq:
+    def _row(self, **kw) -> StuckRow:
+        base = dict(
+            queue="drive-queue", key="acme/widgets#40", state="blocked",
+            cause=queue_diagnose.CAUSE_UNKNOWN, confidence=queue_diagnose.CONFIDENCE_NONE,
+            evidence=(), fresh=True,
+        )
+        base.update(kw)
+        return StuckRow(**base)
+
+    def test_promotes_a_row_blocked_behind_a_blocked_prereq(self) -> None:
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="blocked", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        reclassified = _reclassify_blocked_on_prereq([self._row()], entries_by_key)
+
+        assert reclassified[0].cause == CAUSE_BLOCKED_ON_PREREQ
+        assert any(dep.key in e for e in reclassified[0].evidence)
+
+    def test_never_double_classifies_a_row_the_landed_reclassifier_already_promoted(
+        self,
+    ) -> None:
+        # #4003: the two reclassifiers are mutually exclusive verdicts for
+        # the SAME question — a row the landed reclassifier already
+        # promoted must never also match here.
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="done", last_reason="")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+        row = self._row(cause=CAUSE_AFTER_PREREQS_LANDED)
+
+        reclassified = _reclassify_blocked_on_prereq([row], entries_by_key)
+
+        assert reclassified[0].cause == CAUSE_AFTER_PREREQS_LANDED
+
+    def test_leaves_a_stale_episode_row_alone(self) -> None:
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="blocked", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        reclassified = _reclassify_blocked_on_prereq(
+            [self._row(fresh=False)], entries_by_key,
+        )
+
+        assert reclassified[0].cause == queue_diagnose.CAUSE_UNKNOWN
+
+    def test_leaves_a_merge_queue_row_with_the_same_key_alone(self) -> None:
+        entry = _after_entry()
+        dep = _after_entry(issue=39, position=0, after=(), state="blocked", last_reason="x")
+        entries_by_key = {entry.key: entry, dep.key: dep}
+
+        reclassified = _reclassify_blocked_on_prereq(
+            [self._row(queue="merge-queue")], entries_by_key,
+        )
+
+        assert reclassified[0].cause == queue_diagnose.CAUSE_UNKNOWN
+
+    def test_blocked_on_prereq_is_alert_tier_not_investigate(self) -> None:
+        # #4003: fixing this row means fixing the NAMED pre-req, not
+        # dispatching another leg against this one — never registered on
+        # any auto/investigate tier.
+        assert policy_tier_of(CAUSE_BLOCKED_ON_PREREQ) == TIER_ALERT
+        assert CAUSE_BLOCKED_ON_PREREQ not in INVESTIGATE_CAUSES
+        assert CAUSE_BLOCKED_ON_PREREQ not in ALLOWLIST
 
 
 class TestRequeueAfterPrereqsLanded:
