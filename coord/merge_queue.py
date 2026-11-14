@@ -896,6 +896,69 @@ def scan_approved_reviews(
     return ApprovalScan(approved=False, unknown_head=unknown_head)
 
 
+@dataclass
+class _ApprovalProbe:
+    """Minimal :class:`QueuedMerge`-shaped stand-in for :func:`scan_approved_reviews`
+    (#4002), for a caller that has only a bare work ``Assignment`` in hand —
+    not a real queue entry with ``repo_github``/``target_branch`` populated.
+
+    Deliberately carries no ``branch_patch_id``: see
+    :func:`head_already_approved`'s docstring for why that's the correct
+    choice for its narrower question, not an oversight.
+    """
+
+    assignment_id: str
+    branch: str
+    branch_head_sha: str | None = None
+    branch_patch_id: str | None = None
+
+
+def head_already_approved(
+    board,
+    *,
+    assignment_id: str,
+    branch: str,
+    branch_head_sha: str | None,
+) -> bool:
+    """Is *branch*'s current head (*branch_head_sha*) already covered by an
+    approving review somewhere in *assignment_id*'s work chain? (#4002)
+
+    The ONE answer a dispatch-side pre-check
+    (:func:`coord.review.claim_review_item_dispatch_gate`) and the fix
+    loop's verdict decision (:func:`coord.auto_loop.process_review_completion`)
+    both call, so neither can disagree with the merge gate's own
+    :func:`has_approved_review` about the same commit (#2096 — "one
+    question, one answer"): this is a thin wrapper around the exact same
+    :func:`scan_approved_reviews` walk that function uses, built from only
+    the bare fields a caller holding a work ``Assignment`` (not a
+    ``QueuedMerge`` entry) has on hand.
+
+    Content-identical-rebase / ancillary-files / context-only-diff
+    carry-forward (#1475/#3707/#3749) are deliberately NOT consulted here —
+    those need a real ``QueuedMerge``'s ``repo_github``/``target_branch``
+    plus a live diff fetch, which no caller of this function has cheaply
+    available. This answers only the narrower, free question "is this
+    EXACT head approved", which is all a dispatch gate or a fix-loop
+    decision needs: a content-preserving rebase changes the SHA, so it
+    reads as NOT covered here and gets a fresh (scoped) review the same as
+    before #4002 — the acceptance criterion that a new commit always gets
+    reviewed again stays true either way.
+
+    ``branch_head_sha`` unknown (``None``/empty) fails closed to ``False``
+    — same posture as :func:`scan_approved_reviews`'s own ``unknown_head``
+    handling: a caller that can't confirm the current head never gets to
+    claim it's already approved.
+    """
+    if not branch or not branch_head_sha:
+        return False
+    probe = _ApprovalProbe(
+        assignment_id=assignment_id,
+        branch=branch,
+        branch_head_sha=branch_head_sha,
+    )
+    return scan_approved_reviews(probe, board).approved
+
+
 def find_scoped_review_candidate(
     entry: "QueuedMerge",
     board,

@@ -602,6 +602,111 @@ class TestProcessReviewCompletion:
         # The GitHub notice must name the reviewer's original verdict.
         assert mock_notice.call_args.kwargs["original_verdict"] == "request-changes"
 
+    def test_request_changes_superseded_by_prior_approval_is_non_blocking(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#4002: an approve on the current head is final. A SECOND review of
+        the EXACT SAME commit that comes back request-changes after an
+        earlier approve of that commit must not dispatch a fix round (and
+        so never increments ``fix_rounds``) — the findings are recorded as
+        non-blocking instead of reopening an already-approved item.
+
+        This reproduces the quadraui#2356 shape: two independent reviews of
+        commit ``deadbeef1234`` — one approve, one request-changes — in the
+        SAME work chain.
+        """
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "- Looks like a real problem from this reviewer's own vantage.\n"
+            "END_REVIEW\n"
+        )
+        work = _work_assignment(review_iteration=0)
+        prior_approval = _review_assignment(
+            assignment_id="review-approved-1", review_of="work-abc",
+        )
+        prior_approval.review_verdict = "approve"
+        prior_approval.review_head_sha = "deadbeef1234"
+        review = _review_assignment(assignment_id="review-xyz", review_of="work-abc")
+        review.review_head_sha = "deadbeef1234"
+
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[work, prior_approval, review],
+        )
+
+        mock_http = MagicMock()  # must NOT be used — no dispatch expected
+        with patch(
+            "coord.auto_loop._post_superseded_by_approval_notice"
+        ) as mock_notice:
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert len(actions) == 1
+        assert actions[0].kind == "superseded_by_approval"
+        # No fix worker dispatched — this is exactly the ceiling-wasting
+        # fix round 2 the quadraui#2356 incident describes.
+        assert len(board.active) == 0
+        mock_http.post.assert_not_called()
+        # The reviewer's own genuine verdict is preserved on ITS row...
+        assert review.review_verdict == "request-changes"
+        # ...but the work row is left untouched (not reopened to
+        # request-changes) — `propagate_review_verdict` is never reached.
+        assert work.review_verdict != "request-changes"
+        mock_notice.assert_called_once()
+
+    def test_request_changes_with_new_commit_after_approval_still_dispatches_fix(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#4002 acceptance: a NEW commit (different head SHA) still gets a
+        fresh review and, on request-changes, a fresh fix round — only an
+        EXACT-same-commit request-changes is superseded."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "- Still broken after the new commit.\n"
+            "END_REVIEW\n"
+        )
+        work = _work_assignment(review_iteration=1)
+        prior_approval = _review_assignment(
+            assignment_id="review-approved-1", review_of="work-abc",
+        )
+        prior_approval.review_verdict = "approve"
+        prior_approval.review_head_sha = "deadbeef1234"
+        # A fresh commit landed — this review covers a DIFFERENT SHA.
+        review = _review_assignment(assignment_id="review-xyz2", review_of="work-abc")
+        review.review_head_sha = "cafef00dcafe"
+
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[work, prior_approval, review],
+        )
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-002"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+        assert len(board.active) == 1
+
     def test_request_changes_with_blocking_still_dispatches_fix(
         self, config: Config, tmp_path
     ) -> None:
