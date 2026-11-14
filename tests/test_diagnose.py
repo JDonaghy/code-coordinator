@@ -1591,6 +1591,48 @@ def test_reset_review_reports_delete_failure_when_row_survives(
     assert not any(a.startswith("deleted 1 review row(s)") for a in res.actions_taken)
 
 
+def test_reset_review_stage_reports_claim_release_failure_when_claim_survives(
+    monkeypatch, config, coord_db
+) -> None:
+    """Sibling of the delete-failure regression above for the OTHER write
+    `_reset_review_stage` performs right after it: `release_review_dispatch_
+    claim` is best-effort and never raises, so a swallowed `database is
+    locked` collision must not be reported as a clean release either."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="done",
+        dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="rv1", typ="review", status="failed", dispatched_at=200.0, review_of="w1",
+    ))
+    assert state.claim_review_dispatch("w1") is True
+    # Simulate a release call that reports success but never actually
+    # removes the row.
+    monkeypatch.setattr(state, "release_review_dispatch_claim", lambda *a, **k: None)
+
+    board = Board(completed=[
+        _assign(aid="w1", typ="work", status="done", dispatched_at=100.0),
+        _assign(
+            aid="rv1", typ="review", status="failed", dispatched_at=200.0,
+            review_of="w1",
+        ),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    assert any(
+        "release requested for w1's review-dispatch claim" in a
+        and "did NOT persist" in a
+        for a in res.actions_taken
+    )
+    # Still present — the release never actually took.
+    assert state.has_review_claim("w1") is True
+
+
 def test_reset_review_real_db_resets_test_author_via_review_fk_sparing_sibling(
     monkeypatch, config, coord_db
 ) -> None:
@@ -3512,6 +3554,42 @@ def test_reset_superseded_review_targets_newest_leg_and_keeps_history(
     assert rows["w2"] == "pending"
     assert rows["w1"] == "done"
     assert "rv1" in rows  # older leg's review row kept
+
+
+def test_reset_superseded_review_reports_release_failure_when_claim_survives(
+    monkeypatch, config, coord_db
+) -> None:
+    """`release_review_dispatch_claim` is best-effort and never raises — a
+    swallowed `database is locked` collision must not be reported as a
+    clean release. The re-read confirms it, and `review_state` still gets
+    reset to pending regardless (the claim release and the state reset are
+    independent effects)."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    board = _superseded_board()
+    for a in board.completed:
+        _record(a)
+    coord_db.execute(
+        "UPDATE assignments SET review_state='dispatched' WHERE assignment_id='w2'"
+    )
+    coord_db.commit()
+    assert state.claim_review_dispatch("w2") is True  # leaked claim on the head
+    # Simulate a release call that reports success but never actually
+    # removes the row.
+    monkeypatch.setattr(state, "release_review_dispatch_claim", lambda *a, **k: None)
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    assert res.recovered is True
+    assert any("did NOT persist" in f for f in res.actions_taken)
+    # Still present — the release never actually took.
+    assert state.has_review_claim("w2") is True
+    rows = dict(coord_db.execute(
+        "SELECT assignment_id, review_state FROM assignments"
+    ).fetchall())
+    assert rows["w2"] == "pending"
 
 
 def test_diagnose_review_superseded_leg_names_the_guard_holding_it(

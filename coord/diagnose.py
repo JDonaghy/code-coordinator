@@ -856,7 +856,13 @@ def diagnose_stage(
 # comfortably outlasts a worst-case multi-candidate dispatch plus GitHub API
 # latency, while still being short enough that a *genuinely* leaked claim
 # doesn't sit unrecoverable for long once someone runs `--reset`.
-_REVIEW_CLAIM_LEAK_GRACE_SECS = 600.0
+#
+# Not a second number: `coord.state.review_claim_is_leaked`'s own
+# self-heal answers this SAME question ("how old before a claim with no
+# review row behind it stops being a plausible in-flight dispatch") with
+# `coord.state.REVIEW_CLAIM_LEAK_GRACE_SECS` — this module imports that
+# one directly (`_leaked_review_claim_without_row`, below) rather than
+# naming its own literal, so the two sides can never drift apart.
 
 
 def _leaked_review_claim_without_row(
@@ -894,6 +900,7 @@ def _leaked_review_claim_without_row(
     is the correct (healthy) diagnosis.
     """
     from coord.state import (  # noqa: PLC0415
+        REVIEW_CLAIM_LEAK_GRACE_SECS,
         has_review_claim,
         release_review_dispatch_claim,
         review_claim_age_secs,
@@ -920,7 +927,7 @@ def _leaked_review_claim_without_row(
         return False
 
     age = review_claim_age_secs(work_assignment_id)
-    if age is not None and age < _REVIEW_CLAIM_LEAK_GRACE_SECS:
+    if age is not None and age < REVIEW_CLAIM_LEAK_GRACE_SECS:
         # Too fresh to distinguish from an in-flight `dispatch_review` call
         # that has taken the claim but not yet inserted its review row —
         # report it, but don't offer to release something that might still
@@ -1076,11 +1083,24 @@ def _reset_superseded_review(
     updated = state.mark_work_leg_review_pending(newest.assignment_id)
     newest.review_state = "pending"
     newest.review_dispatch_reason = None
-    res.actions_taken.append(
-        f"released any review-dispatch claim for {newest.assignment_id} and "
-        f"reset its review_state → pending ({updated} row) — the next review "
-        "pass dispatches a review of the newest head"
-    )
+    # Confirm the release with a re-read rather than trusting the absence of
+    # an exception: `release_review_dispatch_claim` is best-effort and never
+    # raises, so a `database is locked` collision it swallowed would
+    # otherwise read here as a clean release.
+    if state.has_review_claim(newest.assignment_id):
+        res.actions_taken.append(
+            f"release requested for {newest.assignment_id}'s review-dispatch "
+            "claim, but it is still present on re-read — the release did NOT "
+            "persist; dispatch_review may still deny with the misleading "
+            "'lost the atomic dispatch-claim race' reason until it clears "
+            f"(reset its review_state → pending ({updated} row) regardless)"
+        )
+    else:
+        res.actions_taken.append(
+            f"released any review-dispatch claim for {newest.assignment_id} and "
+            f"reset its review_state → pending ({updated} row) — the next review "
+            "pass dispatches a review of the newest head"
+        )
     res.reset_performed = True
     res.recovered = True
     res.branch_preserved = True
@@ -2087,6 +2107,21 @@ def _reset_review_stage(
     # racing. Release explicitly; idempotent when no claim is held (a
     # completed/terminal review already released it via the hook above).
     state.release_review_dispatch_claim(assignment_id)
+    # Confirm with a re-read rather than trusting the absence of an
+    # exception — `release_review_dispatch_claim` is best-effort and never
+    # raises, so a swallowed `database is locked` collision would otherwise
+    # read as a clean release here.
+    if state.has_review_claim(assignment_id):
+        res.actions_taken.append(
+            f"release requested for {assignment_id}'s review-dispatch claim, "
+            "but it is still present on re-read — the release did NOT "
+            "persist; dispatch_review may still deny with the misleading "
+            "'lost the atomic dispatch-claim race' reason until it clears"
+        )
+    else:
+        res.actions_taken.append(
+            f"released any review-dispatch claim for {assignment_id}"
+        )
     updated = state.reset_work_review_state(
         repo_name, issue_number, assignment_id=assignment_id
     )

@@ -1657,6 +1657,13 @@ class TestInvestigateLeakedReviewClaim:
     def test_releases_a_leaked_claim_instead_of_dispatching_a_fixit_leg(
         self, monkeypatch,
     ) -> None:
+        # The release now runs AFTER the config-load/tier-opt-in/sealed-
+        # confined gates (#4003 review) — it mutates `review_claims`, so a
+        # repo that opted out of the investigate tier must see no mutation,
+        # not just no fix-it leg. Mocked the same way the sibling tests
+        # below already do.
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: Board(completed=[self._work()]))
         assert state.claim_review_dispatch("w1") is True
         self._backdate_claim("w1")
@@ -1703,6 +1710,42 @@ class TestInvestigateLeakedReviewClaim:
         assert _investigate(row) is True
         # The claim is untouched — still held, by the "live" dispatch this
         # fresh claim stands in for.
+        assert state.has_review_claim("w1") is True
+
+    def test_release_not_confirmed_falls_through_to_the_fixit_leg_dispatch(
+        self, monkeypatch,
+    ) -> None:
+        """The release is attempted but doesn't persist (the #3998 incident
+        shape: a release call that reports success without actually
+        clearing the row) — `has_review_claim`'s re-read still finds it, so
+        this must report `False` (nothing released) and fall through to the
+        ordinary fix-it-leg dispatch rather than claiming a release that
+        never landed."""
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: Board(completed=[self._work()]))
+        assert state.claim_review_dispatch("w1") is True
+        self._backdate_claim("w1")
+        # Simulate a release call that returns without raising but never
+        # actually removes the row.
+        monkeypatch.setattr(state, "release_review_dispatch_claim", lambda *a, **k: None)
+
+        dispatched = {}
+
+        def _record_dispatch(*a, **k):
+            dispatched["called"] = True
+            return {
+                "dispatched": True, "assignment_id": "asn-1", "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", _record_dispatch)
+
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_GATE_BLOCKED)
+
+        assert _investigate(row) is True
+        assert dispatched.get("called") is True
+        # The claim is still held — the release never persisted.
         assert state.has_review_claim("w1") is True
 
     def test_merge_queue_row_is_left_to_the_ordinary_path(
