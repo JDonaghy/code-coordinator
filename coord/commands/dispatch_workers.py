@@ -375,10 +375,37 @@ def _dispatch_review_of(
         click.echo(f"  would exec: {argv}")
         return
 
+    # #4002: the same per-item gate the auto dispatchers
+    # (`coord.review.dispatch_review`/`dispatch_scoped_review`) route
+    # through — a manual `coord assign --review-of` must refuse exactly
+    # the same races and the same already-approved head they do, or this
+    # one remaining door bypasses #4002 entirely. Claimed AFTER the
+    # dry-run check: a preview run must never take a real lease.
+    from coord.review import claim_review_item_dispatch_gate  # noqa: PLC0415
+    from coord.models import effective_issue_number  # noqa: PLC0415
+
+    _item_issue = effective_issue_number(work)
+    _item_allowed, _item_deny_reason = claim_review_item_dispatch_gate(
+        repo_name=repo,
+        issue_number=_item_issue,
+        assignment_id=work.assignment_id,
+        branch=work.branch,
+        repo_github=repo_cfg.github,
+        board=_rv_board,
+    )
+    if not _item_allowed:
+        click.echo(f"error: {_item_deny_reason}", err=True)
+        sys.exit(2)
+
     review_assignment = Assignment(
         machine_name=machine,
         repo_name=repo,
         issue_number=issue,
+        # #4002: carried from `work` so this review row's own
+        # `effective_issue_number` (what the terminal-status release hook
+        # keys the per-item lease release on) agrees with the key
+        # `claim_review_item_dispatch_gate` just claimed above.
+        for_issue_number=work.for_issue_number,
         issue_title=f"[review] {issue_title}",
         briefing=effective_briefing,
         assignment_id=assignment_id,

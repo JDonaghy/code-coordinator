@@ -4441,6 +4441,63 @@ def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:
     retry_on_locked(_write)
 
 
+def _review_item_lease_key(repo_name: str, issue_number: int) -> str:
+    """The ``review_claims`` key for the #4002 per-item lease.
+
+    Deliberately NOT a schema change — reuses :func:`claim_review_dispatch`'s
+    existing ``review_claims`` table (``of_assignment_id TEXT PRIMARY KEY``
+    accepts any string) with a key shape ``of_assignment_id`` values never
+    take: the ``item-lease:`` prefix is not a shape any assignment id uses
+    today, whether the usual ``uuid4().hex[:12]`` or a synthetic one like
+    ``claim.py``'s ``adopted-{repo}-{issue}`` — so an item-lease key can
+    never collide with a real per-assignment claim's key.
+    """
+    return f"item-lease:{repo_name}:{issue_number}"
+
+
+def claim_review_item_lease(repo_name: str, issue_number: int) -> bool:
+    """Atomically claim the ONE-per-item review-dispatch lease for
+    *(repo_name, issue_number)* (#4002).
+
+    Every review dispatcher (:func:`coord.review.dispatch_review`,
+    :func:`coord.review.dispatch_scoped_review`,
+    ``coord.commands.dispatch_workers._dispatch_review_of``) claims this
+    through the shared :func:`coord.review.claim_review_item_dispatch_gate`
+    helper before spending a metered review, in ADDITION to its own
+    per-assignment claim (:func:`claim_review_dispatch`) — the two claims
+    key on different things on purpose. A per-assignment claim only ever
+    contends with ANOTHER dispatch of the SAME assignment id; the
+    quadraui#2356 incident was two reviews of the same commit dispatched
+    from two DIFFERENT assignment ids (the original leg and its fix leg) 90
+    seconds apart, which no per-assignment claim can ever see racing. This
+    is a thin wrapper over :func:`claim_review_dispatch` with a key shaped
+    by :func:`_review_item_lease_key` instead of a bare assignment id — see
+    that function's docstring for why the two key shapes can't collide, and
+    :func:`claim_review_dispatch`'s own docstring for the atomic
+    ``INSERT ... OR IGNORE`` + daemon-routing mechanics this inherits
+    unchanged.
+
+    Released by :func:`release_review_item_lease` — called from every deny
+    path a caller takes after claiming (mirrors the per-assignment claim's
+    ``_claim_held`` pattern) and, on a successful dispatch, from the SAME
+    terminal-status chokepoint that releases the per-assignment claim
+    (:func:`release_review_claim_if_row_is_review`), so it is held for
+    exactly as long as the dispatched review leg is live.
+    """
+    return claim_review_dispatch(_review_item_lease_key(repo_name, issue_number))
+
+
+def release_review_item_lease(repo_name: str, issue_number: int) -> None:
+    """Release a lease taken by :func:`claim_review_item_lease`. Idempotent."""
+    release_review_dispatch_claim(_review_item_lease_key(repo_name, issue_number))
+
+
+def has_review_item_lease(repo_name: str, issue_number: int) -> bool:
+    """True when *(repo_name, issue_number)* currently holds a #4002 item
+    lease — the read side, mirroring :func:`has_review_claim`."""
+    return has_review_claim(_review_item_lease_key(repo_name, issue_number))
+
+
 def release_review_claim_if_row_is_review(assignment_id: str) -> None:
     """Release *assignment_id*'s own review-dispatch claim, iff that row is
     itself a ``type="review"`` assignment (#3206).
@@ -4465,6 +4522,16 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
     nothing was racing (coord-tui#49, stuck ~11h). One shared function
     closes the gap for both existing callers and any future one.
 
+    #4002: also releases the SAME review row's per-item lease
+    (:func:`release_review_item_lease`, keyed on ``(repo_name,
+    effective_issue_number)`` — see :func:`coord.models.effective_issue_number`)
+    at the exact same terminal-status chokepoint, so the one-per-item lease
+    a dispatcher took via :func:`claim_review_item_dispatch_gate` has
+    exactly the lifetime the per-assignment claim already does: held for as
+    long as the review leg is live, released the instant it reaches a
+    terminal status, through this one shared seam rather than a second,
+    independently-timed release path.
+
     Best-effort: a lookup failure here must never turn a successful status
     write into a raised exception.
     """
@@ -4474,16 +4541,29 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
     try:
         row = sql.execute(
             conn,
-            "SELECT type, review_of_assignment_id FROM assignments WHERE assignment_id=?",
+            "SELECT type, review_of_assignment_id, repo_name, issue_number, "
+            "for_issue_number FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
         if row is not None:
-            row_type = row["type"] if hasattr(row, "keys") else row[0]
-            row_of_id = (
-                row["review_of_assignment_id"] if hasattr(row, "keys") else row[1]
-            )
+            if hasattr(row, "keys"):
+                row_type = row["type"]
+                row_of_id = row["review_of_assignment_id"]
+                row_repo = row["repo_name"]
+                row_issue = row["issue_number"]
+                row_for_issue = row["for_issue_number"]
+            else:
+                row_type, row_of_id, row_repo, row_issue, row_for_issue = row
             if row_type == "review" and row_of_id:
                 _release_review_dispatch_claim_local(row_of_id)
+            if row_type == "review" and row_repo:
+                from coord.models import effective_issue_number  # noqa: PLC0415
+
+                effective_issue = effective_issue_number(
+                    {"issue_number": row_issue, "for_issue_number": row_for_issue}
+                )
+                if effective_issue:
+                    release_review_item_lease(row_repo, effective_issue)
     except Exception:  # noqa: BLE001 — best-effort; never break the status write
         pass
 
