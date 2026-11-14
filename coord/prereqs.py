@@ -658,6 +658,14 @@ def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
 # expiry timestamps would have called this host healthy. The only signal
 # that actually caught it is reading the tokens themselves.
 #
+# The reverse false-negative, #4011's precision incident: the CLI's own
+# token-refresh rewrite left `refreshTokenExpiresAt` EARLIER than
+# `expiresAt` while both tokens were present and the login kept refreshing
+# normally — `refreshTokenExpiresAt` alone is not a field the CLI keeps
+# meaningful, so this probe only trusts it as a "dead" signal when it is
+# at least as far out as `expiresAt`; an inconsistent ordering degrades to
+# "unknown, assume alive" rather than disqualifying the host.
+#
 # Deliberately does NOT spawn `claude -p` to verify the credential — `coord
 # doctor` is documented as costing exactly what `coord status` costs, and
 # runs fleet-wide, so a probe that spawned a billable subprocess per machine
@@ -739,19 +747,42 @@ def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProb
         )
     access_token = oauth.get("accessToken") or ""
     refresh_token = oauth.get("refreshToken") or ""
-    refresh_expires_at = oauth.get("refreshTokenExpiresAt")
-    now_ms = time.time() * 1000.0
-    refresh_expired = (
-        isinstance(refresh_expires_at, (int, float))
-        and refresh_expires_at > 0
-        and refresh_expires_at < now_ms
-    )
-    if not access_token or not refresh_token or refresh_expired:
+    if not access_token or not refresh_token:
         return _claude_not_found(
             prereq,
-            f"{path} holds empty or expired OAuth tokens — a failed "
-            "background refresh can blank accessToken/refreshToken while "
-            "leaving refreshTokenExpiresAt looking alive (#3326) — run "
+            f"{path} holds an empty accessToken or refreshToken — a failed "
+            "background refresh can blank these while leaving "
+            "refreshTokenExpiresAt looking alive (#3326) — run `claude` "
+            "(or `claude setup-token`) on this machine to re-authenticate",
+        )
+    expires_at = oauth.get("expiresAt")
+    refresh_expires_at = oauth.get("refreshTokenExpiresAt")
+    now_ms = time.time() * 1000.0
+    expires_at_known = isinstance(expires_at, (int, float)) and expires_at > 0
+    refresh_expires_at_known = (
+        isinstance(refresh_expires_at, (int, float)) and refresh_expires_at > 0
+    )
+    # #4011: on precision, the CLI's own token refresh rewrote this file
+    # and left `refreshTokenExpiresAt` EARLIER than `expiresAt` — the
+    # access token's own, much shorter-lived expiry — while the login kept
+    # refreshing normally. That ordering is impossible for a healthy
+    # credential (the refresh token must outlive the access token it mints),
+    # so it is inconsistent metadata, not a real signal the session is
+    # dead: ignore `refreshTokenExpiresAt` entirely in that shape rather
+    # than trust a field the CLI evidently does not keep meaningful.
+    refresh_expiry_inconsistent = (
+        expires_at_known and refresh_expires_at_known
+        and refresh_expires_at < expires_at
+    )
+    refresh_expired = (
+        refresh_expires_at_known
+        and refresh_expires_at < now_ms
+        and not refresh_expiry_inconsistent
+    )
+    if refresh_expired:
+        return _claude_not_found(
+            prereq,
+            f"{path}'s refreshTokenExpiresAt is in the past — run "
             "`claude` (or `claude setup-token`) on this machine to "
             "re-authenticate",
         )
@@ -759,11 +790,14 @@ def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProb
     # #3371: surface "whatever expiry is knowable" — `refreshTokenExpiresAt`
     # is the SESSION lifetime (weeks), not the short-lived access token's
     # `expiresAt` (hours, auto-refreshed and therefore not the thing an
-    # operator needs forward visibility into — see this field's own
-    # `refresh_expired` check above, which already treats it as the
-    # authoritative "is this credential dead" signal). Only published when
-    # it parses as a real positive timestamp; a missing/garbled field
-    # degrades to `None` ("no expiry known"), never to a fabricated one.
+    # operator needs forward visibility into). Published whenever it parses
+    # as a real positive timestamp, even the #4011 inconsistent shape
+    # (earlier than `expiresAt`) that `refresh_expired` above ignores for
+    # dead/alive purposes — a negative "already expired" reading there
+    # already falls outside `claude_credential_expiry_warning`'s warn
+    # window, so it can't surface as a misleading "expiring soon". A
+    # missing/garbled field degrades to `None` ("no expiry known"), never
+    # to a fabricated one.
     known_expires_at = (
         float(refresh_expires_at)
         if isinstance(refresh_expires_at, (int, float)) and refresh_expires_at > 0

@@ -1265,8 +1265,8 @@ class TestClaudeCredentialsPrereq:
     ) -> None:
         """Missing file and unparsable-but-present file are different
         defects with different remedies — both must be UNMET, but the
-        acceptance bar wants them distinguishable in `what_breaks`, unlike
-        the shared "empty or expired tokens" bucket below."""
+        acceptance bar wants them distinguishable in `what_breaks` (as are
+        the empty-token and expired-refresh-token cases below — #4011)."""
         creds_dir = tmp_path / ".claude"
         creds_dir.mkdir(parents=True)
         (creds_dir / ".credentials.json").write_text("not json", encoding="utf-8")
@@ -1298,12 +1298,17 @@ class TestClaudeCredentialsPrereq:
             probe = prereqs.probe(self._claude_prereq())
         assert probe.found is False
         assert probe.ok is False
-        assert "empty or expired" in probe.what_breaks
+        assert "empty accessToken or refreshToken" in probe.what_breaks
         # Distinct wording from the missing/unparsable-file case.
         assert "does not exist" not in probe.what_breaks
         assert "not valid JSON" not in probe.what_breaks
 
     def test_expired_refresh_token_probes_not_met(self, tmp_path, monkeypatch) -> None:
+        """`refreshTokenExpiresAt` in the past AND no earlier than
+        `expiresAt` (here `expiresAt` isn't even known) is the genuine,
+        consistent-ordering expiry case — this is real positive evidence
+        the session is dead, distinct from #4011's inconsistent-metadata
+        shape covered below."""
         monkeypatch.setenv("HOME", str(tmp_path))
         self._write_credentials(tmp_path, {
             "accessToken": "sk-ant-oat01-live",
@@ -1316,6 +1321,31 @@ class TestClaudeCredentialsPrereq:
             probe = prereqs.probe(self._claude_prereq())
         assert probe.found is False
         assert probe.ok is False
+        assert "refreshTokenExpiresAt is in the past" in probe.what_breaks
+        # Distinct wording from the empty-token / missing-file cases.
+        assert "empty accessToken" not in probe.what_breaks
+
+    def test_refresh_expiry_earlier_than_access_expiry_is_ignored(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """#4011: precision's incident. Both tokens present, `expiresAt` in
+        the future, and `refreshTokenExpiresAt` in the past AND earlier
+        than `expiresAt` — a login the CLI kept refreshing normally. That
+        ordering is impossible for a healthy credential (the refresh token
+        must outlive the access token it mints), so it is inconsistent
+        metadata the probe must ignore, not evidence of a dead session."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": 1000,  # long past, and earlier than expiresAt
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
 
     def test_healthy_credential_probes_met_and_reports_subscription_tier(
         self, tmp_path, monkeypatch
