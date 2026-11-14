@@ -395,6 +395,43 @@ def test_local_health_logs_when_slow(tmp_path: Path, monkeypatch, caplog) -> Non
     )
 
 
+def test_health_does_not_wait_on_slow_base_checkout_refresh(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#4005: `_refresh_base_checkouts` used to run inline on the same
+    thread `/health` answers from, so an hourly fetch + `graphify update .`
+    held the response for the whole pass — long enough that callers
+    probing with `network.DEFAULT_TIMEOUT`'s 3s budget saw a healthy
+    agent as unroutable. Stubbing the pass to sleep 30s and asserting
+    `/health` still returns in well under that is the acceptance test for
+    "moved off the request path": a bug that put the call back inline
+    would make this test hang for ~30s instead of failing fast, but it
+    would still fail.
+    """
+    import coord.agent as agent_module
+
+    server = _server(tmp_path)
+    started = threading.Event()
+
+    def _slow_refresh(self, ctx) -> None:
+        started.set()
+        time.sleep(30.0)
+
+    monkeypatch.setattr(
+        agent_module.AgentServer, "_refresh_base_checkouts", _slow_refresh
+    )
+
+    t0 = time.monotonic()
+    server.health()
+    elapsed = time.monotonic() - t0
+
+    # The kicked-off pass really did start (and is presumably still
+    # sleeping on its own thread) — this isn't passing merely because the
+    # refresh was skipped entirely.
+    assert started.wait(timeout=2.0), "base checkout refresh never kicked off"
+    assert elapsed < 5.0, f"/health blocked for {elapsed:.1f}s on the refresh"
+
+
 def test_health_includes_tool_versions_for_baseline_and_capabilities(
     tmp_path: Path,
 ) -> None:

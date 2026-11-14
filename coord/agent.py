@@ -7301,6 +7301,20 @@ class AgentServer:
         self._graph_refresh_last_run_at: float | None = None
         self._graph_refresh_results: dict[str, dict] = {}
         self._graph_refresh_pending: dict[str, float] = {}
+        # #4005: `_refresh_base_checkouts` (the fetch/ff-merge plus any
+        # `graphify update .` it triggers) used to run INLINE on
+        # `_cached_local_health`'s own thread, so a slow pass blocked that
+        # `/health` response for its whole duration — minutes, on the
+        # hourly tick, against callers' 3s `network.DEFAULT_TIMEOUT`
+        # budget. `_kick_off_base_checkout_refresh` now hands the pass to
+        # its own daemon thread and returns immediately; `/health` only
+        # ever reads `_graph_refresh_results`/`_graph_refresh_pending`
+        # (written by whichever thread last ran the pass), never waits on
+        # it. `_base_checkout_refresh_ran` is a test seam only — set every
+        # time a kicked-off pass finishes (success or failure) so a test
+        # can wait for "at least one pass has run" deterministically
+        # instead of sleeping for an unspecified duration.
+        self._base_checkout_refresh_ran = threading.Event()
 
         # Skills self-heal (#319 follow-up): `coord install-skills` was a
         # real fix (coord/skills/*/SKILL.md) for a real problem, but was a
@@ -7870,11 +7884,16 @@ class AgentServer:
 
             ctx = build_context(self._health_config, allow_network=False, now=now)
             _mark("build_context")
+            # #4005: kicked off on its own thread, never awaited here — see
+            # `_kick_off_base_checkout_refresh`'s docstring. This report's
+            # `graph` results below therefore describe whatever the LAST
+            # completed pass left behind, not necessarily this tick's HEAD;
+            # that is the point (a slow fetch/rebuild must never hold up
+            # this response) and `graph_refresh`/`graph` results carry their
+            # own `checked_at`/timestamps so a caller can see how stale they
+            # are, rather than /health silently blocking until they are not.
             try:
-                # Before the checks run, so this same report's `graph` results
-                # already describe the fast-forwarded HEAD and rebuilt graph.
-                # Own try/except for the same reason as the graph pass below.
-                self._refresh_base_checkouts(ctx)
+                self._kick_off_base_checkout_refresh(ctx)
             except Exception as exc:  # noqa: BLE001 — refresh is best-effort
                 _log.warning("base checkout refresh pass failed: %s", exc)
             _mark("refresh_base_checkouts")
@@ -7952,6 +7971,45 @@ class AgentServer:
         self._local_health_cache = (now, payload)
         return payload
 
+    def _kick_off_base_checkout_refresh(self, ctx: Any) -> None:
+        """Start one `_refresh_base_checkouts` pass on its own daemon
+        thread (#4005), so `/health` never blocks on it.
+
+        `_refresh_base_checkouts` already owns the only guards that matter
+        for correctness — it claims `_graph_refresh_last_run_at` under
+        `self._lock` *before* doing anything slow (so two overlapping
+        passes can't both decide "due"), and dedups the actual
+        fetch/rebuild per checkout path via `_graph_rebuild_in_progress`.
+        Those guards pre-date this method and already had to tolerate
+        concurrent callers (multiple simultaneous `/health` polls used to
+        reach `_refresh_base_checkouts` on separate request threads before
+        this change too — see `_graph_rebuild_in_progress`'s docstring in
+        `__init__`). Handing the pass to a fresh thread on every cache-miss
+        tick therefore does not introduce a new race: at most it costs a
+        thread spin-up that finds nothing due and exits almost immediately,
+        which is cheap next to the fetch/merge/`graphify update .` it would
+        otherwise have blocked `/health` for.
+
+        `/health` reads only the fields this pass writes
+        (`_graph_refresh_results`, `_graph_refresh_pending`) — never this
+        thread or its return value. `_base_checkout_refresh_ran` is cleared
+        before the thread starts and set in its `finally`, purely as a test
+        seam for waiting on "a pass has completed" deterministically.
+        """
+        self._base_checkout_refresh_ran.clear()
+
+        def _run() -> None:
+            try:
+                self._refresh_base_checkouts(ctx)
+            except Exception as exc:  # noqa: BLE001 — refresh is best-effort
+                _log.warning("base checkout refresh pass failed: %s", exc)
+            finally:
+                self._base_checkout_refresh_ran.set()
+
+        threading.Thread(
+            target=_run, name="agent-base-checkout-refresh", daemon=True
+        ).start()
+
     def _refresh_base_checkouts(self, ctx: Any) -> None:
         """Keep each base checkout's HEAD, and so its graph, current with
         origin.
@@ -7976,8 +8034,12 @@ class AgentServer:
           new HEAD, so the stale-graph pass surfaces it as WARN and does not
           retry it.
 
-        Runs before the health checks, so the same report already reflects
-        the new HEAD. Never raises out to /health (the caller wraps it).
+        Runs on its own thread, kicked off by
+        `_kick_off_base_checkout_refresh` and never awaited by `/health`
+        (#4005) — the health checks that ran in the same `/health` poll
+        that triggered this pass do NOT wait for it, so they may still
+        describe the pre-refresh HEAD. Never raises out to its caller (the
+        caller wraps it).
         """
         from coord.graph_health import fast_forward_base_checkout  # noqa: PLC0415
 
