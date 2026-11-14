@@ -4466,12 +4466,11 @@ def claim_review_item_lease(repo_name: str, issue_number: int) -> bool:
     helper before spending a metered review, in ADDITION to its own
     per-assignment claim (:func:`claim_review_dispatch`) — the two claims
     key on different things on purpose. A per-assignment claim only ever
-    contends with ANOTHER dispatch of the SAME assignment id; the
-    quadraui#2356 incident was two reviews of the same commit dispatched
-    from two DIFFERENT assignment ids (the original leg and its fix leg) 90
-    seconds apart, which no per-assignment claim can ever see racing. This
-    is a thin wrapper over :func:`claim_review_dispatch` with a key shaped
-    by :func:`_review_item_lease_key` instead of a bare assignment id — see
+    contends with ANOTHER dispatch of the SAME assignment id, so two
+    reviews of the same commit dispatched from two DIFFERENT assignment
+    ids (an original leg and its fix leg) never race against each other
+    there. This is a thin wrapper over :func:`claim_review_dispatch` with a
+    key shaped by :func:`_review_item_lease_key` instead of a bare assignment id — see
     that function's docstring for why the two key shapes can't collide, and
     :func:`claim_review_dispatch`'s own docstring for the atomic
     ``INSERT ... OR IGNORE`` + daemon-routing mechanics this inherits
@@ -4490,6 +4489,17 @@ def claim_review_item_lease(repo_name: str, issue_number: int) -> bool:
 def release_review_item_lease(repo_name: str, issue_number: int) -> None:
     """Release a lease taken by :func:`claim_review_item_lease`. Idempotent."""
     release_review_dispatch_claim(_review_item_lease_key(repo_name, issue_number))
+
+
+def _release_review_item_lease_local(repo_name: str, issue_number: int) -> None:
+    """Local-DB-only sibling of :func:`release_review_item_lease`, mirroring
+    :func:`_release_review_dispatch_claim_local` — for a caller that is
+    itself already a local-only write (:func:`release_review_claim_if_row_is_review`)
+    and must not re-route this release back over HTTP via
+    :func:`_board_service`/:func:`route_write` the way the public,
+    routed :func:`release_review_item_lease` does.
+    """
+    _release_review_dispatch_claim_local(_review_item_lease_key(repo_name, issue_number))
 
 
 def has_review_item_lease(repo_name: str, issue_number: int) -> bool:
@@ -4523,14 +4533,18 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
     closes the gap for both existing callers and any future one.
 
     #4002: also releases the SAME review row's per-item lease
-    (:func:`release_review_item_lease`, keyed on ``(repo_name,
+    (:func:`_release_review_item_lease_local`, keyed on ``(repo_name,
     effective_issue_number)`` — see :func:`coord.models.effective_issue_number`)
     at the exact same terminal-status chokepoint, so the one-per-item lease
     a dispatcher took via :func:`claim_review_item_dispatch_gate` has
     exactly the lifetime the per-assignment claim already does: held for as
     long as the review leg is live, released the instant it reaches a
     terminal status, through this one shared seam rather than a second,
-    independently-timed release path.
+    independently-timed release path. Local-only, like the per-assignment
+    release just above it (:func:`_release_review_dispatch_claim_local`) —
+    this whole function is itself a local-DB write with no daemon routing
+    of its own, so a routed release here would be a same-process self-HTTP
+    round trip on any host that also has ``COORD_SERVICE_URL`` set.
 
     Best-effort: a lookup failure here must never turn a successful status
     write into a raised exception.
@@ -4563,7 +4577,7 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
                     {"issue_number": row_issue, "for_issue_number": row_for_issue}
                 )
                 if effective_issue:
-                    release_review_item_lease(row_repo, effective_issue)
+                    _release_review_item_lease_local(row_repo, effective_issue)
     except Exception:  # noqa: BLE001 — best-effort; never break the status write
         pass
 

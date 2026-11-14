@@ -360,3 +360,103 @@ class TestReworkIterationIsMonotonic:
         _run_rework(board, cfg, repo, rework_of="issue-7-nothing-here")
 
         assert "(iteration 1/3)" in capsys.readouterr().out
+
+
+# ── #4002: `_dispatch_review_of` routes through the same per-item gate ──────
+#
+# "A review dispatch against a head SHA that already has an approve in the
+# chain is refused by every dispatcher, including `_dispatch_review_of`" is
+# an explicit #4002 acceptance criterion — the manual `coord assign
+# --review-of` escape hatch must not bypass the #4002 gate the two headless
+# dispatchers (`dispatch_review`/`dispatch_scoped_review`) already route
+# through.
+
+
+def _dispatch_review_of_chain(approved_head_sha: str) -> tuple[Assignment, Board]:
+    """One work row plus an earlier review that approved *approved_head_sha*
+    somewhere in its chain."""
+    work = _work_row("work-orig", 0)
+    prior_approval = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=7,
+        issue_title="[review] t", assignment_id="review-approved",
+        type="review", status="done", review_of_assignment_id="work-orig",
+        review_verdict="approve", review_head_sha=approved_head_sha,
+        dispatched_at=5.0,
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[], active=[], completed=[work, prior_approval],
+    )
+    return work, board
+
+
+def _run_review_of(
+    board: Board, cfg: Config, repo: Repo, *, branch_sha: str,
+) -> None:
+    from coord.commands.dispatch_workers import _dispatch_review_of
+
+    with patch(
+        "coord.commands.dispatch_workers.github_ops.find_pr_for_branch",
+        return_value={"number": 1, "url": "u", "existed": True},
+    ), patch(
+        "coord.commands.dispatch_workers.github_ops.pr_diff",
+        return_value="diff --git a/x b/x\n",
+    ), patch(
+        "coord.review.github_ops.get_branch_sha", return_value=branch_sha,
+    ):
+        _dispatch_review_of(
+            machine="laptop",
+            repo="api",
+            issue=7,
+            briefing="",
+            model=None,
+            dry_run=False,
+            review_of="work-orig",
+            cfg=cfg,
+            machine_obj=_fake_machine_obj(),
+            repo_cfg=repo,
+            issue_data={},
+            issue_title="Widget is broken",
+            provider=_fake_provider(),
+            _is_local=True,
+            _svc=None,
+            _interactive_board=lambda _builder: board,
+            _issue_ctx="",
+        )
+
+
+class TestDispatchReviewOfItemGate:
+    def test_refused_when_the_resolved_head_is_already_approved(
+        self, cfg: Config, repo: Repo,
+    ) -> None:
+        """The branch's live head (what `get_branch_sha` resolves to) is the
+        EXACT commit a prior review already approved elsewhere in the work
+        chain — `_dispatch_review_of` must refuse with `sys.exit(2)`,
+        exactly like `dispatch_review`/`dispatch_scoped_review` do, rather
+        than spending a second, possibly-contradicting human-attended
+        review on it."""
+        _work, board = _dispatch_review_of_chain(approved_head_sha="deadbeef1234")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_review_of(board, cfg, repo, branch_sha="deadbeef1234")
+
+        assert exc_info.value.code == 2
+
+    def test_proceeds_when_the_resolved_head_is_a_new_commit(
+        self, cfg: Config, repo: Repo,
+    ) -> None:
+        """A fresh commit (a different live head) must still get dispatched
+        normally — only the EXACT previously-approved commit is refused."""
+        _work, board = _dispatch_review_of_chain(approved_head_sha="deadbeef1234")
+
+        # Reaching past the #4002 gate drives into the real interactive
+        # launch machinery (tmux/subprocess) this test deliberately does not
+        # stand up — a raised exception past the gate (anything other than
+        # the gate's own `sys.exit(2)`) is sufficient proof the gate itself
+        # did not refuse.
+        try:
+            _run_review_of(board, cfg, repo, branch_sha="freshcommitsha")
+        except SystemExit as exc:
+            assert exc.code != 2, "must not be refused by the #4002 gate"
+        except Exception:
+            pass

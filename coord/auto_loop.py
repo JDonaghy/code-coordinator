@@ -104,9 +104,11 @@ FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work"}) | SEALED_PATH_AUTHOR_TY
 # #253), an advisory-only review advanced the pipeline (#476 — ``review_verdict``
 # flips to approve + ``review_state="done"`` so the merge gate unblocks; without
 # this the gate suppresses the fix but the advance is never persisted and the PR
-# silently can't merge), the work was found terminal (#522), or (#1663) a
+# silently can't merge), the work was found terminal (#522), (#1663) a
 # request-changes verdict was propagated onto the parent row without a fix
-# dispatch.
+# dispatch, or (#4002) a request-changes verdict against an already-approved
+# head was recorded on the review row (non-blocking, no fix round) rather
+# than discarded.
 #
 # #1622: module-level rather than a local in ``_run_for_review_transition``
 # because ``coord fix`` is now a second caller of
@@ -114,7 +116,7 @@ FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work"}) | SEALED_PATH_AUTHOR_TY
 # copies of this tuple is exactly the drift shape #1601/#1624 keep hitting.
 PERSIST_ACTION_KINDS: tuple[str, ...] = (
     "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
-    "verdict_propagated", "finisher_dispatched",
+    "verdict_propagated", "finisher_dispatched", "superseded_by_approval",
 )
 
 
@@ -937,12 +939,19 @@ def _head_already_approved_elsewhere(
     Deliberately checks ``review.review_head_sha`` — the exact commit
     *review* was dispatched against (#821) — rather than refetching the
     branch's live head: a request-changes verdict always refers to the
-    commit it actually reviewed, and that is exactly the commit the #4002
-    incident's second review also reviewed (no new commit landed between
-    the two dispatches). A later, genuinely new commit gets a different
-    ``review_head_sha`` and so is correctly treated as unapproved here —
-    the acceptance criterion that a fresh commit still gets reviewed
-    normally.
+    commit it actually reviewed. A later, genuinely new commit gets a
+    different ``review_head_sha`` and so is correctly treated as
+    unapproved here — the acceptance criterion that a fresh commit still
+    gets reviewed normally.
+
+    Residual ordering gap: this asks "does an approve already exist", not
+    "which of the two verdicts was dispatched first". The per-item lease
+    (:func:`coord.review.claim_review_item_dispatch_gate`) normally
+    prevents two reviews of the same commit from co-existing at all, but if
+    one somehow did and its request-changes leg *completes* before the
+    approve leg does, this function sees no approve yet and a fix round is
+    still dispatched — the dispatch-side lease is what is meant to make
+    that scenario unreachable, not this read.
     """
     from coord import merge_queue as mq  # noqa: PLC0415
 
@@ -968,6 +977,15 @@ def _post_superseded_by_approval_notice(
     session already posted remains on the PR, and this comment records,
     for the audit trail, that the coordinator read them as non-blocking
     because a prior review already approved this exact commit.
+
+    Posted via :func:`coord.state.upsert_issue_comment` rather than a bare
+    ``post_issue_comment`` (#2109's marker-keyed edit-in-place) — this
+    outcome can legitimately be recomputed more than once for the SAME
+    review row (the #1582 ``review_done_no_verdict``/stalled-pipeline sweep
+    re-runs :func:`process_review_completion` whenever it still finds this
+    row's fix-less ``request-changes`` outstanding), and without upsert
+    each re-run would append another identical comment to the issue rather
+    than being a no-op.
     """
     repo = config.repo(work.repo_name)
     if repo is None:
@@ -990,7 +1008,11 @@ def _post_superseded_by_approval_notice(
         f"`coord fix` before merging.\n"
     )
     try:
-        github_ops.post_issue_comment(repo.github, work.issue_number, body)
+        from coord.state import upsert_issue_comment  # noqa: PLC0415
+
+        upsert_issue_comment(
+            work.repo_name, work.issue_number, body, repo_github=repo.github,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "auto_loop: failed to post superseded-by-approval notice for "

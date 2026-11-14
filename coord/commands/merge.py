@@ -1239,7 +1239,15 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
     # #522: terminal_skip mutates work.review_state="done" in
     # process_review_completion — persist it (same as the notify path) so the
     # row doesn't get re-evaluated, and treat it as a clean (not failed) exit.
-    terminal = any(a.kind == "terminal_skip" for a in actions)
+    # #4002: superseded_by_approval mutates the review row's own
+    # review_verdict (see PERSIST_ACTION_KINDS) — same "mutates, no
+    # dispatch" shape as terminal_skip, and must persist and exit clean for
+    # the same reason: it is a deliberate, successful outcome (a
+    # request-changes against an already-approved head, recorded
+    # non-blocking), not a failure mode.
+    terminal = any(
+        a.kind in ("terminal_skip", "superseded_by_approval") for a in actions
+    )
     if dispatched or terminal:
         write_board(board)
 
@@ -1247,9 +1255,12 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
         click.echo(f"{a.kind}: {a.detail}")
 
     if not dispatched:
-        # Distinguish clean outcomes (approve / already-merged-or-closed) from
-        # genuine failure modes.
-        if any(a.kind in ("approved", "terminal_skip") for a in actions):
+        # Distinguish clean outcomes (approve / already-merged-or-closed /
+        # superseded-by-approval) from genuine failure modes.
+        if any(
+            a.kind in ("approved", "terminal_skip", "superseded_by_approval")
+            for a in actions
+        ):
             sys.exit(0)
         sys.exit(1)
 

@@ -1173,6 +1173,42 @@ class TestDispatchPerReason:
         assert action.kind == "review_transition_applied"
         assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
 
+    def test_review_request_changes_no_fix_superseded_by_approval_is_not_no_action(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#4002 review follow-up: `superseded_by_approval` mutates the
+        review row's own `review_verdict` in place (recorded non-blocking)
+        exactly like `terminal_skip` mutates the work row, even though no
+        fix is dispatched. Before `superseded_by_approval` was added to
+        `_MUTATING_REVIEW_COMPLETION_KINDS`, this classified as `no_action`
+        — the mutation was never persisted, so every later sweep re-detected
+        the SAME row as `review_done_no_verdict` (verdict never captured)
+        and re-ran `process_review_completion` again, which could escalate
+        to deleting and re-dispatching the review (refused outright by the
+        #4002 per-item gate) and re-posts the GitHub notice on every tick.
+        """
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="superseded_by_approval", assignment_id="review-1",
+                detail="commit already approved elsewhere — findings non-blocking",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_transition_applied"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+
     def test_review_request_changes_no_fix_genuine_no_action_stays_no_action(
         self, config: Config, monkeypatch
     ) -> None:

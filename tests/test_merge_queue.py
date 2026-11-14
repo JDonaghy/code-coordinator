@@ -5035,6 +5035,102 @@ class TestReviewGate:
         assert items[0].state == PENDING  # dry-run: state untouched
 
 
+class TestHeadAlreadyApproved:
+    """#4002: `head_already_approved` is the narrow "is this EXACT head
+    covered" question the dispatch-side gate
+    (`coord.review.claim_review_item_dispatch_gate`) and the fix loop
+    (`coord.auto_loop._head_already_approved_elsewhere`) both ask. It must
+    never answer `True` from a match it cannot actually confirm is THIS
+    head — doing so turns a one-shot dispatch refusal into a permanent
+    lock-out, since every later dispatch (including a fresh commit's) asks
+    the identical unconditioned question.
+    """
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done", branch=f"worker/{aid}",
+        )
+
+    @staticmethod
+    def _review(
+        of_aid: str, *, verdict: str | None = "approve", review_head_sha=None,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=f"rev-{of_aid}", type="review", status="done",
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+            review_head_sha=review_head_sha,
+        )
+
+    def test_matches_an_approve_on_the_exact_same_head(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", review_head_sha="sha-current")
+        board = self._board(completed=[work, review])
+        assert mq.head_already_approved(
+            board, assignment_id="w1", branch="worker/w1",
+            branch_head_sha="sha-current",
+        ) is True
+
+    def test_does_not_match_an_approve_on_a_different_head(self) -> None:
+        """A new commit (a fix or conflict-fix) must still get a fresh
+        review — this is the acceptance criterion that a later commit is
+        never silently treated as pre-approved."""
+        work = self._work("w1")
+        review = self._review("w1", review_head_sha="sha-old")
+        board = self._board(completed=[work, review])
+        assert mq.head_already_approved(
+            board, assignment_id="w1", branch="worker/w1",
+            branch_head_sha="sha-new",
+        ) is False
+
+    def test_null_review_head_sha_does_not_lock_the_item_out_forever(self) -> None:
+        """The defect this guards against: `scan_approved_reviews` itself
+        falls through its legacy "no SHA to compare" branch and reports
+        `approved=True` for ANY head when the matched approve carries no
+        `review_head_sha` at all (a pre-#821 row, or any row written
+        without that column — e.g. `coord assign --review-of`'s review
+        row before it stamps one). `head_already_approved` must NOT inherit
+        that fall-through: without a real `review_head_sha` there is
+        nothing confirming the match is THIS head rather than some earlier
+        one, and reporting `True` here would refuse every future dispatch
+        for this item — including one against a genuinely fresh commit —
+        forever, with no escape hatch.
+        """
+        work = self._work("w1")
+        review = self._review("w1", review_head_sha=None)
+        board = self._board(completed=[work, review])
+        assert mq.head_already_approved(
+            board, assignment_id="w1", branch="worker/w1",
+            branch_head_sha="sha-any-head-whatsoever",
+        ) is False
+
+    def test_unknown_branch_head_fails_closed(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", review_head_sha="sha-current")
+        board = self._board(completed=[work, review])
+        assert mq.head_already_approved(
+            board, assignment_id="w1", branch="worker/w1", branch_head_sha=None,
+        ) is False
+
+    def test_request_changes_never_matches(self) -> None:
+        work = self._work("w1")
+        review = self._review(
+            "w1", verdict="request-changes", review_head_sha="sha-current",
+        )
+        board = self._board(completed=[work, review])
+        assert mq.head_already_approved(
+            board, assignment_id="w1", branch="worker/w1",
+            branch_head_sha="sha-current",
+        ) is False
+
+
 class TestScopedReviewCandidate:
     """#1476: find_scoped_review_candidate / only_conflict_fix_since_review —
     the pure-logic gate deciding whether a voided approval qualifies for a

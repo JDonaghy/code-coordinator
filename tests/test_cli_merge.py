@@ -4583,3 +4583,68 @@ class TestBackfillCost:
         )
         assert result.exit_code == 0, result.output
         assert "No assignments with missing cost/tokens found." in result.output
+
+
+class TestBounceSupersededByApproval:
+    """#4002 review follow-up: `coord bounce` (`coord/commands/merge.py`)
+    exits 1 for any action set containing neither `fix_dispatched` nor
+    `approved`/`terminal_skip` — before `superseded_by_approval` was added
+    to that allow-list, this deliberate, successful outcome (a
+    request-changes against an already-approved head, recorded
+    non-blocking) read as a genuine failure, and the mutation it made
+    (the review row's own `review_verdict`) was never persisted either.
+    """
+
+    @staticmethod
+    def _seed_board(coord_dir: Path) -> None:
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t", assignment_id="work-abc", type="work",
+            status="done", branch="issue-1-fix", review_state="dispatched",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[review] t", assignment_id="review-xyz", type="review",
+            status="done", review_of_assignment_id="work-abc",
+            review_verdict=None,
+        )
+        save_board(Board(active=[], completed=[work, review]))
+
+    def test_exits_clean_and_persists_the_verdict(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        self._seed_board(coord_dir)
+
+        from coord.auto_loop import LoopAction
+
+        with patch(
+            "coord.auto_loop.process_review_completion",
+            return_value=[
+                LoopAction(
+                    kind="superseded_by_approval", assignment_id="review-xyz",
+                    detail="commit already approved elsewhere — non-blocking",
+                ),
+            ],
+        ):
+            result = CliRunner().invoke(
+                main, ["bounce", "review-xyz", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "superseded_by_approval" in result.output
+
+        from coord.state import load_board
+
+        loaded = load_board()
+        review_loaded = loaded.find_by_id("review-xyz")
+        assert review_loaded is not None
+        # The mutation `process_review_completion` made in memory (not
+        # actually run here — it's stubbed — but the CLI's own write_board
+        # call must still fire for this action kind) persists whatever the
+        # in-memory board object carries at that point.
+        work_loaded = loaded.find_by_id("work-abc")
+        assert work_loaded is not None
+        assert work_loaded.review_state == "dispatched"

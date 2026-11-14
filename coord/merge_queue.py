@@ -948,6 +948,20 @@ def head_already_approved(
     — same posture as :func:`scan_approved_reviews`'s own ``unknown_head``
     handling: a caller that can't confirm the current head never gets to
     claim it's already approved.
+
+    A matched approval whose own ``review_head_sha`` is ``None`` (a
+    pre-#821 row, or any row written without that column — e.g. the
+    ``review-reaffirm`` UPDATE path, `coord/state.py`) is deliberately
+    rejected here even though :func:`scan_approved_reviews` itself falls
+    through its "no SHA to compare against" legacy branch and reports that
+    case as approved for ANY current head. That fallback is correct for
+    the merge gate, which has no fresher signal to fall back on. It is
+    wrong for this function's narrower question: without a real
+    ``review_head_sha`` there is nothing confirming the match is *this*
+    head rather than some earlier one, and treating it as proof here would
+    turn the dispatch gate into a permanent lock-out — every later
+    dispatch (including a fresh commit's) would see the same unconditioned
+    `True` and refuse forever, with no escape hatch.
     """
     if not branch or not branch_head_sha:
         return False
@@ -956,7 +970,14 @@ def head_already_approved(
         branch=branch,
         branch_head_sha=branch_head_sha,
     )
-    return scan_approved_reviews(probe, board).approved
+    scan = scan_approved_reviews(probe, board)
+    if not scan.approved:
+        return False
+    review = scan.review_assignment
+    return bool(
+        review is not None
+        and getattr(review, "review_head_sha", None) == branch_head_sha
+    )
 
 
 def find_scoped_review_candidate(
