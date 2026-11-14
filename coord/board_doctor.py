@@ -56,6 +56,7 @@ resolves and recurs.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time as _time
@@ -873,6 +874,83 @@ def _milestone_exists(repo_name: str, title: str) -> bool:
     return any(m.get("title") == title for m in milestones)
 
 
+def _covering_open_pr(github_repo: str, issue_number: int) -> int | None:
+    """An open PR in *github_repo* whose body already carries a GitHub
+    closing keyword for *issue_number* (#4007) — remediation for the
+    parent is already in flight, so :func:`run_followthrough_sweep` must
+    file nothing for it (the quadraui#2419 incident: quadraui#2439 already
+    read ``Closes #2419`` while the follow-through kept treating #2419 as
+    unclaimed and filed two duplicate successors for it).
+
+    Reuses :func:`coord.pr_body_lint.find_closing_references` — the same
+    closing-keyword scan `coord.merge_queue.process` runs pre-merge — so
+    "does this PR close that issue" has one answer, not a second regex.
+    Fail-open on any `gh` read failure: an unreachable PR body must not
+    itself block this sweep from otherwise acting on the row.
+    """
+    from coord import github_ops  # noqa: PLC0415
+    from coord.pr_body_lint import find_closing_references  # noqa: PLC0415
+
+    try:
+        prs = github_ops.list_open_prs(github_repo)
+    except Exception:  # noqa: BLE001 — unreachable reads as "no covering PR"
+        return None
+    for pr in prs:
+        number = pr.get("number")
+        if number is None:
+            continue
+        try:
+            body = github_ops.get_pr_body(github_repo, int(number))
+        except Exception:  # noqa: BLE001 — one bad PR body must not sink the sweep
+            continue
+        if issue_number in find_closing_references(body):
+            return int(number)
+    return None
+
+
+def _load_pending_followthrough(
+    repo_name: str, issue_number: int,
+) -> board_doctor_followthrough.PendingFollowThrough | None:
+    """The most recent unfinished follow-through attempt recorded for
+    *repo_name*#*issue_number*, if any (#4007).
+
+    Reads the durable decision log (:func:`coord.state.
+    board_doctor_decisions`) for the latest
+    :data:`~coord.board_doctor_followthrough.ACTION_WRITE_FAILED` entry and
+    decodes the resumable plan/follow-up-number state
+    :func:`~coord.board_doctor_followthrough.Disposition.as_record` folded
+    into its ``evidence`` list (see
+    :data:`~coord.board_doctor_followthrough.PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX`'s
+    docstring for why there, rather than a new column). ``None`` when there
+    is no such entry, or its evidence carries no resumable payload (an
+    older write-failed row recorded before this existed).
+    """
+    from coord.state import board_doctor_decisions  # noqa: PLC0415
+
+    decisions = board_doctor_decisions(
+        repo=repo_name, issue=issue_number,
+        action=board_doctor_followthrough.ACTION_WRITE_FAILED,
+    )
+    if not decisions:
+        return None
+    prefix = board_doctor_followthrough.PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX
+    for item in reversed(decisions[-1].get("evidence") or []):
+        if not (isinstance(item, str) and item.startswith(prefix)):
+            continue
+        try:
+            payload = json.loads(item[len(prefix):])
+            plan = board_doctor_followthrough.plan_from_jsonable(payload["plan"])
+            follow_up_keys = {
+                str(k): int(v) for k, v in (payload.get("follow_up_keys") or {}).items()
+            }
+        except Exception:  # noqa: BLE001 — a corrupt payload reads as "nothing to resume"
+            return None
+        return board_doctor_followthrough.PendingFollowThrough(
+            plan=plan, follow_up_keys=follow_up_keys,
+        )
+    return None
+
+
 #: Default ceiling on how many eligible ``merged-partial`` rows
 #: :func:`run_followthrough_sweep` will actually dispatch a plan leg for
 #: in ONE call, when the caller passes no *max_rows* of its own. Each
@@ -899,6 +977,10 @@ def run_followthrough_sweep(
     writer: board_doctor_followthrough.FollowThroughWriter | None = None,
     issue_open: Callable[[str, int], bool] | None = None,
     max_rows: int = DEFAULT_FOLLOWTHROUGH_ROWS_PER_SWEEP,
+    covering_pr_check: Callable[[str, int], int | None] | None = None,
+    pending_loader: Callable[
+        [str, int], board_doctor_followthrough.PendingFollowThrough | None
+    ] | None = None,
 ) -> list[board_doctor_followthrough.Disposition]:
     """Resolve every eligible ``merged-partial`` row in *rows*, up to
     *max_rows* of them (#3945).
@@ -923,6 +1005,19 @@ def run_followthrough_sweep(
     local `coordinator.yml` name *repo_name* — :func:`build_partial_merge`
     resolves the same slug for everything it reads/writes, and the two
     must agree on which repo they are each talking to GitHub about.
+
+    Before dispatching anything, each row's existing coverage is checked
+    (#4007): *covering_pr_check* (default :func:`_covering_open_pr`) for an
+    open PR that already carries a GitHub closing keyword for the parent,
+    and — only when that finds none — *pending_loader* (default
+    :func:`_load_pending_followthrough`) for a previously-recorded,
+    unfinished attempt to resume. Both feed
+    :func:`~coord.board_doctor_followthrough.run_followthrough` as its
+    ``coverage`` argument, which is what makes a write failure after
+    `create_issue` idempotent across sweeps rather than re-planned and
+    re-filed from scratch. Injectable the same way *issue_open*/*writer*
+    already are, so a caller can fake either GitHub-side read without a
+    live `gh` call.
     """
     from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
 
@@ -932,6 +1027,8 @@ def run_followthrough_sweep(
         board = build_board()
 
     is_open = issue_open or _issue_open
+    check_covering_pr = covering_pr_check or _covering_open_pr
+    load_pending = pending_loader or _load_pending_followthrough
     row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
     cap = getattr(
         getattr(config, "board_doctor", None), "followthrough_cap",
@@ -956,6 +1053,15 @@ def run_followthrough_sweep(
                 continue
         except Exception:  # noqa: BLE001 — a flaky open-check must not sink the sweep
             continue
+
+        covering_pr = check_covering_pr(github_repo, issue_number)
+        pending = (
+            None if covering_pr is not None
+            else load_pending(repo_name, issue_number)
+        )
+        coverage = board_doctor_followthrough.FollowThroughCoverage(
+            covering_pr=covering_pr, pending=pending,
+        )
 
         partial = build_partial_merge(
             repo_name, issue_number, config=config, board=board,
@@ -986,6 +1092,7 @@ def run_followthrough_sweep(
             milestone_exists=lambda title, _r=github_repo: _milestone_exists(_r, title),
             dry_run=dry_run,
             auto_queue=auto_queue,
+            coverage=coverage,
         )
         dispositions.append(disposition)
     return dispositions

@@ -344,6 +344,134 @@ def test_write_failure_alerts_with_partial_progress() -> None:
     assert "#200" in sinks.alerts[0][1]
 
 
+# ── Idempotent resume / dedupe (#4007) ──────────────────────────────────────
+
+_SINGLE_PLAN = {
+    "items": [{"item": "B", "verified_still_missing": True, "evidence": "no b()"}],
+    "follow_ups": [
+        {"key": "b1", "title": "Implement B core", "body": "Core of B.", "after": ["#100"]},
+    ],
+}
+
+
+def test_write_failed_disposition_records_resumable_evidence() -> None:
+    """The very scenario from the quadraui#2419 incident: `create_issue`
+    confirms but `add_child`'s link never does. The write-failed
+    disposition's recorded evidence must carry enough to resume without
+    asking the plan leg again or re-creating #200."""
+    class Boom(FakeWriter):
+        def add_child(self, repo_name, *, epic, child, after):
+            raise RuntimeError("add_sub_issue returned without error but parent reads None")
+
+    disp, writer, sinks = _run(_partial(), _SINGLE_PLAN, writer=Boom())
+    assert disp.action == ft.ACTION_WRITE_FAILED
+    assert disp.follow_up_keys == {"b1": 200}
+    [rec] = sinks.records
+    [evidence_item] = [
+        e for e in rec["evidence"] if e.startswith(ft.PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX)
+    ]
+    payload = json.loads(evidence_item[len(ft.PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX):])
+    resumed_plan = ft.plan_from_jsonable(payload["plan"])
+    assert [fu.key for fu in resumed_plan.follow_ups] == ["b1"]
+    assert payload["follow_up_keys"] == {"b1": 200}
+
+
+def test_resume_reuses_recorded_child_retries_link_and_closes() -> None:
+    """The next sweep, given the recorded state from the test above: no new
+    plan leg dispatch, no new `create_issue` — only the link retried, then
+    close (#4007 acceptance)."""
+    plan = ft.parse_plan(json.dumps(_SINGLE_PLAN))
+    coverage = ft.FollowThroughCoverage(
+        pending=ft.PendingFollowThrough(plan=plan, follow_up_keys={"b1": 200}),
+    )
+    disp, writer, sinks = _run(_partial(), _SINGLE_PLAN, coverage=coverage)
+
+    assert sinks.prompts == []  # plan leg never dispatched on resume
+    assert writer.created == []  # #200 is reused, never re-created
+    assert disp.action == ft.ACTION_FILED
+    assert disp.follow_up_keys == {"b1": 200}
+    assert writer.children == [(50, 200, (100,))]
+    [(closed, comment)] = writer.closed
+    assert closed == 101
+    assert "#200 — Implement B core" in comment
+    assert sinks.records[0]["action"] == ft.ACTION_FILED
+
+
+def test_covering_open_pr_short_circuits_before_planning() -> None:
+    """An open PR already carrying a closing keyword for the parent: file
+    nothing, don't even dispatch a plan leg (#4007 acceptance)."""
+    coverage = ft.FollowThroughCoverage(covering_pr=2439)
+    disp, writer, sinks = _run(_partial(), HAPPY_PLAN, coverage=coverage)
+
+    assert disp.action == ft.ACTION_ALREADY_COVERED
+    assert sinks.prompts == []
+    assert not writer.wrote_anything
+    assert any("#2439" in r for r in disp.reasons)
+    assert sinks.records[0]["action"] == ft.ACTION_ALREADY_COVERED
+    assert not sinks.alerts and not sinks.pages
+
+
+def test_covering_pr_takes_priority_over_pending() -> None:
+    """A covering PR wins even when a pending resume state also exists —
+    remediation already in flight beats resuming a stale attempt."""
+    plan = ft.parse_plan(json.dumps(_SINGLE_PLAN))
+    coverage = ft.FollowThroughCoverage(
+        covering_pr=2439,
+        pending=ft.PendingFollowThrough(plan=plan, follow_up_keys={"b1": 200}),
+    )
+    disp, writer, sinks = _run(_partial(), _SINGLE_PLAN, coverage=coverage)
+    assert disp.action == ft.ACTION_ALREADY_COVERED
+    assert not writer.wrote_anything
+
+
+def test_already_covered_by_dedupes_without_creating() -> None:
+    """The plan leg naming an existing issue as already covering a slice
+    (quadraui#2443's own body said so in prose; this is the structured
+    counterpart the writer actually honors) links/orders that issue
+    instead of filing a duplicate."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "Implement B core", "body": "Core of B.",
+             "after": ["#100"], "already_covered_by": "#2440"},
+        ],
+    }
+    disp, writer, sinks = _run(_partial(), plan)
+
+    assert disp.action == ft.ACTION_FILED
+    assert writer.created == []
+    assert disp.deduped == {"a": 2440}
+    assert disp.follow_up_keys == {"a": 2440}
+    assert writer.children == [(50, 2440, (100,))]
+    [(closed, comment)] = writer.closed
+    assert "#2440 — Implement B core" in comment
+    assert not sinks.alerts
+
+
+def test_malformed_already_covered_by_rejects_before_any_write() -> None:
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [{"key": "a", "title": "t", "body": "", "already_covered_by": "nope"}],
+    }
+    disp, writer, sinks = _run(_partial(), plan)
+    assert disp.action == ft.ACTION_REJECTED
+    assert any("already_covered_by" in r for r in disp.reasons)
+    assert writer.created == []
+
+
+def test_deduped_follow_up_is_not_auto_queued(monkeypatch) -> None:
+    monkeypatch.delenv(ft.NO_FOLLOWTHROUGH_ENV_VAR, raising=False)
+    enqueue = Enqueue()
+    ctx = ft.AutoQueueContext(machines=FLEET, enqueue=enqueue)
+    plan = {
+        "items": [{"item": "X", "verified_still_missing": True}],
+        "follow_ups": [{"key": "a", "title": "t", "body": "", "already_covered_by": "#2440"}],
+    }
+    disp, writer, sinks = _run(_partial(), plan, auto_queue=ctx)
+    assert disp.action == ft.ACTION_FILED
+    assert enqueue.calls == []
+
+
 def test_enabled_requires_env_fleet_and_repo(monkeypatch) -> None:
     repo = SimpleNamespace(board_doctor=SimpleNamespace(followthrough=True))
     cfg = SimpleNamespace(
@@ -765,7 +893,10 @@ class TestGitHubFollowThroughWriterReadBack:
         monkeypatch.setattr("coord.github_ops.get_issue_state", fake.get_issue_state)
         monkeypatch.setattr("coord.github_ops.update_issue_body", fake.update_issue_body)
         monkeypatch.setattr("coord.github_ops.close_issue", fake.close_issue)
-        return ft.GitHubFollowThroughWriter(), fake
+        # No-op sleep: these tests aren't about the backoff timing itself
+        # (see the dedicated retry tests below), just the confirm/raise
+        # contract, so a real `time.sleep` must not slow every run of them.
+        return ft.GitHubFollowThroughWriter(sleep=lambda _seconds: None), fake
 
     def test_add_child_confirmed_does_not_raise(self, monkeypatch) -> None:
         writer, fake = self._writer_and_fake(monkeypatch)
@@ -780,6 +911,44 @@ class TestGitHubFollowThroughWriterReadBack:
         )
         with pytest.raises(RuntimeError, match="not 50"):
             writer.add_child("acme/api", epic=50, child=500, after=())
+
+    def test_add_child_readback_retries_a_lagging_read_before_succeeding(
+        self, monkeypatch,
+    ) -> None:
+        """#4007 incident: `add_sub_issue` returned without error but the
+        immediate read-back saw the parent still unset — read-after-write
+        lag, not a real failure. A read that lags once and then confirms
+        within the retry window must not be reported as `write-failed`."""
+        fake = _FakeGithubOps()
+        monkeypatch.setattr("coord.github_ops.add_sub_issue", fake.add_sub_issue)
+        calls = {"n": 0}
+
+        def lagging_get_parent(repo, number):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                return None
+            return fake.get_issue_parent(repo, number)
+
+        monkeypatch.setattr("coord.github_ops.get_issue_parent", lagging_get_parent)
+        sleeps: list[float] = []
+        writer = ft.GitHubFollowThroughWriter(sleep=sleeps.append)
+
+        writer.add_child("acme/api", epic=50, child=500, after=())
+
+        assert fake.parents[500] == 50
+        assert sleeps == [1.0]  # one backoff, then the second read confirmed
+
+    def test_add_child_readback_exhausts_retries_then_raises(self, monkeypatch) -> None:
+        fake = _FakeGithubOps()
+        monkeypatch.setattr("coord.github_ops.add_sub_issue", fake.add_sub_issue)
+        monkeypatch.setattr("coord.github_ops.get_issue_parent", lambda repo, number: None)
+        sleeps: list[float] = []
+        writer = ft.GitHubFollowThroughWriter(sleep=sleeps.append)
+
+        with pytest.raises(RuntimeError, match="after 3 read-back attempts"):
+            writer.add_child("acme/api", epic=50, child=500, after=())
+
+        assert sleeps == [1.0, 2.0]
 
     def test_set_issue_body_confirmed_does_not_raise(self, monkeypatch) -> None:
         writer, fake = self._writer_and_fake(monkeypatch)
