@@ -662,6 +662,31 @@ class TestProcessReviewCompletion:
         assert work.review_verdict != "request-changes"
         mock_notice.assert_called_once()
 
+    def test_superseded_by_approval_notice_upserts_not_appends(
+        self, config: Config, tmp_path
+    ) -> None:
+        """The notice is posted via `coord.state.upsert_issue_comment`
+        (marker-keyed edit-in-place, #2109) rather than a bare
+        `post_issue_comment` — this outcome can legitimately be recomputed
+        more than once for the SAME review row (the #1582 stalled-pipeline
+        sweep re-runs `process_review_completion` while this row's
+        fix-less request-changes stays outstanding), and a bare post would
+        append a duplicate comment on every such re-run instead of being a
+        no-op."""
+        from coord.auto_loop import _post_superseded_by_approval_notice
+
+        work = _work_assignment()
+        review = _review_assignment(assignment_id="review-xyz", review_of="work-abc")
+        review.review_head_sha = "deadbeef1234"
+
+        with patch("coord.state.upsert_issue_comment") as mock_upsert:
+            _post_superseded_by_approval_notice(review, work, config)
+
+        mock_upsert.assert_called_once()
+        args, kwargs = mock_upsert.call_args
+        body = args[2] if len(args) > 2 else kwargs["body"]
+        assert "coord:event=auto_loop_superseded_by_approval" in body
+
     def test_request_changes_with_new_commit_after_approval_still_dispatches_fix(
         self, config: Config, tmp_path
     ) -> None:
@@ -2636,6 +2661,72 @@ class TestRunForReviewTransition:
         assert entries[0]["details"]["original_verdict"] == "request-changes"
         assert entries[0]["details"]["effective_verdict"] == "approve"
         assert entries[0]["details"]["blocking"] == 0
+
+    def test_superseded_by_approval_persists_the_verdict_to_db(
+        self, config: Config, tmp_path, coord_db
+    ) -> None:
+        """#4002 review follow-up: `superseded_by_approval` mutates
+        `review.review_verdict` in place but was missing from
+        `PERSIST_ACTION_KINDS` — so `run_for_review_transition` never wrote
+        it back, the DB row stayed `review_verdict IS NULL`, and every
+        later `coord notify` pass re-detected this exact row as the #1582
+        "review done, no verdict ever captured" stall shape, which can
+        escalate to deleting and re-dispatching the review (which the
+        #4002 per-item gate then refuses, wedging the item for good).
+
+        Regression guard: the request-changes verdict must round-trip
+        through the DB as `request-changes` — recorded, not lost — and the
+        work row must be untouched (not reopened).
+        """
+        from coord.state import load_board, save_board
+
+        review_log = tmp_path / "review.log"
+        review_log.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "- Looks like a real problem from this reviewer's own vantage.\n"
+            "END_REVIEW\n"
+        )
+        work = _work_assignment()
+        prior_approval = _review_assignment(
+            assignment_id="review-approved-1", review_of="work-abc",
+        )
+        prior_approval.review_verdict = "approve"
+        prior_approval.review_head_sha = "deadbeef1234"
+        review = _review_assignment(assignment_id="review-xyz", review_of="work-abc")
+        review.review_head_sha = "deadbeef1234"
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[work, prior_approval, review],
+        )
+        save_board(board)
+
+        record = {"type": "review", "review_of_assignment_id": "work-abc"}
+        entry = {"log_path": str(review_log)}
+
+        with patch("coord.auto_loop._post_superseded_by_approval_notice"):
+            actions = run_for_review_transition(
+                "review-xyz", record, entry, config,
+            )
+
+        assert actions and actions[0].kind == "superseded_by_approval"
+        loaded = load_board()
+        assert loaded is not None
+        review_loaded = loaded.find_by_id("review-xyz")
+        assert review_loaded is not None
+        assert review_loaded.review_verdict == "request-changes", (
+            "the verdict must be durably recorded, not dropped — a #1582 "
+            "stall-sweep re-run must see it and never re-process this row "
+            "as 'no verdict ever captured'"
+        )
+        work_loaded = loaded.find_by_id("work-abc")
+        assert work_loaded is not None
+        assert work_loaded.review_state == "dispatched", (
+            "the work row is left untouched — superseded is not a reopen"
+        )
 
     def test_review_not_on_board_returns_empty(
         self, config: Config, tmp_path, coord_db

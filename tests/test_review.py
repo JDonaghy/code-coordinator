@@ -6013,6 +6013,31 @@ def test_scoped_review_releases_claim_when_dispatch_raises(
 # final ───────────────────────────────────────────────────────────────────
 
 
+def test_claim_review_item_dispatch_gate_skips_lease_for_falsy_issue_number() -> None:
+    """`effective_issue_number` resolves to `0` for a row carrying neither
+    `issue_number` nor `for_issue_number` (coord/models.py) — every such
+    row would otherwise share the single lease key `item-lease:{repo}:0`,
+    turning the per-item lease into one shared global lock across
+    unrelated rows. The gate must skip taking the lease entirely rather
+    than claim that shared key, and must still allow the dispatch (there
+    is nothing to refuse it on)."""
+    from coord.review import claim_review_item_dispatch_gate
+    from coord.state import has_review_item_lease
+
+    board = Board()
+    allowed, reason = claim_review_item_dispatch_gate(
+        repo_name="api",
+        issue_number=0,
+        assignment_id="w1",
+        branch="worker/w1",
+        repo_github="acme/api",
+        board=board,
+    )
+    assert allowed is True
+    assert reason is None
+    assert has_review_item_lease("api", 0) is False
+
+
 def test_scoped_review_and_full_review_race_on_same_item_only_one_wins(
     two_machine_config: Config,
 ) -> None:

@@ -4139,15 +4139,10 @@ def claim_review_item_dispatch_gate(
 
     1. **One review per item at a time.** Claims
        :func:`coord.state.claim_review_item_lease` on *(repo_name,
-       issue_number)* — not on any one assignment id. Before this,
-       ``dispatch_review`` claimed the completed FIX leg's assignment id
-       and ``dispatch_scoped_review`` claimed the ORIGINAL leg's — two
-       different per-assignment claims that never contended with each
-       other for the same item, which is exactly how quadraui#2356
-       dispatched two reviews of the same commit 90 seconds apart (one via
-       each dispatcher). Keying on the item instead of the leg closes that
-       gap for every dispatcher that calls through here, regardless of
-       which assignment id it would otherwise have claimed.
+       issue_number)* — not on any one assignment id, so two dispatchers
+       that would otherwise take two DIFFERENT per-assignment claims (one
+       keyed on a completed fix leg's id, the other on the original leg's)
+       still contend with each other for the same item.
     2. **An approve on the current head is final.** Once the lease is
        held, resolves *branch*'s live head SHA (*head_sha* when the caller
        already fetched it this pass — every existing dispatcher already
@@ -4186,7 +4181,15 @@ def claim_review_item_dispatch_gate(
     from coord.state import claim_review_item_lease, release_review_item_lease  # noqa: PLC0415
     from coord import merge_queue as mq  # noqa: PLC0415
 
-    if not claim_review_item_lease(repo_name, issue_number):
+    # A row with neither `issue_number` nor `for_issue_number` set resolves
+    # `effective_issue_number` to `0` (coord/models.py) — every such row
+    # would otherwise share the single lease key `item-lease:{repo}:0`,
+    # turning this into one shared global lock across unrelated rows
+    # instead of a per-item one. Skip the lease (never take it, nothing to
+    # release) rather than claim that shared key; `issue_number=0` is
+    # vanishingly unlikely for a real work row.
+    _lease_held = bool(issue_number)
+    if _lease_held and not claim_review_item_lease(repo_name, issue_number):
         return False, (
             f"a review is already in flight for {repo_name}#{issue_number} "
             "(lost the per-item dispatch-lease race — #4002)"
@@ -4206,7 +4209,8 @@ def claim_review_item_dispatch_gate(
         branch=branch,
         branch_head_sha=resolved_head_sha,
     ):
-        release_review_item_lease(repo_name, issue_number)
+        if _lease_held:
+            release_review_item_lease(repo_name, issue_number)
         return False, (
             f"{repo_name}#{issue_number}'s current head "
             f"{(resolved_head_sha or '?')[:12]} already has an approving "
@@ -4515,6 +4519,18 @@ def dispatch_review(
         if repo is None:
             return _deny(f"repo {completed.repo_name!r} not found in config")
 
+        # #821: capture branch HEAD SHA once here — ahead of its previous
+        # spot further down — so it can be threaded into the #4002 gate
+        # below as `head_sha` instead of making the gate do its own
+        # `get_branch_sha` round trip; `dispatch_scoped_review`'s call
+        # already reuses its own `review_head_sha` the same way.
+        _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+        review_head_sha: str | None = None
+        try:
+            review_head_sha = _get_sha(repo.github, completed.branch)
+        except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
+            pass
+
         # #4002: the per-item gate — one review per (repo, issue) in flight
         # at a time, and never against a head already approved in this
         # work's chain. See `claim_review_item_dispatch_gate`'s docstring.
@@ -4526,6 +4542,7 @@ def dispatch_review(
             repo_github=repo.github,
             board=board,
             branch_sha_fetcher=branch_sha_fetcher,
+            head_sha=review_head_sha,
         )
         if not _item_allowed:
             return _deny(_item_deny_reason)
@@ -4947,13 +4964,8 @@ def dispatch_review(
         )
         review_model_wire = config.models.resolve(review_model_alias)
 
-        # #821: capture branch HEAD SHA once; staleness detected post-review.
-        _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
-        review_head_sha: str | None = None
-        try:
-            review_head_sha = _get_sha(repo.github, completed.branch)
-        except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
-            pass
+        # #821: branch HEAD SHA — captured once, above, ahead of the #4002
+        # gate call; staleness detected post-review.
 
         # #1475: fingerprint the *full* merge-base diff (`full_diff_text`, computed
         # above) — not the display-truncated `diff_text` — so this matches the
