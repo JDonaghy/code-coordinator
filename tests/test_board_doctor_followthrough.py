@@ -376,6 +376,29 @@ def test_write_failed_disposition_records_resumable_evidence() -> None:
     assert payload["follow_up_keys"] == {"b1": 200}
 
 
+def test_resumed_write_failure_alert_reports_reused_child_not_none() -> None:
+    """A resumed attempt that fails writing AGAIN must not claim "Filed so
+    far: none" — #200 is already confirmed via the recorded resume state,
+    not freshly created THIS run, so the alert has to read it off
+    `follow_up_keys`, not `follow_ups`."""
+    class StillBoom(FakeWriter):
+        def add_child(self, repo_name, *, epic, child, after):
+            raise RuntimeError("gh down again")
+
+    plan = ft.parse_plan(json.dumps(_SINGLE_PLAN))
+    coverage = ft.FollowThroughCoverage(
+        pending=ft.PendingFollowThrough(plan=plan, follow_up_keys={"b1": 200}),
+    )
+    disp, writer, sinks = _run(
+        _partial(), _SINGLE_PLAN, writer=StillBoom(), coverage=coverage,
+    )
+    assert disp.action == ft.ACTION_WRITE_FAILED
+    assert disp.follow_ups == []  # nothing freshly created this run
+    assert disp.follow_up_keys == {"b1": 200}
+    assert "#200" in sinks.alerts[0][1]
+    assert "none" not in sinks.alerts[0][1]
+
+
 def test_resume_reuses_recorded_child_retries_link_and_closes() -> None:
     """The next sweep, given the recorded state from the test above: no new
     plan leg dispatch, no new `create_issue` — only the link retried, then
@@ -457,6 +480,53 @@ def test_malformed_already_covered_by_rejects_before_any_write() -> None:
     assert disp.action == ft.ACTION_REJECTED
     assert any("already_covered_by" in r for r in disp.reasons)
     assert writer.created == []
+
+
+def test_already_covered_by_int_is_accepted() -> None:
+    """The plan leg's own schema documents `epic` as a bare int; a plan
+    leg spelling `already_covered_by` the same way must not hard-fail the
+    whole plan into `ACTION_PLAN_FAILED`."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [{"key": "a", "title": "t", "body": "", "already_covered_by": 2440}],
+    }
+    disp, writer, sinks = _run(_partial(), plan)
+    assert disp.action == ft.ACTION_FILED
+    assert disp.deduped == {"a": 2440}
+
+
+def test_already_covered_by_closed_issue_rejects_before_any_write() -> None:
+    """A syntactically valid `already_covered_by` reference is not honoured
+    on the plan leg's word alone — the referenced issue must independently
+    read as open (quadraui#2440/#2443's own failure mode: a stale or wrong
+    reference must not silently drop the remainder on the floor)."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [{"key": "a", "title": "t", "body": "", "already_covered_by": "#2440"}],
+    }
+    disp, writer, sinks = _run(_partial(), plan, covering_issue_open=lambda _n: False)
+    assert disp.action == ft.ACTION_REJECTED
+    assert any(
+        "already_covered_by" in r and "open" in r for r in disp.reasons
+    )
+    assert writer.created == []
+
+
+def test_fully_deduped_plan_filed_with_explicit_reason() -> None:
+    """When every follow-up resolves via `already_covered_by`, nothing new
+    is filed — `ACTION_FILED` still closes the parent (the remainder has
+    somewhere to live), but the decision log must say so explicitly rather
+    than reading like a bare "something was filed" claim."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "t", "body": "", "already_covered_by": "#2440"},
+        ],
+    }
+    disp, writer, sinks = _run(_partial(), plan)
+    assert disp.action == ft.ACTION_FILED
+    assert disp.follow_ups == []
+    assert any("already covered" in r for r in disp.reasons)
 
 
 def test_deduped_follow_up_is_not_auto_queued(monkeypatch) -> None:

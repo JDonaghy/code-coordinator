@@ -74,14 +74,14 @@ ACTION_REJECTED = "followthrough-rejected"
 ACTION_DEPTH_PAGED = "followthrough-depth-paged"
 ACTION_WRITE_FAILED = "followthrough-write-failed"
 ACTION_PLAN_FAILED = "followthrough-plan-failed"
-#: #4007: nothing was filed because an already-open PR carries a GitHub
-#: closing keyword for the parent — remediation is already in flight.
+#: Nothing was filed because an already-open PR carries a GitHub closing
+#: keyword for the parent — remediation is already in flight.
 ACTION_ALREADY_COVERED = "followthrough-already-covered"
 
 _ISSUE_REF_RE = re.compile(r"^#?(\d+)$")
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
 
-#: Marker prefix for the one ``evidence`` string (#4007) that carries a
+#: Marker prefix for the one ``evidence`` string that carries a
 #: ``followthrough-write-failed`` disposition's resumable state — the
 #: validated plan plus which of its follow-ups already have a confirmed
 #: issue number. ``evidence`` is the only free-form, JSON-round-tripping
@@ -93,9 +93,9 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
 #: which only has fixed columns for ``queue``/``key``/``cause``/``tier``/
 #: ``action``/``count``/``escalated``/``confidence``/``evidence_json``/
 #: ``outcome``/``recorded_at``). Piggybacking on ``evidence`` — rather than
-#: adding a new column — keeps this a same-file change: the next sweep
-#: reads it back via the existing :func:`coord.state.board_doctor_decisions`
-#: filtered to ``action=ACTION_WRITE_FAILED``, exactly like the diagnostic
+#: adding a new column — keeps this a same-file change: `coord.board_doctor.
+#: _load_pending_followthrough` reads it back via the existing
+#: :func:`coord.state.board_doctor_decisions`, exactly like the diagnostic
 #: evidence strings :func:`coord.board_doctor.merged_partial_rows` already
 #: writes into the same field.
 PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX = "pending-followthrough-json="
@@ -167,12 +167,11 @@ class FollowUp:
     capability: str | None = None
     machine: str | None = None
     files: tuple[str, ...] = ()
-    #: #4007: an existing open issue/PR (``"#N"``) that already covers this
+    #: An existing open issue/PR (``"#N"``) that already covers this
     #: slice, per the plan leg's own verification. When set, the write step
     #: links/orders *that* issue instead of filing a duplicate — the
-    #: structured counterpart to a plan leg merely SAYING so in a follow-up's
-    #: prose `body` (quadraui#2443 named #2440 in its own body and the
-    #: writer filed it anyway).
+    #: structured counterpart to a plan leg merely SAYING so in a
+    #: follow-up's prose `body`, which the writer does not read.
     already_covered_by: str | None = None
 
 
@@ -311,11 +310,11 @@ class GitHubFollowThroughWriter:
     exception from a write as a failure to alert on, so an unconfirmed
     write surfaces exactly the same way a `gh` error would.
 
-    ``add_child``'s read-back retries with a short backoff (#4007
-    incident: ``add_sub_issue`` returned without error but the immediate
-    read-back saw the child's parent still unset — read-after-write lag on
-    GitHub's own API, not a real failure) before concluding the link truly
-    did not take. *sleep*/*readback_attempts* are injectable for tests.
+    ``add_child``'s read-back retries with a short backoff — a clean
+    ``add_sub_issue`` return whose immediate read-back still sees the
+    child's parent unset is more likely read-after-write lag on GitHub's
+    own API than a real failure — before concluding the link truly did
+    not take. *sleep*/*readback_attempts* are injectable for tests.
     """
 
     sleep: Callable[[float], None] = _time.sleep
@@ -336,19 +335,20 @@ class GitHubFollowThroughWriter:
         from coord import github_ops  # noqa: PLC0415
 
         github_ops.add_sub_issue(repo_name, parent_number=epic, child_number=child)
+        attempts = max(1, self.readback_attempts)
         linked: int | None = None
-        for attempt in range(max(1, self.readback_attempts)):
+        for attempt in range(attempts):
             parent = github_ops.get_issue_parent(repo_name, child)
             linked = parent.get("number") if parent else None
             if linked == epic:
                 return
-            if attempt < self.readback_attempts - 1:
+            if attempt < attempts - 1:
                 self.sleep(self.readback_backoff_seconds * (attempt + 1))
         raise RuntimeError(
             f"add_sub_issue({repo_name}, parent={epic}, child={child}) "
             f"returned without error but {repo_name}#{child}'s parent "
             f"still reads {linked!r}, not {epic}, after "
-            f"{self.readback_attempts} read-back attempts"
+            f"{attempts} read-back attempt{'s' if attempts != 1 else ''}"
         )
 
     def get_issue_body(self, repo_name: str, number: int) -> str:
@@ -485,6 +485,20 @@ def _opt_str(raw: Mapping[str, Any], key: str) -> str | None:
     return value
 
 
+def _opt_issue_ref(raw: Mapping[str, Any], key: str) -> str | None:
+    """Like :func:`_opt_str`, but also accepts a bare int issue number —
+    `epic` three lines below already does, so a plan leg spelling this
+    field the same way must not hard-fail the whole plan."""
+    value = raw.get(key)
+    if value is None or value == "":
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"#{value}"
+    if not isinstance(value, str):
+        raise PlanError(f"follow-up field {key!r} must be a string or integer")
+    return value
+
+
 def parse_plan(text: str) -> FollowThroughPlan:
     """Parse the plan leg's output into a :class:`FollowThroughPlan`.
 
@@ -538,7 +552,7 @@ def parse_plan(text: str) -> FollowThroughPlan:
             capability=_opt_str(raw, "capability"),
             machine=_opt_str(raw, "machine"),
             files=tuple(files),
-            already_covered_by=_opt_str(raw, "already_covered_by"),
+            already_covered_by=_opt_issue_ref(raw, "already_covered_by"),
         ))
     return FollowThroughPlan(items=tuple(items), follow_ups=tuple(follow_ups))
 
@@ -592,8 +606,18 @@ def validate_plan(
     backends: Sequence[str] = (),
     epic_exists: Callable[[int], bool] = lambda _n: True,
     milestone_exists: Callable[[str], bool] = lambda _m: True,
+    covering_issue_open: Callable[[int], bool] = lambda _n: True,
 ) -> list[str]:
-    """Every reason *plan* must not be written; empty means it is valid."""
+    """Every reason *plan* must not be written; empty means it is valid.
+
+    *covering_issue_open* answers whether a follow-up's `already_covered_by`
+    reference names an issue that is readably OPEN right now — the plan
+    leg's word that a reference parses as `#N` is not, by itself, proof the
+    issue exists, is still open, or has anything to do with this parent.
+    Defaulting to "always open" keeps every caller that does not pass a
+    live check (most tests) exercising the same parse-only validation as
+    before; `coord.board_doctor` wires its own `_issue_open`.
+    """
     reasons: list[str] = []
     if not plan.items:
         reasons.append("plan verifies no remaining items")
@@ -669,11 +693,18 @@ def validate_plan(
             reasons.append(f"{label}: epic #{fu.epic} does not exist")
         if fu.milestone is not None and not milestone_exists(fu.milestone):
             reasons.append(f"{label}: milestone {fu.milestone!r} does not exist")
-        if fu.already_covered_by is not None and _issue_ref_to_int(fu.already_covered_by) is None:
-            reasons.append(
-                f"{label}: `already_covered_by` {fu.already_covered_by!r} is not a "
-                "valid issue reference"
-            )
+        if fu.already_covered_by is not None:
+            covering_number = _issue_ref_to_int(fu.already_covered_by)
+            if covering_number is None:
+                reasons.append(
+                    f"{label}: `already_covered_by` {fu.already_covered_by!r} is "
+                    "not a valid issue reference"
+                )
+            elif not covering_issue_open(covering_number):
+                reasons.append(
+                    f"{label}: `already_covered_by` {fu.already_covered_by!r} does "
+                    "not reference a currently open issue"
+                )
         named = detect_cross_backend_scope(title=fu.title, body=fu.body, backends=backends)
         if named:
             reasons.append(
@@ -923,6 +954,7 @@ def run_followthrough(
     backends: Sequence[str] = (),
     epic_exists: Callable[[int], bool] = lambda _n: True,
     milestone_exists: Callable[[str], bool] = lambda _m: True,
+    covering_issue_open: Callable[[int], bool] = lambda _n: True,
     dry_run: bool = False,
     auto_queue: AutoQueueContext | None = None,
     coverage: FollowThroughCoverage | None = None,
@@ -946,6 +978,10 @@ def run_followthrough(
     :func:`_write_follow_ups` skips `create_issue` for every follow-up that
     already has a confirmed number, retrying only the link/close steps that
     did not confirm last time.
+
+    *covering_issue_open* is forwarded to :func:`validate_plan` to confirm
+    a plan's own `already_covered_by` claim names a real, currently open
+    issue before the dedupe is honoured.
     """
     key = f"{partial.repo_name}#{partial.issue_number}"
     disposition = Disposition(
@@ -999,6 +1035,7 @@ def run_followthrough(
     reasons = validate_plan(
         plan, partial=partial, cap=cap, backends=backends,
         epic_exists=epic_exists, milestone_exists=milestone_exists,
+        covering_issue_open=covering_issue_open,
     )
     if reasons:
         disposition.reasons.extend(reasons)
@@ -1026,7 +1063,11 @@ def run_followthrough(
         alert(
             f"{key}: follow-through write failed",
             f"Writing stopped at: {exc}\nFollow-ups already filed: "
-            + (", ".join(f"#{n}" for n in disposition.follow_ups) or "none"),
+            # `follow_up_keys` (not `follow_ups`): a resumed attempt's
+            # reused child issues confirm here too, not just one THIS run
+            # freshly created — "Filed so far: none" would otherwise be
+            # false the moment a resumed write fails again.
+            + (", ".join(f"#{n}" for n in disposition.follow_up_keys.values()) or "none"),
         )
         return _finish(ACTION_WRITE_FAILED)
     if auto_queue is not None and disposition.follow_up_keys:
@@ -1035,6 +1076,16 @@ def run_followthrough(
         except Exception as exc:  # noqa: BLE001 — the follow-ups are filed; alert, don't fail
             disposition.reasons.append(f"auto-queue failed: {exc}")
             alert(f"{key}: follow-up auto-queue failed", str(exc))
+    if not plan.all_landed and not disposition.follow_ups and disposition.deduped:
+        # Every follow-up resolved via `already_covered_by` — nothing was
+        # actually filed this run. `ACTION_FILED` still closes the parent
+        # correctly (the remainder has somewhere to live), but a bare
+        # action name reads as a claim that something new was filed, so
+        # the decision log carries an explicit reason instead.
+        disposition.reasons.append(
+            "every follow-up was already covered by an existing issue; "
+            "nothing new was filed"
+        )
     return _finish(ACTION_ALL_LANDED if plan.all_landed else ACTION_FILED)
 
 
