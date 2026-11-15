@@ -16,7 +16,9 @@ import pytest
 
 import pytest
 
+from coord import agent
 from coord.agent import (
+    _GitError,
     ADVISORY,
     CANCELLED,
     DONE,
@@ -8129,3 +8131,142 @@ def test_smoke_leg_with_missing_target_branch_still_refused(
         assert "issue-7-never-pushed" in a.error
     finally:
         server.shutdown()
+
+
+class TestPullDependencyRetry:
+    """A transient `.git/index.lock` (or similar) failure on a
+    `pull_repos` dependency pull is retried with backoff instead of
+    failing the whole leg on the first hit; a persistent lock still fails,
+    but names the lock path plainly rather than just echoing git's text."""
+
+    def test_transient_lock_error_retries_then_spawns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent, "_PULL_RETRY_DELAYS_S", (0.0,))
+        dep_path = tmp_path / "dep"
+        dep_path.mkdir()
+        real_git = agent._git
+        calls = {"n": 0}
+
+        def fake_git(cwd, *args, **kwargs):
+            if Path(cwd) == dep_path and args == ("pull", "--ff-only"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise _GitError(
+                        "git pull --ff-only failed: fatal: Unable to create "
+                        f"'{dep_path}/.git/index.lock': File exists.\n"
+                        "Another git process seems to be running in this "
+                        "repository..."
+                    )
+                return "Already up to date."
+            return real_git(cwd, *args, **kwargs)
+
+        monkeypatch.setattr(agent, "_git", fake_git)
+
+        rp = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=rp)
+        server.repo_paths["dep"] = str(dep_path)
+        try:
+            spec = _spec(rp, pull_repos=["dep"])
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=15)
+            assert final.status != FAILED, final.error
+            assert calls["n"] == 2
+            log = Path(final.log_path).read_text()
+            assert "retrying" in log
+            assert "all pulls succeeded" in log
+        finally:
+            server.shutdown()
+
+    def test_persistent_lock_failure_names_lock_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent, "_PULL_RETRY_DELAYS_S", (0.0, 0.0))
+        dep_path = tmp_path / "dep"
+        dep_path.mkdir()
+        lock_path = dep_path / ".git" / "index.lock"
+        real_git = agent._git
+        calls = {"n": 0}
+
+        def fake_git(cwd, *args, **kwargs):
+            if Path(cwd) == dep_path and args == ("pull", "--ff-only"):
+                calls["n"] += 1
+                raise _GitError(
+                    "git pull --ff-only failed: fatal: Unable to create "
+                    f"'{lock_path}': File exists.\n"
+                    "Another git process seems to be running in this "
+                    "repository..."
+                )
+            return real_git(cwd, *args, **kwargs)
+
+        monkeypatch.setattr(agent, "_git", fake_git)
+
+        rp = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=rp)
+        server.repo_paths["dep"] = str(dep_path)
+        try:
+            spec = _spec(rp, pull_repos=["dep"])
+            a = server.assign(spec)
+            for _ in range(200):
+                if server.get(a.id).status == FAILED:
+                    break
+                time.sleep(0.02)
+            final = server.get(a.id)
+            assert final.status == FAILED
+            assert str(lock_path) in final.error
+            # 1 initial attempt + 2 retries, all transient, then give up.
+            assert calls["n"] == 3
+        finally:
+            server.shutdown()
+
+    def test_non_transient_pull_error_fails_without_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent, "_PULL_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+        dep_path = tmp_path / "dep"
+        dep_path.mkdir()
+        real_git = agent._git
+        calls = {"n": 0}
+
+        def fake_git(cwd, *args, **kwargs):
+            if Path(cwd) == dep_path and args == ("pull", "--ff-only"):
+                calls["n"] += 1
+                raise _GitError(
+                    "git pull --ff-only failed: fatal: Not possible to "
+                    "fast-forward, aborting."
+                )
+            return real_git(cwd, *args, **kwargs)
+
+        monkeypatch.setattr(agent, "_git", fake_git)
+
+        rp = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=rp)
+        server.repo_paths["dep"] = str(dep_path)
+        try:
+            spec = _spec(rp, pull_repos=["dep"])
+            a = server.assign(spec)
+            for _ in range(200):
+                if server.get(a.id).status == FAILED:
+                    break
+                time.sleep(0.02)
+            final = server.get(a.id)
+            assert final.status == FAILED
+            assert calls["n"] == 1, "a non-transient pull failure must not retry"
+        finally:
+            server.shutdown()
+
+    def test_pull_lock_for_same_path_returns_same_lock(self, tmp_path: Path) -> None:
+        """Two dependency specs resolving to the SAME checkout path must
+        serialize through the identical `threading.Lock` — the whole point
+        of the per-path lock is that concurrent pulls into one checkout
+        block each other instead of racing through git's own
+        `.git/index.lock`."""
+        server = _server(tmp_path)
+        try:
+            a = server._pull_lock_for("/some/dep/path")
+            b = server._pull_lock_for("/some/dep/path")
+            c = server._pull_lock_for("/other/dep/path")
+            assert a is b
+            assert a is not c
+        finally:
+            server.shutdown()

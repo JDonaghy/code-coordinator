@@ -1377,6 +1377,57 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     return result.stdout.strip()
 
 
+# Backoff schedule for `AgentServer._pull_dependency`'s retry of a
+# transient `git pull` failure (a held `.git/index.lock`, or a network
+# blip) — a handful of attempts spread over roughly 30s, comfortably longer
+# than a lock held by a sibling leg's own concurrent pull into the same
+# checkout is expected to survive. A test monkeypatches this module
+# attribute directly to shrink it to near-zero so the retry path doesn't
+# actually sleep.
+_PULL_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
+
+# Substrings (case-insensitive) in a failed `git pull`'s stderr that mark the
+# failure as transient — worth the retry above rather than failing the leg
+# outright. Anchored on git's own index.lock message (see
+# `_GIT_LOCK_PATH_RE` below, which pulls the lock path out of the same text)
+# and a handful of well-known network blips. Deliberately narrow: a real
+# merge conflict, a `--ff-only` divergence, or a bad ref must still fail
+# fast — retrying can never fix those, and silently eating 30s on every such
+# failure would make a genuine config error look like a hang.
+_TRANSIENT_GIT_PULL_RE = re.compile(
+    r"("
+    r"unable to create '[^']+\.lock': file exists"
+    r"|could not resolve host"
+    r"|connection timed out"
+    r"|connection reset by peer"
+    r"|the remote end hung up unexpectedly"
+    r"|operation timed out"
+    r"|temporary failure in name resolution"
+    r"|early eof"
+    r")",
+    re.IGNORECASE,
+)
+
+# Pulls the lock file path out of git's own "Unable to create '<path>':
+# File exists" message, so a persistent-lock failure (retries exhausted)
+# can name it plainly rather than just echoing git's generic text.
+_GIT_LOCK_PATH_RE = re.compile(r"[Uu]nable to create '([^']+)': File exists")
+
+
+def _is_transient_pull_error(message: str) -> bool:
+    """True when *message* (a failed `git pull`'s error text) looks
+    transient — a lock held by another git process, or a network blip —
+    rather than a real conflict that retrying can never resolve."""
+    return bool(_TRANSIENT_GIT_PULL_RE.search(message))
+
+
+def _git_lock_path_from_error(message: str) -> str | None:
+    """The lock file path named in *message*, when it is an
+    index.lock-shaped failure — otherwise ``None``."""
+    m = _GIT_LOCK_PATH_RE.search(message)
+    return m.group(1) if m else None
+
+
 def _remote_already_has_head(
     wt_path: Path, remote: str, branch: str, *, timeout: float = 30.0
 ) -> bool:
@@ -7175,6 +7226,16 @@ class AgentServer:
         # lazily per assignment id; pruned alongside `_assignments` in
         # `_prune_completed_history`.
         self._cleanup_locks: dict[str, threading.Lock] = {}
+        # Per-dependency-checkout lock serializing `_pull_dependency` across
+        # concurrent assignments on this agent. Keyed on the resolved
+        # dependency path (not the dependency *name*, which can differ
+        # between specs) so two legs pulling the SAME checkout at once never
+        # race through git's own `.git/index.lock` — one waits for the
+        # other's pull to finish rather than both hitting the lock and one
+        # of them failing the leg. Created lazily, same pattern as
+        # `_cleanup_locks` above; never pruned since the set of distinct
+        # dependency checkouts on one agent is small and fixed by config.
+        self._pull_locks: dict[str, threading.Lock] = {}
         # #1424: signals that `_reap` (and therefore `_cleanup_worktree`,
         # which it calls near the end) has fully finished for an assignment.
         # `_reap` flips `assignment.status` out of RUNNING/PENDING partway
@@ -10758,6 +10819,61 @@ class AgentServer:
                 f"its commits are untouched.",
             )
 
+    def _pull_lock_for(self, dep_path: str) -> threading.Lock:
+        """The lock serializing `_pull_dependency` calls against *dep_path*
+        — created lazily, one per distinct resolved dependency path, so two
+        legs on this agent pulling the SAME checkout at once never race
+        through git's own `.git/index.lock`."""
+        with self._lock:
+            lock = self._pull_locks.get(dep_path)
+            if lock is None:
+                lock = threading.Lock()
+                self._pull_locks[dep_path] = lock
+            return lock
+
+    def _pull_dependency(self, dep_path: Path, log_fh: Any) -> str:
+        """Run ``git -C dep_path pull --ff-only``, serialized against any
+        other pull into the SAME *dep_path* on this agent, retrying with
+        backoff on a transient-looking failure.
+
+        A transient failure (`_is_transient_pull_error`) is retried per
+        `_PULL_RETRY_DELAYS_S`; a non-transient one (a real `--ff-only`
+        divergence, a bad ref) is raised immediately, unchanged, on the
+        first attempt. If retries are exhausted and the last failure was an
+        `index.lock`-shaped error, the lock file's path is named plainly in
+        the raised `_GitError` — the lock itself is never touched; a human
+        has to confirm it's safe to remove.
+        """
+        with self._pull_lock_for(str(dep_path)):
+            attempt = 0
+            while True:
+                try:
+                    return _git(dep_path, "pull", "--ff-only")
+                except _GitError as exc:
+                    message = str(exc)
+                    retries_exhausted = attempt >= len(_PULL_RETRY_DELAYS_S)
+                    if retries_exhausted or not _is_transient_pull_error(message):
+                        if retries_exhausted:
+                            lock_path = _git_lock_path_from_error(message)
+                            if lock_path:
+                                elapsed = sum(_PULL_RETRY_DELAYS_S[:attempt])
+                                raise _GitError(
+                                    f"{message} (lock file {lock_path!r} "
+                                    f"still present after {attempt} retries "
+                                    f"over ~{elapsed:.0f}s — not deleted; "
+                                    "confirm no git process holds it before "
+                                    "removing it by hand)"
+                                ) from exc
+                        raise
+                    delay = _PULL_RETRY_DELAYS_S[attempt]
+                    log_fh.write(
+                        f"# pull attempt {attempt + 1} failed transiently "
+                        f"({message}); retrying in {delay:.0f}s\n"
+                    )
+                    log_fh.flush()
+                    time.sleep(delay)
+                    attempt += 1
+
     def _pull_then_spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
         """Pull each dep before spawning the worker. Logs to the assignment log.
 
@@ -10783,7 +10899,7 @@ class AgentServer:
                 log_fh.write(f"# git -C {dep_path} pull --ff-only\n")
                 log_fh.flush()
                 try:
-                    output = _git(dep_path, "pull", "--ff-only")
+                    output = self._pull_dependency(dep_path, log_fh)
                 except _GitError as e:
                     log_fh.write(f"# pull failed for {dep_name}: {e}\n")
                     # Same ordering requirement as above: flush before the
