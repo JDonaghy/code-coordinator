@@ -557,16 +557,19 @@ def reconcile_completed_assignments(
         # "nothing said the word asleep" gap #2638 exists to close.
         # #4018: `entry.get("error")` is a DIFFERENT column — `AgentAssignment
         # .error`, set by `AgentServer.assign`/`_fail` when the agent fails
-        # BEFORE a worker ever spawns (worktree setup, a `pull_repos` pull).
-        # None of the seven reasons above can ever be set on such an entry —
-        # they are all stamped by `_reap`, which only runs after a worker
-        # process has started and exited — so this is a pure fallback, tried
-        # last. Without it, a pre-spawn failure landed FAILED with
+        # BEFORE a worker ever spawns (worktree setup, a `pull_repos` pull,
+        # a bare process-spawn `OSError`), or loses track of one entirely
+        # (an agent restart, the #3363 phantom-assignment sweep). None of
+        # the seven reasons above can ever be set on such an entry — they
+        # are all stamped by `_reap`, which only runs after a worker process
+        # has started and exited — so this is a pure fallback, tried last.
+        # Without it, a pre-spawn failure landed FAILED with
         # `failure_reason` left `None`: invisible to `coord status`/the
         # drive's die message, and `coord log <aid>` 404s because no log
         # file was ever created to begin with, so this was the ONLY
         # surviving copy of the diagnostic.
-        _failure_reason = (
+        _agent_error = entry.get("error")
+        _reap_stamped_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
@@ -574,8 +577,31 @@ def reconcile_completed_assignments(
             or entry.get("truncation_reason")
             or entry.get("runtime_ceiling_reason")
             or entry.get("host_sleep_reason")
-            or entry.get("error")
         )
+        _failure_reason = _reap_stamped_reason or _agent_error
+        # #4018 review: every `AgentAssignment.error` string (see the block
+        # above) is written by the agent's own code describing the agent's
+        # or the worker's bookkeeping, never a worker's terminal output —
+        # the worker in question either never spawned at all or the agent
+        # lost track of it (a restart, the phantom-assignment sweep). None
+        # of those is evidence the WORK is broken. `classify_failure`'s own
+        # vocabulary only recognizes three such strings (the `_SETUP_RE`
+        # prefixes) and defaults everything else to `WORK` by design (#1590
+        # — unrecognized text IS evidence, for ordinary worker prose). That
+        # default is wrong here because this text was never worker prose in
+        # the first place, so a `type="smoke"` leg whose `_failure_reason`
+        # resolved from this fallback — i.e. none of the seven more
+        # specific, `_reap`-stamped reasons fired — is passed straight
+        # through as `environmental=True`, the same override
+        # `_reconcile_no_agent_record` already uses for its own
+        # coordinator-authored "the agent forgot" text: it skips
+        # `classify_failure` entirely rather than risk it landing on `WORK`
+        # for a signature the regex doesn't happen to know yet. Without
+        # this, a smoke leg's agent restarting mid-run (an ordinary `coord
+        # agent update`) would record `test_state="failed"` and spend a
+        # `coord fix` round on code that was never tested (#3705's own
+        # silent-death guard is bypassed by this field being non-empty).
+        _smoke_environmental_override = bool(_agent_error) and not _reap_stamped_reason
         _escalate_spend_ceiling_best_effort(a, entry)
         update_state_fn(
             assignment_id=aid,
@@ -606,6 +632,12 @@ def reconcile_completed_assignments(
             propagate_smoke_terminal_failure(
                 parent_assignment_id=a.review_of_assignment_id,
                 failure_reason=_failure_reason,
+                # #4018 review: see `_smoke_environmental_override` above —
+                # `True` only when `_failure_reason` resolved from the
+                # agent-authored `error` fallback (no worker ever ran, or
+                # the agent lost track of one), `None` otherwise so every
+                # pre-#4018 call keeps classifying from the text as before.
+                environmental=True if _smoke_environmental_override else None,
                 exit_code=entry.get("exit_code"),
             )
 
