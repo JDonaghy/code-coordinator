@@ -103,6 +103,14 @@ KIND_INFRA = "infra"
 #: environmental pattern" (that case has real diagnostic text and stays
 #: `KIND_WORK`), but zero evidence at all. See :func:`silent_test_death`.
 KIND_SILENT = "silent"
+#: #4018: the agent's own pre-spawn setup failed — a worktree checkout
+#: (`AgentServer._setup_worktree`) or a `pull_repos` pull (`AgentServer.
+#: _pull_then_spawn`) — before a worker process ever started. This is the
+#: coordinator/agent's own infrastructure failing to prepare a workspace,
+#: never a verdict about code the worker wrote (no worker ever ran), so it
+#: is classified the same way as the Test-stage #3670 infra outage: wait
+#: and retry, don't spend the work-attempt budget on it.
+KIND_SETUP = "setup"
 KIND_WORK = "work"
 
 #: HTTP statuses from the Claude API that mean "the provider, not the work".
@@ -302,6 +310,25 @@ _INFRA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# #4018: the literal strings `AgentServer.assign`/`_pull_then_spawn` write
+# to `AgentAssignment.error` (and from there into `failure_reason`, via
+# `coord.reconcile`'s fallback) when the agent fails BEFORE a worker ever
+# spawns. Agent-authored, never worker prose — the worker in question never
+# ran — so, like the infra tokens above, safe to scan unconditionally.
+# Anchored on the exact prefixes `assign()`/`_pull_then_spawn()` emit
+# (`"worktree setup failed:"`, `"pull failed for <dep>:"`, `"no repo_path
+# configured for dependency"`) rather than loose words like "worktree" or
+# "pull" alone, which a genuine test asserting worktree/pull behaviour could
+# legitimately contain in its own failure text.
+_SETUP_RE = re.compile(
+    r"("
+    r"worktree\s+setup\s+failed\s*:"
+    r"|pull\s+failed\s+for\s+\S+\s*:"
+    r"|no\s+repo_path\s+configured\s+for\s+dependency\b"
+    r")",
+    re.IGNORECASE,
+)
+
 # How much worker-authored terminal prose to consider. An error `result` is a
 # one-liner plus a JSON blob; anything past this is a transcript that should
 # not have been passed here in the first place.
@@ -311,6 +338,12 @@ _RESULT_TEXT_LIMIT = 4000
 def _environmental_infra(text: str) -> str | None:
     """The matched infra-outage signature, if *text* carries one."""
     m = _INFRA_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _environmental_setup(text: str) -> str | None:
+    """The matched pre-spawn setup-failure signature, if *text* carries one."""
+    m = _SETUP_RE.search(text)
     return m.group(1) if m else None
 
 
@@ -450,6 +483,11 @@ def classify_failure(
        status produced) in ``failure_reason`` / ``terminal_reason`` — same
        "coordinator-authored, always scanned" treatment as the wire tokens
        above, via :func:`_environmental_infra`.
+    6. An anchored pre-spawn setup-failure signature (#4018: ``AgentServer
+       .assign``'s worktree setup, or ``_pull_then_spawn``'s dependency
+       pull, failing before any worker started) in ``failure_reason`` /
+       ``terminal_reason`` — same treatment as 5, via
+       :func:`_environmental_setup`.
 
     Anything that matches none of those is :data:`WORK`, including the case
     where no evidence was supplied at all. ``is_error=True`` on its own is not
@@ -545,6 +583,20 @@ def classify_failure(
                     "not a defect in the work (#3670)"
                 ),
                 signal=infra,
+            )
+
+        setup = _environmental_setup(text)
+        if setup is not None:
+            return FailureClassification(
+                failure_class=ENVIRONMENTAL,
+                kind=KIND_SETUP,
+                reason=(
+                    "environmental (setup): the agent failed preparing the "
+                    "workspace (worktree checkout / dependency pull) before "
+                    "a worker ever started — not a defect in the work "
+                    "(#4018)"
+                ),
+                signal=setup,
             )
 
     detail = next((t for t in (failure_reason, terminal_reason) if t), None)

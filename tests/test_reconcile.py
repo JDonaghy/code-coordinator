@@ -63,9 +63,11 @@ from coord.models import Assignment, Board, Machine, Repo
 from coord.reconcile import (
     RetryProviderMismatch,
     _reassign,
+    _record_usage_limit_reason,
     _resolve_retry_provider,
     describe_retry_provider_mismatch,
     reconcile,
+    reconcile_completed_assignments,
 )
 from coord.state import get_connection
 
@@ -2180,3 +2182,114 @@ class TestReconcileConflictFixRewordMismatchMarker:
         assert "reword-commit worker refused to push" in posted_body
         assert "Manual reword required" in posted_body
         assert f"Refs #{entry.issue_number}" in posted_body
+
+
+# ── #4018: a pre-spawn agent failure (worktree setup, a dependency pull) ───
+# must reach the board's `failure_reason` the same way a usage-limit kill or
+# an API error already does, even though it is stamped onto a different
+# field (`AgentAssignment.error`, not one of the `_reap`-only reasons).
+
+
+class _RecordUpdateState:
+    """Mirrors `tests/test_reconcile_usage_limit_done.py`'s `_Recorder`."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(
+        self, *, assignment_id, terminal_status, branch, review_state,
+        failure_reason=None, exit_code=None,
+    ) -> None:
+        self.calls.append(
+            {
+                "assignment_id": assignment_id,
+                "terminal_status": terminal_status,
+                "branch": branch,
+                "failure_reason": failure_reason,
+                "exit_code": exit_code,
+            }
+        )
+
+
+def _setup_cfg() -> Config:
+    return Config(
+        repos=[Repo(name="cc", github="acme/cc")],
+        machines=[Machine(name="precision", host="precision", repos=["cc"])],
+    )
+
+
+def _setup_board(aid: str = "presp00001", *, atype: str = "work") -> Board:
+    return Board(
+        repos=[Repo(name="cc", github="acme/cc")], machines=[],
+        active=[
+            Assignment(
+                machine_name="precision", repo_name="cc",
+                issue_number=4018, issue_title="pre-spawn failure",
+                status="running", assignment_id=aid, type=atype,
+            ),
+        ],
+    )
+
+
+class TestPreSpawnFailureReachesFailureReason:
+    def test_worktree_setup_failure_lands_in_failure_reason(self) -> None:
+        """`AgentServer.assign`'s worktree-setup branch never spawns a
+        worker, so none of the `_reap`-only reasons are ever set — the
+        agent's own `error` field is the ONLY place this diagnostic lives."""
+        rec = _RecordUpdateState()
+        error = (
+            "worktree setup failed: _setup_worktree: target_branch "
+            "'issue-4018-x' was requested but origin/issue-4018-x could "
+            "not be resolved"
+        )
+        out = reconcile_completed_assignments(
+            _setup_cfg(),
+            board=_setup_board(),
+            agent_status_fn=lambda host: {"completed": [
+                {"id": "presp00001", "status": "failed", "error": error},
+            ]},
+            update_state_fn=rec,
+            capture_plan=False,
+        )
+        assert out[0]["to_status"] == "failed"
+        assert len(rec.calls) == 1
+        assert rec.calls[0]["failure_reason"] == error
+
+    def test_a_more_specific_reason_still_wins_over_error(self) -> None:
+        """`error` is the last-tried fallback — a `_reap`-stamped reason
+        (here, a usage-limit kill) must still win when both are present,
+        exactly like the other six reasons already in the chain."""
+        rec = _RecordUpdateState()
+        kill = "usage limit — resets 8:30pm (America/Chicago)"
+        out = reconcile_completed_assignments(
+            _setup_cfg(),
+            board=_setup_board(),
+            agent_status_fn=lambda host: {"completed": [
+                {
+                    "id": "presp00001", "status": "failed",
+                    "usage_limit_reason": kill,
+                    "error": "worktree setup failed: unrelated",
+                },
+            ]},
+            update_state_fn=rec,
+            capture_plan=False,
+        )
+        assert out[0]["to_status"] == "failed"
+        assert rec.calls[0]["failure_reason"] == kill
+
+    def test_record_usage_limit_reason_also_falls_back_to_error(self) -> None:
+        """The `coord resume` write path (`_record_usage_limit_reason`)
+        exercises the SAME fallback — it is the other producer of this
+        column (see that function's docstring)."""
+        from coord.state import load_board, save_board
+
+        board = _setup_board(aid="presp00002")
+        save_board(board)
+        error = "pull failed for dep-repo: git pull --ff-only exited 1"
+        _record_usage_limit_reason("presp00002", {"error": error})
+        reloaded = load_board()
+        updated = next(
+            a for a in reloaded.active + reloaded.completed
+            if a.assignment_id == "presp00002"
+        )
+        assert updated.failure_reason == error

@@ -32,6 +32,7 @@ from coord.failure_class import (
     KIND_API_ERROR,
     KIND_INFRA,
     KIND_NETWORK,
+    KIND_SETUP,
     KIND_SILENT,
     KIND_USAGE_LIMIT,
     KIND_WORK,
@@ -364,6 +365,53 @@ class TestClassifyInfra:
         ],
     )
     def test_genuine_failures_are_not_misclassified_as_infra(
+        self, reason: str
+    ) -> None:
+        c = classify_failure(failure_reason=reason)
+        assert c.failure_class == WORK
+        assert c.kind == KIND_WORK
+
+
+# ── #4018: pre-spawn agent failures (worktree setup, a dependency pull) ────
+# classify environmental, never as a code defect — no worker ever ran.
+
+
+class TestClassifySetup:
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "worktree setup failed: _setup_worktree: target_branch "
+            "'issue-4018-x' was requested but origin/issue-4018-x could "
+            "not be resolved",
+            "worktree setup failed: [Errno 2] No such file or directory",
+            "pull failed for vimcode: git -C /repo/vimcode pull --ff-only "
+            "exited 1",
+            "no repo_path configured for dependency 'vimcode'",
+        ],
+    )
+    def test_setup_signatures_classify_environmental(self, reason: str) -> None:
+        c = classify_failure(failure_reason=reason)
+        assert c.failure_class == ENVIRONMENTAL
+        assert c.kind == KIND_SETUP
+
+    def test_setup_reason_says_environmental_and_names_4018(self) -> None:
+        c = classify_failure(
+            failure_reason="worktree setup failed: could not resolve branch"
+        )
+        assert "environmental" in c.reason
+        assert "#4018" in c.reason
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # Mentions "worktree"/"pull" individually, but not the anchored
+            # setup phrasing — a genuine test asserting worktree/pull
+            # behaviour must never be reclassified away.
+            "test_worktree_pull_retries_on_conflict failed: AssertionError",
+            "3 tests failed: test_foo, test_bar (exit code 1)",
+        ],
+    )
+    def test_genuine_failures_are_not_misclassified_as_setup(
         self, reason: str
     ) -> None:
         c = classify_failure(failure_reason=reason)
