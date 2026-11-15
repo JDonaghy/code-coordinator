@@ -8041,3 +8041,91 @@ class TestConfigHotReload:
             assert server._health_config.path == cfg_path
         finally:
             server.shutdown()
+
+
+# ── #4017: `fresh_branch` lets a `target_branch` retry survive a branch ────
+# that never reached origin ─────────────────────────────────────────────────
+
+
+def _init_repo_with_origin(path: Path) -> tuple[Path, Path]:
+    """A working clone on `main` whose `origin` is a bare repo.
+
+    Returns ``(clone, origin)`` — mirrors production, where every repo has
+    a remote (unlike :func:`_init_repo`, which is local-only).
+    """
+    origin = path / "origin.git"
+    origin.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main"], cwd=str(origin),
+        check=True, capture_output=True,
+    )
+    clone = path / "clone"
+    clone.mkdir()
+    for args in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "t@t.com"],
+        ["git", "config", "user.name", "Test"],
+        ["git", "remote", "add", "origin", str(origin)],
+    ):
+        subprocess.run(args, cwd=str(clone), check=True, capture_output=True)
+    (clone / "README").write_text("init\n")
+    subprocess.run(["git", "add", "README"], cwd=str(clone), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=str(clone), check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"], cwd=str(clone), check=True, capture_output=True,
+    )
+    return clone, origin
+
+
+def test_fresh_branch_lets_a_never_pushed_target_branch_retry_proceed(
+    tmp_path: Path,
+) -> None:
+    """#4017: a retry whose recorded branch never reached origin (the
+    leg died before its first push) must not hit `_setup_worktree`'s
+    #3857 hard refusal — `_reassign` (`coord/reconcile.py`) now sets
+    `fresh_branch=True` alongside `target_branch` whenever it can confirm
+    the branch is absent on origin, so the agent starts a fresh branch
+    under that exact name instead of refusing the assignment."""
+    clone, _origin = _init_repo_with_origin(tmp_path)
+    server = _server(tmp_path, repo_path=clone)
+    spec = _spec(
+        clone, issue_number=4017, issue_title="retry after a dead leg",
+        target_branch="issue-4017-never-pushed", fresh_branch=True,
+    )
+    try:
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=10)
+        assert final.status != FAILED, final.error
+        assert final.branch == "issue-4017-never-pushed"
+        branch_sha = subprocess.run(
+            ["git", "rev-parse", "issue-4017-never-pushed"], cwd=str(clone),
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert branch_sha
+    finally:
+        server.shutdown()
+
+
+def test_smoke_leg_with_missing_target_branch_still_refused(
+    tmp_path: Path,
+) -> None:
+    """#4017 control: the #3857 refusal must keep applying to a grading
+    leg (smoke/review) that must run against one specific PR branch —
+    only a `_reassign` retry that explicitly confirms the branch is gone
+    and opts in via `fresh_branch` gets the fallback. A `type="smoke"`
+    assignment with a `target_branch` absent from origin and no
+    `fresh_branch` must still fail setup exactly as before."""
+    clone, _origin = _init_repo_with_origin(tmp_path)
+    server = _server(tmp_path, repo_path=clone)
+    spec = _spec(
+        clone, issue_number=7, issue_title="smoke this PR", type="smoke",
+        target_branch="issue-7-never-pushed",
+    )
+    try:
+        a = server.assign(spec)
+        assert a.status == FAILED
+        assert "issue-7-never-pushed" in a.error
+    finally:
+        server.shutdown()
