@@ -2293,3 +2293,67 @@ class TestPreSpawnFailureReachesFailureReason:
             if a.assignment_id == "presp00002"
         )
         assert updated.failure_reason == error
+
+
+class TestSmokeLegLostAgentStaysEnvironmental:
+    def test_agent_restart_during_smoke_leg_does_not_record_a_work_failure(
+        self, coord_db,
+    ) -> None:
+        """#4018 review: `error="agent restarted; subprocess lost"` (and
+        every other `AgentAssignment.error` string — a worktree write
+        check, a raw spawn `OSError`, the #3363 phantom-assignment sweep)
+        is agent-authored bookkeeping prose describing a lost/never-spawned
+        worker, never a worker's own verdict — `_reap` never ran, so
+        `exit_code` stays `None` too. A `type="smoke"` leg dying this way
+        (an ordinary `coord agent update` restart, not a code defect) must
+        still take the #3705 silent/environmental path and clear the
+        parent's `test_state` for a fresh re-dispatch, never record
+        `test_state="failed"` and spend a bounded `coord fix` round on code
+        that was never actually tested."""
+        from coord.state import (  # noqa: PLC0415
+            _record_dispatched_assignment_local,
+            get_connection,
+        )
+
+        work = Assignment(
+            assignment_id="w-4018-restart", machine_name="precision",
+            repo_name="cc", issue_number=4018, issue_title="X", type="work",
+            status="done", branch="issue-4018",
+        )
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/cc")
+
+        board = Board(
+            repos=[Repo(name="cc", github="acme/cc")], machines=[],
+            active=[
+                Assignment(
+                    machine_name="precision", repo_name="cc",
+                    issue_number=4018, issue_title="[smoke] X",
+                    status="running", assignment_id="presp00003", type="smoke",
+                    review_of_assignment_id="w-4018-restart",
+                ),
+            ],
+        )
+        rec = _RecordUpdateState()
+        out = reconcile_completed_assignments(
+            _setup_cfg(),
+            board=board,
+            agent_status_fn=lambda host: {"completed": [
+                {
+                    "id": "presp00003", "status": "failed",
+                    "error": "agent restarted; subprocess lost",
+                },
+            ]},
+            update_state_fn=rec,
+            capture_plan=False,
+        )
+        assert out[0]["to_status"] == "failed"
+        assert rec.calls[0]["failure_reason"] == "agent restarted; subprocess lost"
+
+        row = get_connection().execute(
+            "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+            ("w-4018-restart",),
+        ).fetchone()
+        assert row["test_state"] is None, (
+            "an agent-lost smoke leg must clear the parent's test_state for "
+            f"re-dispatch, never record a work failure — got {row['test_state']!r}"
+        )
