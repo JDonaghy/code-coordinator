@@ -81,14 +81,18 @@ class BoardDoctorRepoConfig:
     (`Config.board_doctor.finish`) and its `COORD_BOARD_DOCTOR_NO_FINISHER`
     env-var override.
 
-    ``stale_race`` is this repo's opt-in to the #3859 checks-stale-race
-    disposition: a drive-queue row that exhausted its merge-attempt budget
-    losing a race against sibling merges (not a real problem with the
-    branch) gets a per-repo merge-gate reservation plus one fresh
-    stale-rebase dispatch instead of escalating straight to a human. `False`
-    (the default) leaves today's behavior unchanged — the row still
-    escalates via `coord.commands.drive_queue._run_auto_revalidate_checks_
-    stale`'s existing `merge_checks_stale_human_required` path.
+    ``stale_race`` is this repo's participation in the #3859
+    checks-stale-race disposition: a drive-queue row that keeps losing its
+    stale-rebase retries to sibling merges landing mid re-run gets a
+    per-repo merge-gate reservation ordering it ahead of the next
+    leapfrogging sibling, instead of burning its whole retry budget on
+    races it cannot win and escalating to a human. Unlike `investigate`/
+    `finish` above, this disposition dispatches nothing a repo isn't
+    already exposed to — the same stale-rebase conflict-fix fires with or
+    without it; the reservation only orders attempts that would otherwise
+    collide — so it defaults to `True`: every repo participates unless it
+    (or the fleet-wide switch) explicitly opts out. Set this to `False` to
+    opt a specific repo out while leaving the rest of the fleet on.
     `coord.board_doctor_policy._stale_race_tier_enabled` is the single
     function that reads this alongside the fleet-wide kill switch
     (`Config.board_doctor.stale_race`) and its
@@ -112,7 +116,7 @@ class BoardDoctorRepoConfig:
 
     investigate: bool = False
     finish: bool = False
-    stale_race: bool = False
+    stale_race: bool = True
     followthrough: bool = False
     followthrough_auto_queue: bool = False
 

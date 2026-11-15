@@ -1603,11 +1603,14 @@ class BoardDoctorConfig:
     field and the per-repo opt-in.
 
     ``stale_race`` is the fleet-wide switch for #3859's checks-stale-race
-    disposition, mirroring ``investigate``/``finish`` exactly: a repo must
-    still opt in via its own ``repos[].board_doctor.stale_race``
-    (``BoardDoctorRepoConfig.stale_race``, default ``False``).
+    disposition. Unlike ``investigate``/``finish``, the per-repo field
+    (``BoardDoctorRepoConfig.stale_race``) defaults ``True`` rather than
+    ``False`` — the disposition only orders stale-rebase retries a repo is
+    already exposed to, it does not dispatch anything new, so there is no
+    safety case for requiring an explicit per-repo opt-in. A repo opts OUT
+    by setting its own ``repos[].board_doctor.stale_race: false``.
     `coord.board_doctor_policy._stale_race_tier_enabled` reads both this
-    field and the per-repo opt-in.
+    field and the per-repo switch.
 
     ``followthrough`` is the fleet-wide switch for the merged-partial
     follow-through disposition, mirroring ``stale_race`` exactly: a repo
@@ -4191,8 +4194,10 @@ def _parse_worker_permissions(raw: Any, repo_index: int) -> WorkerPermissionsCon
 def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRepoConfig:
     """Parse the ``board_doctor`` block for a single repo.
 
-    When *raw* is ``None`` (key absent from YAML), ``investigate`` stays at
-    its safety-by-default ``False`` — see :class:`BoardDoctorRepoConfig`.
+    When *raw* is ``None`` (key absent from YAML), ``investigate``/
+    ``finish``/``followthrough`` stay at their safety-by-default ``False``,
+    while ``stale_race`` stays at its participate-by-default ``True`` — see
+    :class:`BoardDoctorRepoConfig`.
     """
     if raw is None:
         return BoardDoctorRepoConfig()
