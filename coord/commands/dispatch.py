@@ -2429,8 +2429,15 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         retry_model = None
 
     try:
+        # #4017: wire a real branch-existence check — a `coord retry` of a
+        # leg that died before its first push (e.g. a dependency-pull
+        # failure) must not carry a `target_branch` the agent's
+        # `_setup_worktree` (#3857) permanently refuses; `github_ops.
+        # branch_exists_on_remote` tells `_reassign` to fall back to a
+        # fresh branch under the same name instead.
         result = _reassign(
             assignment, board, cfg, model=retry_model, issue_labels=issue_labels,
+            branch_exists_fetcher=github_ops.branch_exists_on_remote,
         )
     except UnsupportedRetryType as exc:
         # Defense in depth — the precheck above already covers this, but

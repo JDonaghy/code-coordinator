@@ -377,6 +377,77 @@ class TestReassignThreadsProvider:
         assert payload["model"] == cfg.models.resolve("opus")
 
 
+class TestReassignBranchExistsFetcher:
+    """#4017: a work leg that dies before its first push never puts
+    `failed.branch` on origin — a plain `target_branch` continuation of it
+    is exactly the payload `coord.agent`'s `_setup_worktree` (#3857)
+    permanently refuses, wedging every later retry. `_reassign` must set
+    `fresh_branch=True` alongside `target_branch` when an opted-in
+    *branch_exists_fetcher* confirms the branch is gone."""
+
+    @patch("coord.reconcile.httpx.post")
+    def test_missing_branch_sets_fresh_branch_alongside_target_branch(
+        self, mock_post: MagicMock,
+    ) -> None:
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        failed = _failed(branch="issue-1-never-pushed")
+
+        result = _reassign(
+            failed, Board(), _plain_cfg(),
+            branch_exists_fetcher=lambda repo, branch: False,
+        )
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["target_branch"] == "issue-1-never-pushed"
+        assert payload["fresh_branch"] is True
+
+    @patch("coord.reconcile.httpx.post")
+    def test_existing_branch_continues_without_fresh_branch(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Control: when the fetcher confirms the branch IS still on
+        origin, the payload must stay exactly as before #4017 — no
+        `fresh_branch` field at all, so a genuine continuation (real work
+        already pushed) is never silently re-forked."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        failed = _failed(branch="issue-1-already-pushed")
+
+        result = _reassign(
+            failed, Board(), _plain_cfg(),
+            branch_exists_fetcher=lambda repo, branch: True,
+        )
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["target_branch"] == "issue-1-already-pushed"
+        assert "fresh_branch" not in payload
+
+    @patch("coord.reconcile.httpx.post")
+    def test_no_fetcher_is_unconditional_as_before(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Every existing direct caller/test that doesn't pass the fetcher
+        (the default, `None`) must see byte-identical behavior to before
+        #4017 — only `reconcile()`'s and `coord retry`'s own call sites
+        wire a real one."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        failed = _failed(branch="issue-1-x")
+
+        result = _reassign(failed, Board(), _plain_cfg())
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["target_branch"] == "issue-1-x"
+        assert "fresh_branch" not in payload
+
+
 # ── #3376: the dispatch-liveness gate, applied to auto-reassign ────────────
 
 
@@ -799,6 +870,56 @@ class TestCliRetryProviderRouting:
         payload = mock_post.call_args.kwargs["json"]
         assert payload["model"] == "opus"
         assert "provider" not in payload
+
+
+class TestCliRetryNeverPushedBranch:
+    """#4017: `coord retry` of a work leg that died before its first push
+    must not permanently wedge on `_setup_worktree`'s (#3857) hard refusal
+    — the CLI call site wires `github_ops.branch_exists_on_remote` into
+    `_reassign` for exactly this reason."""
+
+    @patch("coord.commands.dispatch.github_ops.branch_exists_on_remote")
+    @patch("coord.reconcile.httpx.post")
+    def test_retry_sets_fresh_branch_when_branch_never_reached_origin(
+        self, mock_post: MagicMock, mock_branch_exists: MagicMock,
+        tmp_path: Path, coord_db,
+    ) -> None:
+        mock_branch_exists.return_value = False
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n"
+            "  - name: laptop\n    host: l\n    repos: [api]\n"
+            "    repo_paths:\n      api: /tmp/api\n"
+            "  - name: server\n    host: s\n    repos: [api]\n"
+            "    repo_paths:\n      api: /tmp/api\n"
+            "models:\n  default: sonnet\n  escalation: [haiku, sonnet, opus]\n"
+        )
+        board = Board(completed=[
+            _failed(
+                assignment_id="workid3", issue_number=3,
+                branch="issue-3-never-pushed",
+            ),
+        ])
+        resp = MagicMock()
+        resp.json.return_value = {"id": "retry3"}
+        resp.raise_for_status = lambda: None
+        mock_post.return_value = resp
+
+        with (
+            patch("coord.board_service.read_board", return_value=board),
+            patch("coord.board_service.write_board"),
+        ):
+            result = CliRunner().invoke(
+                main, ["retry", "workid3", "--config", str(config_file)],
+            )
+
+        out = output_and_stderr(result)
+        assert result.exit_code == 0, out
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["target_branch"] == "issue-3-never-pushed"
+        assert payload["fresh_branch"] is True
+        mock_branch_exists.assert_called_once_with("acme/api", "issue-3-never-pushed")
 
 
 # ── auto_reassign: the passive reconcile() tick shares _reassign too ───────

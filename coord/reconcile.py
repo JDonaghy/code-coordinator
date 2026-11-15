@@ -1878,6 +1878,7 @@ def _reassign(
     issue_labels: list[str] | None = None,
     credential_fetcher=None,
     issue_liveness_fetcher=None,
+    branch_exists_fetcher=None,
 ) -> Assignment | None:
     """Re-dispatch a failed assignment to a machine with spare capacity.
 
@@ -1924,6 +1925,20 @@ def _reassign(
     ``failed.branch`` — the exact branch a retry would land on — so a
     merged sibling branch for the same issue no longer masquerades as
     "this issue's work already merged".
+
+    *branch_exists_fetcher* (#4017) is an optional ``(repo_github: str,
+    branch: str) -> bool`` callable, same opt-in shape as the two fetchers
+    above — ``None`` (the default here) performs no check, preserving this
+    function's old unconditional behavior for every direct caller/test that
+    doesn't pass it. The real wiring (`coord.github_ops.
+    branch_exists_on_remote`) happens at `reconcile()`'s and `coord
+    retry`'s own call sites. A leg that dies before its first push (e.g. a
+    dependency-pull failure) never puts ``failed.branch`` on origin, so a
+    plain ``target_branch`` continuation of it is exactly the payload
+    `_setup_worktree` (#3857) permanently refuses — wedging every later
+    retry. When the fetcher confirms the branch is absent, this also sets
+    ``payload["fresh_branch"] = True`` so the agent starts a fresh branch
+    under the SAME name instead of refusing.
 
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
@@ -2130,10 +2145,22 @@ def _reassign(
     # already committed and pushed must not be orphaned by a retry. Mirrors
     # the `target_branch` wire field `--fix-of`/`--rework-of`/
     # `_dispatch_followup` already use; the agent checks out this exact
-    # branch (hard-reset to the remote tip) when it exists on origin, and
-    # falls back to a fresh branch off `branch` above when it doesn't.
+    # branch (hard-reset to the remote tip) when it exists on origin. #4017:
+    # it does NOT fall back to a fresh branch on its own when the branch is
+    # missing — `_setup_worktree` (#3857) hard-refuses an unresolvable
+    # `target_branch` instead, since for most callers (a `review`/`smoke`
+    # leg grading a specific PR) a missing branch means something is
+    # already wrong. A retry's failed leg may simply have died before its
+    # first push, so when *branch_exists_fetcher* (opt-in — see this
+    # function's own docstring) confirms the branch never reached origin,
+    # tell the agent explicitly to start fresh under the same name rather
+    # than assume it can resolve `target_branch` itself.
     if failed.branch:
         payload["target_branch"] = failed.branch
+        if branch_exists_fetcher is not None:
+            repo_github = repo_cfg.github if repo_cfg is not None else None
+            if repo_github and not branch_exists_fetcher(repo_github, failed.branch):
+                payload["fresh_branch"] = True
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     try:
@@ -2914,12 +2941,21 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 # already-fetched state (the local `issues` cache table,
                 # this same in-memory `board`) — no GitHub call from this
                 # passive tick, matching `cached_labels` just above.
+                #
+                # #4017: also wire a real *branch_exists_fetcher* — a leg
+                # that died before its first push recorded a branch that
+                # was never pushed, and every auto-retry of it would
+                # otherwise carry a `target_branch` `_setup_worktree`
+                # (#3857) permanently refuses, wedging the issue forever.
+                from coord import github_ops  # noqa: PLC0415
+
                 reassigned = _reassign(
                     failed_a, board, config, issue_labels=cached_labels,
                     credential_fetcher=claude_credential_reachable,
                     issue_liveness_fetcher=lambda repo, num, branch=None: (
                         _issue_liveness_from_cache(board, repo, num, branch)
                     ),
+                    branch_exists_fetcher=github_ops.branch_exists_on_remote,
                 )
             except RetryProviderMismatch:
                 # Refuse rather than substitute (#2323) — leave the failed
