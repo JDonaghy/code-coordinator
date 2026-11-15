@@ -3497,8 +3497,8 @@ def test_auto_split_invalid_value_is_config_error(tmp_path: Path) -> None:
 
 def test_board_doctor_stale_race_defaults_to_true() -> None:
     """Absent `board_doctor:` -> the fleet-wide switch stays at its default
-    (`True`); each repo's own opt-in is still the gate that actually
-    matters (see `_stale_race_tier_enabled`)."""
+    (`True`); each repo's own switch (also default `True`, #4023) is the
+    other half of the gate (see `_stale_race_tier_enabled`)."""
     cfg = _parse_board_doctor(None)
     assert cfg.stale_race is True
 
@@ -3513,13 +3513,17 @@ def test_board_doctor_stale_race_rejects_non_bool() -> None:
         _parse_board_doctor({"stale_race": "true"})
 
 
-def test_repo_board_doctor_stale_race_defaults_to_false() -> None:
+def test_repo_board_doctor_stale_race_defaults_to_true() -> None:
+    """#4023: unlike `investigate`/`finish`, the per-repo switch defaults
+    `True` — the disposition only orders retries a repo is already
+    exposed to, so it participates without an explicit opt-in."""
     cfg = _parse_board_doctor_repo_config(None, 0)
-    assert cfg.stale_race is False
+    assert cfg.stale_race is True
 
 
 def test_repo_board_doctor_stale_race_parses_bool() -> None:
     assert _parse_board_doctor_repo_config({"stale_race": True}, 0).stale_race is True
+    assert _parse_board_doctor_repo_config({"stale_race": False}, 0).stale_race is False
 
 
 def test_repo_board_doctor_stale_race_rejects_non_bool() -> None:

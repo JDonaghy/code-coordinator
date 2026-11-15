@@ -1500,14 +1500,18 @@ def _stale_race_tier_enabled(repo_name: str, config: "Config") -> bool:
     instead of today's straight-to-``merge_checks_stale_human_required``
     escalation.
 
-    Mirrors :func:`_investigate_tier_enabled`/:func:`_finisher_tier_enabled`'s
-    three independent gates exactly, reading the ``stale_race``-named fields:
+    Three independent gates, structurally like
+    :func:`_investigate_tier_enabled`/:func:`_finisher_tier_enabled` but with
+    the per-repo polarity flipped — this disposition only orders retries a
+    repo is already exposed to, so it participates by default rather than
+    needing an explicit per-repo opt-in:
 
     1. :data:`NO_STALE_RACE_ENV_VAR` — a process-wide kill switch.
     2. ``board_doctor.stale_race`` — the fleet-wide config switch.
-    3. ``repos[].board_doctor.stale_race`` — the per-repo opt-in. A repo
-       that has not opted in keeps today's behavior unchanged regardless of
-       the fleet-wide switch.
+    3. ``repos[].board_doctor.stale_race`` — the per-repo switch, defaulting
+       ``True`` (:class:`~coord.models.BoardDoctorRepoConfig`). A repo that
+       has explicitly opted OUT keeps today's straight-to-escalation
+       behavior regardless of the fleet-wide switch.
 
     Called directly by `coord.commands.drive_queue._run_auto_revalidate_
     checks_stale` (not only from the periodic board-doctor sweep) — the

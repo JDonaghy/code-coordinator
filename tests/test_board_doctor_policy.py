@@ -2905,9 +2905,11 @@ class TestFinisherTierEnabled:
 
 
 class TestStaleRaceTierEnabled:
-    """#3859: `_stale_race_tier_enabled` mirrors `_investigate_tier_enabled`/
-    `_finisher_tier_enabled`'s three independent gates, reading the
-    `stale_race`-named fields.
+    """#3859/#4023: `_stale_race_tier_enabled` has the same three-gate shape
+    as `_investigate_tier_enabled`/`_finisher_tier_enabled`, reading the
+    `stale_race`-named fields — but the per-repo field's polarity is
+    flipped (default `True`, a repo opts OUT rather than in), since this
+    disposition only orders retries a repo is already exposed to.
     """
 
     @staticmethod
@@ -2927,7 +2929,18 @@ class TestStaleRaceTierEnabled:
             board_doctor=BoardDoctorConfig(stale_race=fleet_stale_race),
         )
 
-    def test_disabled_when_repo_has_not_opted_in(self) -> None:
+    def test_enabled_by_default_with_no_explicit_config(self) -> None:
+        """#4023: a repo that declares no `board_doctor:` block at all, and
+        a fleet with no `board_doctor.stale_race:` override, still gets the
+        disposition — neither switch requires an explicit opt-in commit to
+        coordinator.yml."""
+        config = Config(
+            repos=[Repo(name="acme/widgets", github="acme/widgets")],
+            machines=[],
+        )
+        assert board_doctor_policy._stale_race_tier_enabled("acme/widgets", config) is True
+
+    def test_disabled_when_repo_has_explicitly_opted_out(self) -> None:
         config = self._config(fleet_stale_race=True, repo_stale_race=False)
         assert board_doctor_policy._stale_race_tier_enabled("acme/widgets", config) is False
 

@@ -1790,14 +1790,14 @@ def _reclassify_checks_stale_race(rows: list[StuckRow], *, config) -> list[Stuck
     inherited from whenever the episode last concluded.
 
     Gated per-repo by :func:`coord.board_doctor_policy._stale_race_tier_
-    enabled` — the same fleet + per-repo opt-in
+    enabled` — the same fleet switch + per-repo switch (default `True`)
     `coord.commands.drive_queue._run_auto_revalidate_checks_stale` checks
-    before reserving a merge-gate slot. A repo that has not opted in keeps
-    its pre-#3859 label (whatever `queue_diagnose` assigned) unchanged; this
-    label is purely informational today (`policy_tier_of` has no entry for
-    `CAUSE_CHECKS_STALE_RACE`, so it resolves to the same alert tier either
-    way), but it must not claim a race-driven disposition is in play on a
-    repo where that disposition cannot actually fire.
+    before reserving a merge-gate slot. A repo that has explicitly opted
+    out keeps its pre-#3859 label (whatever `queue_diagnose` assigned)
+    unchanged; this label is purely informational today (`policy_tier_of`
+    has no entry for `CAUSE_CHECKS_STALE_RACE`, so it resolves to the same
+    alert tier either way), but it must not claim a race-driven disposition
+    is in play on a repo where that disposition cannot actually fire.
     """
     from coord.board_doctor_policy import _stale_race_tier_enabled  # noqa: PLC0415
     from coord.drive_queue import (  # noqa: PLC0415
