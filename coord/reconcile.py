@@ -555,6 +555,17 @@ def reconcile_completed_assignments(
         # no `failure_reason` — invisible to `coord status`/`coord health`,
         # `coord retry`, and the GitHub failure comment, which is the exact
         # "nothing said the word asleep" gap #2638 exists to close.
+        # #4018: `entry.get("error")` is a DIFFERENT column — `AgentAssignment
+        # .error`, set by `AgentServer.assign`/`_fail` when the agent fails
+        # BEFORE a worker ever spawns (worktree setup, a `pull_repos` pull).
+        # None of the seven reasons above can ever be set on such an entry —
+        # they are all stamped by `_reap`, which only runs after a worker
+        # process has started and exited — so this is a pure fallback, tried
+        # last. Without it, a pre-spawn failure landed FAILED with
+        # `failure_reason` left `None`: invisible to `coord status`/the
+        # drive's die message, and `coord log <aid>` 404s because no log
+        # file was ever created to begin with, so this was the ONLY
+        # surviving copy of the diagnostic.
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
@@ -563,6 +574,7 @@ def reconcile_completed_assignments(
             or entry.get("truncation_reason")
             or entry.get("runtime_ceiling_reason")
             or entry.get("host_sleep_reason")
+            or entry.get("error")
         )
         _escalate_spend_ceiling_best_effort(a, entry)
         update_state_fn(
@@ -945,6 +957,7 @@ def _environmental_cause_phrase(classification: "FailureClassification") -> str:
         KIND_API_ERROR,
         KIND_INFRA,
         KIND_NETWORK,
+        KIND_SETUP,
         KIND_SILENT,
         KIND_USAGE_LIMIT,
     )
@@ -969,6 +982,11 @@ def _environmental_cause_phrase(classification: "FailureClassification") -> str:
         # failing — a worktree repeatedly vanishing mid-run, a runner
         # repeatedly killed before it could report — never the code.
         return "a sustained Test-stage infrastructure failure"
+    if classification.kind == KIND_SETUP:
+        # #4018: the agent itself kept failing BEFORE a worker ever spawned
+        # — a worktree checkout or dependency pull, never the code (no
+        # worker ran to have a code defect in the first place).
+        return "a sustained agent pre-spawn setup failure (worktree/pull)"
     return "a sustained environmental failure"  # pragma: no cover — defensive
 
 
@@ -2498,6 +2516,12 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
         # `reconcile_completed_assignments`.
         or entry.get("runtime_ceiling_reason")
         or entry.get("host_sleep_reason")
+        # #4018: `AgentAssignment.error` — a pre-spawn failure (worktree
+        # setup, a `pull_repos` pull) that never reaches `_reap` at all, so
+        # none of the reasons above are ever set on it. Same fallback-last
+        # placement as the identical chain in
+        # `reconcile_completed_assignments`.
+        or entry.get("error")
     )
     if not reason or not assignment_id:
         return
