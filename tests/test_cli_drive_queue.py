@@ -1713,6 +1713,18 @@ def test_list_json_emits_the_raw_rows(cli):
     assert rows[0]["after_json"] == []  # a real list on the wire, never a string
 
 
+def test_list_with_repo_filter_does_not_crash(cli):
+    """#4025: `--repo` took the `all_entries = ... else entries_from_rows(
+    list_drive_queue())` branch, which referenced `list_drive_queue` without
+    importing it into `drive_queue_list`'s scope — an unconditional
+    `NameError` on every `--repo`-filtered call, never just the diagnosis
+    path. Must render the same row the unfiltered form does."""
+    cli("add", REPO, "1650")
+    result = cli("list", "--repo", REPO)
+    assert result.exit_code == 0, result.output
+    assert f"{REPO}#1650" in result.output
+
+
 # ── #2133: `last_reason` is a snapshot, never re-validated — its rendering
 # must carry its own age so it can never be mistaken for a current diagnosis.
 # Reproduces the shape of the #2104 incident: a `blocked` entry's reason was
