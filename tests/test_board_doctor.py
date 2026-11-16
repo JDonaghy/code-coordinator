@@ -25,6 +25,7 @@ from coord.board_doctor import (
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CHECKS_STALE_RACE,
     CAUSE_MERGE_NEVER_ATTEMPTED,
+    CAUSE_MERGE_PENDING_STUCK,
     CAUSE_MERGED_PARTIAL,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
@@ -5527,6 +5528,119 @@ class TestRunSweepFollowthroughWiring:
 
         assert called == []
         assert report.followthrough == []
+
+
+class TestRunSweepMechanicalCausesFilter:
+    """``mechanical_causes`` (the tight-cadence entry point) must drop
+    every row outside the named set BEFORE classification — never merely
+    suppress its dispatch — and must never let this narrower view wipe a
+    non-mechanical row's convergence counter."""
+
+    def test_only_named_causes_reach_sweep(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        rows = [
+            _row("quadraui#1", CAUSE_MERGE_PENDING_STUCK),
+            _row("quadraui#2", "ci_red"),
+            StuckRow(
+                queue="drive-queue", key="quadraui#3", state=STATE_MERGED_PARTIAL,
+                cause=CAUSE_MERGED_PARTIAL, confidence="high",
+            ),
+        ]
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config: (rows, Board()),
+        )
+        followthrough_called = []
+
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            tier_of=lambda cause: TIER_AUTO if cause == CAUSE_MERGE_PENDING_STUCK else TIER_ALERT,
+            auto_dispatchers={CAUSE_MERGE_PENDING_STUCK: lambda row: True},
+            alert_dispatcher=lambda row: True,
+            mechanical_causes=frozenset({CAUSE_MERGE_PENDING_STUCK}),
+            followthrough_sweep=lambda *a, **k: followthrough_called.append(1) or [],
+        )
+
+        # Only the mechanical row reached the tier loop — the `ci_red` row
+        # and the `merged-partial` row were both dropped before
+        # classification, never alerted on, never handed to followthrough.
+        assert [d.key for d in report.decisions] == ["quadraui#1"]
+        assert followthrough_called == []
+        assert report.followthrough == []
+        assert report.rows_observed == 1
+
+    def test_clear_absent_rows_is_forced_off(self, monkeypatch) -> None:
+        """A row this invocation's own filter excludes must never be read
+        by `sweep`'s own ``clear_absent_rows`` as "resolved" — that would
+        wipe a non-mechanical row's convergence/escalation state on every
+        tight-cadence tick, purely because this narrower view never
+        looked at it."""
+        import coord.board_doctor as board_doctor_mod
+
+        captured: dict = {}
+
+        def _fake_sweep(rows, **kwargs):
+            captured.update(kwargs)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config: ([], Board()),
+        )
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            mechanical_causes=frozenset({CAUSE_MERGE_PENDING_STUCK}),
+        )
+
+        assert captured["clear_absent_rows"] is False
+
+    def test_mechanical_causes_none_keeps_clear_absent_rows_on(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        captured: dict = {}
+
+        def _fake_sweep(rows, **kwargs):
+            captured.update(kwargs)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config: ([], Board()),
+        )
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        board_doctor_mod.run_sweep(config=Config(repos=[], machines=[]))
+
+        assert captured["clear_absent_rows"] is True
+
+
+class TestMechanicalCausesPolicy:
+    """:func:`coord.board_doctor_policy.mechanical_causes` names exactly
+    the deterministic, pre-reviewed queue repairs — never an
+    investigate- or decomposition-tier cause, even though both also
+    read :data:`coord.board_doctor.TIER_AUTO` from `policy_tier_of`."""
+
+    def test_names_only_allowlist_causes(self) -> None:
+        from coord import board_doctor_policy
+
+        causes = board_doctor_policy.mechanical_causes()
+
+        assert CAUSE_MERGE_NEVER_ATTEMPTED in causes
+        assert CAUSE_MERGE_PENDING_STUCK in causes
+        for cause in causes:
+            assert cause in board_doctor_policy.ALLOWLIST
+
+    def test_excludes_investigate_and_decomposition_causes(self) -> None:
+        from coord import board_doctor_policy
+
+        causes = board_doctor_policy.mechanical_causes()
+
+        assert not (causes & board_doctor_policy.INVESTIGATE_CAUSES)
+        assert not (causes & board_doctor_policy.DECOMPOSITION_CAUSES)
+        assert queue_diagnose.CAUSE_CI_RED not in causes
 
 
 class TestDriveQueueSweepCliFollowthroughOutput:

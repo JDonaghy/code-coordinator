@@ -3935,6 +3935,7 @@ def run_sweep(
     followthrough_sweep: Callable[..., list[board_doctor_followthrough.Disposition]] = (
         run_followthrough_sweep
     ),
+    mechanical_causes: frozenset[str] | None = None,
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -3972,10 +3973,29 @@ def run_sweep(
     for this invocation regardless of any repo's own opt-in
     (:func:`coord.board_doctor_followthrough.followthrough_enabled` is
     still consulted per-row on top of this).
+
+    *mechanical_causes*, when given, restricts this call to ONLY the
+    named causes — every other row :func:`collect_rows` found (including
+    every ``merged-partial`` follow-through row) is dropped before
+    :func:`sweep` ever sees it, not merely alert-suppressed. This is the
+    tight-cadence entry point a scheduler can run every minute or two
+    alongside an hourly full sweep: a narrower, more frequent pass that
+    only ever touches the deterministic, pre-approved queue repairs
+    (``coord.board_doctor_policy.mechanical_causes()``), never the
+    investigate or decomposition tiers' convergence counters,
+    escalations or `gh`/leg-dispatch load. ``clear_absent_rows=False`` is
+    forced alongside the filter for exactly this reason: this call's own
+    row set is a deliberate subset, so a row outside it going "absent"
+    from THIS sweep's point of view must never be read as "resolved" and
+    have its counter wiped — only a full (unfiltered) sweep's own absence
+    check may draw that conclusion.
     """
     rows, board = _collect_rows_with_board(config=config)
     followthrough_rows = [r for r in rows if r.cause == CAUSE_MERGED_PARTIAL]
     other_rows = [r for r in rows if r.cause != CAUSE_MERGED_PARTIAL]
+    if mechanical_causes is not None:
+        other_rows = [r for r in other_rows if r.cause in mechanical_causes]
+        followthrough_rows = []
     resolved_capacity_check = (
         default_investigate_capacity(config)
         if capacity_check is _CAPACITY_CHECK_UNSET
@@ -3991,12 +4011,13 @@ def run_sweep(
         convergence_limit=convergence_limit,
         escalation_resolver=escalation_resolver,
         capacity_check=resolved_capacity_check,
+        clear_absent_rows=mechanical_causes is None,
         log_retention_days=getattr(board_doctor_cfg, "log_retention_days", None),
         backoff_initial_hours=getattr(board_doctor_cfg, "backoff_initial_hours", None),
         backoff_cap_hours=getattr(board_doctor_cfg, "backoff_cap_hours", None),
         outcome_grace_hours=getattr(board_doctor_cfg, "outcome_grace_hours", None),
     )
-    report.rows_observed = len(rows)
+    report.rows_observed = len(rows) if mechanical_causes is None else len(other_rows)
     if followthrough and followthrough_rows:
         report.followthrough = followthrough_sweep(
             followthrough_rows, config=config, board=board, dry_run=dry_run,

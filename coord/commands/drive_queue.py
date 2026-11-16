@@ -3380,10 +3380,26 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
         "invocation."
     ),
 )
+@click.option(
+    "--mechanical-only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Restrict this sweep to the deterministic, pre-reviewed queue "
+        "repairs (mark_done/clear_latch/merge/conflict_fix_redispatch/"
+        "drive_queue_requeue/restage/drive_queue_add — "
+        "coord.board_doctor_policy.mechanical_causes()) and drop every "
+        "other row before it is even classified: no investigate-tier "
+        "fix-it leg, no decomposition act, no `merged-partial` follow-"
+        "through, no alert-tier escalation for a non-mechanical cause. "
+        "Meant for a tight (sub-hourly) cadence alongside the full "
+        "hourly sweep — see coord-board-doctor-fast.timer."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_sweep(
     output_json: bool, dry_run: bool, no_investigate: bool, no_followthrough: bool,
-    config_path: Path,
+    mechanical_only: bool, config_path: Path,
 ) -> None:
     """Board-doctor sweep: classify every stuck row, dispatch, record (#3758).
 
@@ -3468,6 +3484,18 @@ def drive_queue_sweep(
     kill switch scoped to this command would disarm nothing it does. Use
     `coord fix <REVIEW_ID> --no-finish` instead — that IS the call site
     where Trigger A fires.
+
+    `--mechanical-only` narrows a single invocation to just the
+    deterministic mechanical repairs (`coord.board_doctor.run_sweep`'s
+    own `mechanical_causes` parameter) — a row outside that set is
+    dropped before classification, so it is never auto-dispatched,
+    never investigate-dispatched, never alerted on and never counted
+    toward that row's own convergence/backoff clock by THIS invocation;
+    only a full (non-`--mechanical-only`) sweep's absence check may ever
+    treat a row as resolved. This is the shape a tight, sub-hourly
+    cadence runs safely alongside the full hourly sweep: cheap, narrow,
+    side-effect-bounded to the handful of causes `coord.
+    board_doctor_policy.mechanical_causes()` names.
     """
     from coord import board_doctor, board_doctor_followthrough, board_doctor_policy  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
@@ -3498,6 +3526,9 @@ def drive_queue_sweep(
             dry_run=dry_run,
             escalation_resolver=board_doctor_policy.dismiss_resolved_escalation,
             followthrough=not no_followthrough,
+            mechanical_causes=(
+                board_doctor_policy.mechanical_causes() if mechanical_only else None
+            ),
         )
     finally:
         # Restore rather than blindly delete: a caller already running with

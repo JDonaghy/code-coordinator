@@ -1,0 +1,57 @@
+# coord board-doctor FAST sweep — the mechanical-only half of the
+# scheduled harness over the stuck rows, paired with
+# coord-board-doctor-fast.timer.
+#
+# Runs `coord drive-queue sweep --mechanical-only` on a tight cadence:
+# exactly the same classify-and-log harness as coord-board-doctor.service,
+# restricted to the handful of pre-reviewed queue repairs named by
+# `coord.board_doctor_policy.mechanical_causes()` (mark_done, clear_latch,
+# merge, conflict_fix_redispatch, drive_queue_requeue, restage,
+# drive_queue_add). A row outside that set is dropped before this
+# invocation ever classifies it — no fix-it leg, no escalation, no
+# convergence-counter write for anything this unit does not name. The
+# investigate/alert tiers and `merged-partial` follow-through are entirely
+# this unit's own no-op; they keep running on `coord-board-doctor.timer`'s
+# hourly cadence, with their existing per-repo opt-in and budget untouched.
+#
+# Same packaged-dry-run-by-default posture as coord-board-doctor.service:
+# the ExecStart below passes `--dry-run`, so installing this unit gets
+# classification + logging with ZERO dispatch until an operator
+# deliberately edits this unit (after install) to drop the flag.
+#
+# Install ONLY on the box that owns ~/.coord/coord.db — same host and same
+# `is_remote()` guard as coord-board-doctor.service; do not install this on
+# a thin client.
+#
+# Install (alongside coord-board-doctor.service/.timer):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-board-doctor-fast.service deploy/coord-board-doctor-fast.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-board-doctor-fast.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-board-doctor-fast.service` directly (it
+# has no [Install] section; the timer unit is what you enable).
+#
+# Prereqs: same as coord-board-doctor.service (coordinator.yml at
+# ~/.coord/coordinator.yml, a `gh`-authenticated environment).
+
+[Unit]
+Description=coord board-doctor mechanical-only sweep (tight cadence)
+After=network-online.target
+Wants=network-online.target
+# Same escalation wiring as coord-board-doctor.service — if this unit
+# itself fails (not a row it looked at; this unit's own process), page and
+# attempt the mechanical fleet repair.
+OnFailure=coord-failure-notify.service coord-fleet-watchdog.service
+
+[Service]
+Type=oneshot
+# Byte-identical PATH to coord-board-doctor.service / coord-notify.service
+# / coord-serve.service — same host, same role family, same reasoning
+# (see those units' comments for why each entry is there and why the
+# ordering matters).
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/code-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=%h/.coord-venv/bin/coord drive-queue sweep --mechanical-only --dry-run --config %h/.coord/coordinator.yml
+TimeoutStartSec=300

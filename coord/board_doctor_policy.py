@@ -394,6 +394,25 @@ def policy_tier_of(cause: str) -> str:
     return TIER_ALERT
 
 
+def mechanical_causes() -> frozenset[str]:
+    """The causes a tight-cadence sweep is safe to run unattended on.
+
+    Exactly :func:`policy_tier_of`'s mechanical route — a cause present
+    in both :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS` whose named
+    action is on ``SAFE_TIER_ACTIONS`` — never the investigate or
+    decomposition routes, which dispatch a worker leg or a split rather
+    than a direct, pre-reviewed queue repair and stay on the hourly
+    cadence's own budget and per-repo opt-in. Passed to
+    :func:`coord.board_doctor.run_sweep` as *mechanical_causes* to narrow
+    a sweep invocation to only this set.
+    """
+    return frozenset(
+        cause
+        for cause, action in ALLOWLIST.items()
+        if cause in AUTO_DISPATCHERS and action in SAFE_TIER_ACTIONS
+    )
+
+
 def _board_doctor_stage(queue: str) -> str:
     return f"board-doctor:{queue}"
 
