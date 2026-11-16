@@ -1498,6 +1498,24 @@ class Assignment:
     # feature and for ordinary full reviews.
     review_scoped: bool = False
     review_scope_base_sha: str | None = None
+    # #4029: the work-like assignment a SCOPED re-review ACTUALLY reviewed,
+    # captured deterministically at dispatch time from the (possibly
+    # throwaway) merge-queue entry's own ``assignment_id`` —
+    # ``coord.review.dispatch_scoped_review``'s *entry* argument, which both
+    # the merge-queue sweep and ``maybe_scoped_review_for_completed_fix``
+    # already keep pointed at the branch's current work leg. Deliberately a
+    # SEPARATE field from ``review_of_assignment_id``, which must keep
+    # carrying the #3310 claim-key (an OLDER round on the same chain) so the
+    # claim this review was dispatched under still releases correctly at its
+    # own terminal-status write. ``coord.auto_loop.propagate_review_verdict``
+    # prefers this exact id over its ``newest_done_work_leg`` timestamp
+    # heuristic when present — the heuristic compares ``dispatched_at``/
+    # ``finished_at`` across potentially different machines' clocks (the
+    # coordinator's for the review, the fix worker's own agent for its
+    # completion), which a few seconds of clock skew can flip. None for rows
+    # predating this field and for every non-scoped (full) review, which
+    # never needs it — ``review_of_assignment_id`` is already exact there.
+    review_scoped_work_id: str | None = None
     # #208: parsed worker cost from the final stream-json `result` event.
     # None means "not yet captured" (older rows, in-flight workers, or
     # workers whose log lacked usage data).  Set on completion by

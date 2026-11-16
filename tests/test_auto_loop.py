@@ -2536,6 +2536,59 @@ class TestFullCycle:
         assert fix1.review_state == "dispatched"
         assert fix1.review_verdict is None
 
+    def test_scoped_rereview_reparents_via_review_scoped_work_id_despite_clock_skew(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#4029: the dispatch-time-recorded ``review_scoped_work_id`` must
+        win over the #3891 timestamp heuristic — which compares the
+        review's own ``dispatched_at`` (stamped by the coordinator process)
+        against the fix round's ``finished_at`` (self-reported by the fix
+        worker's OWN agent process, on a possibly different machine). A few
+        seconds of clock skew between those two machines is exactly the
+        shape that flipped ``review_could_have_seen_head`` false in
+        production (claude-coordinator#4027, quadraui#2448) even though the
+        scoped review was genuinely dispatched to review the fix round.
+        """
+        from coord.state import save_board
+
+        work = _work_assignment(assignment_id="w-1", review_iteration=0)
+        fix1 = _work_assignment(assignment_id="fix-1", review_iteration=1)
+        # The fix worker's own agent clock reports it finished at 1050 —
+        # but the scoped review below (dispatched by a DIFFERENT, skewed
+        # coordinator-side clock) reports a `dispatched_at` BEFORE that,
+        # which would make the old timestamp-only heuristic refuse to
+        # credit it to fix-1 at all.
+        fix1.dispatched_at = 1000.0
+        fix1.finished_at = 1050.0
+        fix1.review_state = "dispatched"
+        board = Board(completed=[work, fix1])
+        save_board(board)
+
+        review = _review_assignment(assignment_id="r-2", review_of="w-1")
+        # Clock-skewed: earlier than fix1.finished_at, so
+        # `review_could_have_seen_head` alone would say "no".
+        review.dispatched_at = 1020.0
+        review.finished_at = 1030.0
+        review.review_verdict = "approve"
+        review.review_scoped = True
+        # #4029: the exact id `dispatch_scoped_review` stamps at dispatch
+        # time — deterministic, no clock comparison involved.
+        review.review_scoped_work_id = "fix-1"
+
+        work_result = propagate_review_verdict(review, board, config)
+
+        assert work_result is not None
+        assert work_result.assignment_id == "fix-1"
+        assert review.review_of_assignment_id == "fix-1"
+        fix1_final = board.find_by_id("fix-1")
+        assert fix1_final is not None
+        assert fix1_final.review_state == "done"
+        assert fix1_final.review_verdict == "approve"
+        # The original round must not have silently absorbed the approval.
+        w1_final = board.find_by_id("w-1")
+        assert w1_final is not None
+        assert w1_final.review_verdict != "approve"
+
     def test_max_iterations_stops_at_configured_limit(
         self, config: Config, tmp_path
     ) -> None:

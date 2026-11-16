@@ -166,6 +166,10 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         # #1476: scoped-re-review audit trail.
         int(a.review_scoped),
         a.review_scope_base_sha,
+        # #4029: the work-like assignment a scoped re-review actually
+        # reviewed, captured at dispatch time — see the field's docstring
+        # in coord.models.Assignment.
+        a.review_scoped_work_id,
         a.cost_usd,
         # #252: encode list as JSON; None → NULL.
         (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
@@ -190,6 +194,7 @@ _UPSERT_SQL = """
         uat_actor, uat_prior, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
         review_patch_id, review_scoped, review_scope_base_sha,
+        review_scoped_work_id,
         cost_usd, smoke_tests, provider_name, verdict_source, verdict_source_reason,
         model_reason
     ) VALUES (
@@ -202,6 +207,7 @@ _UPSERT_SQL = """
         ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
+        ?,
         ?, ?, ?, ?, ?,
         ?
     )
@@ -355,6 +361,12 @@ _UPSERT_SQL = """
             WHEN assignments.review_scoped = 1 THEN 1 ELSE excluded.review_scoped END,
         review_scope_base_sha = COALESCE(
             excluded.review_scope_base_sha, assignments.review_scope_base_sha),
+        -- #4029: same COALESCE-preserve pattern as review_scope_base_sha
+        -- above — set once at dispatch, never changed again; a later
+        -- upsert without it (older code path, agent reload) must not
+        -- erase it.
+        review_scoped_work_id = COALESCE(
+            excluded.review_scoped_work_id, assignments.review_scoped_work_id),
         -- #208: cost_usd is set once at completion.  COALESCE so a re-load
         -- of the same row from an agent that doesn't know the cost
         -- doesn't blow away a previously-captured value.

@@ -1185,7 +1185,7 @@ def retry_on_locked(
 # `_dedupe_merge_queue_assignment_ids` runs immediately before this index is
 # created so an upgrading database that already carries duplicate
 # `assignment_id` rows doesn't fail the `CREATE UNIQUE INDEX` outright.
-_DB_SCHEMA_VERSION = 27
+_DB_SCHEMA_VERSION = 28
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -2810,6 +2810,12 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # #3681: "single" or "workflow" — see the CREATE TABLE comment above.
     # NULL for every row predating this migration.
     "ALTER TABLE assignments ADD COLUMN mode TEXT",
+    # #4029: the work-like assignment a SCOPED re-review actually reviewed,
+    # captured deterministically at dispatch time (see
+    # coord.models.Assignment.review_scoped_work_id) rather than
+    # reconstructed later from cross-machine clock comparisons. NULL for
+    # every row predating this column and for every non-scoped review.
+    "ALTER TABLE assignments ADD COLUMN review_scoped_work_id TEXT",
 ]
 
 

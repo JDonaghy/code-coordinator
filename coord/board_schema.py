@@ -179,6 +179,14 @@ class BoardAssignment:
     # was written to prevent, repeated one PR later. Appended last, matching
     # DDL order (`_MIGRATE_ADD_COLUMNS` in coord/db.py).
     test_confirmation: str | None = None
+    # #4029: the work-like assignment a SCOPED re-review actually reviewed
+    # (`coord.models.Assignment.review_scoped_work_id`). Undeclared here,
+    # `coord.auto_loop.propagate_review_verdict`'s exact re-parent — the
+    # whole point of this column — would silently fall back to its
+    # cross-machine-clock heuristic on every daemon-routed fleet, exactly
+    # the shape that gap exists to replace. Appended last, matching DDL
+    # order.
+    review_scoped_work_id: str | None = None
 
 
 @dataclasses.dataclass(kw_only=True)

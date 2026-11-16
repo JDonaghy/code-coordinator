@@ -690,18 +690,25 @@ def propagate_review_verdict(
     ``review.review_of_assignment_id`` is not always the round this review
     actually reviewed — a SCOPED re-review (see
     :func:`coord.review.dispatch_scoped_review`'s docstring) keeps it
-    anchored to an OLDER round on the same issue. Resolve the issue's
-    newest done work leg via :func:`coord.review.newest_done_work_leg` —
-    the same answer the Review gate itself uses, rather than a second
-    lookup that could disagree with it — and, only when *review* was
-    actually dispatched late enough to have read that leg's head
+    anchored to an OLDER round on the same issue.
+
+    #4029: when *review* carries ``review_scoped_work_id`` (stamped at
+    dispatch time — see :func:`coord.review.dispatch_scoped_review`), that
+    id is resolved FIRST and exactly: it is the work leg *review* was
+    actually dispatched to cover, recorded deterministically rather than
+    reconstructed. Falls back to the #3891 heuristic — the issue's newest
+    done work leg via :func:`coord.review.newest_done_work_leg` (the same
+    answer the Review gate itself uses), accepted only when *review* was
+    dispatched late enough to have read that leg's head
     (:func:`coord.review.review_could_have_seen_head`, the exact
     discriminator :func:`coord.review.superseded_review_gap` uses, so the
-    two can never disagree), re-parent *review* onto it: both in memory and
-    durably via :func:`coord.state.repoint_review_of_assignment_id`, before
-    writing the verdict. Every reader keyed on ``review_of_assignment_id``
-    (``drive_state.project``'s review match chief among them) then agrees
-    on which round was actually reviewed.
+    two can never disagree) — for a review dispatched before this field
+    existed, or whose ``review_scoped_work_id`` doesn't resolve on *board*.
+    Either way, re-parent *review* onto the resolved round: both in memory
+    and durably via :func:`coord.state.repoint_review_of_assignment_id`,
+    before writing the verdict. Every reader keyed on
+    ``review_of_assignment_id`` (``drive_state.project``'s review match
+    chief among them) then agrees on which round was actually reviewed.
     """
     if not review.review_of_assignment_id:
         return None
@@ -709,21 +716,34 @@ def propagate_review_verdict(
     if anchor is None:
         return None
     work = anchor
-    newest = newest_done_work_leg(
-        board, anchor.repo_name, effective_issue_number(anchor)
+
+    # #4029: the exact, dispatch-time-recorded answer takes priority over
+    # the timestamp heuristic below — it needs no cross-machine clock
+    # comparison at all.
+    scoped_work = (
+        board.find_by_id(review.review_scoped_work_id)
+        if getattr(review, "review_scoped_work_id", None)
+        else None
     )
-    if (
-        newest is not None
-        and newest.assignment_id != anchor.assignment_id
-        and review_could_have_seen_head(review, newest)
-    ):
-        work = newest
+    if scoped_work is not None:
+        work = scoped_work
+    else:
+        newest = newest_done_work_leg(
+            board, anchor.repo_name, effective_issue_number(anchor)
+        )
+        if (
+            newest is not None
+            and newest.assignment_id != anchor.assignment_id
+            and review_could_have_seen_head(review, newest)
+        ):
+            work = newest
 
     if work.assignment_id != anchor.assignment_id:
         log.info(
             "auto_loop: re-parenting review %s from stale round %s to "
-            "newest round %s on the same issue (#3891)",
+            "round %s on the same issue (%s)",
             review.assignment_id, anchor.assignment_id, work.assignment_id,
+            "#4029: dispatch-time recorded" if scoped_work is not None else "#3891",
         )
         review.review_of_assignment_id = work.assignment_id
         from coord.state import repoint_review_of_assignment_id  # noqa: PLC0415
