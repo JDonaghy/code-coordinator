@@ -9,6 +9,12 @@
 # records the decision with provenance. It takes no board-mutating action
 # itself — see coord/board_doctor.py's module docstring.
 #
+# The mechanical-only half of this same sweep also runs on its own,
+# much tighter cadence — see coord-board-doctor-fast.service/.timer
+# (`coord drive-queue sweep --mechanical-only`). Installing that sibling
+# unit is independent of this one; this unit's hourly full sweep keeps
+# running unchanged either way.
+#
 # #3758 requires this ship DRY-RUN BY DEFAULT: the packaged ExecStart below
 # passes `--dry-run`, so even a host that installs and enables this unit
 # gets classification + logging with ZERO dispatch and ZERO convergence-

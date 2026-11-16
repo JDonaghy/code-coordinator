@@ -1,0 +1,42 @@
+# coord board-doctor FAST sweep: the deterministic mechanical repairs
+# only (`coord drive-queue sweep --mechanical-only`), on a tight cadence —
+# split off from `coord-board-doctor.timer`'s hourly full sweep.
+#
+# The hourly sweep's own rationale ("no correctness reason to run it
+# tighter") only ever covered the expensive half: walking both queues
+# and classifying every cause with `gh`, then — if a repo opted in — a
+# fix-it leg for an ambiguous cause. That reasoning never applied to the
+# mechanical half: a handful of pre-reviewed, side-effect-safe queue
+# repairs (a PR merged out-of-band, a stale HUMAN_REQUIRED latch, a
+# PENDING merge-queue row that already reads green/approved/mergeable
+# but the ordinary merge tick keeps missing, a conflict-fix that
+# completed clean but never moved the branch, a frozen blocked/parked
+# row whose block cause already resolved) — exactly as safe to run every
+# minute or two as `coord-serve`'s own `merge.auto_drain` tick. Left on
+# the hourly-only cadence, one of these can sit broken for up to an
+# hour even though the fix is a plain `coord merge --only` (or
+# equivalent) away the whole time.
+#
+# `--mechanical-only` (coord/commands/drive_queue.py) makes this
+# genuinely a DIFFERENT, narrower invocation, not just a faster repeat
+# of the same one: it drops every row outside
+# `coord.board_doctor_policy.mechanical_causes()` before classification,
+# so this timer never dispatches a fix-it leg, never escalates a
+# non-mechanical cause, and never touches that row's own convergence
+# counter. The investigate/alert tiers keep their current hourly budget
+# and per-repo opt-in entirely via `coord-board-doctor.timer`, unaffected
+# by this one running underneath it.
+#
+# Install: see deploy/coord-board-doctor-fast.service's header.
+
+[Unit]
+Description=Run coord board-doctor's mechanical-only sweep on a tight cadence
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

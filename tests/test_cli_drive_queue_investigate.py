@@ -432,6 +432,32 @@ def test_no_investigate_flag_disarms_the_tier_fleet_wide(
     assert state.get_drive_escalation(REPO, 401) is not None
 
 
+def test_mechanical_only_flag_drops_the_row_entirely_not_just_no_dispatch(
+    config_path, cli, seed, gh_world, block_log, fake_dispatch,
+):
+    """`--mechanical-only` is a stricter cut than `--no-investigate`:
+    an investigate-eligible row is not merely left un-dispatched, it never
+    reaches classification at all this sweep — no decision logged, no
+    convergence counter bumped, no alert-tier escalation filed either.
+    Same repo opt-in and same CI-red world `--no-investigate` above covers,
+    so the only variable is the flag."""
+    _write_config(config_path, repo_investigate=True, max_parallel=2)
+    seed(issues={501: "open"})
+    cli("add", REPO, "501")
+    _stall(501, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
+
+    result = cli("sweep", "--mechanical-only", "--json")
+    assert result.exit_code == 0, result.output
+    payload = _sweep_json(result.output)
+    assert payload["decisions"] == []
+    assert _dispatched_issues() == []
+    assert fake_dispatch == []
+    # Unlike `--no-investigate`'s fallback-to-alert path, this row was
+    # never even alerted on — it was dropped before classification.
+    assert state.get_drive_escalation(REPO, 501) is None
+
+
 # `--no-finish` does not exist on this command (#3837 fix round): the
 # finisher tier fires off `coord.auto_loop.process_review_completion` at
 # review-completion time, never from this sweep's own dispatch loop, so a
