@@ -30,6 +30,8 @@ from coord.board_doctor import (
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
     CAUSE_STRANDED_PREREQ_BLOCKED,
+    MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS,
+    MECHANICAL_SWEEP_COUNTER_NAMESPACE,
     MERGE_PENDING_STALE_AFTER_SECONDS,
     STRANDED_PREREQ_OPT_OUT_LABEL,
     TIER_ALERT,
@@ -42,6 +44,7 @@ from coord.board_doctor import (
     baseline_red_rows,
     dispatch_plan_leg,
     drive_queue_rows,
+    merge_queue_rows,
     merged_partial_rows,
     no_progress_rows,
     run_followthrough_sweep,
@@ -775,6 +778,63 @@ class TestReclassifyMergeNeverAttempted:
 
         assert out.cause == CAUSE_MERGE_NEVER_ATTEMPTED
 
+    def test_stale_after_seconds_override_shortens_the_floor(self) -> None:
+        """#4027 review: the motivating "green/approved/mergeable but the
+        ordinary merge tick keeps missing it" row must not have to wait
+        the full `MERGE_PENDING_STALE_AFTER_SECONDS` (30 minutes) for a
+        tight-cadence (`mechanical_causes`-filtered) sweep — only for the
+        plain, unfiltered one."""
+        now = 10_000.0
+        # Well past a 120s override, nowhere near the default 1800s floor.
+        entry = self._merge_entry(enqueued_at=now - 130.0)
+        row = _row("acme/widgets#2160", queue_diagnose.CAUSE_UNKNOWN, fresh=True)
+
+        [default_floor] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(), now=now,
+        )
+        [tight_floor] = _reclassify_merge_never_attempted(
+            [row], [entry], board=Board(), config=_widgets_config(), now=now,
+            stale_after_seconds=120.0,
+        )
+
+        assert default_floor == row
+        assert tight_floor.cause == CAUSE_MERGE_NEVER_ATTEMPTED
+
+
+class TestMergeQueueRowsStaleAfterSecondsOverride:
+    """#4027 review: :func:`merge_queue_rows`'s own staleness pre-filter for
+    :data:`CAUSE_MERGE_PENDING_STUCK` must take the SAME *stale_after_seconds*
+    override :func:`_reclassify_merge_never_attempted` does — both causes
+    gate the motivating "green/approved/mergeable but the ordinary merge
+    tick keeps missing it" row on the same floor, so a tight-cadence sweep
+    needs both shortened together."""
+
+    @staticmethod
+    def _pending_entry(*, last_attempt):
+        from coord import merge_queue as mq
+
+        return mq.QueuedMerge(
+            assignment_id="w1", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-1-fix", target_branch="main", issue_number=1,
+            issue_title="Fix the thing", state=mq.PENDING, last_attempt=last_attempt,
+        )
+
+    def test_default_floor_leaves_a_recently_stale_row_alone(self) -> None:
+        now = 10_000.0
+        entry = self._pending_entry(last_attempt=now - 130.0)
+
+        rows = merge_queue_rows([entry], now=now)
+
+        assert rows == []
+
+    def test_override_shortens_the_floor_for_the_same_row(self) -> None:
+        now = 10_000.0
+        entry = self._pending_entry(last_attempt=now - 130.0)
+
+        rows = merge_queue_rows([entry], now=now, stale_after_seconds=120.0)
+
+        assert [r.cause for r in rows] == [CAUSE_MERGE_PENDING_STUCK]
+
 
 class TestMergeNeverAttemptedAndReviewTestStaleAreWiredToRealActions:
     """Acceptance (#3929): `CAUSE_REVIEW_STALE`/`CAUSE_TEST_STALE` dispatch
@@ -1334,6 +1394,140 @@ class TestConvergence:
             if d["sweep_id"] == "sweep-1" and d["key"] == key
         ]
         assert still_pending[0]["outcome"] is None
+
+
+class TestSweepCounterNamespace:
+    """#4027 review: a ``counter_namespace``-scoped call's convergence
+    counter must be independent of a plain (unnamespaced) call's for the
+    exact same ``(queue, key, cause)`` — otherwise a tight-cadence
+    ``mechanical_causes`` sweep running 60x more often than the hourly one
+    burns the SAME ``convergence_limit`` budget 60x faster, pre-empting
+    the hourly sweep's own dispatch decision for a cause it never actually
+    saw fail that many times itself."""
+
+    def test_namespaced_and_plain_counters_are_independent(self) -> None:
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#42"
+        cause = "ci_red"
+
+        # Three fast-cadence (namespaced) observations reach the limit on
+        # ITS OWN counter — never touching the plain counter for the same
+        # row/cause.
+        for _ in range(3):
+            sweep(
+                [_row(key, cause)],
+                tier_of=_always(TIER_AUTO),
+                auto_dispatchers={cause: dispatch},
+                alert_dispatcher=alert,
+                convergence_limit=3,
+                counter_namespace=MECHANICAL_SWEEP_COUNTER_NAMESPACE,
+            )
+        assert dispatch.count == 2  # sweeps 1-2 dispatch; sweep 3 alerts instead
+        assert alert.count == 1
+
+        # The plain (unnamespaced) counter for the SAME row/cause is
+        # completely untouched — still fresh, still under budget.
+        plain_dispatch = _Recorder()
+        plain_alert = _Recorder()
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: plain_dispatch},
+            alert_dispatcher=plain_alert,
+            convergence_limit=3,
+        )
+
+        assert plain_dispatch.count == 1
+        assert plain_alert.count == 0
+        plain_row_state = state.board_doctor_row_state("drive-queue", key)
+        assert plain_row_state["count"] == 1
+        assert plain_row_state["escalated"] is False
+
+    def test_a_namespaced_counter_survives_its_own_sweeps_clear_absent_rows_pass(self) -> None:
+        """A namespaced counter's own row IS present in the row set that
+        wrote it — `clear_absent_rows`'s "is this row still present?" check
+        must compare in the SAME (namespaced) key space the counter itself
+        was written in, or every namespaced counter reads as absent the
+        instant it is written and gets wiped before the next sweep ever
+        sees it (the bug this test pins)."""
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#43"
+        cause = "ci_red"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+            counter_namespace=MECHANICAL_SWEEP_COUNTER_NAMESPACE,
+            clear_absent_rows=True,
+        )
+
+        row_state = state.board_doctor_row_state(
+            "drive-queue", f"{key}::{MECHANICAL_SWEEP_COUNTER_NAMESPACE}",
+        )
+        assert row_state["count"] == 1
+
+    def test_run_sweep_threads_the_mechanical_namespace(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+        from coord.config import Config
+
+        captured: dict = {}
+
+        def _fake_sweep(rows, **kwargs):
+            captured.update(kwargs)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([], Board()),
+        )
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            mechanical_causes=frozenset({CAUSE_MERGE_PENDING_STUCK}),
+        )
+        assert captured["counter_namespace"] == MECHANICAL_SWEEP_COUNTER_NAMESPACE
+
+        captured.clear()
+        board_doctor_mod.run_sweep(config=Config(repos=[], machines=[]))
+        assert captured["counter_namespace"] is None
+
+
+class TestRunSweepMechanicalFloorOverride:
+    """#4027 review: a ``mechanical_causes``-filtered :func:`run_sweep`
+    call must collect with :data:`MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS`
+    in place of the 30-minute :data:`MERGE_PENDING_STALE_AFTER_SECONDS`
+    floor — the plain call keeps the 30-minute floor."""
+
+    def test_mechanical_call_passes_the_tight_floor(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+        from coord.config import Config
+
+        captured: dict = {}
+
+        def _fake_collect(*, config, **kwargs):
+            captured.update(kwargs)
+            return [], Board()
+
+        monkeypatch.setattr(board_doctor_mod, "_collect_rows_with_board", _fake_collect)
+
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            mechanical_causes=frozenset({CAUSE_MERGE_PENDING_STUCK}),
+        )
+        assert (
+            captured["merge_pending_stale_after_seconds"]
+            == MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS
+        )
+
+        captured.clear()
+        board_doctor_mod.run_sweep(config=Config(repos=[], machines=[]))
+        assert captured["merge_pending_stale_after_seconds"] is None
 
 
 class TestOutcomeTracking:
@@ -5477,7 +5671,7 @@ class TestRunSweepFollowthroughWiring:
         ]
         monkeypatch.setattr(
             board_doctor_mod, "_collect_rows_with_board",
-            lambda *, config: (rows, Board()),
+            lambda *, config, **_: (rows, Board()),
         )
 
         captured_followthrough_rows: list = []
@@ -5516,7 +5710,7 @@ class TestRunSweepFollowthroughWiring:
         )
         monkeypatch.setattr(
             board_doctor_mod, "_collect_rows_with_board",
-            lambda *, config: ([row], Board()),
+            lambda *, config, **_: ([row], Board()),
         )
         called = []
 
@@ -5549,9 +5743,13 @@ class TestRunSweepMechanicalCausesFilter:
         ]
         monkeypatch.setattr(
             board_doctor_mod, "_collect_rows_with_board",
-            lambda *, config: (rows, Board()),
+            lambda *, config, **_: (rows, Board()),
         )
         followthrough_called = []
+
+        def _fake_followthrough_sweep(*args, **kwargs):
+            followthrough_called.append(1)
+            return []
 
         report = board_doctor_mod.run_sweep(
             config=Config(repos=[], machines=[]),
@@ -5559,7 +5757,7 @@ class TestRunSweepMechanicalCausesFilter:
             auto_dispatchers={CAUSE_MERGE_PENDING_STUCK: lambda row: True},
             alert_dispatcher=lambda row: True,
             mechanical_causes=frozenset({CAUSE_MERGE_PENDING_STUCK}),
-            followthrough_sweep=lambda *a, **k: followthrough_called.append(1) or [],
+            followthrough_sweep=_fake_followthrough_sweep,
         )
 
         # Only the mechanical row reached the tier loop — the `ci_red` row
@@ -5586,7 +5784,7 @@ class TestRunSweepMechanicalCausesFilter:
 
         monkeypatch.setattr(
             board_doctor_mod, "_collect_rows_with_board",
-            lambda *, config: ([], Board()),
+            lambda *, config, **_: ([], Board()),
         )
         monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
 
@@ -5608,7 +5806,7 @@ class TestRunSweepMechanicalCausesFilter:
 
         monkeypatch.setattr(
             board_doctor_mod, "_collect_rows_with_board",
-            lambda *, config: ([], Board()),
+            lambda *, config, **_: ([], Board()),
         )
         monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
 
@@ -5638,6 +5836,18 @@ class TestMechanicalCausesPolicy:
 
         causes = board_doctor_policy.mechanical_causes()
 
+        # `INVESTIGATE_CAUSES`/`DECOMPOSITION_CAUSES` are disjoint from
+        # `ALLOWLIST` by construction (`_register_investigate_action`/
+        # `_register_decomposition_action` never touch `ALLOWLIST`), so
+        # the two intersection checks above cannot fail for the reason
+        # their old assertion-only form implied. Pin the actual contract
+        # instead: exactly the causes `policy_tier_of` reaches TIER_AUTO
+        # on via the mechanical route.
+        assert causes == {
+            cause
+            for cause in board_doctor_policy.ALLOWLIST
+            if board_doctor_policy.policy_tier_of(cause) == TIER_AUTO
+        }
         assert not (causes & board_doctor_policy.INVESTIGATE_CAUSES)
         assert not (causes & board_doctor_policy.DECOMPOSITION_CAUSES)
         assert queue_diagnose.CAUSE_CI_RED not in causes

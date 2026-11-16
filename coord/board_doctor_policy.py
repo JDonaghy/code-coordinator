@@ -354,6 +354,26 @@ def _register_auto_action(
     AUTO_DISPATCHERS[cause] = _gated
 
 
+def _is_mechanical_route(cause: str) -> bool:
+    """The #3760 mechanical route's own predicate (#4027 review, epic
+    #2096/#2085 "one question, one answer") — *cause* present in BOTH
+    :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS`, and the action
+    :data:`ALLOWLIST` names for it is on ``SAFE_TIER_ACTIONS``.
+
+    The ONE place that answers "is this cause on the mechanical route?" —
+    :func:`policy_tier_of`'s first branch and :func:`mechanical_causes`
+    both call this rather than each re-deriving the same conjunction from
+    the same three structures. Without that, the two could silently
+    diverge the moment the mechanical route gained a fourth term: a
+    cause :func:`policy_tier_of` had moved to :data:`coord.board_doctor.
+    TIER_ALERT` would stay in :func:`mechanical_causes`' result, and the
+    tight-cadence sweep would then escalate it every minute instead of
+    hourly.
+    """
+    action = ALLOWLIST.get(cause)
+    return action is not None and cause in AUTO_DISPATCHERS and action in SAFE_TIER_ACTIONS
+
+
 def policy_tier_of(cause: str) -> str:
     """#3745's C2 (extended by #3769): cause -> tier policy.
 
@@ -364,9 +384,7 @@ def policy_tier_of(cause: str) -> str:
     the third answers to its own, separate mechanical gate instead (see
     :data:`DECOMPOSITION_CAUSES`'s own docstring for why):
 
-    * The #3760 mechanical route — *cause* present in BOTH
-      :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS`, and the action
-      :data:`ALLOWLIST` names for it is on ``SAFE_TIER_ACTIONS``.
+    * The #3760 mechanical route — :func:`_is_mechanical_route`.
     * The #3769 investigate route — *cause* present in BOTH
       :data:`INVESTIGATE_CAUSES` and :data:`AUTO_DISPATCHERS`, and
       ``"dispatch_fixit_leg"`` is on ``SAFE_TIER_ACTIONS``.
@@ -380,8 +398,7 @@ def policy_tier_of(cause: str) -> str:
     as a cause with no entry at all. This is the function `coord
     drive-queue sweep` wires in as `tier_of`.
     """
-    action = ALLOWLIST.get(cause)
-    if action is not None and cause in AUTO_DISPATCHERS and action in SAFE_TIER_ACTIONS:
+    if _is_mechanical_route(cause):
         return TIER_AUTO
     if (
         cause in INVESTIGATE_CAUSES
@@ -397,20 +414,15 @@ def policy_tier_of(cause: str) -> str:
 def mechanical_causes() -> frozenset[str]:
     """The causes a tight-cadence sweep is safe to run unattended on.
 
-    Exactly :func:`policy_tier_of`'s mechanical route — a cause present
-    in both :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS` whose named
-    action is on ``SAFE_TIER_ACTIONS`` — never the investigate or
+    Exactly :func:`policy_tier_of`'s mechanical route
+    (:func:`_is_mechanical_route`) — never the investigate or
     decomposition routes, which dispatch a worker leg or a split rather
     than a direct, pre-reviewed queue repair and stay on the hourly
     cadence's own budget and per-repo opt-in. Passed to
     :func:`coord.board_doctor.run_sweep` as *mechanical_causes* to narrow
     a sweep invocation to only this set.
     """
-    return frozenset(
-        cause
-        for cause, action in ALLOWLIST.items()
-        if cause in AUTO_DISPATCHERS and action in SAFE_TIER_ACTIONS
-    )
+    return frozenset(cause for cause in ALLOWLIST if _is_mechanical_route(cause))
 
 
 def _board_doctor_stage(queue: str) -> str:

@@ -88,6 +88,13 @@ ALERT_SKIPPED = "skipped"
 #: re-acting on it and falls back to the (backoff-gated) alert tier.
 CONVERGENCE_LIMIT = 3
 
+#: :func:`sweep`'s *counter_namespace* for a ``mechanical_causes``-filtered
+#: :func:`run_sweep` call — keeps that tight-cadence pass's convergence
+#: counter separate from the plain hourly call's, so running this pass 60x
+#: more often does not burn :data:`CONVERGENCE_LIMIT` 60x faster on the
+#: SAME counter the hourly sweep still relies on for these causes.
+MECHANICAL_SWEEP_COUNTER_NAMESPACE = "mechanical-only"
+
 #: Merge-queue states this sweep treats as "stuck". A row merely waiting
 #: its turn (``pending``/``merging``) or past (``merged``/``skipped``) is
 #: not this doctor's problem — only a row that cannot progress on its own.
@@ -219,6 +226,23 @@ CAUSE_CONFLICT_FIX_HEAD_UNMOVED = "conflict-fix-head-unmoved"
 #: never matches, short enough that a genuinely stuck green/approved PR
 #: does not wait indefinitely for a human to notice.
 MERGE_PENDING_STALE_AFTER_SECONDS = 1800.0
+
+#: #4027: the staleness floor :func:`run_sweep` uses in place of
+#: :data:`MERGE_PENDING_STALE_AFTER_SECONDS` for a ``mechanical_causes``-
+#: filtered (tight-cadence) call ONLY — the plain hourly call keeps the
+#: 30-minute floor unchanged. 30 minutes exists to keep a row merely
+#: waiting its ordinary turn off this sweep's radar; it was never a
+#: correctness requirement, since :func:`_confirm_merge_pending_stuck` /
+#: :func:`_reclassify_merge_never_attempted`'s own LIVE ``entry_gate_
+#: status`` re-check is what actually proves a row safe to act on, not
+#: this pre-filter. Left at the hourly value, the motivating "green,
+#: approved, mergeable, not merging" shape would still sit for up to 30
+#: minutes no matter how often the fast timer fires; this value (2
+#: minutes — long enough that a row the ordinary `merge.auto_drain` tick
+#: (30s cadence) is still actively retrying does not flap in and out of
+#: this sweep) is what actually closes that gap down to the fast timer's
+#: own cadence.
+MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS = 120.0
 
 #: #3901 (#3887 case 4, the remainder #3887 itself claimed but never
 #: wired): a `blocked`/`parked` drive-queue row that was DISPATCHED at
@@ -1291,7 +1315,12 @@ class SweepReport:
     )
 
 
-def merge_queue_rows(entries: Sequence[Any], *, now: float | None = None) -> list[StuckRow]:
+def merge_queue_rows(
+    entries: Sequence[Any],
+    *,
+    now: float | None = None,
+    stale_after_seconds: float | None = None,
+) -> list[StuckRow]:
     """Local cause mapping for merge-queue rows (#3758).
 
     :func:`coord.queue_diagnose.run_pass` only understands drive-queue
@@ -1338,12 +1367,24 @@ def merge_queue_rows(entries: Sequence[Any], *, now: float | None = None) -> lis
 
     *now* defaults to :func:`time.time` — overridable so a replay test can
     assert on a fixed, reproducible staleness window.
+
+    *stale_after_seconds* (#4027) overrides :data:`MERGE_PENDING_STALE_AFTER_SECONDS`
+    for this call only — :func:`run_sweep`'s ``mechanical_causes``-filtered
+    (tight-cadence) call threads a much shorter window through here so the
+    "green/approved/mergeable but the ordinary merge tick keeps missing it"
+    shape does not wait up to 30 minutes just because the general-purpose
+    pre-filter does; the live re-check in :func:`_confirm_merge_pending_stuck`
+    still has to confirm the row before anything acts on it either way, so
+    shortening this cheap candidate window never trades away correctness.
     """
     import time as _time  # noqa: PLC0415
 
     from coord.merge_queue import CONFLICT_FIX_HEAD_UNMOVED_SIGNAL, PENDING  # noqa: PLC0415
 
     moment = _time.time() if now is None else now
+    stale_after = (
+        MERGE_PENDING_STALE_AFTER_SECONDS if stale_after_seconds is None else stale_after_seconds
+    )
     rows: list[StuckRow] = []
     for entry in entries:
         cause = _MERGE_QUEUE_STUCK_CAUSE.get(entry.state)
@@ -1356,7 +1397,7 @@ def merge_queue_rows(entries: Sequence[Any], *, now: float | None = None) -> lis
             if (
                 entry.state == PENDING
                 and entry.last_attempt is not None
-                and moment - entry.last_attempt >= MERGE_PENDING_STALE_AFTER_SECONDS
+                and moment - entry.last_attempt >= stale_after
             ):
                 cause = CAUSE_MERGE_PENDING_STUCK
             else:
@@ -2215,6 +2256,7 @@ def _reclassify_merge_never_attempted(
     board: Board,
     config,
     now: float | None = None,
+    stale_after_seconds: float | None = None,
 ) -> list[StuckRow]:
     """#3929: promote a no-progress drive-queue row to
     :data:`CAUSE_MERGE_NEVER_ATTEMPTED` when its merge-queue row is
@@ -2265,6 +2307,11 @@ def _reclassify_merge_never_attempted(
     *now* defaults to :func:`time.time` — overridable so a replay test can
     assert on a fixed, reproducible staleness window, same convention as
     :func:`merge_queue_rows`.
+
+    *stale_after_seconds* (#4027) overrides :data:`MERGE_PENDING_STALE_AFTER_SECONDS`
+    for this call only — same rationale and same caller
+    (:func:`run_sweep`'s ``mechanical_causes``-filtered call) as
+    :func:`merge_queue_rows`'s own override.
     """
     import time as _time  # noqa: PLC0415
 
@@ -2273,6 +2320,9 @@ def _reclassify_merge_never_attempted(
     from coord.merge_queue import PENDING, PLAN_READY, entry_gate_status  # noqa: PLC0415
 
     moment = _time.time() if now is None else now
+    stale_after = (
+        MERGE_PENDING_STALE_AFTER_SECONDS if stale_after_seconds is None else stale_after_seconds
+    )
     entries_by_key = {
         f"{entry.repo_name}#{entry.issue_number}": entry for entry in merge_entries
     }
@@ -2292,7 +2342,7 @@ def _reclassify_merge_never_attempted(
             or entry.last_attempt is not None
             or (
                 entry.enqueued_at is not None
-                and moment - entry.enqueued_at < MERGE_PENDING_STALE_AFTER_SECONDS
+                and moment - entry.enqueued_at < stale_after
             )
         ):
             out.append(row)
@@ -2960,18 +3010,30 @@ def no_progress_rows(
     return rows
 
 
-def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRow]:
+def collect_rows(
+    *,
+    config,
+    trigger: str = "board-doctor-sweep",
+    merge_pending_stale_after_seconds: float | None = None,
+) -> list[StuckRow]:
     """The impure production walk over both queues (#3758). Thin wrapper
     over :func:`_collect_rows_with_board` for every caller that only wants
     the rows — :func:`run_sweep` wants the :class:`Board` this walk
     already built too, so it unpacks both instead of paying for a second
     :func:`coord.state.build_board` read of its own."""
-    rows, _board = _collect_rows_with_board(config=config, trigger=trigger)
+    rows, _board = _collect_rows_with_board(
+        config=config,
+        trigger=trigger,
+        merge_pending_stale_after_seconds=merge_pending_stale_after_seconds,
+    )
     return rows
 
 
 def _collect_rows_with_board(
-    *, config, trigger: str = "board-doctor-sweep",
+    *,
+    config,
+    trigger: str = "board-doctor-sweep",
+    merge_pending_stale_after_seconds: float | None = None,
 ) -> tuple[list[StuckRow], Board]:
     """The impure production walk over both queues (#3758).
 
@@ -3015,6 +3077,12 @@ def _collect_rows_with_board(
     Deferred imports, same reason ``drive_queue_diagnose`` defers them: this
     module is imported by the CLI's thin registration layer, and these
     pull in `gh`-touching modules this harness's own tests must not need.
+
+    *merge_pending_stale_after_seconds* (#4027) is forwarded, unchanged, as
+    both :func:`merge_queue_rows`'s and :func:`_reclassify_merge_never_
+    attempted`'s own *stale_after_seconds* override — ``None`` (every
+    caller except :func:`run_sweep`'s ``mechanical_causes``-filtered one)
+    keeps today's :data:`MERGE_PENDING_STALE_AFTER_SECONDS` floor.
     """
     from coord import block_log  # noqa: PLC0415
     from coord.commands.drive_queue import (  # noqa: PLC0415
@@ -3075,7 +3143,11 @@ def _collect_rows_with_board(
     rows.extend(refreshed_rows)
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     merge_entries = load_merge_queue()
-    rows.extend(merge_queue_rows(merge_entries))
+    rows.extend(
+        merge_queue_rows(
+            merge_entries, stale_after_seconds=merge_pending_stale_after_seconds,
+        )
+    )
 
     # #3945: a `merged-partial` row carries no open `block_log` episode (it
     # is terminal/done-like, never `blocked`/`parked`) and no merge-queue
@@ -3140,7 +3212,10 @@ def _collect_rows_with_board(
     )
     rows = _reclassify_blocked_on_prereq(rows, entries_by_key)
     rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
-    rows = _reclassify_merge_never_attempted(rows, merge_entries, board=board, config=config)
+    rows = _reclassify_merge_never_attempted(
+        rows, merge_entries, board=board, config=config,
+        stale_after_seconds=merge_pending_stale_after_seconds,
+    )
     rows.extend(smoke_no_verdict_rows(board))
 
     # #3944: a `waiting` row stranded on an open, unqueued `after=` pre-req
@@ -3470,6 +3545,7 @@ def sweep(
     backoff_initial_hours: float | None = None,
     backoff_cap_hours: float | None = None,
     outcome_grace_hours: float | None = None,
+    counter_namespace: str | None = None,
 ) -> SweepReport:
     """The pure harness core: classify-already-done rows in, decisions out.
 
@@ -3591,6 +3667,23 @@ def sweep(
     :func:`coord.state.board_doctor_alert_due`/
     :func:`coord.state.mark_board_doctor_escalated`'s re-alert schedule.
 
+    *counter_namespace*, when given, is folded into the convergence
+    counter's storage key (never into *rows*' own ``(queue, key)`` identity
+    used for ``touched``/decision-log/outcome-grading) so this call's
+    observations land in a counter distinct from a plain (unnamespaced)
+    call's. Without this, two callers sweeping the SAME rows at different
+    cadences (:func:`run_sweep`'s hourly default call and its
+    ``mechanical_causes``-filtered call, run every minute or two
+    alongside it) would silently SHARE one counter — the tight-cadence
+    caller would then burn *convergence_limit* in minutes instead of
+    sweeps, and the slower caller would inherit that exhausted count the
+    next time it ran, permanently pre-empting its own dispatch decision
+    for a cause the fast pass merely saw a transient no-op on. Each
+    distinct namespace gets its own independent budget against the SAME
+    *convergence_limit*, so a caller meant to run 60x more often does not
+    have to compensate with a 60x larger limit just to behave as if it
+    were the only writer.
+
     *outcome_grace_hours* (#3907) defaults to ``None``, resolved below to
     :data:`coord.state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS`. Outcome
     backfill (see :func:`_grade_open_outcomes`) grades BOTH #3889's
@@ -3632,7 +3725,21 @@ def sweep(
         else state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS
     )
 
+    def _counter_key(key: str) -> str:
+        """*key*, namespaced for the convergence counter only (never for
+        ``touched``/decision-log/outcome-grading identity) — see
+        *counter_namespace* above."""
+        return key if counter_namespace is None else f"{key}::{counter_namespace}"
+
     touched: set[tuple[str, str]] = set()
+    # `clear_absent_rows` below walks `state.board_doctor_tracked_rows()`,
+    # which decodes the RAW (possibly namespaced) stored row key — a plain
+    # `touched` (real row identity) would never match a namespaced entry,
+    # so every namespaced counter would read as "absent" and get wiped on
+    # the very sweep that just wrote it. This tracks presence in THAT same
+    # (possibly namespaced) key space instead; identical to `touched` when
+    # *counter_namespace* is ``None``.
+    counter_touched: set[tuple[str, str]] = set()
     # Outcome backfill: decisions from EARLIER sweeps still open for a
     # verdict, read once up front so this sweep's own decisions below
     # never get evaluated against themselves. #3889's still-``None``
@@ -3681,7 +3788,7 @@ def sweep(
         if not outcome:
             return False, "alert-failed"
         state.mark_board_doctor_escalated(
-            row.queue, row.key, now=moment,
+            row.queue, _counter_key(row.key), now=moment,
             backoff_initial_hours=backoff_initial_hours,
             backoff_cap_hours=backoff_cap_hours,
         )
@@ -3689,6 +3796,7 @@ def sweep(
 
     for row in rows:
         touched.add((row.queue, row.key))
+        counter_touched.add((row.queue, _counter_key(row.key)))
         if row.suppressed:
             # #3761: present (so `clear_absent_rows` below leaves its
             # counter and any live escalation alone) but deliberately
@@ -3697,7 +3805,7 @@ def sweep(
             # (never writes) the persisted counter purely so the decision
             # log / CLI can still show what this row was last known at,
             # instead of a misleading ``count=0``.
-            prior = state.board_doctor_row_state(row.queue, row.key) or {}
+            prior = state.board_doctor_row_state(row.queue, _counter_key(row.key)) or {}
             decision = Decision(
                 queue=row.queue,
                 key=row.key,
@@ -3743,13 +3851,13 @@ def sweep(
             # moved the counter that decides when to stop deferring and
             # page a human instead).
             if dry_run:
-                prior = state.board_doctor_row_state(row.queue, row.key) or None
+                prior = state.board_doctor_row_state(row.queue, _counter_key(row.key)) or None
                 counter_state = state.next_board_doctor_counter(
                     prior, row.cause, backoff_initial_hours=backoff_initial_hours,
                 )
             else:
                 counter_state = state.record_board_doctor_observation(
-                    row.queue, row.key, row.cause,
+                    row.queue, _counter_key(row.key), row.cause,
                     backoff_initial_hours=backoff_initial_hours,
                 )
             count, escalated = counter_state["count"], counter_state["escalated"]
@@ -3801,13 +3909,13 @@ def sweep(
                 )
             continue
         if dry_run:
-            prior = state.board_doctor_row_state(row.queue, row.key) or None
+            prior = state.board_doctor_row_state(row.queue, _counter_key(row.key)) or None
             counter_state = state.next_board_doctor_counter(
                 prior, row.cause, backoff_initial_hours=backoff_initial_hours,
             )
         else:
             counter_state = state.record_board_doctor_observation(
-                row.queue, row.key, row.cause,
+                row.queue, _counter_key(row.key), row.cause,
                 backoff_initial_hours=backoff_initial_hours,
             )
         count, escalated = counter_state["count"], counter_state["escalated"]
@@ -3903,11 +4011,23 @@ def sweep(
 
     if not dry_run and clear_absent_rows:
         for queue, key in state.board_doctor_tracked_rows():
-            if (queue, key) not in touched:
+            # *key* here is the RAW stored key — namespaced if some call
+            # (this one or another) wrote it via *counter_namespace* — so
+            # this compares against `counter_touched`, never the plain
+            # `touched` (real row identity), or every namespaced counter
+            # would read as "absent" and get wiped the instant it is
+            # written. See `counter_touched`'s own comment above.
+            if (queue, key) not in counter_touched:
                 state.clear_board_doctor_row(queue, key)
                 if escalation_resolver is not None:
                     try:
-                        escalation_resolver(queue, key)
+                        # `"::"` is reserved as the counter-namespace
+                        # separator (never legitimate in a real
+                        # `repo#issue` key) — strip it so a resolver
+                        # written against real row identity never gets
+                        # handed a mangled one, regardless of which
+                        # namespace (if any) produced this stored key.
+                        escalation_resolver(queue, key.split("::", 1)[0])
                     except Exception:  # noqa: BLE001, S110 — one row's cleanup
                         # failing must not abort the walk and leave the
                         # remaining tracked rows' counters uncleared.
@@ -3988,9 +4108,31 @@ def run_sweep(
     row set is a deliberate subset, so a row outside it going "absent"
     from THIS sweep's point of view must never be read as "resolved" and
     have its counter wiped — only a full (unfiltered) sweep's own absence
-    check may draw that conclusion.
+    check may draw that conclusion. This call also threads
+    :data:`MECHANICAL_SWEEP_COUNTER_NAMESPACE` through as *sweep*'s
+    *counter_namespace* — its own convergence counter, independent of the
+    plain (unfiltered) call's, so a tight-cadence scheduler running this
+    pass every minute or two does not burn the SAME ``convergence_limit``
+    budget the hourly call still relies on for these causes.
+
+    It also collects with :data:`MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS`
+    in place of :data:`MERGE_PENDING_STALE_AFTER_SECONDS` for
+    :data:`CAUSE_MERGE_PENDING_STUCK`/:data:`CAUSE_MERGE_NEVER_ATTEMPTED`'s
+    own staleness pre-filter — the motivating "green, approved, mergeable,
+    but the ordinary merge tick keeps missing it" row would otherwise stay
+    invisible to THIS call for up to 30 minutes regardless of how often the
+    tight cadence fires, since both causes are minted off that same floor.
+    The plain (unfiltered) call keeps the 30-minute floor unchanged.
     """
-    rows, board = _collect_rows_with_board(config=config)
+    board_doctor_cfg = getattr(config, "board_doctor", None)
+    rows, board = _collect_rows_with_board(
+        config=config,
+        merge_pending_stale_after_seconds=(
+            MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS
+            if mechanical_causes is not None
+            else None
+        ),
+    )
     followthrough_rows = [r for r in rows if r.cause == CAUSE_MERGED_PARTIAL]
     other_rows = [r for r in rows if r.cause != CAUSE_MERGED_PARTIAL]
     if mechanical_causes is not None:
@@ -4001,7 +4143,6 @@ def run_sweep(
         if capacity_check is _CAPACITY_CHECK_UNSET
         else capacity_check
     )
-    board_doctor_cfg = getattr(config, "board_doctor", None)
     report = sweep(
         other_rows,
         tier_of=tier_of,
@@ -4016,8 +4157,17 @@ def run_sweep(
         backoff_initial_hours=getattr(board_doctor_cfg, "backoff_initial_hours", None),
         backoff_cap_hours=getattr(board_doctor_cfg, "backoff_cap_hours", None),
         outcome_grace_hours=getattr(board_doctor_cfg, "outcome_grace_hours", None),
+        counter_namespace=(
+            MECHANICAL_SWEEP_COUNTER_NAMESPACE if mechanical_causes is not None else None
+        ),
     )
-    report.rows_observed = len(rows) if mechanical_causes is None else len(other_rows)
+    # `sweep()` already set `report.rows_observed = len(other_rows)` (the
+    # *rows* it was actually handed) — only the unfiltered call needs
+    # correcting here, to the FULL walk (`rows`, before the mechanical
+    # filter/`merged-partial` split above), so "nothing stuck" keeps
+    # meaning the whole board, not just this call's own narrowed subset.
+    if mechanical_causes is None:
+        report.rows_observed = len(rows)
     if followthrough and followthrough_rows:
         report.followthrough = followthrough_sweep(
             followthrough_rows, config=config, board=board, dry_run=dry_run,
