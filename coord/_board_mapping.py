@@ -140,6 +140,10 @@ def row_to_assignment(row: object) -> Assignment:
         # this feature or ordinary (non-scoped) reviews.
         review_scoped=bool(d.get("review_scoped") or False),
         review_scope_base_sha=d.get("review_scope_base_sha"),
+        # #4029: the work-like assignment this scoped review actually
+        # reviewed, captured at dispatch time; None for rows predating this
+        # column and for ordinary (non-scoped) reviews.
+        review_scoped_work_id=d.get("review_scoped_work_id"),
         cost_usd=d.get("cost_usd"),
         # #3158: "captured"/"unmeasured"/None — see the field's own docstring.
         cost_capture_state=d.get("cost_capture_state"),

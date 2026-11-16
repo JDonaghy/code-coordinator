@@ -2640,7 +2640,11 @@ class TestUatStateAndReasonColumns:
 # ["assignment_id"])`. `coord.db._dedupe_merge_queue_assignment_ids` runs
 # ahead of the index creation so an upgrading database that already has a
 # duplicate `assignment_id` doesn't fail it outright.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (27, 101)
+# #4029 bumped this to (28, 102): `assignments.review_scoped_work_id` — the
+# work-like assignment a SCOPED re-review actually reviewed, captured
+# deterministically at dispatch time instead of reconstructed later from a
+# cross-machine clock comparison.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (28, 102)
 
 
 class TestMigrateAddColumnsVersionGuard:

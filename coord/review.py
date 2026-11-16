@@ -7004,6 +7004,19 @@ def dispatch_scoped_review(
                 # #1476 audit trail.
                 review_scoped=True,
                 review_scope_base_sha=prior_review.review_head_sha,
+                # #4029: the work-like assignment this scoped review
+                # ACTUALLY reviews. `entry.assignment_id` is kept pointed at
+                # the branch's current work leg by both callers (the
+                # merge-queue sweep's `mq.refresh_entry_assignment` and
+                # `maybe_scoped_review_for_completed_fix`'s throwaway
+                # entry, built with `assignment_id=completed.assignment_id`)
+                # — deterministic, unlike reconstructing the same answer
+                # later from a cross-machine `dispatched_at`/`finished_at`
+                # comparison. Deliberately NOT stored in
+                # `review_of_assignment_id` itself, which must keep carrying
+                # the #3310 claim key (`prior_review.review_of_assignment_id`)
+                # so this dispatch's claim still releases correctly.
+                review_scoped_work_id=entry.assignment_id,
             )
             board.active.append(review_assignment)
 
