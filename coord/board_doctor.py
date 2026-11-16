@@ -3611,10 +3611,15 @@ def sweep(
     driving a partial row set out of it) drops its counter entirely via
     ``coord.state.clear_board_doctor_row``, so a later recurrence starts
     fresh at ``count=1, escalated=False`` instead of resuming a stale count
-    or staying permanently escalation-blind.
+    or staying permanently escalation-blind. "Did not appear in *rows*" is
+    decided on the real row behind each stored counter, so counters another
+    caller wrote under its own *counter_namespace* are dropped on the same
+    evidence as the plain one — the row genuinely left the walk — and kept
+    whenever it is still stuck here.
 
     *escalation_resolver*, if given, is called as ``escalation_resolver
-    (queue, key)`` for every row :func:`clear_absent_rows` drops — the
+    (queue, key)`` (always the real, un-namespaced row key, once per row)
+    for every row :func:`clear_absent_rows` drops — the
     counterpart to the alert path: once a row's cause has resolved (it
     stopped appearing), whatever alert was filed for it is stale and the
     resolver is expected to dismiss it. Called only on real (non-dry-run)
@@ -3684,6 +3689,14 @@ def sweep(
     have to compensate with a 60x larger limit just to behave as if it
     were the only writer.
 
+    ``"::"`` is reserved as that namespace separator and never appears in
+    a real ``repo#issue`` row key, so a stored counter key always decodes
+    back to the row it belongs to. ``clear_absent_rows`` below relies on
+    that: it judges presence on the REAL row identity behind each stored
+    key, so a namespaced counter is cleared when (and only when) its row
+    has genuinely left this sweep's walk — never merely because a
+    different call's namespace wrote it.
+
     *outcome_grace_hours* (#3907) defaults to ``None``, resolved below to
     :data:`coord.state.BOARD_DOCTOR_OUTCOME_GRACE_HOURS`. Outcome
     backfill (see :func:`_grade_open_outcomes`) grades BOTH #3889's
@@ -3732,14 +3745,6 @@ def sweep(
         return key if counter_namespace is None else f"{key}::{counter_namespace}"
 
     touched: set[tuple[str, str]] = set()
-    # `clear_absent_rows` below walks `state.board_doctor_tracked_rows()`,
-    # which decodes the RAW (possibly namespaced) stored row key — a plain
-    # `touched` (real row identity) would never match a namespaced entry,
-    # so every namespaced counter would read as "absent" and get wiped on
-    # the very sweep that just wrote it. This tracks presence in THAT same
-    # (possibly namespaced) key space instead; identical to `touched` when
-    # *counter_namespace* is ``None``.
-    counter_touched: set[tuple[str, str]] = set()
     # Outcome backfill: decisions from EARLIER sweeps still open for a
     # verdict, read once up front so this sweep's own decisions below
     # never get evaluated against themselves. #3889's still-``None``
@@ -3796,7 +3801,6 @@ def sweep(
 
     for row in rows:
         touched.add((row.queue, row.key))
-        counter_touched.add((row.queue, _counter_key(row.key)))
         if row.suppressed:
             # #3761: present (so `clear_absent_rows` below leaves its
             # counter and any live escalation alone) but deliberately
@@ -4010,24 +4014,28 @@ def sweep(
         )
 
     if not dry_run and clear_absent_rows:
+        # A single resolved row can have several stored counters (a plain
+        # one plus one per namespace that observed it); its escalation is
+        # one object, so dismiss it once rather than per stored key.
+        dismissed: set[tuple[str, str]] = set()
         for queue, key in state.board_doctor_tracked_rows():
-            # *key* here is the RAW stored key — namespaced if some call
-            # (this one or another) wrote it via *counter_namespace* — so
-            # this compares against `counter_touched`, never the plain
-            # `touched` (real row identity), or every namespaced counter
-            # would read as "absent" and get wiped the instant it is
-            # written. See `counter_touched`'s own comment above.
-            if (queue, key) not in counter_touched:
+            # *key* here is the RAW stored key, which carries a
+            # ``"::<namespace>"`` suffix whenever the call that wrote it
+            # passed a *counter_namespace* — this one's, or any other
+            # caller's. Presence is judged on the REAL row identity
+            # behind that key, never on the stored key itself: this
+            # sweep's own `touched` only ever holds plain row keys, so
+            # comparing raw would read EVERY foreign-namespaced counter
+            # as absent and wipe it (plus dismiss the row's live
+            # escalation) even while the row sits stuck in this very
+            # sweep's own walk.
+            real_key = key.split("::", 1)[0]
+            if (queue, real_key) not in touched:
                 state.clear_board_doctor_row(queue, key)
-                if escalation_resolver is not None:
+                if escalation_resolver is not None and (queue, real_key) not in dismissed:
+                    dismissed.add((queue, real_key))
                     try:
-                        # `"::"` is reserved as the counter-namespace
-                        # separator (never legitimate in a real
-                        # `repo#issue` key) — strip it so a resolver
-                        # written against real row identity never gets
-                        # handed a mangled one, regardless of which
-                        # namespace (if any) produced this stored key.
-                        escalation_resolver(queue, key.split("::", 1)[0])
+                        escalation_resolver(queue, real_key)
                     except Exception:  # noqa: BLE001, S110 — one row's cleanup
                         # failing must not abort the walk and leave the
                         # remaining tracked rows' counters uncleared.
@@ -4113,7 +4121,11 @@ def run_sweep(
     *counter_namespace* — its own convergence counter, independent of the
     plain (unfiltered) call's, so a tight-cadence scheduler running this
     pass every minute or two does not burn the SAME ``convergence_limit``
-    budget the hourly call still relies on for these causes.
+    budget the hourly call still relies on for these causes. The budgets
+    are independent, not immortal: the plain call's absence check judges
+    presence on real row identity, so it retires this call's namespaced
+    counter too — once the row it belongs to has genuinely left the full
+    walk, and never while it is still stuck.
 
     It also collects with :data:`MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS`
     in place of :data:`MERGE_PENDING_STALE_AFTER_SECONDS` for

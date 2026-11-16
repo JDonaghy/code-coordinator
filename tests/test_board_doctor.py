@@ -1471,6 +1471,98 @@ class TestSweepCounterNamespace:
         )
         assert row_state["count"] == 1
 
+    def test_a_plain_sweep_keeps_a_namespaced_counter_for_a_row_it_still_sees(
+        self,
+    ) -> None:
+        """The cross-call case: the fast (namespaced) pass writes a counter
+        and escalates; the plain hourly pass then walks the SAME backing
+        store with ``clear_absent_rows=True``. The row is still stuck and
+        still in the hourly pass's own walk, so the namespaced counter must
+        survive and the row's real escalation must NOT be dismissed — the
+        hourly pass only ever holds plain keys in its presence set, so
+        judging presence on the raw stored key would wipe every mechanical
+        counter and dismiss its live escalation on every single tick.
+        """
+        key = "repo#44"
+        cause = "ci_red"
+        namespaced_key = f"{key}::{MECHANICAL_SWEEP_COUNTER_NAMESPACE}"
+        resolved: list[tuple[str, str]] = []
+
+        # Fast pass: three observations, so it escalates and persists that.
+        for _ in range(3):
+            sweep(
+                [_row(key, cause)],
+                tier_of=_always(TIER_AUTO),
+                auto_dispatchers={cause: _Recorder()},
+                alert_dispatcher=_Recorder(),
+                convergence_limit=3,
+                counter_namespace=MECHANICAL_SWEEP_COUNTER_NAMESPACE,
+                clear_absent_rows=False,
+            )
+        assert state.board_doctor_row_state("drive-queue", namespaced_key)["count"] == 3
+        assert state.board_doctor_row_state("drive-queue", namespaced_key)["escalated"] is True
+
+        # Plain hourly pass over the same still-stuck row.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: _Recorder()},
+            alert_dispatcher=_Recorder(),
+            convergence_limit=3,
+            escalation_resolver=lambda queue, k: resolved.append((queue, k)),
+            clear_absent_rows=True,
+        )
+
+        surviving = state.board_doctor_row_state("drive-queue", namespaced_key)
+        assert surviving, "the fast pass's counter was wiped by the hourly pass"
+        assert surviving["count"] == 3
+        assert surviving["escalated"] is True
+        assert resolved == [], "the row is still stuck — its escalation must stand"
+
+    def test_a_plain_sweep_clears_a_namespaced_counter_once_its_row_resolves(self) -> None:
+        """The other half of the contract: a namespaced counter is not
+        immortal. Once the real row genuinely leaves the full sweep's walk,
+        the plain pass drops every counter stored for it — whichever
+        namespace wrote it — and dismisses the row's escalation exactly
+        once, under its real (un-namespaced) key.
+        """
+        key = "repo#45"
+        cause = "ci_red"
+        namespaced_key = f"{key}::{MECHANICAL_SWEEP_COUNTER_NAMESPACE}"
+        resolved: list[tuple[str, str]] = []
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: _Recorder()},
+            alert_dispatcher=_Recorder(),
+            counter_namespace=MECHANICAL_SWEEP_COUNTER_NAMESPACE,
+            clear_absent_rows=False,
+        )
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: _Recorder()},
+            alert_dispatcher=_Recorder(),
+            clear_absent_rows=True,
+        )
+        assert state.board_doctor_row_state("drive-queue", namespaced_key)["count"] == 1
+
+        # The row resolves — gone from the full sweep's walk entirely.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: _Recorder()},
+            alert_dispatcher=_Recorder(),
+            escalation_resolver=lambda queue, k: resolved.append((queue, k)),
+            clear_absent_rows=True,
+        )
+
+        assert not state.board_doctor_row_state("drive-queue", namespaced_key)
+        assert not state.board_doctor_row_state("drive-queue", key)
+        # Two stored counters, one real row: dismissed once, un-namespaced.
+        assert resolved == [("drive-queue", key)]
+
     def test_run_sweep_threads_the_mechanical_namespace(self, monkeypatch) -> None:
         import coord.board_doctor as board_doctor_mod
         from coord.config import Config
