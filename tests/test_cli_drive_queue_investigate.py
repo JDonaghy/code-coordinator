@@ -458,6 +458,29 @@ def test_mechanical_only_flag_drops_the_row_entirely_not_just_no_dispatch(
     assert state.get_drive_escalation(REPO, 501) is None
 
 
+def test_mechanical_only_empty_result_names_the_narrowed_scope(
+    config_path, cli, seed, gh_world, block_log, fake_dispatch,
+):
+    """#4027 review: when `--mechanical-only` drops every row it observed
+    (a stuck-but-non-mechanical row is present, just filtered out before
+    classification), the CLI must not print the plain "nothing stuck: no
+    drive-queue, merge-queue, or baseline-red row was observed" line —
+    that claims a board-wide health verdict this invocation never
+    actually walked. It gets a message naming its own narrowed scope
+    instead."""
+    _write_config(config_path, repo_investigate=True, max_parallel=2)
+    seed(issues={601: "open"})
+    cli("add", REPO, "601")
+    _stall(601, _CI_RED_REASON, block_log)
+    _ci_red(gh_world)
+
+    result = cli("sweep", "--mechanical-only")
+    assert result.exit_code == 0, result.output
+    assert "nothing stuck: no drive-queue, merge-queue, or baseline-red row" not in result.output
+    assert "mechanical-only" in result.output
+    assert "full sweep without --mechanical-only" in result.output
+
+
 # `--no-finish` does not exist on this command (#3837 fix round): the
 # finisher tier fires off `coord.auto_loop.process_review_completion` at
 # review-completion time, never from this sweep's own dispatch loop, so a

@@ -3583,10 +3583,25 @@ def drive_queue_sweep(
         return
 
     if not report.decisions and not report.followthrough:
-        click.echo(
-            "nothing stuck: no drive-queue, merge-queue, or baseline-red row "
-            "was observed"
-        )
+        if mechanical_only:
+            # #4027 review: this invocation deliberately dropped every
+            # non-mechanical row before classification (see
+            # `--mechanical-only`'s own help text above) — a plain "nothing
+            # stuck" here would claim a health verdict this walk never
+            # actually observed. A stuck-but-non-mechanical row may well
+            # exist right now; only a full (non-`--mechanical-only`) sweep
+            # can say otherwise.
+            click.echo(
+                "nothing stuck among the mechanical-only causes observed "
+                "this pass (coord.board_doctor_policy.mechanical_causes()) "
+                "— a full sweep without --mechanical-only is the only one "
+                "that can say the board overall has nothing stuck"
+            )
+        else:
+            click.echo(
+                "nothing stuck: no drive-queue, merge-queue, or baseline-red row "
+                "was observed"
+            )
         return
     for d in report.decisions:
         escalated = " (escalated)" if d.escalated else ""
