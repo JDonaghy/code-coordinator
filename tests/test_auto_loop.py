@@ -2589,6 +2589,54 @@ class TestFullCycle:
         assert w1_final is not None
         assert w1_final.review_verdict != "approve"
 
+    def test_scoped_rereview_falls_through_when_review_scoped_work_id_is_stale(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#4029 review: a live merge-queue entry is only re-keyed to a
+        newer round ON APPROVAL (``refresh_entry_assignment``), so a scoped
+        re-review dispatched during a request-changes bounce can carry
+        ``review_scoped_work_id`` pointed at the chain's ROOT work leg even
+        though it actually reviewed a newer fix round. Trusting that stale
+        id unconditionally reproduces #4029 exactly: the verdict lands on
+        the root and the fix leg is left wedged at
+        ``review_state='dispatched'`` forever. The composed resolution must
+        recognize the recorded leg is older than the issue's newest done
+        leg and fall through to the #3891 timestamp heuristic instead.
+        """
+        from coord.state import save_board
+
+        root = _work_assignment(assignment_id="w-1", review_iteration=0)
+        fix1 = _work_assignment(assignment_id="fix-1", review_iteration=1)
+        fix1.dispatched_at = 1000.0
+        fix1.finished_at = 1050.0
+        fix1.review_state = "dispatched"
+        board = Board(completed=[root, fix1])
+        save_board(board)
+
+        review = _review_assignment(assignment_id="r-2", review_of="w-1")
+        # Dispatched well after fix-1's head was ready — genuinely could
+        # have reviewed it.
+        review.dispatched_at = 1100.0
+        review.finished_at = 1150.0
+        review.review_verdict = "approve"
+        review.review_scoped = True
+        # Stale: still keyed to the chain root, as a not-yet-re-keyed
+        # merge-queue entry would be during a request-changes bounce.
+        review.review_scoped_work_id = "w-1"
+
+        work_result = propagate_review_verdict(review, board, config)
+
+        assert work_result is not None
+        assert work_result.assignment_id == "fix-1"
+        assert review.review_of_assignment_id == "fix-1"
+        fix1_final = board.find_by_id("fix-1")
+        assert fix1_final is not None
+        assert fix1_final.review_state == "done"
+        assert fix1_final.review_verdict == "approve"
+        w1_final = board.find_by_id("w-1")
+        assert w1_final is not None
+        assert w1_final.review_verdict != "approve"
+
     def test_max_iterations_stops_at_configured_limit(
         self, config: Config, tmp_path
     ) -> None:

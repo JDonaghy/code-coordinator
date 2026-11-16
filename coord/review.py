@@ -7005,14 +7005,16 @@ def dispatch_scoped_review(
                 review_scoped=True,
                 review_scope_base_sha=prior_review.review_head_sha,
                 # #4029: the work-like assignment this scoped review
-                # ACTUALLY reviews. `entry.assignment_id` is kept pointed at
-                # the branch's current work leg by both callers (the
-                # merge-queue sweep's `mq.refresh_entry_assignment` and
-                # `maybe_scoped_review_for_completed_fix`'s throwaway
-                # entry, built with `assignment_id=completed.assignment_id`)
-                # — deterministic, unlike reconstructing the same answer
-                # later from a cross-machine `dispatched_at`/`finished_at`
-                # comparison. Deliberately NOT stored in
+                # ACTUALLY reviews, as best known at dispatch time.
+                # `entry.assignment_id` usually names the branch's current
+                # work leg, but a request-changes bounce with a live queue
+                # entry can leave it keyed to an EARLIER round —
+                # `mq.refresh_entry_assignment` only re-keys the entry ON
+                # APPROVAL, after a scoped re-review has already dispatched
+                # against it. `propagate_review_verdict` treats this as one
+                # input, not the final answer: it composes it with the
+                # issue's newest done work leg rather than trusting it
+                # unconditionally. Deliberately NOT stored in
                 # `review_of_assignment_id` itself, which must keep carrying
                 # the #3310 claim key (`prior_review.review_of_assignment_id`)
                 # so this dispatch's claim still releases correctly.
