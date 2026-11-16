@@ -1895,6 +1895,8 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     # filtered down to — otherwise a `--repo` view would misdiagnose an
     # out-of-repo pre-req as "unknown to the queue" purely from the filter,
     # not from anything actually true.
+    from coord.state import list_drive_queue  # noqa: PLC0415
+
     all_entries = entries if repo is None else entries_from_rows(list_drive_queue())
     # A row with no `after=` at all has nothing for #2183's re-diagnosis to
     # do — criterion "entries with no after= are unaffected" — so both the
