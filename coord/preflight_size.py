@@ -379,35 +379,54 @@ def verify_split_proposal(
 ) -> SplitVerification:
     """Mechanically verify *proposal* is safe to file as a real epic.
 
-    Three checks, each of which rejects on its own (no check is skipped
-    because an earlier one happened to pass — see the module's "a gate must
-    be able to fail" bar):
+    Checks, each of which rejects on its own (no check is skipped because
+    an earlier one happened to pass — see the module's "a gate must be able
+    to fail" bar):
 
     1. Every chunk declares a non-empty `## Files` scope
        (``chunk.files_likely``) — checked directly against the proposal,
        independently of whichever parser produced it, because one of the
        two legitimate producers (`coord.brain.parse_split_proposals`,
        the JSON wire shape) does not enforce this itself.
-    2. *epic_body* — the `## Sub-issues` block that would actually be
+    2. No declared file is an unfilled template placeholder (containing a
+       literal ``<``/``>``, e.g. ``quadraui/examples/tui_<name>.rs``) —
+       meaningless to :func:`coord.overlap_predict.predict_overlap` and not
+       safe to file onto a real issue's ``## Files`` section (#4031, the
+       quadraui#2664 incident).
+    3. *epic_body* — the `## Sub-issues` block that would actually be
        written to the real epic issue — parses under the create-epic
        grammar (:func:`coord.milestone_order.parse_sub_issues`) and
        produces exactly one node per proposed chunk (so every child will
        actually be visible once filed).
-    3. When the caller has no real epic body yet (the common case: the
+    4. When the caller has no real epic body yet (the common case: the
        real issue numbers don't exist until the epic and its children are
        filed), one is COMPUTED here — sequential placeholder numbers in
-       proposal order, with each child's ``after`` edges derived from
-       :func:`coord.overlap_predict.predict_overlap` against only the
-       chunks strictly before it (a construction that is a DAG by
-       built-in, so it can never itself trip check 2's cycle/undeclared-
-       target failure; those failure modes are reachable through the
-       *epic_body* override instead — see the test suite).
+       proposal order, with each child's ``after`` edges the UNION (#4031)
+       of:
+
+       * whatever each chunk explicitly declared via ``chunk.after`` — a
+         semantic dependency (e.g. "consumes a type/API another child
+         adds") that file overlap can never see, carried from the
+         size-triage wire format's ``After: Child N`` line
+         (:func:`coord.decomposition_chat.parse_size_triage_response`);
+         rejected right here, with no work order even attempted, when it
+         names a position that isn't an earlier chunk in *this* proposal
+         — a nonexistent child or a forward/self reference; and
+       * :func:`coord.overlap_predict.predict_overlap` against only the
+         chunks strictly before it.
+
+       This construction is a DAG by built-in (every edge, declared or
+       predicted, only ever points strictly backward), so it can never
+       itself trip check 3's cycle/undeclared-target failure; those
+       failure modes are reachable through the *epic_body* override
+       instead — see the test suite.
 
     *epic_body*, when given, is validated AS GIVEN — this lets a caller
     that already has real issue numbers (or a test asserting a specific
     failure mode) hand the gate the exact text about to be filed, rather
     than only ever checking this module's own self-computed convenience
-    default.
+    default. ``chunk.after`` plays no role in that path: a caller handing
+    over a real epic body has already decided what it says.
     """
     if not proposal.chunks:
         return SplitVerification(
@@ -423,16 +442,39 @@ def verify_split_proposal(
                     f"child {i} ({chunk.title!r}) declares no '## Files' scope"
                 ),
             )
+        placeholders = [f for f in files if "<" in f or ">" in f]
+        if placeholders:
+            return SplitVerification(
+                ok=False,
+                reason=(
+                    f"child {i} ({chunk.title!r}) declares unfilled template "
+                    f"placeholder(s) in '## Files': {placeholders!r}"
+                ),
+            )
 
     if epic_body is None:
         nodes: list[WorkOrderNode] = []
         footprints_so_far: list[Footprint] = []
         for i, chunk in enumerate(proposal.chunks, start=1):
+            declared_after = sorted({int(p) for p in (chunk.after or ())})
+            for target in declared_after:
+                if not (1 <= target < i):
+                    return SplitVerification(
+                        ok=False,
+                        reason=(
+                            f"child {i} ({chunk.title!r}) declares "
+                            f"'After: Child {target}', but child {target} is "
+                            "not an earlier child of this proposal (it has "
+                            f"{len(proposal.chunks)} chunk(s)) — a declared "
+                            "dependency must never name a nonexistent or "
+                            "later child, since nothing later can have "
+                            "landed yet"
+                        ),
+                    )
             files = tuple(f for f in chunk.files_likely if str(f).strip())
             prediction = predict_overlap(files, footprints_so_far)
-            after = tuple(
-                sorted({int(k) for k in prediction.after_keys})
-            )
+            predicted_after = {int(k) for k in prediction.after_keys}
+            after = tuple(sorted(set(declared_after) | predicted_after))
             nodes.append(WorkOrderNode(issue_number=i, after=after))
             footprints_so_far.append(
                 Footprint(key=str(i), issue_number=i, files=files)

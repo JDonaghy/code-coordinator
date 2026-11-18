@@ -1804,6 +1804,11 @@ class TestBuildSizeTriageBriefing:
         assert "SIZE_TRIAGE_VERDICT: proceed" in briefing
         assert "END_SIZE_TRIAGE" in briefing
         assert "HARD REQUIREMENT" in briefing
+        # #4031: the required-output template demonstrates the `After:`
+        # dependency line and explains when to use it.
+        assert "After: Child 1" in briefing
+        assert "consumes a type, API, or other seam" in briefing
+        assert "no unfilled placeholder" in briefing
 
     def test_includes_size_signals_when_given(self):
         briefing = decomposition_chat.build_size_triage_briefing(
@@ -1933,6 +1938,118 @@ class TestParseSizeTriageResponse:
                 issue_number=3818,
                 issue_title="Preflight guard",
             )
+
+    def test_after_declaration_is_parsed_onto_the_chunk(self):
+        # #4031: an `After: Child N` line declares a semantic dependency
+        # file overlap alone can't see — the two children's '## Files'
+        # below are disjoint.
+        response = """SIZE_TRIAGE_VERDICT: split
+## Child 1: Core type
+Adds the shared type.
+
+## Files
+- coord/a.py
+
+## Child 2: Consumer
+Consumes the type Child 1 added.
+After: Child 1
+
+## Files
+- coord/b.py
+
+END_SIZE_TRIAGE
+"""
+        proposal = decomposition_chat.parse_size_triage_response(
+            response,
+            repo_name="code-coordinator",
+            issue_number=4031,
+            issue_title="Dependent split",
+        )
+        assert proposal is not None
+        assert proposal.chunks[0].after == ()
+        assert proposal.chunks[1].after == (1,)
+        # The declaration line itself must not leak into the rendered scope.
+        assert "After:" not in proposal.chunks[1].scope
+        assert "Consumes the type Child 1 added." in proposal.chunks[1].scope
+
+    def test_after_declaration_accepts_multiple_bare_numbers(self):
+        response = """SIZE_TRIAGE_VERDICT: split
+## Child 1: First
+Prose.
+
+## Files
+- coord/a.py
+
+## Child 2: Second
+Prose.
+
+## Files
+- coord/b.py
+
+## Child 3: Third
+Depends on both earlier children.
+After: 1, 2
+
+## Files
+- coord/c.py
+
+END_SIZE_TRIAGE
+"""
+        proposal = decomposition_chat.parse_size_triage_response(
+            response,
+            repo_name="code-coordinator",
+            issue_number=4031,
+            issue_title="Dependent split",
+        )
+        assert proposal is not None
+        assert proposal.chunks[2].after == (1, 2)
+
+    def test_no_after_line_defaults_to_empty_tuple(self):
+        proposal = decomposition_chat.parse_size_triage_response(
+            _SPLIT_RESPONSE,
+            repo_name="code-coordinator",
+            issue_number=3818,
+            issue_title="Preflight guard",
+        )
+        assert proposal is not None
+        assert all(c.after == () for c in proposal.chunks)
+
+    def test_after_declaration_survives_the_verify_split_proposal_gate(self):
+        """End-to-end #4031 acceptance: a parsed `After: Child 1` edge
+        between two disjoint-file children lands in the work order
+        `verify_split_proposal` hands back — the whole point being that
+        `coord.preflight_size.verify_split_proposal` (not just this
+        module's own parser) actually honours the declared edge."""
+        from coord.preflight_size import verify_split_proposal
+
+        response = """SIZE_TRIAGE_VERDICT: split
+## Child 1: Core type
+Adds the shared type.
+
+## Files
+- coord/core.py
+
+## Child 2: Consumer
+Consumes the type Child 1 added.
+After: Child 1
+
+## Files
+- coord/consumer.py
+
+END_SIZE_TRIAGE
+"""
+        proposal = decomposition_chat.parse_size_triage_response(
+            response,
+            repo_name="code-coordinator",
+            issue_number=4031,
+            issue_title="Dependent split",
+        )
+        assert proposal is not None
+
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+        assert verification.work_order is not None
+        assert verification.work_order.nodes[1].after == (1,)
 
     def test_child_with_no_declared_files_raises(self):
         """A `## Child N:` section with a `## Files` heading but no file
