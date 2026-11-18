@@ -1226,10 +1226,22 @@ def build_size_triage_briefing(
         "that splitting it into independently-assignable children first is "
         "safer (SPLIT)? For a SPLIT, give each child a clear title, a short "
         "prose rationale/scope, and a `## Files` list of exactly the files "
-        "it should touch — the same declaration convention every issue in "
+        "it should touch, with no unfilled placeholder like `<new-file>` or "
+        "`<name>` in it — the same declaration convention every issue in "
         "this repo already uses for its own scope. List the children in the "
         "order they should be worked, chaining later ones on earlier ones "
         "where one genuinely depends on another."
+    )
+    lines.append("")
+    lines.append(
+        "File-overlap between two children's `## Files` lists is detected "
+        "and chained automatically — you do not need to declare that case. "
+        "Declare an `After: Child N[, Child M...]` line (see the format "
+        "below) ONLY when a child depends on another in a way file overlap "
+        "can never see: it consumes a type, API, or other seam an earlier "
+        "child adds, even though the two children's `## Files` are "
+        "disjoint. Omit it when there is no such dependency — most splits "
+        "need no `After:` line at all."
     )
     lines.append("")
 
@@ -1253,7 +1265,11 @@ def build_size_triage_briefing(
     lines.append("- path/b.py")
     lines.append("")
     lines.append("## Child 2: <title>")
-    lines.append("...")
+    lines.append("<one paragraph of rationale/scope>")
+    lines.append("After: Child 1")
+    lines.append("")
+    lines.append("## Files")
+    lines.append("- path/c.py")
     lines.append("")
     lines.append("END_SIZE_TRIAGE")
     lines.append("")
@@ -1282,7 +1298,44 @@ _SIZE_TRIAGE_CHILD_HEADING_RE = re.compile(
 _SIZE_TRIAGE_FILES_HEADING_RE = re.compile(
     r"^##\s*Files\s*$", re.IGNORECASE | re.MULTILINE
 )
+#: #4031: a child's declared dependency on an earlier one — see
+#: `build_size_triage_briefing`'s own "when to use it" guidance (a seam a
+#: child consumes that file-overlap can never see). Matched only against
+#: the scope prose ahead of a child's own `## Files` heading, never across
+#: the whole response — see `_split_after_declaration`.
+_SIZE_TRIAGE_AFTER_RE = re.compile(r"^After:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 SIZE_TRIAGE_END_MARKER = "END_SIZE_TRIAGE"
+
+
+def _split_after_declaration(scope_text: str) -> tuple[str, tuple[int, ...]]:
+    """Pull an `After: Child N[, Child M...]` line (#4031) out of
+    *scope_text*, returning ``(scope_without_that_line, positions)``.
+
+    *positions* are every integer found in the line's value, in the order
+    they appear, deduplicated — "Child 1, Child 2" and "1, 2" both parse
+    the same way, since the agent is free to phrase it either way and only
+    the numbers matter to the caller. ``()`` (and *scope_text* returned
+    unchanged) when no `After:` line is present — the common case, and the
+    one that keeps a response with no declared dependency behaving exactly
+    as it did before this line existed.
+
+    Only the FIRST `After:` line is recognised, matching `## Child N:`'s
+    own one-heading-per-child convention — a child declares at most one
+    dependency line, even though it may name several earlier children on
+    it.
+    """
+    match = _SIZE_TRIAGE_AFTER_RE.search(scope_text)
+    if match is None:
+        return scope_text, ()
+    positions: list[int] = []
+    seen: set[int] = set()
+    for raw in re.findall(r"\d+", match.group(1)):
+        n = int(raw)
+        if n not in seen:
+            seen.add(n)
+            positions.append(n)
+    remaining = scope_text[: match.start()] + scope_text[match.end() :]
+    return remaining, tuple(positions)
 
 
 def parse_size_triage_response(
@@ -1362,6 +1415,7 @@ def parse_size_triage_response(
 
         files_heading = _SIZE_TRIAGE_FILES_HEADING_RE.search(block)
         scope_text = block[: files_heading.start()] if files_heading else block
+        scope_text, after_positions = _split_after_declaration(scope_text)
         files_likely = parse_declared_files(block)
         if not files_likely:
             raise SizeTriageError(
@@ -1375,6 +1429,7 @@ def parse_size_triage_response(
                 title=title,
                 scope=scope_text.strip(),
                 files_likely=files_likely,
+                after=after_positions,
             )
         )
 

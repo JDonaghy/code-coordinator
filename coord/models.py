@@ -1862,6 +1862,20 @@ class SplitChunk:
     title: str
     scope: str
     files_likely: list[str] = field(default_factory=list)
+    #: #4031: 1-based positions (matching this proposal's own `## Child N:`
+    #: numbering, i.e. `chunks` index + 1 — never a real GitHub issue
+    #: number, which doesn't exist until the proposal is filed) of other
+    #: chunks this one was EXPLICITLY declared to depend on, e.g. an
+    #: `After: Child 1` line in the size-triage wire format
+    #: (`coord.decomposition_chat.parse_size_triage_response`). Empty by
+    #: default — every existing producer (`coord.brain.parse_split_
+    #: proposals`'s JSON wire shape) never sets this, so it keeps
+    #: producing chunks with no declared dependency, exactly as before
+    #: this field existed. `coord.preflight_size.verify_split_proposal`
+    #: unions this with whatever file-overlap prediction finds; it does
+    #: not trust this field on its own, since a child can declare a
+    #: dependency on something undeclared or filed later.
+    after: tuple[int, ...] = field(default_factory=tuple)
 
 
 @dataclass

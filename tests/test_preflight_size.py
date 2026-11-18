@@ -270,6 +270,161 @@ class TestVerifySplitProposalAcceptsWellFormed:
         assert verification.ok is True
         assert verification.epic_body == epic_body
 
+    def test_declared_after_is_honoured_with_disjoint_files(self) -> None:
+        # #4031: child 2 declares `After: Child 1` even though the two
+        # chunks' '## Files' share nothing — file overlap alone would never
+        # chain them, so the declared edge must still land in the work
+        # order.
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/unrelated.py"],
+                    after=(1,),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+        assert verification.work_order is not None
+        assert verification.work_order.nodes[1].after == (1,)
+
+    def test_declared_and_predicted_after_are_unioned_without_duplicates(
+        self,
+    ) -> None:
+        # Chunk 3 both declares `After: Child 1` AND shares a file with
+        # chunk 2 — the resulting after= must contain both, exactly once
+        # each.
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+                SplitChunk(
+                    title="c",
+                    scope="scope c",
+                    files_likely=["coord/b.py", "coord/c.py"],
+                    after=(1,),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+        assert verification.work_order is not None
+        assert verification.work_order.nodes[2].after == (1, 2)
+
+    def test_no_after_lines_behaves_exactly_as_before(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+        assert verification.work_order is not None
+        assert verification.work_order.nodes[0].after == ()
+        assert verification.work_order.nodes[1].after == ()
+
+
+class TestVerifySplitProposalRejectsBadDeclaredAfter:
+    """#4031: a declared `After:` edge that is nonexistent or a forward
+    reference fails verification before any epic body is even built."""
+
+    def test_after_naming_a_later_child_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    after=(2,),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 1" in verification.reason
+        assert "not an earlier child" in verification.reason
+
+    def test_after_naming_a_nonexistent_child_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/b.py"],
+                    after=(5,),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+        assert "not an earlier child" in verification.reason
+
+    def test_after_naming_self_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/b.py"],
+                    after=(2,),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+
+
+class TestVerifySplitProposalRejectsPlaceholderFiles:
+    """#4031: a child whose '## Files' carries an unfilled template
+    placeholder (e.g. `<new-file>`) is rejected — meaningless to the
+    overlap predictor and not safe to file verbatim onto a real issue."""
+
+    def test_angle_bracket_placeholder_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["quadraui/examples/tui_<name>.rs"],
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+        assert "placeholder" in verification.reason
+
+    def test_unclosed_angle_bracket_placeholder_is_also_rejected(self) -> None:
+        # quadraui#2664's own observed shape — no closing '>' at all.
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["quadraui/examples/common/<new"],
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+
 
 class TestVerifySplitProposalRejectsNoChunks:
     def test_no_chunks_is_rejected_with_a_reason(self) -> None:
