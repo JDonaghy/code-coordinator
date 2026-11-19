@@ -1952,6 +1952,40 @@ def entries_from_rows(rows: Iterable[Mapping[str, Any]]) -> list[QueueEntry]:
     )
 
 
+def write_queue_after(entry: QueueEntry, after: Sequence[str]) -> None:
+    """Replace *entry*'s own ``after=`` edges, leaving every other
+    operator-declared field on the row unchanged.
+
+    ``coord.state.update_drive_queue_entry`` explicitly refuses ``after``
+    (the queue's order columns are owned by ``enqueue``/``move``, not a
+    tick-owned field) — this is the one write path a caller that only
+    wants to change `after=` edges goes through, the same full-row upsert
+    `coord.commands.drive_queue._apply_reversed_overlap_after` already
+    uses for the #3395 reversed-edge write. ``position=None`` leaves the
+    entry's current queue slot untouched — `enqueue_drive_queue` only
+    moves a row when an explicit position is given.
+
+    #4037: the write half of :func:`coord.board_doctor.
+    drop_stale_predicted_after_edges`'s sweep.
+    """
+    from coord.state import enqueue_drive_queue  # noqa: PLC0415
+
+    enqueue_drive_queue(
+        entry.repo,
+        entry.issue,
+        machine=entry.machine or None,
+        after=list(after),
+        position=None,
+        hold_after=entry.hold_after,
+        hold_reason=entry.hold_reason,
+        resume_when=entry.resume_when,
+        hold_scope=entry.hold_scope,
+        max_fix_rounds=entry.max_fix_rounds,
+        no_acceptance=entry.no_acceptance,
+        plan_destructive=entry.plan_destructive,
+    )
+
+
 def effective_max_fix_rounds(
     entry: QueueEntry, config_default: int | None
 ) -> int:

@@ -1313,6 +1313,14 @@ class SweepReport:
     followthrough: list[board_doctor_followthrough.Disposition] = field(
         default_factory=list,
     )
+    #: #4037: one note per PREDICTED ``after=`` edge
+    #: :func:`drop_stale_predicted_after_edges` dropped this round, via
+    #: :func:`sweep_predicted_after_edges`. Separate from *decisions* for
+    #: the same reason *followthrough* is: dropping a stale edge is not a
+    #: tier/auto_dispatchers/convergence decision over a :class:`StuckRow`
+    #: at all — it runs over the raw queue, independent of `collect_rows`'
+    #: own classification walk.
+    dropped_predicted_after_edges: list[str] = field(default_factory=list)
 
 
 def merge_queue_rows(
@@ -2211,6 +2219,191 @@ def _reclassify_blocked_on_prereq(
                 )
         reclassified.append(row)
     return reclassified
+
+
+# ── #4037: drop stale predicted `after=` edges ──────────────────────────────
+#
+# #2247's predictor chains a newcomer `--after` any in-flight work it
+# collides with on files — correct the moment it is written, but the edge is
+# never revisited once the target stops being reachable soon: deferred and
+# dequeued (#2537's shape — the target's own row is simply gone), or stuck
+# itself behind something else entirely unrelated to the newcomer (#2534's
+# shape — a whole CellGrid/MCP chain sitting behind one blocked root). Both
+# left the newcomer waiting on `coord drive-queue list`'s "(open, not
+# queued)" or `cause=blocked-on-prereq tier=alert` forever, with nothing
+# auto-acting on either. This sweep is the fix: drop a PREDICTED edge (never
+# an operator's `--after` or an epic's `{after:}` — see
+# :func:`coord.overlap_predict.predicted_after_targets`, the provenance
+# seam) whose target cannot land soon. Self-correction needs no new code
+# here: the moment the dropped target re-enters the queue (or anything else
+# does, on top of it), the SAME predictor chains against its then-current
+# footprint — a real branch diff once it has launched — exactly as every
+# other `add` call already does.
+
+
+def _after_chain_hits_blocked_or_parked(
+    entry: Any, entries_by_key: Mapping[str, Any], *, _seen: set[str] | None = None,
+) -> bool:
+    """Does *entry*'s OWN ``after=`` graph transitively reach a row sitting
+    `blocked`/`parked` right now (#2534's shape) — never *entry* itself,
+    only what it is chained behind. ``_seen`` guards a cycle (malformed data;
+    `coord.drive_queue.find_cycle` already refuses to write one, but this
+    walk must still terminate against a row some other path let through).
+    """
+    from coord.drive_queue import STATE_BLOCKED, STATE_PARKED  # noqa: PLC0415
+
+    seen = _seen if _seen is not None else set()
+    for dep_key in entry.after:
+        if dep_key in seen:
+            continue
+        seen.add(dep_key)
+        dep = entries_by_key.get(dep_key)
+        if dep is None:
+            continue
+        if dep.state in (STATE_BLOCKED, STATE_PARKED):
+            return True
+        if _after_chain_hits_blocked_or_parked(dep, entries_by_key, _seen=seen):
+            return True
+    return False
+
+
+def predicted_after_target_drop_reason(
+    target_key: str,
+    entries_by_key: Mapping[str, Any],
+    *,
+    issue_open: Callable[[str, int], bool] | None = None,
+) -> str:
+    """Why a PREDICTED ``after=`` edge pointed at *target_key* should be
+    dropped, or ``""`` when the target still looks reachable soon enough
+    that the edge is worth keeping (#4037).
+
+    Only ever called for an edge :func:`drop_stale_predicted_after_edges`
+    has already confirmed came from the predictor, never an operator's own
+    ``--after`` or an epic's ``{after:}`` — this predicate has no opinion on
+    provenance, only on the target's own reachability. Four shapes qualify,
+    the exact set the issue's own evidence (#2537, #2534) landed in:
+
+    * the target left the queue entirely — ``entries_by_key`` has no row
+      for it — while its issue is STILL OPEN on GitHub: dequeued, or never
+      queued at all (#2537's "waiting on #N (open, not queued)" shape). A
+      target that is instead closed/merged is `_resolve_prereqs`'s own
+      satisfied case, not a stale edge — left alone here on purpose, so
+      this sweep never races the ordinary tick's own resume of it;
+    * the target itself reads ``blocked``;
+    * the target itself reads ``parked``;
+    * the target is ``waiting``/``running`` right now, but its OWN
+      ``after=`` graph transitively reaches a `blocked`/`parked` row
+      (#2534's shape — the dependent is fine, everything IT depends on is
+      not);
+    * the target has never actually launched — ``attempts == 0`` and no
+      ``launched_at`` — so there was never a real branch for this edge to
+      have been serializing against in the first place.
+
+    *issue_open* defaults to :func:`_issue_open` (a live `gh` read); tests
+    inject a stub so this stays a pure-logic call over hand-built entries.
+    """
+    from coord.drive_queue import STATE_BLOCKED, STATE_PARKED  # noqa: PLC0415
+    from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+
+    target = entries_by_key.get(target_key)
+    if target is None:
+        parsed = _parse_row_key(target_key)
+        opener = issue_open or _issue_open
+        if parsed is not None and opener(*parsed):
+            return "dequeued"
+        return ""
+    if target.state == STATE_BLOCKED:
+        return "blocked"
+    if target.state == STATE_PARKED:
+        return "parked"
+    if _after_chain_hits_blocked_or_parked(target, entries_by_key):
+        return "blocked chain"
+    if target.attempts == 0 and target.launched_at is None:
+        return "no branch yet"
+    return ""
+
+
+def drop_stale_predicted_after_edges(
+    entries: Sequence[Any],
+    *,
+    predicted_keys_for: Callable[[Any], frozenset[str]],
+    issue_open: Callable[[str, int], bool] | None = None,
+    write_after: Callable[[Any, Sequence[str]], None] | None = None,
+) -> list[str]:
+    """Drop every PREDICTED ``after=`` edge pointed at a row
+    :func:`predicted_after_target_drop_reason` says cannot land soon (#4037).
+
+    *predicted_keys_for* is the provenance seam: ``entry ->`` the subset of
+    *entry*'s OWN ``after=`` the predictor actually wrote (see
+    :func:`coord.overlap_predict.predicted_after_targets`). An edge not in
+    that set is operator- or epic-declared and is NEVER a candidate here,
+    whatever its target looks like — this sweep only ever touches edges
+    #2247 itself produced.
+
+    *write_after*, when given, is called once per CHANGED entry with its
+    surviving ``after=`` tuple (``coord.drive_queue.write_queue_after`` in
+    production). ``None`` (the default) computes the drop set without
+    writing anything — the shape a dry run, or a test asserting only on the
+    returned notes, wants.
+
+    Returns one note per dropped edge — ``"{entry.key}: edge dropped:
+    {dep} (predicted, target {reason})"``, the issue's own acceptance text
+    — in entry/edge order, so a caller can log or alert on them directly.
+    """
+    entries_by_key = {e.key: e for e in entries}
+    notes: list[str] = []
+    for entry in entries:
+        if not entry.after:
+            continue
+        predicted = predicted_keys_for(entry)
+        if not predicted:
+            continue
+        keep: list[str] = []
+        drops: list[tuple[str, str]] = []
+        for dep_key in entry.after:
+            reason = (
+                predicted_after_target_drop_reason(
+                    dep_key, entries_by_key, issue_open=issue_open,
+                )
+                if dep_key in predicted
+                else ""
+            )
+            if reason:
+                drops.append((dep_key, reason))
+            else:
+                keep.append(dep_key)
+        if not drops:
+            continue
+        if write_after is not None:
+            write_after(entry, keep)
+        for dep_key, reason in drops:
+            notes.append(
+                f"{entry.key}: edge dropped: {dep_key} (predicted, target {reason})"
+            )
+    return notes
+
+
+def sweep_predicted_after_edges(*, dry_run: bool = False) -> list[str]:
+    """Production entry point for :func:`drop_stale_predicted_after_edges`
+    (#4037): read the live drive queue, drop every stale predicted
+    ``after=`` edge, and report what changed.
+
+    *dry_run* computes the drop set without writing it back — the same
+    "classify, never mutate" contract :func:`sweep`'s own *dry_run* keeps.
+    Advisory the same way every other optional pass in :func:`run_sweep` is:
+    a caller that cannot reach the queue or the audit log this round skips
+    this sweep, not the rest of the report.
+    """
+    from coord.drive_queue import entries_from_rows, write_queue_after  # noqa: PLC0415
+    from coord.overlap_predict import predicted_after_targets  # noqa: PLC0415
+    from coord.state import list_drive_queue  # noqa: PLC0415
+
+    entries = entries_from_rows(list_drive_queue())
+    return drop_stale_predicted_after_edges(
+        entries,
+        predicted_keys_for=lambda e: predicted_after_targets(e.repo, e.issue),
+        write_after=None if dry_run else write_queue_after,
+    )
 
 
 #: #3929 (#3918 gap 1, second half): a merge-queue entry that has NEVER been
@@ -4064,6 +4257,8 @@ def run_sweep(
         run_followthrough_sweep
     ),
     mechanical_causes: frozenset[str] | None = None,
+    drop_predicted_after_edges: bool = True,
+    predicted_after_edges_sweep: Callable[..., list[str]] = sweep_predicted_after_edges,
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -4135,6 +4330,18 @@ def run_sweep(
     invisible to THIS call for up to 30 minutes regardless of how often the
     tight cadence fires, since both causes are minted off that same floor.
     The plain (unfiltered) call keeps the 30-minute floor unchanged.
+
+    #4037: *predicted_after_edges_sweep* (default
+    :func:`sweep_predicted_after_edges`) runs once per call and reports onto
+    :attr:`SweepReport.dropped_predicted_after_edges` — gated on
+    *drop_predicted_after_edges* (the same kind of fleet-wide kill switch
+    *followthrough* already is) AND ``mechanical_causes is None``, so the
+    tight-cadence call does not pay for an extra queue read plus one audit
+    query per `after=`-bearing entry every minute or two; the hourly plain
+    call still catches it well inside #2534's "every hour and did nothing"
+    window. A failure here is advisory-only, same posture as the
+    no-progress pass in :func:`_collect_rows_with_board`: it never takes
+    the rest of this report down.
     """
     board_doctor_cfg = getattr(config, "board_doctor", None)
     rows, board = _collect_rows_with_board(
@@ -4184,6 +4391,16 @@ def run_sweep(
         report.followthrough = followthrough_sweep(
             followthrough_rows, config=config, board=board, dry_run=dry_run,
         )
+    if drop_predicted_after_edges and mechanical_causes is None:
+        try:
+            report.dropped_predicted_after_edges = predicted_after_edges_sweep(
+                dry_run=dry_run,
+            )
+        except Exception:  # noqa: BLE001 — advisory, see docstring
+            _log.warning(
+                "board-doctor: predicted after= edge sweep failed this round",
+                exc_info=True,
+            )
     return report
 
 
