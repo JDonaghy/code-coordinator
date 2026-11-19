@@ -3597,6 +3597,22 @@ def _covering_escalation_remedy_refused_now(
     return _is_relaunch_shaped_remedy(str(existing.get("proposed_command") or ""))
 
 
+def _covering_escalation_names_concrete_action(existing: Mapping[str, Any]) -> bool:
+    """Does *existing* — a different-stage escalation `write_drive_escalation`
+    is weighing deferring to — actually tell an operator what to do next?
+
+    `coord.state.get_drive_escalation` only ever returns a row that is
+    still open (a dismissed row is deleted, not marked closed), so a
+    non-``None`` *existing* already answers "is the covering record still
+    live". It says nothing about whether that record ever carried a real
+    remedy: a row whose ``proposed_command`` is blank or whitespace-only
+    names nothing to run, so deferring to it leaves the stuck row with no
+    alert and no actionable next step at all — worse than no cover,
+    because it also blocks this writer's own alert from ever landing.
+    """
+    return bool(str(existing.get("proposed_command") or "").strip())
+
+
 def write_drive_escalation(
     repo_name: str,
     issue_number: int,
@@ -3616,7 +3632,12 @@ def write_drive_escalation(
     covers this issue — `drive_escalations` holds one row per issue, so an
     unconditional write here would clobber a live e.g. `plan.blocked`
     escalation's `reason`/`gate_readings`/`created_at` with a generic one.
-    That case returns :data:`ALERT_SKIPPED` — UNLESS *row* is given and
+    A covering row only actually counts as cover when
+    :func:`_covering_escalation_names_concrete_action` confirms it still
+    names something to run; one that does not falls straight through to
+    recording this writer's own alert instead, the same as if no covering
+    row existed at all. Given a row that does name an action, the skip case
+    returns :data:`ALERT_SKIPPED` — UNLESS *row* is given and
     :func:`_covering_escalation_remedy_refused_now` confirms the covering
     escalation's own remedy is a relaunch this row's fresh evidence
     already proves would be refused (#3999): a dead end never "covers"
@@ -3637,7 +3658,17 @@ def write_drive_escalation(
 
     try:
         existing = get_drive_escalation(repo_name, issue_number)
-        if existing is not None and existing.get("stage") != stage:
+        covering = existing is not None and existing.get("stage") != stage
+        if covering and not _covering_escalation_names_concrete_action(existing):
+            click.echo(
+                f"warning: board-doctor NOT deferring to a covering "
+                f"{existing.get('stage')!r} escalation for "
+                f"{repo_name}#{issue_number} — it names no "
+                "proposed_command at all, so it covers nothing; recording "
+                "this row's own cause/evidence instead",
+                err=True,
+            )
+        elif covering:
             if row is None or not _covering_escalation_remedy_refused_now(existing, row):
                 return ALERT_SKIPPED
             click.echo(
