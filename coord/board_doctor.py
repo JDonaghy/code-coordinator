@@ -821,6 +821,161 @@ def build_refile_candidate(
     )
 
 
+def build_auto_split_candidate(
+    repo_name: str, issue_number: int, *, config: Any, entry: Any,
+    findings: Sequence[str],
+) -> board_doctor_followthrough.AutoSplitCandidate:
+    """Real :class:`~coord.board_doctor_followthrough.AutoSplitCandidate`
+    builder for a live ceiling-blocked row (#4034) — mirrors
+    :func:`build_refile_candidate` exactly, except *findings* (the latest
+    review's already-classified missing-scope blocking findings — see
+    :func:`latest_review_blocking_findings`) is supplied by the caller
+    rather than read here, since fetching and classifying is a separate,
+    independently testable step.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    github_repo = _github_slug(repo_name, config)
+
+    issue = github_ops.get_issue(github_repo, issue_number)
+    milestone = issue.get("milestone") or {}
+    labels = tuple(
+        name for label in (issue.get("labels") or [])
+        if (name := label.get("name"))
+    )
+    parent = github_ops.get_issue_parent(github_repo, issue_number)
+    epic_number = parent.get("number") if parent else None
+
+    return board_doctor_followthrough.AutoSplitCandidate(
+        repo_name=repo_name,
+        github_repo=github_repo,
+        issue_number=issue_number,
+        title=issue.get("title") or "",
+        body=issue.get("body") or "",
+        findings=tuple(findings),
+        labels=labels,
+        milestone=milestone.get("title"),
+        epic_number=epic_number,
+        queue_position=int(getattr(entry, "position", 0) or 0),
+        queue_after=tuple(getattr(entry, "after", ()) or ()),
+        queue_machine=str(getattr(entry, "machine", "") or ""),
+        queue_hold_after=bool(getattr(entry, "hold_after", False)),
+        queue_hold_reason=str(getattr(entry, "hold_reason", "") or ""),
+        queue_resume_when=str(getattr(entry, "resume_when", "") or ""),
+        queue_hold_scope=str(getattr(entry, "hold_scope", "entry") or "entry"),
+        queue_max_fix_rounds=getattr(entry, "max_fix_rounds", None),
+        queue_no_acceptance=bool(getattr(entry, "no_acceptance", False)),
+        queue_plan_destructive=bool(getattr(entry, "plan_destructive", False)),
+    )
+
+
+def latest_review_blocking_findings(
+    repo_name: str, issue_number: int, *, board: Board, config: Any,
+) -> list[str]:
+    """The live, remaining blocking findings off the ISSUE's most recently
+    dispatched review assignment, split one-per-bullet (#4034 point 1's own
+    data source).
+
+    Walks :func:`coord.diagnose.stage_assignments` for ``stage="review"``
+    (the same newest-first list the TUI's own `assignments_for_stage`
+    mirrors) to find the latest review's ``assignment_id``, recovers its
+    findings off the GitHub message bus
+    (:func:`coord.review.fetch_review_findings_from_github` — interactive
+    reviews never land a parseable local log, so GitHub is the one store
+    every machine already reaches), extracts the "## Blocking findings"
+    section (:func:`coord.review.extract_blocking_section`) and splits it
+    (:func:`coord.board_doctor_followthrough.split_blocking_findings`).
+
+    Returns ``[]`` on any failure to resolve a review, an assignment id, or
+    a findings body — the fail-safe "nothing to classify" answer
+    :func:`coord.board_doctor_followthrough.classify_split_findings` already
+    reads as ineligible, never a crash.
+    """
+    from coord.diagnose import stage_assignments  # noqa: PLC0415
+    from coord.review import extract_blocking_section, fetch_review_findings_from_github  # noqa: PLC0415
+
+    reviews = stage_assignments(board, repo_name, issue_number, "review")
+    if not reviews:
+        return []
+    latest = reviews[0]
+    if not latest.assignment_id:
+        return []
+    github_repo = _github_slug(repo_name, config)
+    try:
+        findings = fetch_review_findings_from_github(
+            github_repo, issue_number, latest.assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — a flaky/unreachable fetch reads as "nothing to classify"
+        return []
+    if findings is None:
+        return []
+    blocking = extract_blocking_section(findings.body)
+    if not blocking:
+        return []
+    return board_doctor_followthrough.split_blocking_findings(blocking)
+
+
+def run_auto_split_for_row(
+    repo_name: str, issue_number: int, *, config: Any, board: Board,
+    dry_run: bool = False,
+    findings_fetcher: Callable[..., list[str]] = latest_review_blocking_findings,
+    writer: board_doctor_followthrough.FollowThroughWriter | None = None,
+    reset_review: Callable[[str, int], None] | None = None,
+) -> board_doctor_followthrough.Disposition | None:
+    """Production entry point :func:`coord.board_doctor_policy._investigate`
+    calls, instead of its own :func:`_alert_fallback`, for a row that has
+    given up on the #2972 fix-round ceiling (#4034).
+
+    Returns ``None`` — never a disposition — for every reason the caller
+    must fall back to its own alert path: the repo hasn't opted in
+    (:func:`~coord.board_doctor_followthrough.auto_split_enabled`), there is
+    no live drive-queue row for ``(repo_name, issue_number)`` any more, or
+    the latest review's remaining blocking findings don't classify as
+    missing-scope-only (:func:`~coord.board_doctor_followthrough.
+    classify_split_findings`). A real :class:`~coord.board_doctor_
+    followthrough.Disposition` is returned only once a split has actually
+    been attempted — the caller still must check ``disposition.action``
+    before treating this as handled (#2096: returning a disposition at all
+    is not the same as confirming it filed).
+    """
+    if not board_doctor_followthrough.auto_split_enabled(repo_name, config):
+        return None
+
+    from coord.drive_queue import QueueEntry  # noqa: PLC0415
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(repo_name, issue_number)
+    if row is None:
+        return None
+    entry = QueueEntry.from_row(row)
+
+    findings = findings_fetcher(repo_name, issue_number, board=board, config=config)
+    classification = board_doctor_followthrough.classify_split_findings(findings)
+    if not classification.eligible:
+        return None
+
+    candidate = build_auto_split_candidate(
+        repo_name, issue_number, config=config, entry=entry,
+        findings=classification.findings,
+    )
+    row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
+
+    def _default_reset_review(_repo: str, _issue: int) -> None:
+        from coord.diagnose import diagnose_stage  # noqa: PLC0415
+
+        diagnose_stage(board, config, _repo, _issue, "review", reset=True, dry_run=dry_run)
+
+    return board_doctor_followthrough.run_auto_split(
+        candidate,
+        writer=row_writer,
+        alert=lambda subject, body, _r=repo_name, _n=issue_number: _followthrough_notify(
+            _r, _n, "board-doctor:auto-split-alert", subject, body,
+        ),
+        dry_run=dry_run,
+        reset_review=reset_review or _default_reset_review,
+    )
+
+
 def dispatch_plan_leg(
     prompt: str,
     *,

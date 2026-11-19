@@ -2058,6 +2058,45 @@ def _release_leaked_review_claim_for_row(
     return released
 
 
+def _try_auto_split(repo_name: str, issue_number: int) -> bool:
+    """#4034: attempt the board-doctor auto-split disposition for a
+    ceiling-blocked row that is NOT eligible for the fix-it rebudget
+    exemption, instead of falling straight to :func:`_alert_fallback`.
+
+    Loads its own config (the caller's own `config` is not yet resolved at
+    this point in :func:`_investigate` — the ceiling check runs before that)
+    and builds its own board, so a caller that declines this (for ANY
+    reason — the repo hasn't opted in, config failed to load, the row's
+    queue entry is already gone, or the latest review's remaining blocking
+    findings don't classify as missing-scope-only) falls through to the
+    existing alert-fallback behaviour completely unaffected.
+
+    Returns ``True`` only when `coord.board_doctor.run_auto_split_for_row`
+    returns a disposition AND that disposition's own ``action`` confirms
+    ``ACTION_AUTO_SPLIT_FILED`` — never merely because a disposition object
+    came back (#2096: a write-failed disposition still alerted on its own,
+    so returning `True` for it here would both double-alert AND tell the
+    caller a human page never fired for a row that, in fact, still needs
+    one).
+    """
+    from coord.board_doctor import run_auto_split_for_row  # noqa: PLC0415
+    from coord.board_doctor_followthrough import ACTION_AUTO_SPLIT_FILED  # noqa: PLC0415
+    from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
+
+    try:
+        config = resolve_and_load_config(None)
+    except ConfigError:
+        return False
+
+    from coord.state import build_board  # noqa: PLC0415
+
+    board = build_board()
+    disposition = run_auto_split_for_row(
+        repo_name, issue_number, config=config, board=board,
+    )
+    return disposition is not None and disposition.action == ACTION_AUTO_SPLIT_FILED
+
+
 def _investigate(row: StuckRow) -> bool:
     """#3769's C1 wiring: dispatch a fix-it leg for an alert-eligible
     cause instead of paging a human outright.
@@ -2140,6 +2179,8 @@ def _investigate(row: StuckRow) -> bool:
     ceiling_bypassed = False
     if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
         if not _fixit_rebudget_eligible(row, repo_name, issue_number):
+            if _try_auto_split(repo_name, issue_number):
+                return True
             click.echo(
                 f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
                 "— its drive-queue row already gave up on the fix-round ceiling "
