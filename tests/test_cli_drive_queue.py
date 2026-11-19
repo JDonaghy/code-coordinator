@@ -9157,6 +9157,107 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     assert state.get_drive_escalation(REPO, 1762) is None
 
 
+def test_sweep_resolves_the_github_slug_for_a_dequeued_predicted_target(
+    cli, monkeypatch,
+):
+    """The dequeued-and-open check this pass runs must address GitHub by
+    the configured `github:` slug, never the local `coordinator.yml` repo
+    name — this fixture's own REPO ("claude-coordinator") differs from its
+    slug ("john/claude-coordinator") exactly the way the fleet's real repos
+    do. A bare local name would make `gh` error, the check would read
+    "could not tell" and fail closed, and the edge would be kept forever."""
+    from coord.audit import record_audit
+    from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED
+    from coord.state import enqueue_drive_queue
+
+    enqueue_drive_queue(REPO, 1762, after=[f"{REPO}#9999"])
+    record_audit(
+        tier="business",
+        category=AUDIT_CATEGORY,
+        event_type=EVENT_PREDICTED,
+        actor="drive-queue",
+        summary="predicted file overlap",
+        repo=REPO,
+        issue=1762,
+        details={"applied_after": [f"{REPO}#9999"], "after": [f"{REPO}#9999"]},
+    )
+    seen_repos: list[str] = []
+
+    def _get_issue_state(repo: str, issue: int) -> str:
+        seen_repos.append(repo)
+        return "open"
+
+    monkeypatch.setattr("coord.github_ops.get_issue_state", _get_issue_state)
+
+    result = cli("sweep")
+
+    assert result.exit_code == 0, result.output
+    assert seen_repos == ["john/claude-coordinator"]
+    assert f"edge dropped: {REPO}#9999 (predicted, target dequeued)" in result.output
+    [entry] = [
+        e for e in state.list_drive_queue() if e["issue_number"] == 1762
+    ]
+    assert entry["after_json"] == []
+
+
+def test_sweep_json_includes_dropped_predicted_after_edges(cli, monkeypatch):
+    """The ``--json`` payload must carry the same drop note the text mode
+    prints — a caller parsing JSON must see it too, not just a human
+    reading stdout."""
+    from coord.audit import record_audit
+    from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED
+    from coord.state import enqueue_drive_queue
+
+    enqueue_drive_queue(REPO, 1763, after=[f"{REPO}#9998"])
+    record_audit(
+        tier="business",
+        category=AUDIT_CATEGORY,
+        event_type=EVENT_PREDICTED,
+        actor="drive-queue",
+        summary="predicted file overlap",
+        repo=REPO,
+        issue=1763,
+        details={"applied_after": [f"{REPO}#9998"], "after": [f"{REPO}#9998"]},
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue_state", lambda repo, issue: "open")
+
+    result = cli("sweep", "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["dropped_predicted_after_edges"] == [
+        f"{REPO}#1763: edge dropped: {REPO}#9998 (predicted, target dequeued)"
+    ]
+
+
+def test_sweep_reports_a_dropped_edge_even_with_nothing_else_stuck(cli, monkeypatch):
+    """A sweep that observes no stuck drive-queue/merge-queue/baseline-red
+    row must still surface a dropped predicted edge, not swallow it under
+    the generic "nothing stuck" message."""
+    from coord.audit import record_audit
+    from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED
+    from coord.state import enqueue_drive_queue
+
+    enqueue_drive_queue(REPO, 1764, after=[f"{REPO}#9997"])
+    record_audit(
+        tier="business",
+        category=AUDIT_CATEGORY,
+        event_type=EVENT_PREDICTED,
+        actor="drive-queue",
+        summary="predicted file overlap",
+        repo=REPO,
+        issue=1764,
+        details={"applied_after": [f"{REPO}#9997"], "after": [f"{REPO}#9997"]},
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue_state", lambda repo, issue: "open")
+
+    result = cli("sweep")
+
+    assert result.exit_code == 0, result.output
+    assert "nothing stuck" not in result.output
+    assert f"edge dropped: {REPO}#9997 (predicted, target dequeued)" in result.output
+
+
 def test_doctor_log_reads_back_recorded_decisions(cli):
     """The durable decision log, read through the CLI the same shape
     `sweep` writes it in — filterable, and summarizable."""

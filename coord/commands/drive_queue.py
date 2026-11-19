@@ -3577,12 +3577,19 @@ def drive_queue_sweep(
                         }
                         for f in report.followthrough
                     ],
+                    "dropped_predicted_after_edges": list(
+                        report.dropped_predicted_after_edges
+                    ),
                 }
             )
         )
         return
 
-    if not report.decisions and not report.followthrough:
+    if (
+        not report.decisions
+        and not report.followthrough
+        and not report.dropped_predicted_after_edges
+    ):
         if mechanical_only:
             # #4027 review: this invocation deliberately dropped every
             # non-mechanical row before classification (see
@@ -3634,6 +3641,14 @@ def drive_queue_sweep(
             )
         for reason in f.reasons:
             click.echo(f"  reason: {reason}")
+    # Its own section, independent of the tier loop and the follow-through
+    # pass above: a dropped predicted `after=` edge is neither a `Decision`
+    # nor a `Disposition`, and may be the ONLY thing this round touched —
+    # the early "nothing stuck" return above already accounts for that.
+    if report.dropped_predicted_after_edges:
+        click.echo("\ndropped predicted after= edge(s):")
+        for note in report.dropped_predicted_after_edges:
+            click.echo(f"  {note}")
     if dry_run:
         if report.followthrough:
             click.echo(
@@ -3644,7 +3659,7 @@ def drive_queue_sweep(
             )
         else:
             click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
-    else:
+    elif report.decisions or report.followthrough:
         click.echo(
             f"{report.rows_observed} row(s) observed and decided — read the log later with "
             "`coord drive-queue doctor-log`"

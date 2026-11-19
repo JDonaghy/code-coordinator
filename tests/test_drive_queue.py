@@ -1343,6 +1343,71 @@ def test_entries_from_rows_types_after_json_in_either_encoding():
     assert typed[2].after == ()
 
 
+# ── write_queue_after / record_predicted_after_drop ─────────────────────────
+
+
+def test_write_queue_after_replaces_edges_without_touching_the_gate(coord_db):
+    """A fired deploy gate and an already-consumed fix-round baseline must
+    survive a write that only means to drop a stale `after=` edge — unlike
+    `enqueue_drive_queue`'s own full-row upsert, which would re-arm the gate
+    and restamp the baseline on every call."""
+    from coord.drive_queue import HOLD_FIRED, entries_from_rows, write_queue_after
+    from coord.state import enqueue_drive_queue, list_drive_queue, update_drive_queue_entry
+
+    enqueue_drive_queue(
+        REPO, 42, after=["acme#1", "acme#2"], hold_after=True,
+    )
+    update_drive_queue_entry(REPO, 42, hold_state=HOLD_FIRED, hold_probes=3)
+
+    [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 42]
+    write_queue_after(entry, ["acme#2"])
+
+    [row] = [r for r in list_drive_queue() if r["issue_number"] == 42]
+    assert row["after_json"] == ["acme#2"]
+    assert row["hold_state"] == HOLD_FIRED
+    assert row["hold_probes"] == 3
+
+
+def test_record_predicted_after_drop_writes_last_reason_and_audit_row(coord_db):
+    from coord.audit import query_audit_log
+    from coord.drive_queue import QueueEntry, record_predicted_after_drop
+    from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED_DROPPED
+    from coord.state import enqueue_drive_queue, list_drive_queue
+
+    enqueue_drive_queue(REPO, 43, after=["acme#1"])
+    entry = QueueEntry(repo=REPO, issue=43, after=("acme#1",))
+
+    record_predicted_after_drop(entry, [("acme#1", "blocked")])
+
+    [row] = [r for r in list_drive_queue() if r["issue_number"] == 43]
+    assert row["last_reason"] == "edge dropped: acme#1 (predicted, target blocked)"
+    logged = query_audit_log(
+        event_type=EVENT_PREDICTED_DROPPED, category=AUDIT_CATEGORY,
+        repo=REPO, issue=43,
+    )
+    assert len(logged["entries"]) == 1
+
+
+def test_record_predicted_after_drop_is_a_noop_with_nothing_to_record(coord_db):
+    from coord.audit import query_audit_log
+    from coord.drive_queue import QueueEntry, record_predicted_after_drop
+    from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED_DROPPED
+    from coord.state import enqueue_drive_queue, list_drive_queue
+
+    enqueue_drive_queue(REPO, 44, after=["acme#1"])
+    entry = QueueEntry(repo=REPO, issue=44, after=("acme#1",))
+
+    record_predicted_after_drop(entry, [])
+
+    [row] = [r for r in list_drive_queue() if r["issue_number"] == 44]
+    assert row["last_reason"] == ""
+    logged = query_audit_log(
+        event_type=EVENT_PREDICTED_DROPPED, category=AUDIT_CATEGORY,
+        repo=REPO, issue=44,
+    )
+    assert logged["entries"] == []
+
+
 # ── compute_leg_counts: per-issue assignment leg counts (#3060) ─────────────
 
 
