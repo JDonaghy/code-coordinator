@@ -112,6 +112,18 @@ class BoardDoctorRepoConfig:
     disposition files, pinned to a machine that declares the follow-up's
     capability. `False` (the default) files follow-ups but never queues
     them. It has no effect unless ``followthrough`` is also enabled.
+
+    ``auto_refile`` is this repo's opt-in to the #4038 auto-refile
+    disposition: a drive-queue row the #3376 structural dispatch-liveness
+    gate refused permanently because one of the issue's own
+    ``issue-{N}-*`` branches already merged (`coord.dispatch_liveness.
+    is_branch_merged_guard_refusal_reason`) — a shape no retry can ever
+    clear, since the guard refuses the SAME dispatch again every time.
+    `False` (the default) leaves such a row exactly as before: the doctor
+    alerts but never writes. `coord.board_doctor_followthrough.
+    auto_refile_enabled` is the single function that reads this alongside
+    the fleet-wide kill switch (`Config.board_doctor.auto_refile`) and its
+    `COORD_BOARD_DOCTOR_NO_AUTO_REFILE` env-var override.
     """
 
     investigate: bool = False
@@ -119,6 +131,7 @@ class BoardDoctorRepoConfig:
     stale_race: bool = True
     followthrough: bool = False
     followthrough_auto_queue: bool = False
+    auto_refile: bool = False
 
 
 @dataclass

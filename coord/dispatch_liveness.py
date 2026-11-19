@@ -73,10 +73,12 @@ __all__ = [
     "record_dispatch_refusal",
     "github_issue_liveness_fetcher",
     "is_credential_probe_refusal_reason",
+    "is_branch_merged_guard_refusal_reason",
     "PREDICATE_ISSUE_CLOSED",
     "PREDICATE_BRANCH_MERGED",
     "PREDICATE_MACHINE_UNHEALTHY",
     "CREDENTIAL_PROBE_REFUSAL_MARKER",
+    "BRANCH_MERGED_GUARD_MARKER",
 ]
 
 PREDICATE_ISSUE_CLOSED = "issue_closed"
@@ -97,6 +99,17 @@ EVENT_DISPATCH_REFUSED = "dispatch_refused_liveness"
 # differently on the very next tick — so it deliberately carries none of
 # `coord.drive_queue._PERMANENT_BLOCK_MARKERS`' own text.
 CREDENTIAL_PROBE_REFUSAL_MARKER = "[credential-probe-refusal #4004]"
+
+# #4038: embedded verbatim in the `PREDICATE_BRANCH_MERGED` reason only —
+# distinguishes THIS one predicate's standing, permanent refusal from
+# `PREDICATE_ISSUE_CLOSED`'s (same marker-based recognition posture as
+# `CREDENTIAL_PROBE_REFUSAL_MARKER` above). `coord.board_doctor`'s
+# auto-refile disposition needs exactly this distinction: an issue that is
+# merely closed needs nothing done, but one whose `issue-{N}-*` branch
+# already merged while the issue itself is still open has real remaining
+# work this guard can never let dispatch again, and that remainder needs a
+# fresh issue number to be driven under.
+BRANCH_MERGED_GUARD_MARKER = "[branch-merged-guard-refusal #4038]"
 
 
 @dataclass(frozen=True)
@@ -157,7 +170,7 @@ def check_dispatch_liveness(
             reason=(
                 f"{repo_name}#{issue_number}'s branch has already merged "
                 "into the target branch — dispatching now cannot matter "
-                "(#3376)"
+                f"(#3376). {BRANCH_MERGED_GUARD_MARKER}"
             ),
         )
     if machine_healthy is False:
@@ -205,6 +218,28 @@ def is_credential_probe_refusal_reason(text: str | None) -> bool:
     if not text:
         return False
     return CREDENTIAL_PROBE_REFUSAL_MARKER in text
+
+
+def is_branch_merged_guard_refusal_reason(text: str | None) -> bool:
+    """Does *text* (a stored `last_reason`/exit message) name THIS
+    predicate — :data:`PREDICATE_BRANCH_MERGED` — specifically, as opposed
+    to the other two `check_dispatch_liveness` predicates or any unrelated
+    `(#1844)`-shaped guard refusal that also exits `EXIT_DISPATCH_REFUSED`?
+
+    Marker-based (:data:`BRANCH_MERGED_GUARD_MARKER`), same convention as
+    :func:`is_credential_probe_refusal_reason`. `coord.board_doctor` is the
+    one caller: it recognises a drive-queue row the #3376 guard refused
+    permanently for THIS reason — an open issue whose branch already
+    merged, with real remaining work this guard can never let dispatch
+    again — and offers to refile the remainder under a fresh issue number
+    (#4038), which the other two predicates never need (a closed issue
+    needs nothing done; a machine-health refusal is re-evaluable, not
+    permanent, and already routed elsewhere by
+    :func:`is_credential_probe_refusal_reason`).
+    """
+    if not text:
+        return False
+    return BRANCH_MERGED_GUARD_MARKER in text
 
 
 def github_issue_liveness_fetcher(

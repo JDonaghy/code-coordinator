@@ -22,6 +22,7 @@ from coord import board_doctor_followthrough as ft
 from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
+    CAUSE_BRANCH_MERGED_GUARD,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     CAUSE_CHECKS_STALE_RACE,
     CAUSE_MERGE_NEVER_ATTEMPTED,
@@ -37,11 +38,14 @@ from coord.board_doctor import (
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
+    _reclassify_branch_merged_guard,
     _reclassify_ceiling_blocked,
     _reclassify_checks_stale_race,
     _reclassify_merge_never_attempted,
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
+    branch_merged_guard_rows,
+    build_refile_candidate,
     dispatch_plan_leg,
     drive_queue_rows,
     drop_stale_predicted_after_edges,
@@ -50,6 +54,8 @@ from coord.board_doctor import (
     no_progress_rows,
     predicted_after_target_drop_reason,
     run_followthrough_sweep,
+    run_pending_refile_close_sweep,
+    run_refile_sweep,
     smoke_no_verdict_rows,
     stranded_prereq_dep,
     stranded_prereq_guard,
@@ -6855,3 +6861,450 @@ class TestSelfCorrectionAfterDropIsExistingBehaviour:
         )
 
         assert prediction.after_keys == ("quadraui#2532",)
+
+
+class TestBranchMergedGuardRows:
+    """:func:`branch_merged_guard_rows` — the `StuckRow` source that feeds
+    :func:`run_refile_sweep` (#4038)."""
+
+    def test_a_branch_merged_guard_entry_is_flagged(self) -> None:
+        from coord.dispatch_liveness import BRANCH_MERGED_GUARD_MARKER
+
+        entry = QueueEntry(
+            repo="quadraui", issue=2467, state=STATE_BLOCKED,
+            last_reason=(
+                "quadraui#2467's branch has already merged into the target "
+                f"branch — dispatching now cannot matter (#3376). "
+                f"{BRANCH_MERGED_GUARD_MARKER} — refused by a pre-dispatch "
+                "guard, which cannot change on retry (#1844); blocking "
+                "without spending an attempt"
+            ),
+        )
+        [row] = branch_merged_guard_rows([entry])
+        assert row.key == "quadraui#2467"
+        assert row.queue == "drive-queue"
+        assert row.cause == CAUSE_BRANCH_MERGED_GUARD
+        assert row.fresh is True
+
+    def test_a_plain_blocked_entry_is_not_flagged(self) -> None:
+        plain = QueueEntry(
+            repo="quadraui", issue=1, state=STATE_BLOCKED,
+            last_reason="refused by a pre-dispatch guard (#1844)",
+        )
+        waiting = QueueEntry(repo="quadraui", issue=2, state=STATE_WAITING)
+        assert branch_merged_guard_rows([plain, waiting]) == []
+
+
+class TestReclassifyBranchMergedGuard:
+    """:func:`_reclassify_branch_merged_guard` must win over whatever cause
+    the episode walk already assigned, since the marker is deterministic
+    and the episode walk's own guess can be wrong (#4038)."""
+
+    def test_overrides_an_existing_generic_cause(self) -> None:
+        from coord.dispatch_liveness import BRANCH_MERGED_GUARD_MARKER
+
+        entry = QueueEntry(
+            repo="quadraui", issue=2467, state=STATE_BLOCKED,
+            last_reason=f"some refusal text {BRANCH_MERGED_GUARD_MARKER}",
+        )
+        row = StuckRow(
+            queue="drive-queue", key="quadraui#2467", state=STATE_BLOCKED,
+            cause=queue_diagnose.CAUSE_UNKNOWN, confidence="low",
+        )
+        [reclassified] = _reclassify_branch_merged_guard(
+            [row], {"quadraui#2467": entry},
+        )
+        assert reclassified.cause == CAUSE_BRANCH_MERGED_GUARD
+
+    def test_leaves_an_unrelated_row_untouched(self) -> None:
+        entry = QueueEntry(
+            repo="quadraui", issue=9, state=STATE_BLOCKED,
+            last_reason="refused by a pre-dispatch guard (#1844)",
+        )
+        row = StuckRow(
+            queue="drive-queue", key="quadraui#9", state=STATE_BLOCKED,
+            cause=queue_diagnose.CAUSE_GATE_BLOCKED, confidence="high",
+        )
+        [reclassified] = _reclassify_branch_merged_guard(
+            [row], {"quadraui#9": entry},
+        )
+        assert reclassified.cause == queue_diagnose.CAUSE_GATE_BLOCKED
+
+
+class TestBuildRefileCandidate:
+    """:func:`build_refile_candidate` — the real (best-effort)
+    :class:`~coord.board_doctor_followthrough.RefileCandidate` builder."""
+
+    def test_pulls_issue_epic_and_queue_snapshot(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        def fake_get_issue(repo, number):
+            if number == 2467:
+                return {
+                    "number": 2467, "title": "Py-port the app layer",
+                    "body": "Do A. Do B.", "milestone": {"title": "M1"},
+                    "labels": [{"name": "backend:python"}],
+                }
+            raise AssertionError(f"unexpected issue number {number}")
+
+        monkeypatch.setattr("coord.github_ops.get_issue", fake_get_issue)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_parent", lambda repo, number: {"number": 50},
+        )
+        entry = QueueEntry(
+            repo="quadraui", issue=2467, position=3, state=STATE_BLOCKED,
+            after=("quadraui#2400",), machine="precision",
+        )
+
+        candidate = board_doctor_mod.build_refile_candidate(
+            "quadraui", 2467, config=Config(repos=[], machines=[]), entry=entry,
+        )
+
+        assert candidate.repo_name == "quadraui" and candidate.issue_number == 2467
+        assert candidate.title == "Py-port the app layer"
+        assert candidate.epic_number == 50
+        assert candidate.milestone == "M1"
+        assert candidate.labels == ("backend:python",)
+        assert candidate.queue_position == 3
+        assert candidate.queue_after == ("quadraui#2400",)
+        assert candidate.queue_machine == "precision"
+
+
+class _FakeRefileWriter:
+    def __init__(self, *, new_number: int = 2739) -> None:
+        self.new_number = new_number
+        self.created: list[tuple[str, str]] = []
+        self.closed: list[int] = []
+        self.commented: list[tuple[int, str]] = []
+        self.epic_bodies: dict[int, str] = {}
+        self.linked: list[tuple[int, int]] = []
+
+    def create_issue(self, repo_name, *, title, body, milestone, labels=()):
+        self.created.append((title, body))
+        return self.new_number
+
+    def add_child(self, repo_name, *, epic, child, after):
+        self.linked.append((epic, child))
+
+    def get_issue_body(self, repo_name, number):
+        return self.epic_bodies.get(number, "")
+
+    def set_issue_body(self, repo_name, number, body):
+        self.epic_bodies[number] = body
+
+    def close_issue(self, repo_name, number, *, comment):
+        self.closed.append(number)
+
+    def comment_issue(self, repo_name, number, *, body):
+        self.commented.append((number, body))
+
+
+class TestRunRefileSweep:
+    """:func:`run_refile_sweep` — the production wiring between a
+    `branch-merged-guard` :class:`StuckRow` and
+    :func:`coord.board_doctor_followthrough.run_refile` (#4038)."""
+
+    @staticmethod
+    def _config(*, opted_in: bool = True) -> Config:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_refile=opted_in),
+        )
+        return Config(repos=[repo], machines=[])
+
+    @staticmethod
+    def _fake_plan_leg(remainder_on_default_branch: bool, evidence: str = "e"):
+        import json as _json
+
+        def leg(prompt, *, partial, config):
+            payload = {
+                "remainder_on_default_branch": remainder_on_default_branch,
+                "evidence": evidence,
+            }
+            return ft.PlanLegResult(
+                assignment_id="plan-1", output="```json\n" + _json.dumps(payload) + "\n```",
+            )
+        return leg
+
+    def _row(self, issue: int = 2467) -> StuckRow:
+        return StuckRow(
+            queue="drive-queue", key=f"quadraui#{issue}", state=STATE_BLOCKED,
+            cause=CAUSE_BRANCH_MERGED_GUARD, confidence="high",
+        )
+
+    def _stub_get_issue(self, monkeypatch, *, epic_number: int | None = None) -> None:
+        def fake_get_issue(repo, number):
+            return {"number": number, "title": "T", "body": "B"}
+        monkeypatch.setattr("coord.github_ops.get_issue", fake_get_issue)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_parent",
+            lambda repo, number: {"number": epic_number} if epic_number else None,
+        )
+
+    def test_remainder_absent_refiles_moves_the_row_and_repoints_dependents(
+        self, monkeypatch,
+    ) -> None:
+        """The #2467 shape: a guard refusal with the remainder still
+        missing produces a refile, a moved drive-queue row (same position,
+        same `after=`), and a re-pointed dependent."""
+        self._stub_get_issue(monkeypatch)
+        state.enqueue_drive_queue("quadraui", 2467, after=["quadraui#2400"])
+        state.enqueue_drive_queue("quadraui", 2468, after=["quadraui#2467"])
+        writer = _FakeRefileWriter(new_number=2739)
+
+        dispositions = run_refile_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(False, "B is not on develop"),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        disposition = dispositions[0]
+        assert disposition.action == ft.ACTION_REFILE_FILED
+        assert disposition.follow_ups == [2739]
+        assert writer.created and writer.created[0][0] == "T (refile of #2467)"
+        assert writer.commented and writer.commented[0][0] == 2467
+        assert writer.closed == []  # not closed yet — deferred to step 4
+
+        rows = state.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert 2467 not in by_issue
+        assert 2739 in by_issue
+        assert by_issue[2739]["after_json"] == ["quadraui#2400"]
+        assert by_issue[2468]["after_json"] == ["quadraui#2739"]
+
+    def test_remainder_present_closes_the_issue_as_done(self, monkeypatch) -> None:
+        self._stub_get_issue(monkeypatch)
+        state.enqueue_drive_queue("quadraui", 2467)
+        writer = _FakeRefileWriter()
+
+        dispositions = run_refile_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(True, "B already on develop"),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 1
+        assert dispositions[0].action == ft.ACTION_REFILE_ALL_LANDED
+        assert writer.closed == [2467]
+        assert writer.created == []
+
+    def test_a_repo_without_opt_in_is_skipped(self, monkeypatch) -> None:
+        state.enqueue_drive_queue("quadraui", 2467)
+        dispositions = run_refile_sweep(
+            [self._row()], config=self._config(opted_in=False),
+            issue_open=lambda r, n: True,
+        )
+        assert dispositions == []
+
+    def test_an_already_closed_issue_is_skipped(self, monkeypatch) -> None:
+        state.enqueue_drive_queue("quadraui", 2467)
+        dispositions = run_refile_sweep(
+            [self._row()], config=self._config(), issue_open=lambda r, n: False,
+        )
+        assert dispositions == []
+
+    def test_a_row_with_no_matching_queue_entry_is_skipped(self, monkeypatch) -> None:
+        """The original row was already refiled by an earlier iteration
+        (or a concurrent writer) — retrying would refile it twice."""
+        dispositions = run_refile_sweep(
+            [self._row()], config=self._config(), issue_open=lambda r, n: True,
+        )
+        assert dispositions == []
+
+
+class TestRunPendingRefileCloseSweep:
+    """:func:`run_pending_refile_close_sweep` — step 4's deferred close:
+    "once the refile merges, close #N as superseded" (#4038)."""
+
+    def test_closes_the_original_once_the_refile_is_observed_closed(self) -> None:
+        state.record_board_doctor_decision({
+            "queue": "drive-queue",
+            "key": "quadraui#2467",
+            "cause": CAUSE_BRANCH_MERGED_GUARD,
+            "action": ft.ACTION_REFILE_FILED,
+            "dry_run": False,
+            "plan_leg_assignment_id": "plan-1",
+            "follow_ups": [2739],
+            "follow_up_keys": {"refile": 2739},
+            "deduped": {},
+            "queued": {},
+            "reasons": [],
+            "evidence": [ft.PENDING_REFILE_CLOSE_EVIDENCE_PREFIX + '{"refile_issue": 2739}'],
+        })
+        writer = _FakeRefileWriter()
+
+        results = run_pending_refile_close_sweep(
+            config=Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[]),
+            issue_closed=lambda repo, number: number == 2739,
+            writer=writer,
+        )
+
+        assert len(results) == 1
+        assert results[0]["action"] == ft.ACTION_REFILE_SUPERSEDED
+        assert writer.closed == [2467]
+
+    def test_leaves_it_alone_while_the_refile_is_still_open(self) -> None:
+        state.record_board_doctor_decision({
+            "queue": "drive-queue",
+            "key": "quadraui#2467",
+            "cause": CAUSE_BRANCH_MERGED_GUARD,
+            "action": ft.ACTION_REFILE_FILED,
+            "dry_run": False,
+            "plan_leg_assignment_id": "plan-1",
+            "follow_ups": [2739],
+            "follow_up_keys": {"refile": 2739},
+            "deduped": {},
+            "queued": {},
+            "reasons": [],
+            "evidence": [ft.PENDING_REFILE_CLOSE_EVIDENCE_PREFIX + '{"refile_issue": 2739}'],
+        })
+        writer = _FakeRefileWriter()
+
+        results = run_pending_refile_close_sweep(
+            config=Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[]),
+            issue_closed=lambda repo, number: False,
+            writer=writer,
+        )
+
+        assert results == []
+        assert writer.closed == []
+
+    def test_dry_run_writes_nothing(self) -> None:
+        state.record_board_doctor_decision({
+            "queue": "drive-queue",
+            "key": "quadraui#2467",
+            "cause": CAUSE_BRANCH_MERGED_GUARD,
+            "action": ft.ACTION_REFILE_FILED,
+            "dry_run": False,
+            "plan_leg_assignment_id": "plan-1",
+            "follow_ups": [2739],
+            "follow_up_keys": {"refile": 2739},
+            "deduped": {},
+            "queued": {},
+            "reasons": [],
+            "evidence": [ft.PENDING_REFILE_CLOSE_EVIDENCE_PREFIX + '{"refile_issue": 2739}'],
+        })
+        writer = _FakeRefileWriter()
+
+        results = run_pending_refile_close_sweep(
+            config=Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[]),
+            issue_closed=lambda repo, number: True,
+            writer=writer,
+            dry_run=True,
+        )
+
+        assert len(results) == 1 and results[0]["action"] == "would-close"
+        assert writer.closed == []
+
+
+class TestAutoRefileEnabled:
+    """:func:`coord.board_doctor_followthrough.auto_refile_enabled` — the
+    #4038 opt-in gate: ``board_doctor.auto_refile: true`` fleet-wide AND
+    the per-repo opt-in."""
+
+    def test_disabled_by_default(self) -> None:
+        repo = Repo(name="quadraui", github="acme/quadraui")
+        config = Config(repos=[repo], machines=[])
+        assert ft.auto_refile_enabled("quadraui", config) is False
+
+    def test_enabled_when_both_opt_in(self) -> None:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_refile=True),
+        )
+        config = Config(repos=[repo], machines=[])
+        assert ft.auto_refile_enabled("quadraui", config) is True
+
+    def test_fleet_kill_switch_disarms_a_repo_that_opted_in(self) -> None:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_refile=True),
+        )
+        config = Config(
+            repos=[repo], machines=[], board_doctor=BoardDoctorConfig(auto_refile=False),
+        )
+        assert ft.auto_refile_enabled("quadraui", config) is False
+
+
+class TestRunRefileDirect:
+    """:func:`coord.board_doctor_followthrough.run_refile` exercised
+    directly (not through the sweep) — the epic sub-issue swap and the
+    depth limit, which :class:`TestRunRefileSweep` does not touch."""
+
+    @staticmethod
+    def _candidate(**overrides) -> "ft.RefileCandidate":
+        base = dict(
+            repo_name="quadraui", issue_number=2467, title="Py-port",
+            body="Do A. Do B.", github_repo="acme/quadraui",
+        )
+        base.update(overrides)
+        return ft.RefileCandidate(**base)
+
+    @staticmethod
+    def _fake_plan_leg(remainder_on_default_branch: bool):
+        import json as _json
+
+        def leg(prompt):
+            payload = {"remainder_on_default_branch": remainder_on_default_branch}
+            return ft.PlanLegResult(
+                assignment_id="plan-1", output="```json\n" + _json.dumps(payload) + "\n```",
+            )
+        return leg
+
+    def test_refile_swaps_the_old_reference_in_the_epic_body(self) -> None:
+        writer = _FakeRefileWriter(new_number=2739)
+        writer.epic_bodies[50] = "## Sub-issues\n- [ ] #2467 — app layer\n"
+        candidate = self._candidate(epic_number=50)
+        recorded: list[dict] = []
+
+        disposition = ft.run_refile(
+            candidate,
+            plan_leg=self._fake_plan_leg(False),
+            writer=writer,
+            alert=lambda *a: None,
+            record=recorded.append,
+            requeue=lambda candidate, new_number: None,
+        )
+
+        assert disposition.action == ft.ACTION_REFILE_FILED
+        assert writer.linked == [(50, 2739)]
+        assert "#2739" in writer.epic_bodies[50]
+        assert "#2467" not in writer.epic_bodies[50]
+        assert recorded and recorded[0]["action"] == ft.ACTION_REFILE_FILED
+
+    def test_depth_limit_pages_instead_of_recursing(self) -> None:
+        candidate = self._candidate(
+            body=f"B\n{ft.REFILE_MARKER.format(issue=1)}",
+        )
+        writer = _FakeRefileWriter()
+        paged: list[tuple[str, str]] = []
+
+        def boom_plan_leg(prompt):
+            raise AssertionError("must not dispatch a plan leg for a depth-limited row")
+
+        disposition = ft.run_refile(
+            candidate, plan_leg=boom_plan_leg, writer=writer,
+            alert=lambda subject, body: paged.append((subject, body)),
+            record=lambda entry: None,
+        )
+
+        assert disposition.action == ft.ACTION_REFILE_DEPTH_PAGED
+        assert writer.created == [] and writer.closed == []
+        assert len(paged) == 1
+
+    def test_refile_note_is_present_in_the_filed_body(self) -> None:
+        writer = _FakeRefileWriter(new_number=2739)
+        candidate = self._candidate()
+
+        ft.run_refile(
+            candidate, plan_leg=self._fake_plan_leg(False), writer=writer,
+            alert=lambda *a: None, record=lambda entry: None,
+            requeue=lambda candidate, new_number: None,
+        )
+
+        [(title, body)] = writer.created
+        assert title == "Py-port (refile of #2467)"
+        assert "Refiled from #2467 for execution" in body
+        assert "issue-2467-*" in body
+        assert "#3376" in body
