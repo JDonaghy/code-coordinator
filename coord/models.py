@@ -135,6 +135,18 @@ class BoardDoctorRepoConfig:
     auto_split_enabled` is the single function that reads this alongside
     the fleet-wide kill switch (`Config.board_doctor.auto_split`) and its
     `COORD_BOARD_DOCTOR_NO_AUTO_SPLIT` env-var override.
+
+    ``config_drift_autofix`` is this repo's opt-in to the #4035
+    config-drift disposition: a Test-stage command still names a cargo
+    ``--example``/``--bin``/``--test``/``--bench`` target a branch's own
+    diff deletes outright (quadraui#2695's shape) — no amount of retrying
+    the branch ever clears it, since the command, not the code, is wrong.
+    `False` (the default) leaves such a row exactly as before: the doctor
+    alerts, naming the exact one-line patch, but never writes
+    ``coordinator.yml`` itself. `coord.board_doctor_policy.
+    _config_drift_autofix_enabled` is the single function that reads this
+    alongside the fleet-wide kill switch (`Config.board_doctor.
+    config_drift_autofix`).
     """
 
     investigate: bool = False
@@ -144,6 +156,7 @@ class BoardDoctorRepoConfig:
     followthrough_auto_queue: bool = False
     auto_refile: bool = False
     auto_split: bool = False
+    config_drift_autofix: bool = False
 
 
 @dataclass

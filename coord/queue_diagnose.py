@@ -1893,6 +1893,83 @@ def extract_failing_file_paths(output: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_FAILING_FILE_RE.findall(output)))
 
 
+#: #4035: a stage failing because the FLEET config (``coordinator.yml``,
+#: never the repo under test) names a cargo target the branch's own diff
+#: just deleted — quadraui#2695's shape: the PR finished removing `Panel`,
+#: deleting `examples/win_panel.rs`, but the smoke command still ran
+#: `cargo clippy --example win_panel ...`, so every leg failed identically
+#: no matter what the branch did. Never minted by :func:`diagnose` itself —
+#: only by a caller that has independently confirmed, against the branch's
+#: OWN diff, that the named target is really gone (see
+#: :func:`classify_config_drift`) — the same "narrow cause minted by a
+#: reclassifier" shape :data:`coord.board_doctor.CAUSE_CEILING_BLOCKED_
+#: MERGEABLE` documents for itself.
+CAUSE_CONFIG_DRIFT = "config-drift"
+
+CAUSE_PROSE[CAUSE_CONFIG_DRIFT] = (
+    "the failing command names a cargo target this branch's own diff "
+    "deletes — the fleet config is stale, not the code; fix or flag "
+    "coordinator.yml's smoke/test/build command instead of spending a fix "
+    "round on it"
+)
+
+#: Matches cargo's own wording for a dangling ``--example``/``--bin``/
+#: ``--test``/``--bench`` target — the one piece of vocabulary both
+#: :func:`extract_dangling_cargo_target` (parses a FAILING command's
+#: output) and :mod:`coord.smoke`'s own command-TEXT parser
+#: (``cargo_target_flags_in_command``) need to agree on. Anchored on
+#: cargo's literal wording (not a generic "not found") so this never
+#: mis-fires on an unrelated missing-file error.
+_DANGLING_CARGO_TARGET_RE = re.compile(
+    r"no (example|bin|test|bench) target named [`'\"]?([\w.\-]+)[`'\"]?",
+    re.IGNORECASE,
+)
+
+
+def extract_dangling_cargo_target(output: str) -> tuple[str, str] | None:
+    """``(kind, name)`` for cargo's own "no such target" wording in
+    *output* (e.g. ``"no example target named win_panel in `quadraui`
+    package"`` -> ``("example", "win_panel")``), or ``None`` when *output*
+    names no such target at all — including a genuine test failure's own
+    summary, which this never mistakes for a dangling-target error.
+    """
+    match = _DANGLING_CARGO_TARGET_RE.search(output or "")
+    if match is None:
+        return None
+    return match.group(1).lower(), match.group(2)
+
+
+def classify_config_drift(
+    test_reason: str | None, deleted_paths: Iterable[str],
+) -> tuple[str, str] | None:
+    """``(kind, name)`` when *test_reason* is #4035's config-drift shape —
+    cargo's own "no such target" wording naming a target *deleted_paths*
+    (paths a diff REMOVES ENTIRELY, never merely touches) confirms this
+    branch's own diff actually deleted. ``None`` otherwise, which covers
+    two very different failure modes identically: *test_reason* names no
+    dangling target at all (an ordinary test failure), or it names one
+    *deleted_paths* does NOT show as deleted (the target is dangling for
+    some OTHER reason — a real regression, not config drift, and this must
+    never guess otherwise).
+
+    Delegates the kind->path mapping to :func:`coord.smoke.
+    cargo_target_touches_path` rather than re-deriving it here — the two
+    callers (this failing-OUTPUT parser, and :mod:`coord.smoke`'s own
+    command-TEXT parser used for the #4035 pre-smoke check) must never
+    silently drift onto two different ideas of which file a given
+    ``kind``/``name`` pair names (#2096, "one question, one answer").
+    """
+    from coord.smoke import cargo_target_touches_path  # noqa: PLC0415
+
+    found = extract_dangling_cargo_target(test_reason or "")
+    if found is None:
+        return None
+    kind, name = found
+    if not cargo_target_touches_path(kind, name, deleted_paths):
+        return None
+    return kind, name
+
+
 @dataclass(frozen=True)
 class EnvProbeResult:
     """One re-run of a repo's test command, on one host.

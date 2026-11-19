@@ -94,7 +94,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -2101,6 +2101,130 @@ def _fetch_touched_files(repo_github: str, branch: str) -> list[str]:
     return [f.get("path", "") for f in files if f.get("path")]
 
 
+def _fetch_deleted_files(repo_github: str, branch: str) -> list[str]:
+    """Paths the diff on `branch` REMOVES ENTIRELY vs the base branch — a
+    strict subset of :func:`_fetch_touched_files` (#4035).
+
+    ``gh pr view --json files`` (what :func:`_fetch_touched_files` uses)
+    carries no per-file status, so a file this branch only edited would be
+    indistinguishable from one it deleted outright. The PR-files REST
+    endpoint does carry one (``added``/``removed``/``modified``/
+    ``renamed``), so this goes one level lower to it instead of trying to
+    infer deletion from byte counts. Returns an empty list on any lookup
+    failure, matching `_fetch_touched_files`'s own fail-open posture — the
+    caller then simply finds no config-drift target, never a false one.
+    """
+    pr = None
+    try:
+        pr = github_ops.find_pr_for_branch(repo_github, branch)
+    except RuntimeError:
+        pr = None
+    if pr is None:
+        return []
+    try:
+        raw = github_ops._gh(
+            "api", f"repos/{repo_github}/pulls/{pr['number']}/files",
+            "--jq", '.[] | select(.status=="removed") | .filename',
+            caller="smoke._fetch_deleted_files",
+        )
+    except RuntimeError:
+        return []
+    return [line for line in (ln.strip() for ln in raw.splitlines()) if line]
+
+
+# ── Config drift (#4035) ─────────────────────────────────────────────────────
+
+#: cargo's own per-target-kind directory convention — the file a
+#: ``cargo <verb> --<kind> <name>`` flag resolves against when the
+#: manifest carries no explicit ``[[bin]]``/``[[example]]``/... override.
+#: The ONE table both this module's command-TEXT parser
+#: (:func:`cargo_target_flags_in_command`) and
+#: :mod:`coord.queue_diagnose`'s failing-OUTPUT parser
+#: (:func:`~coord.queue_diagnose.classify_config_drift`, via
+#: :func:`cargo_target_touches_path`) read, rather than two independently
+#: maintained copies that could silently drift apart (#2096).
+CARGO_TARGET_KIND_DIRS: dict[str, str] = {
+    "example": "examples",
+    "bin": "src/bin",
+    "test": "tests",
+    "bench": "benches",
+}
+
+
+def cargo_target_source_path(kind: str, name: str) -> str | None:
+    """The file cargo's own ``--<kind> <name>`` convention names, or
+    ``None`` for a *kind* this module does not recognise."""
+    directory = CARGO_TARGET_KIND_DIRS.get(kind)
+    if directory is None:
+        return None
+    return f"{directory}/{name}.rs"
+
+
+def cargo_target_touches_path(kind: str, name: str, paths: Iterable[str]) -> bool:
+    """True when *paths* contains the file cargo's own ``--<kind> <name>``
+    convention maps *kind*/*name* to — matched either exactly or as a
+    path-component suffix (``crates/foo/examples/win_panel.rs`` still
+    matches ``examples/win_panel.rs`` from a workspace sub-crate), same
+    suffix-match shape :func:`_fetch_touched_files`'s own callers already
+    use elsewhere in this module for a path pattern inside a larger repo
+    tree."""
+    source = cargo_target_source_path(kind, name)
+    if source is None:
+        return False
+    return any(p == source or p.endswith(f"/{source}") for p in paths)
+
+
+#: Matches a cargo-style ``--example``/``--bin``/``--test``/``--bench``
+#: flag naming one target in a configured smoke/test/build COMMAND string
+#: (as opposed to :mod:`coord.queue_diagnose`'s
+#: ``_DANGLING_CARGO_TARGET_RE``, which matches cargo's own FAILING-output
+#: wording) — the `=`/space-separated value form cargo itself accepts.
+_CARGO_TARGET_FLAG_RE = re.compile(r"--(example|bin|test|bench)[=\s]+(\S+)")
+
+
+def cargo_target_flags_in_command(command: str) -> list[tuple[str, str, str]]:
+    """Every ``(kind, name, token)`` a cargo-style *command* string names
+    via ``--example``/``--bin``/``--test``/``--bench`` — *token* is the
+    exact substring (flag + value) matched, so a caller that needs to
+    remove precisely that text later (:func:`remove_dangling_target_token`)
+    never has to re-derive it from *kind*/*name* alone (which would risk
+    matching the wrong occurrence of an ambiguous flag spelling)."""
+    return [
+        (m.group(1), m.group(2), m.group(0))
+        for m in _CARGO_TARGET_FLAG_RE.finditer(command or "")
+    ]
+
+
+def config_drift_target_in_command(
+    command: str, deleted_paths: Iterable[str],
+) -> tuple[str, str, str] | None:
+    """First ``(kind, name, token)`` :func:`cargo_target_flags_in_command`
+    finds in *command* whose source file *deleted_paths* shows the diff
+    removes entirely (#4035's pre-smoke check) — ``None`` when *command*
+    names no cargo target at all, or names one *deleted_paths* does not
+    confirm as deleted."""
+    deleted = list(deleted_paths)
+    for kind, name, token in cargo_target_flags_in_command(command):
+        if cargo_target_touches_path(kind, name, deleted):
+            return kind, name, token
+    return None
+
+
+def remove_dangling_target_token(command: str, token: str) -> str | None:
+    """Remove *token* from *command*, collapsing the extra whitespace it
+    leaves behind (#4035's fix path).
+
+    Returns ``None`` — never editing *command* at all — when *token*
+    does not appear in it, or appears more than once: which exact
+    occurrence dangles is not knowable from the token text alone, so an
+    ambiguous match is left for a human rather than guessed at.
+    """
+    if command.count(token) != 1:
+        return None
+    replaced = command.replace(token, "", 1)
+    return re.sub(r"[ \t]{2,}", " ", replaced).strip()
+
+
 # ── Unroutable reporting (#1672) ────────────────────────────────────────────
 
 
@@ -3258,6 +3382,77 @@ def _gate_already_terminal_work(completed: Assignment, config: Config) -> bool:
     return True
 
 
+def _gate_config_drift_target_deleted(
+    completed: Assignment, config: Config, *, repo: Any, touched: list[str],
+) -> bool:
+    """#4035's Prevent step: refuse to dispatch a Test leg whose own
+    configured command still names a cargo target this branch's diff just
+    deleted — no code a worker could write will ever make a deleted
+    ``--example``/``--bin``/``--test``/``--bench`` target reappear, so
+    running the suite only burns a round on a config fault, repeating
+    identically next time.
+
+    Narrow by construction: :func:`config_drift_target_in_command` only
+    even LOOKS at the diff when the resolved command names a cargo target
+    at all (most commands name none, so this is a no-op for them), and
+    only confirms a hit against :func:`_fetch_deleted_files`'s own
+    positive "removed" status — never against *touched* alone, which
+    would also match an ordinary edit to the same file and misclassify a
+    real regression as drift.
+
+    Mirrors `_gate_zero_commit_branch`/`_gate_already_terminal_work`'s own
+    shape: records a `blocked` Test verdict (never `failed` — nothing
+    about the BRANCH is wrong) naming the exact command source and token,
+    and returns ``True`` so the caller stops before any machine is walked.
+    """
+    smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
+    command_obj = resolve_smoke_command(repo, smoke_cfg, touched)
+    if not command_obj.command:
+        return False
+
+    deleted = _fetch_deleted_files(repo.github, completed.branch)
+    if not deleted:
+        return False
+
+    found = config_drift_target_in_command(command_obj.command, deleted)
+    if found is None:
+        return False
+    kind, name, token = found
+
+    reason = (
+        f"Test stage refused: the configured command ({command_obj.source}) "
+        f"still runs `{token}`, but this branch's own diff deletes the "
+        f"{kind} it names (`{cargo_target_source_path(kind, name)}`) — "
+        "config drift, not a code failure (#4035). Remove the token from "
+        f"{command_obj.source} (set `board_doctor.config_drift_autofix: "
+        "true` on this repo to have the board doctor do it automatically) "
+        "instead of spending a fix round on it."
+    )
+    logger.warning(
+        "_dispatch_smoke_legs: %s#%s — %s", completed.repo_name,
+        completed.issue_number, reason,
+    )
+    if completed.assignment_id is None:
+        return True
+    try:
+        from coord.state import record_test_verdict  # noqa: PLC0415
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "_dispatch_smoke_legs: failed to record the #4035 config-drift "
+            "Test verdict for %s", completed.assignment_id,
+        )
+        return True
+    completed.test_state = TEST_STATE_BLOCKED
+    completed.test_reason = reason
+    return True
+
+
 def _dispatch_smoke_legs(
     completed: Assignment,
     board: Board,
@@ -3336,6 +3531,9 @@ def _dispatch_smoke_legs(
         return []
 
     touched = diff_lookup(repo.github, completed.branch)
+
+    if _gate_config_drift_target_deleted(completed, config, repo=repo, touched=touched):
+        return []
 
     # #3182: partition BEFORE computing the flat union — a diff whose matched
     # rules split across capability sets no one machine carries together must

@@ -2089,6 +2089,115 @@ def smoke_no_verdict_rows(board: Board) -> list[StuckRow]:
     return list(seen.values())
 
 
+def config_drift_rows(
+    board: Board,
+    config: Any,
+    *,
+    diff_lookup: Callable[[str, str], list[str]] | None = None,
+) -> list[StuckRow]:
+    """One :class:`StuckRow` per issue whose Test-stage verdict names a
+    cargo target this branch's OWN diff deletes entirely (#4035's Detect
+    step) — quadraui#2695's shape: the fleet config still runs a command
+    naming a target the branch legitimately removed, so the identical
+    failure repeats every round no matter what a worker does to the
+    branch's own code.
+
+    *diff_lookup* defaults to :func:`coord.smoke._fetch_deleted_files` —
+    injectable so a test never needs a live ``gh`` call. Mirrors
+    :func:`smoke_no_verdict_rows`'s own shape: walks ``board.active +
+    board.completed`` directly (never a second ``build_board`` call),
+    reads ``assignment.test_reason``/``.branch`` straight off the row the
+    normal Test-stage write already populated, and dedupes to ONE row per
+    issue.
+
+    Classification is :func:`coord.queue_diagnose.classify_config_drift` —
+    the SAME function :mod:`coord.smoke`'s own pre-smoke gate
+    (``_gate_config_drift_target_deleted``) ultimately answers to via the
+    shared ``coord.smoke.cargo_target_touches_path`` primitive (#2096,
+    "one question, one answer") — never a second, independently-tuned
+    copy of "does this look like config drift" living in this module.
+    A deleted-paths lookup that comes back empty (no PR found, a transient
+    `gh` failure) never manufactures a hit — it just finds nothing, the
+    same fail-open posture every other probe in this module takes.
+
+    Once a row is confirmed, the evidence line is
+    :func:`coord.board_doctor_policy.plan_config_drift_fix`'s own
+    ``alert_message`` whenever the issue's TODAY-configured command still
+    names the SAME target (the common case) — the exact one-line
+    coordinator.yml patch a human (or, opted in, the doctor itself) would
+    apply — falling back to a plainer description only when the command
+    has already moved on from the failure's own snapshot of it.
+    """
+    from coord.board_doctor_policy import plan_config_drift_fix  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+    from coord.queue_diagnose import CAUSE_CONFIG_DRIFT, classify_config_drift  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        SmokeTestsConfig,
+        TEST_STATE_BLOCKED,
+        _fetch_deleted_files,
+        cargo_target_flags_in_command,
+        resolve_smoke_command,
+    )
+
+    lookup = diff_lookup if diff_lookup is not None else _fetch_deleted_files
+
+    seen: dict[str, StuckRow] = {}
+    for assignment in (*board.active, *board.completed):
+        if assignment.type not in WORK_LIKE_TYPES:
+            continue
+        if assignment.test_state not in ("failed", TEST_STATE_BLOCKED):
+            continue
+        if not assignment.test_reason or not assignment.branch:
+            continue
+        key = f"{assignment.repo_name}#{assignment.issue_number}"
+        if key in seen:
+            continue
+        repo = config.repo(assignment.repo_name)
+        if repo is None:
+            continue
+        deleted = lookup(repo.github, assignment.branch)
+        if not deleted:
+            continue
+        found = classify_config_drift(assignment.test_reason, deleted)
+        if found is None:
+            continue
+        kind, name = found
+
+        evidence = (
+            f"dangling cargo {kind} target {name!r} — confirmed deleted by "
+            "this branch's own diff (#4035)"
+        )
+        smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
+        command_obj = resolve_smoke_command(repo, smoke_cfg, deleted)
+        if command_obj.command:
+            token = next(
+                (
+                    tok for k, n, tok in cargo_target_flags_in_command(
+                        command_obj.command,
+                    )
+                    if k == kind and n == name
+                ),
+                None,
+            )
+            if token is not None:
+                plan = plan_config_drift_fix(
+                    assignment.repo_name, command=command_obj.command,
+                    source=command_obj.source, token=token, config=config,
+                )
+                evidence = plan.alert_message
+
+        seen[key] = StuckRow(
+            queue="config-drift",
+            key=key,
+            state="blocked",
+            cause=CAUSE_CONFIG_DRIFT,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(evidence,),
+            fresh=True,
+        )
+    return list(seen.values())
+
+
 def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:
     """Adapt :func:`coord.queue_diagnose.run_pass` output to :class:`StuckRow`.
 
@@ -3988,6 +4097,16 @@ def _collect_rows_with_board(
         stale_after_seconds=merge_pending_stale_after_seconds,
     )
     rows.extend(smoke_no_verdict_rows(board))
+
+    # #4035: a row whose Test-stage verdict names a cargo target this
+    # branch's own diff deletes outright — covered_keys guards against
+    # double-classifying a key `smoke_no_verdict_rows` just above (or any
+    # earlier pass) already explained, same discipline as every other
+    # additive pass in this function.
+    covered_keys = frozenset(row.key for row in rows)
+    rows.extend(
+        row for row in config_drift_rows(board, config) if row.key not in covered_keys
+    )
 
     # #3944: a `waiting` row stranded on an open, unqueued `after=` pre-req
     # carries neither a `block_log` episode nor merge-queue evidence, so
