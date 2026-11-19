@@ -2271,6 +2271,7 @@ def predicted_after_target_drop_reason(
     target_key: str,
     entries_by_key: Mapping[str, Any],
     *,
+    config: Any = None,
     issue_open: Callable[[str, int], bool] | None = None,
 ) -> str:
     """Why a PREDICTED ``after=`` edge pointed at *target_key* should be
@@ -2294,10 +2295,24 @@ def predicted_after_target_drop_reason(
     * the target is ``waiting``/``running`` right now, but its OWN
       ``after=`` graph transitively reaches a `blocked`/`parked` row
       (#2534's shape — the dependent is fine, everything IT depends on is
-      not);
-    * the target has never actually launched — ``attempts == 0`` and no
-      ``launched_at`` — so there was never a real branch for this edge to
-      have been serializing against in the first place.
+      not).
+
+    Deliberately NOT a fifth, standalone shape for "the target has simply
+    never launched yet": the predictor's own declared-vs-declared half
+    (``coord.overlap_predict.declared_footprints``) exists precisely for
+    two rows that both have no branch yet and share declared files —
+    dropping on launch status alone would delete that exact edge before
+    either row starts, which is the one case the predictor exists to
+    serialize. An unlaunched target is only droppable through the
+    blocked-chain shape above: an unstarted target chained behind a
+    blocked/parked root is genuinely stuck; an unstarted target with
+    nothing blocking it may simply be next in line.
+
+    *config*, when given, resolves *target_key*'s repo to the GitHub
+    ``owner/repo`` slug (:func:`_github_slug`) before calling *issue_open*
+    for the dequeued-and-open check — the local `coordinator.yml` repo
+    name is not a slug `gh` accepts. ``None`` (a bare test double, or a
+    repo whose local name already IS its slug) leaves the name unresolved.
 
     *issue_open* defaults to :func:`_issue_open` (a live `gh` read); tests
     inject a stub so this stays a pure-logic call over hand-built entries.
@@ -2309,8 +2324,10 @@ def predicted_after_target_drop_reason(
     if target is None:
         parsed = _parse_row_key(target_key)
         opener = issue_open or _issue_open
-        if parsed is not None and opener(*parsed):
-            return "dequeued"
+        if parsed is not None:
+            repo_name, issue_number = parsed
+            if opener(_github_slug(repo_name, config), issue_number):
+                return "dequeued"
         return ""
     if target.state == STATE_BLOCKED:
         return "blocked"
@@ -2318,8 +2335,6 @@ def predicted_after_target_drop_reason(
         return "parked"
     if _after_chain_hits_blocked_or_parked(target, entries_by_key):
         return "blocked chain"
-    if target.attempts == 0 and target.launched_at is None:
-        return "no branch yet"
     return ""
 
 
@@ -2327,8 +2342,10 @@ def drop_stale_predicted_after_edges(
     entries: Sequence[Any],
     *,
     predicted_keys_for: Callable[[Any], frozenset[str]],
+    config: Any = None,
     issue_open: Callable[[str, int], bool] | None = None,
     write_after: Callable[[Any, Sequence[str]], None] | None = None,
+    record_drop: Callable[[Any, Sequence[tuple[str, str]]], None] | None = None,
 ) -> list[str]:
     """Drop every PREDICTED ``after=`` edge pointed at a row
     :func:`predicted_after_target_drop_reason` says cannot land soon (#4037).
@@ -2340,11 +2357,18 @@ def drop_stale_predicted_after_edges(
     whatever its target looks like — this sweep only ever touches edges
     #2247 itself produced.
 
+    *config* is forwarded to :func:`predicted_after_target_drop_reason` to
+    resolve the GitHub slug for the dequeued-and-open check.
+
     *write_after*, when given, is called once per CHANGED entry with its
     surviving ``after=`` tuple (``coord.drive_queue.write_queue_after`` in
-    production). ``None`` (the default) computes the drop set without
-    writing anything — the shape a dry run, or a test asserting only on the
-    returned notes, wants.
+    production). *record_drop*, when given, is called once per CHANGED
+    entry with its ``(dep_key, reason)`` drops, so the drop lands somewhere
+    durable on the row itself rather than only in this call's own return
+    value (``coord.drive_queue.record_predicted_after_drop`` in
+    production). Both default to ``None``, which computes the drop set
+    without writing or recording anything — the shape a dry run, or a test
+    asserting only on the returned notes, wants.
 
     Returns one note per dropped edge — ``"{entry.key}: edge dropped:
     {dep} (predicted, target {reason})"``, the issue's own acceptance text
@@ -2363,7 +2387,7 @@ def drop_stale_predicted_after_edges(
         for dep_key in entry.after:
             reason = (
                 predicted_after_target_drop_reason(
-                    dep_key, entries_by_key, issue_open=issue_open,
+                    dep_key, entries_by_key, config=config, issue_open=issue_open,
                 )
                 if dep_key in predicted
                 else ""
@@ -2376,6 +2400,8 @@ def drop_stale_predicted_after_edges(
             continue
         if write_after is not None:
             write_after(entry, keep)
+        if record_drop is not None:
+            record_drop(entry, drops)
         for dep_key, reason in drops:
             notes.append(
                 f"{entry.key}: edge dropped: {dep_key} (predicted, target {reason})"
@@ -2383,10 +2409,18 @@ def drop_stale_predicted_after_edges(
     return notes
 
 
-def sweep_predicted_after_edges(*, dry_run: bool = False) -> list[str]:
+def sweep_predicted_after_edges(
+    *, dry_run: bool = False, config: Any = None,
+) -> list[str]:
     """Production entry point for :func:`drop_stale_predicted_after_edges`
     (#4037): read the live drive queue, drop every stale predicted
     ``after=`` edge, and report what changed.
+
+    *config* resolves the GitHub slug for each target's dequeued-and-open
+    check (see :func:`predicted_after_target_drop_reason`) — forwarded
+    from :func:`run_sweep`'s own *config*, never defaulted to a live read
+    here, since there is no board-doctor-wide config to fall back to
+    outside a caller that already has one.
 
     *dry_run* computes the drop set without writing it back — the same
     "classify, never mutate" contract :func:`sweep`'s own *dry_run* keeps.
@@ -2394,7 +2428,11 @@ def sweep_predicted_after_edges(*, dry_run: bool = False) -> list[str]:
     a caller that cannot reach the queue or the audit log this round skips
     this sweep, not the rest of the report.
     """
-    from coord.drive_queue import entries_from_rows, write_queue_after  # noqa: PLC0415
+    from coord.drive_queue import (  # noqa: PLC0415
+        entries_from_rows,
+        record_predicted_after_drop,
+        write_queue_after,
+    )
     from coord.overlap_predict import predicted_after_targets  # noqa: PLC0415
     from coord.state import list_drive_queue  # noqa: PLC0415
 
@@ -2402,7 +2440,9 @@ def sweep_predicted_after_edges(*, dry_run: bool = False) -> list[str]:
     return drop_stale_predicted_after_edges(
         entries,
         predicted_keys_for=lambda e: predicted_after_targets(e.repo, e.issue),
+        config=config,
         write_after=None if dry_run else write_queue_after,
+        record_drop=None if dry_run else record_predicted_after_drop,
     )
 
 
@@ -4394,7 +4434,7 @@ def run_sweep(
     if drop_predicted_after_edges and mechanical_causes is None:
         try:
             report.dropped_predicted_after_edges = predicted_after_edges_sweep(
-                dry_run=dry_run,
+                dry_run=dry_run, config=config,
             )
         except Exception:  # noqa: BLE001 — advisory, see docstring
             _log.warning(

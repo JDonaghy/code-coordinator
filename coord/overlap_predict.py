@@ -138,12 +138,17 @@ LANDED_STATUSES = frozenset(
 SOURCE_BRANCH = "branch"
 SOURCE_DECLARED = "declared"
 
-# Audit-log coordinates for the two events this feature emits. Both are
+# Audit-log coordinates for the events this feature emits. All three are
 # business tier: an order change to real dispatched work is a board decision,
 # not tick housekeeping, and it must survive `audit.level = business`.
 AUDIT_CATEGORY = "drive-queue"
 EVENT_PREDICTED = "overlap_predicted"
 EVENT_SCORED = "overlap_scored"
+#: A PREDICTED ``after=`` edge dropped by the board-doctor sweep because its
+#: target can no longer land soon (dequeued, blocked, parked, or stuck
+#: behind one of those transitively). See
+#: ``coord.drive_queue.record_predicted_after_drop``.
+EVENT_PREDICTED_DROPPED = "overlap_predicted_dropped"
 
 # Outcome verdicts from :func:`classify_outcome`.
 OUTCOME_CONFIRMED = "confirmed"
@@ -1164,4 +1169,3 @@ def predicted_after_targets(
         else:
             predicted.update(str(k) for k in (details.get("applied_after") or ()))
     return frozenset(predicted)
-    return out

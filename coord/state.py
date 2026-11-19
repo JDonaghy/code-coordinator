@@ -11096,6 +11096,15 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
         "apply_verdict",
         "apply_verdict_reason",
         "apply_verdict_at",
+        # The narrow exception to "order columns are owned by
+        # enqueue/move" — an autonomous caller that only wants to drop a
+        # stale predicted `after=` edge (`coord.drive_queue.
+        # write_queue_after`) needs a write path that touches NOTHING
+        # else on the row, unlike `enqueue_drive_queue`'s full-row upsert
+        # (which also re-arms the deploy gate and restamps
+        # `legs_at_enqueue`). `position`/`machine` stay enqueue/move-only;
+        # only the edge list itself is updatable here.
+        "after_json",
     }
 )
 
@@ -11633,10 +11642,14 @@ def _dequeue_drive_queue_local(
 def update_drive_queue_entry(repo_name: str, issue_number: int, **fields) -> bool:
     """Write the tick-owned columns of a queue entry.
 
-    Accepts any of ``state`` / ``attempts`` / ``deferrals`` / ``last_reason`` /
-    ``session_name`` / ``launched_at`` / ``launch_host``; anything else raises
-    ``ValueError`` (the queue's order is owned by ``enqueue``/``move``, not by
-    a tick). A ``last_reason`` update is stamped with its capture time
+    See :data:`_DRIVE_QUEUE_UPDATABLE` for the full accepted set; anything
+    else raises ``ValueError``. Most of those columns are tick-owned
+    rather than operator-declared; ``after_json`` is the one narrow
+    exception, letting an autonomous caller replace just a row's `after=`
+    edges without the deploy-gate and fix-round-baseline side effects
+    `enqueue_drive_queue`'s full-row upsert carries along with
+    `position`/`machine`. A ``last_reason`` update is stamped with its
+    capture time
     (``reason_at``, #2133) by ``_update_drive_queue_entry_local`` — the one
     function both this local path and the daemon's ``/drive-queue`` handler
     call, so no caller can write a reason without also dating it.

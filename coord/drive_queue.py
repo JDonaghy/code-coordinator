@@ -1953,37 +1953,84 @@ def entries_from_rows(rows: Iterable[Mapping[str, Any]]) -> list[QueueEntry]:
 
 
 def write_queue_after(entry: QueueEntry, after: Sequence[str]) -> None:
-    """Replace *entry*'s own ``after=`` edges, leaving every other
-    operator-declared field on the row unchanged.
+    """Replace *entry*'s own ``after=`` edges, leaving every other column
+    on the row — including the deploy gate's ``hold_state``/``hold_probes``
+    and the fix-round baseline ``legs_at_enqueue`` — untouched.
 
-    ``coord.state.update_drive_queue_entry`` explicitly refuses ``after``
-    (the queue's order columns are owned by ``enqueue``/``move``, not a
-    tick-owned field) — this is the one write path a caller that only
-    wants to change `after=` edges goes through, the same full-row upsert
-    `coord.commands.drive_queue._apply_reversed_overlap_after` already
-    uses for the #3395 reversed-edge write. ``position=None`` leaves the
-    entry's current queue slot untouched — `enqueue_drive_queue` only
-    moves a row when an explicit position is given.
-
-    #4037: the write half of :func:`coord.board_doctor.
-    drop_stale_predicted_after_edges`'s sweep.
+    Deliberately NOT ``enqueue_drive_queue``'s full-row upsert: that path
+    treats every field it accepts as freshly operator-declared, so it
+    re-arms a fired gate back to ``armed`` (resetting ``hold_probes``) and
+    stamps a brand-new ``legs_at_enqueue`` baseline on every call — correct
+    for an explicit operator `add`, wrong for an autonomous sweep that only
+    wants to drop a stale edge. Goes through
+    ``coord.state.update_drive_queue_entry`` instead, which only ever
+    writes the columns its own whitelist names — ``after_json`` is in that
+    whitelist as the one field an automated caller may replace without
+    touching anything else on the row.
     """
-    from coord.state import enqueue_drive_queue  # noqa: PLC0415
+    from coord.state import update_drive_queue_entry  # noqa: PLC0415
 
-    enqueue_drive_queue(
+    update_drive_queue_entry(
         entry.repo,
         entry.issue,
-        machine=entry.machine or None,
-        after=list(after),
-        position=None,
-        hold_after=entry.hold_after,
-        hold_reason=entry.hold_reason,
-        resume_when=entry.resume_when,
-        hold_scope=entry.hold_scope,
-        max_fix_rounds=entry.max_fix_rounds,
-        no_acceptance=entry.no_acceptance,
-        plan_destructive=entry.plan_destructive,
+        after_json=json.dumps([str(a) for a in after]),
     )
+
+
+def record_predicted_after_drop(
+    entry: QueueEntry, drops: Sequence[tuple[str, str]],
+) -> None:
+    """Record, durably, that a stale PREDICTED ``after=`` edge was dropped
+    from *entry* — so the drop is recorded on the row itself, not only in
+    the sweep's own return value.
+
+    Two sinks, the same split ``coord.commands.drive_queue.
+    _record_overlap_prediction``/``._record_reverse_overlap_prediction``
+    already use for the opposite event (an edge being ADDED rather than
+    dropped): a durable audit row so the drop can be scored or audited
+    later, and ``last_reason`` so an operator reading ``coord drive-queue
+    list`` right now sees it immediately — even though the entry's own
+    next tick attempt will overwrite that column.
+
+    Does nothing when *drops* is empty. Both writes are best-effort: a
+    failure here must never surface as the sweep failing to apply the drop
+    it already computed and wrote via :func:`write_queue_after`.
+    """
+    if not drops:
+        return
+    note = "; ".join(
+        f"edge dropped: {dep_key} (predicted, target {reason})"
+        for dep_key, reason in drops
+    )
+    try:
+        from coord.audit import record_audit  # noqa: PLC0415
+        from coord.overlap_predict import (  # noqa: PLC0415
+            AUDIT_CATEGORY,
+            EVENT_PREDICTED_DROPPED,
+        )
+
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_PREDICTED_DROPPED,
+            actor="board-doctor",
+            summary=note,
+            repo=entry.repo,
+            issue=entry.issue,
+            details={
+                "dropped": [
+                    {"after": dep_key, "reason": reason} for dep_key, reason in drops
+                ],
+            },
+        )
+    except Exception:  # noqa: BLE001 — recording must never fail the sweep
+        pass
+    try:
+        from coord.state import update_drive_queue_entry  # noqa: PLC0415
+
+        update_drive_queue_entry(entry.repo, entry.issue, last_reason=note)
+    except Exception:  # noqa: BLE001 — same
+        pass
 
 
 def effective_max_fix_rounds(
