@@ -44,15 +44,18 @@ from coord.board_doctor import (
     baseline_red_rows,
     dispatch_plan_leg,
     drive_queue_rows,
+    drop_stale_predicted_after_edges,
     merge_queue_rows,
     merged_partial_rows,
     no_progress_rows,
+    predicted_after_target_drop_reason,
     run_followthrough_sweep,
     smoke_no_verdict_rows,
     stranded_prereq_dep,
     stranded_prereq_guard,
     stranded_prereq_rows,
     sweep,
+    sweep_predicted_after_edges,
 )
 from coord.config import (
     BoardDoctorConfig,
@@ -68,6 +71,8 @@ from coord.drive_queue import (
     QueueEntry,
     STATE_BLOCKED,
     STATE_MERGED_PARTIAL,
+    STATE_PARKED,
+    STATE_RUNNING,
     STATE_WAITING,
 )
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
@@ -6424,3 +6429,288 @@ class TestCoveringEscalationMustNameAConcreteAction:
         escalation = state.get_drive_escalation("acme/widgets", 3002)
         assert escalation is not None
         assert escalation["stage"] == "plan.blocked"
+
+
+class TestPredictedAfterTargetDropReason:
+    """#4037: :func:`predicted_after_target_drop_reason`'s four droppable
+    target shapes, plus the cases that must NOT drop."""
+
+    def test_dequeued_and_open_target_drops(self) -> None:
+        reason = predicted_after_target_drop_reason(
+            "quadraui#2532", {}, issue_open=lambda repo, issue: True,
+        )
+        assert reason == "dequeued"
+
+    def test_dequeued_but_closed_target_is_kept(self) -> None:
+        # A closed/merged target is `_resolve_prereqs`'s own satisfied case,
+        # not a stale edge -- this predicate must never claim one is.
+        reason = predicted_after_target_drop_reason(
+            "quadraui#2532", {}, issue_open=lambda repo, issue: False,
+        )
+        assert reason == ""
+
+    def test_blocked_target_drops(self) -> None:
+        target = QueueEntry(repo="quadraui", issue=2695, state=STATE_BLOCKED)
+        reason = predicted_after_target_drop_reason(target.key, {target.key: target})
+        assert reason == "blocked"
+
+    def test_parked_target_drops(self) -> None:
+        target = QueueEntry(repo="quadraui", issue=2695, state=STATE_PARKED)
+        reason = predicted_after_target_drop_reason(target.key, {target.key: target})
+        assert reason == "parked"
+
+    def test_waiting_behind_a_blocked_row_drops_transitively(self) -> None:
+        root = QueueEntry(repo="quadraui", issue=2695, state=STATE_BLOCKED)
+        mid = QueueEntry(
+            repo="quadraui", issue=2731, state=STATE_WAITING, after=(root.key,),
+        )
+        entries_by_key = {root.key: root, mid.key: mid}
+
+        reason = predicted_after_target_drop_reason(mid.key, entries_by_key)
+
+        assert reason == "blocked chain"
+
+    def test_never_launched_target_drops_as_no_branch_yet(self) -> None:
+        target = QueueEntry(repo="quadraui", issue=2712, state=STATE_WAITING)
+        assert target.attempts == 0 and target.launched_at is None
+
+        reason = predicted_after_target_drop_reason(target.key, {target.key: target})
+
+        assert reason == "no branch yet"
+
+    def test_a_running_target_with_no_blocked_chain_is_kept(self) -> None:
+        target = QueueEntry(
+            repo="quadraui", issue=2712, state=STATE_RUNNING,
+            attempts=1, launched_at=100.0,
+        )
+
+        reason = predicted_after_target_drop_reason(target.key, {target.key: target})
+
+        assert reason == ""
+
+
+class TestDropStalePredictedAfterEdges:
+    """#4037 acceptance shapes: a predicted edge into a dequeued or blocked
+    row is dropped; an operator-declared edge to the same kind of row never
+    is."""
+
+    def test_2537_shape_predicted_edge_to_a_dequeued_row_is_dropped(self) -> None:
+        """quadraui#2537 waited forever on quadraui#2532, which had been
+        deferred and dequeued — the edge came from the predictor sharing
+        `extra_paint.rs`, not a real dependency."""
+        entry = QueueEntry(
+            repo="quadraui", issue=2537, state=STATE_WAITING,
+            after=("quadraui#2532",),
+        )
+
+        notes = drop_stale_predicted_after_edges(
+            [entry],
+            predicted_keys_for=lambda e: frozenset({"quadraui#2532"}),
+            issue_open=lambda repo, issue: True,
+        )
+
+        assert notes == [
+            "quadraui#2537: edge dropped: quadraui#2532 (predicted, target dequeued)"
+        ]
+
+    def test_2534_shape_predicted_edges_into_a_blocked_chain_are_dropped(self) -> None:
+        """quadraui#2534 waited on four MCP/CellGrid rows, all of them
+        blocked behind quadraui#2695 or simply never started — every edge
+        came from the predictor sharing `leaf.rs`/`a11y/`."""
+        root = QueueEntry(repo="quadraui", issue=2695, state=STATE_BLOCKED)
+        mid = QueueEntry(
+            repo="quadraui", issue=2731, state=STATE_WAITING, after=(root.key,),
+        )
+        never_started_a = QueueEntry(repo="quadraui", issue=2713, state=STATE_WAITING)
+        never_started_b = QueueEntry(repo="quadraui", issue=2725, state=STATE_WAITING)
+        entry = QueueEntry(
+            repo="quadraui", issue=2534, state=STATE_WAITING,
+            after=(root.key, mid.key, never_started_a.key, never_started_b.key),
+        )
+        predicted = frozenset(entry.after)
+
+        notes = drop_stale_predicted_after_edges(
+            [root, mid, never_started_a, never_started_b, entry],
+            predicted_keys_for=lambda e: predicted if e.key == entry.key else frozenset(),
+        )
+
+        assert notes == [
+            f"{entry.key}: edge dropped: {root.key} (predicted, target blocked)",
+            f"{entry.key}: edge dropped: {mid.key} (predicted, target blocked chain)",
+            f"{entry.key}: edge dropped: {never_started_a.key} "
+            "(predicted, target no branch yet)",
+            f"{entry.key}: edge dropped: {never_started_b.key} "
+            "(predicted, target no branch yet)",
+        ]
+
+    def test_operator_after_to_a_blocked_row_is_kept(self) -> None:
+        """An operator's own ``--after`` (or an epic's ``{after:}``) to a
+        blocked row must never be dropped — only the predictor's edges are
+        candidates, whatever the target looks like."""
+        target = QueueEntry(repo="quadraui", issue=2000, state=STATE_BLOCKED)
+        entry = QueueEntry(
+            repo="quadraui", issue=2001, state=STATE_WAITING, after=(target.key,),
+        )
+
+        notes = drop_stale_predicted_after_edges(
+            [target, entry], predicted_keys_for=lambda e: frozenset(),
+        )
+
+        assert notes == []
+
+    def test_write_after_receives_only_the_surviving_edges(self) -> None:
+        target = QueueEntry(repo="quadraui", issue=2000, state=STATE_BLOCKED)
+        kept = QueueEntry(
+            repo="quadraui", issue=1999, state=STATE_RUNNING,
+            attempts=1, launched_at=1.0,
+        )
+        entry = QueueEntry(
+            repo="quadraui", issue=2001, state=STATE_WAITING,
+            after=(target.key, kept.key),
+        )
+        writes: list[tuple[str, tuple[str, ...]]] = []
+
+        notes = drop_stale_predicted_after_edges(
+            [target, kept, entry],
+            predicted_keys_for=lambda e: (
+                frozenset({target.key, kept.key}) if e.key == entry.key else frozenset()
+            ),
+            write_after=lambda e, after: writes.append((e.key, tuple(after))),
+        )
+
+        assert writes == [(entry.key, (kept.key,))]
+        assert notes == [
+            f"{entry.key}: edge dropped: {target.key} (predicted, target blocked)"
+        ]
+
+    def test_write_after_is_never_called_with_nothing_to_drop(self) -> None:
+        kept = QueueEntry(
+            repo="quadraui", issue=1999, state=STATE_RUNNING,
+            attempts=1, launched_at=1.0,
+        )
+        entry = QueueEntry(
+            repo="quadraui", issue=2001, state=STATE_WAITING, after=(kept.key,),
+        )
+        writes: list[tuple[str, tuple[str, ...]]] = []
+
+        notes = drop_stale_predicted_after_edges(
+            [kept, entry],
+            predicted_keys_for=lambda e: frozenset({kept.key}),
+            write_after=lambda e, after: writes.append((e.key, tuple(after))),
+        )
+
+        assert notes == []
+        assert writes == []
+
+
+class TestSweepPredictedAfterEdgesIntegration:
+    """#4037: the production wiring, end-to-end through the real audit log
+    and drive-queue DB — exactly the provenance
+    :func:`coord.overlap_predict.predicted_after_targets` reads and the
+    write :func:`coord.drive_queue.write_queue_after` performs."""
+
+    def test_real_predicted_edge_to_a_dequeued_target_is_dropped_and_persisted(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+        from coord.audit import record_audit
+        from coord.drive_queue import entries_from_rows
+        from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2537, after=["quadraui#2532"])
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_PREDICTED,
+            actor="drive-queue",
+            summary="predicted file overlap (#2247) — ordered --after quadraui#2532",
+            repo="quadraui",
+            issue=2537,
+            details={
+                "predicted_files": ["src/extra_paint.rs"],
+                "overlaps": [{"key": "quadraui#2532", "source": "declared"}],
+                "after": ["quadraui#2532"],
+                "applied_after": ["quadraui#2532"],
+            },
+        )
+        monkeypatch.setattr(board_doctor_mod, "_issue_open", lambda repo, issue: True)
+
+        notes = sweep_predicted_after_edges()
+
+        assert notes == [
+            "quadraui#2537: edge dropped: quadraui#2532 (predicted, target dequeued)"
+        ]
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2537]
+        assert entry.after == ()
+
+    def test_dry_run_computes_but_never_writes(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+        from coord.audit import record_audit
+        from coord.drive_queue import entries_from_rows
+        from coord.overlap_predict import AUDIT_CATEGORY, EVENT_PREDICTED
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2538, after=["quadraui#2533"])
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_PREDICTED,
+            actor="drive-queue",
+            summary="predicted file overlap (#2247)",
+            repo="quadraui",
+            issue=2538,
+            details={"applied_after": ["quadraui#2533"], "after": ["quadraui#2533"]},
+        )
+        monkeypatch.setattr(board_doctor_mod, "_issue_open", lambda repo, issue: True)
+
+        notes = sweep_predicted_after_edges(dry_run=True)
+
+        assert notes == [
+            "quadraui#2538: edge dropped: quadraui#2533 (predicted, target dequeued)"
+        ]
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2538]
+        assert entry.after == ("quadraui#2533",)
+
+    def test_an_operators_after_edge_with_no_predicted_record_is_kept(self) -> None:
+        """No :data:`EVENT_PREDICTED` audit row was ever written for this
+        entry's own ``add`` — the SAME shape an operator's own ``--after``
+        (never passed through the predictor) produces — so nothing in the
+        sweep's provenance read says "predicted", and the edge survives
+        even though its target never queued at all."""
+        from coord.drive_queue import entries_from_rows
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2539, after=["quadraui#9999"])
+
+        notes = sweep_predicted_after_edges()
+
+        assert notes == []
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2539]
+        assert entry.after == ("quadraui#9999",)
+
+
+class TestSelfCorrectionAfterDropIsExistingBehaviour:
+    """#4037: dropping a stale predicted edge must never disable the
+    ordinary predictor. The moment a previously-dropped target has a REAL
+    branch again, :func:`coord.overlap_predict.predict_overlap` — entirely
+    unchanged by this sweep — still orders a fresh candidate against it."""
+
+    def test_predict_overlap_still_orders_against_the_relaunched_target(self) -> None:
+        from coord.overlap_predict import SOURCE_BRANCH, Footprint, predict_overlap
+
+        footprints = [
+            Footprint(
+                key="quadraui#2532",
+                issue_number=2532,
+                files=("src/extra_paint.rs",),
+                source=SOURCE_BRANCH,
+                branch="quadraui-2532-fix",
+            ),
+        ]
+
+        prediction = predict_overlap(
+            candidate_files=["src/extra_paint.rs"], footprints=footprints,
+        )
+
+        assert prediction.after_keys == ("quadraui#2532",)
