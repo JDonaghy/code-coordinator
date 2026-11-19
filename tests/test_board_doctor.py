@@ -47,6 +47,7 @@ from coord.board_doctor import (
     baseline_red_rows,
     branch_merged_guard_rows,
     build_refile_candidate,
+    config_drift_rows,
     dispatch_plan_leg,
     drive_queue_rows,
     drop_stale_predicted_after_edges,
@@ -8023,3 +8024,445 @@ class TestTryAutoSplitExceptionShielding:
 
         assert dispatched is False
         assert alerted == ["acme/widgets#2695"]
+
+
+# ── #4035: board doctor config drift ────────────────────────────────────────
+
+import coord.board_doctor_policy as board_doctor_policy_mod  # noqa: E402
+import coord.smoke as smoke  # noqa: E402
+
+
+class TestExtractDanglingCargoTarget:
+    """`coord.queue_diagnose.extract_dangling_cargo_target` — the pure
+    cargo-error-wording parser both the Detect-step classifier and this
+    test suite build on."""
+
+    def test_an_example_target_is_extracted(self) -> None:
+        assert queue_diagnose.extract_dangling_cargo_target(
+            "error: no example target named `win_panel` in `quadraui` package"
+        ) == ("example", "win_panel")
+
+    def test_a_bin_target_is_extracted(self) -> None:
+        assert queue_diagnose.extract_dangling_cargo_target(
+            "error: no bin target named `old_tool`"
+        ) == ("bin", "old_tool")
+
+    def test_an_ordinary_test_failure_extracts_nothing(self) -> None:
+        assert queue_diagnose.extract_dangling_cargo_target(
+            "FAILED tests/test_panel.py::test_render - AssertionError"
+        ) is None
+
+    def test_empty_output_extracts_nothing(self) -> None:
+        assert queue_diagnose.extract_dangling_cargo_target("") is None
+        assert queue_diagnose.extract_dangling_cargo_target(None) is None
+
+
+class TestClassifyConfigDrift:
+    """`coord.queue_diagnose.classify_config_drift` — acceptance #1: the
+    quadraui#2695 shape classifies as config-drift, not a test failure."""
+
+    def test_the_2695_shape_classifies_as_config_drift(self) -> None:
+        test_reason = (
+            "error: no example target named `win_panel` in `quadraui` package"
+        )
+        deleted_paths = ["examples/win_panel.rs"]
+
+        assert queue_diagnose.classify_config_drift(test_reason, deleted_paths) == (
+            "example", "win_panel",
+        )
+
+    def test_a_named_target_the_diff_does_not_delete_is_not_config_drift(self) -> None:
+        # The target is dangling for some OTHER reason (a real regression)
+        # — this must never guess config drift just because the error text
+        # matches the shape.
+        test_reason = (
+            "error: no example target named `win_panel` in `quadraui` package"
+        )
+        deleted_paths = ["examples/some_other_example.rs"]
+
+        assert queue_diagnose.classify_config_drift(test_reason, deleted_paths) is None
+
+    def test_an_ordinary_failure_is_not_config_drift(self) -> None:
+        assert queue_diagnose.classify_config_drift(
+            "FAILED tests/test_panel.py::test_render - AssertionError",
+            ["examples/win_panel.rs"],
+        ) is None
+
+    def test_no_reason_is_not_config_drift(self) -> None:
+        assert queue_diagnose.classify_config_drift(None, ["examples/win_panel.rs"]) is None
+
+
+class TestCargoTargetCommandParsing:
+    """`coord.smoke`'s command-TEXT side of #4035 — the pre-smoke check's
+    own building blocks."""
+
+    def test_cargo_target_source_path_maps_kind_to_directory(self) -> None:
+        assert smoke.cargo_target_source_path("example", "win_panel") == (
+            "examples/win_panel.rs"
+        )
+        assert smoke.cargo_target_source_path("bin", "old_tool") == "src/bin/old_tool.rs"
+        assert smoke.cargo_target_source_path("unknown_kind", "x") is None
+
+    def test_cargo_target_touches_path_matches_exact_and_suffix(self) -> None:
+        assert smoke.cargo_target_touches_path(
+            "example", "win_panel", ["examples/win_panel.rs"]
+        )
+        assert smoke.cargo_target_touches_path(
+            "example", "win_panel", ["crates/quadraui/examples/win_panel.rs"]
+        )
+        assert not smoke.cargo_target_touches_path(
+            "example", "win_panel", ["examples/other.rs"]
+        )
+
+    def test_cargo_target_flags_in_command_finds_every_occurrence(self) -> None:
+        command = "cargo clippy --example win_panel -- -D warnings && cargo test --bin old_tool"
+
+        assert smoke.cargo_target_flags_in_command(command) == [
+            ("example", "win_panel", "--example win_panel"),
+            ("bin", "old_tool", "--bin old_tool"),
+        ]
+
+    def test_config_drift_target_in_command_flags_a_deleted_example(self) -> None:
+        # Acceptance #2: the pre-smoke check flags a diff that deletes an
+        # example named in the smoke command.
+        command = "cargo clippy --workspace --example win_panel -- -D warnings"
+
+        assert smoke.config_drift_target_in_command(
+            command, ["examples/win_panel.rs"]
+        ) == ("example", "win_panel", "--example win_panel")
+
+    def test_config_drift_target_in_command_is_none_when_nothing_deleted(self) -> None:
+        command = "cargo clippy --workspace --example win_panel -- -D warnings"
+
+        assert smoke.config_drift_target_in_command(command, ["src/lib.rs"]) is None
+
+    def test_config_drift_target_in_command_is_none_for_a_plain_command(self) -> None:
+        assert smoke.config_drift_target_in_command(
+            "cargo test --workspace", ["examples/win_panel.rs"],
+        ) is None
+
+
+class TestRemoveDanglingTargetToken:
+    """`coord.smoke.remove_dangling_target_token` — acceptance #3: the fix
+    path edits only the matched token."""
+
+    def test_a_token_appearing_once_is_removed(self) -> None:
+        command = "cargo clippy --workspace --example win_panel -- -D warnings"
+
+        result = smoke.remove_dangling_target_token(command, "--example win_panel")
+
+        assert result == "cargo clippy --workspace -- -D warnings"
+        assert "win_panel" not in result
+
+    def test_a_token_absent_from_the_command_is_a_no_op(self) -> None:
+        command = "cargo clippy --workspace -- -D warnings"
+
+        assert smoke.remove_dangling_target_token(command, "--example win_panel") is None
+
+    def test_a_token_appearing_more_than_once_is_a_no_op(self) -> None:
+        # Ambiguous: which occurrence actually dangles is not knowable from
+        # the token text alone, so this refuses rather than guessing.
+        command = (
+            "cargo clippy --example win_panel && cargo build --example win_panel"
+        )
+
+        assert smoke.remove_dangling_target_token(command, "--example win_panel") is None
+
+
+class TestGateConfigDriftTargetDeleted:
+    """`coord.smoke._gate_config_drift_target_deleted` — the Prevent-step
+    gate wired into `_dispatch_smoke_legs` itself."""
+
+    @staticmethod
+    def _assignment() -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2695,
+            issue_title="issue-2695-remove-panel",
+            assignment_id="aid-2695",
+            status="done",
+            branch="issue-2695-remove-panel",
+            type="work",
+        )
+
+    @staticmethod
+    def _config(ci_command: str) -> Config:
+        return Config(
+            repos=[Repo(name="widgets", github="acme/widgets", ci_command=ci_command)],
+            machines=[],
+        )
+
+    def test_a_confirmed_deleted_target_blocks_dispatch(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.smoke._fetch_deleted_files",
+            lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+        recorded: dict[str, object] = {}
+        monkeypatch.setattr(
+            "coord.state.record_test_verdict",
+            lambda **kwargs: recorded.update(kwargs),
+        )
+
+        completed = self._assignment()
+        config = self._config("cargo clippy --workspace --example win_panel")
+        repo = config.repo("widgets")
+
+        blocked = smoke._gate_config_drift_target_deleted(
+            completed, config, repo=repo, touched=["examples/win_panel.rs"],
+        )
+
+        assert blocked is True
+        assert completed.test_state == TEST_STATE_BLOCKED
+        assert "win_panel" in (completed.test_reason or "")
+        assert recorded["test_state"] == TEST_STATE_BLOCKED
+
+    def test_no_deleted_files_never_blocks(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.smoke._fetch_deleted_files", lambda repo_github, branch: [],
+        )
+        completed = self._assignment()
+        config = self._config("cargo clippy --workspace --example win_panel")
+        repo = config.repo("widgets")
+
+        blocked = smoke._gate_config_drift_target_deleted(
+            completed, config, repo=repo, touched=[],
+        )
+
+        assert blocked is False
+        assert completed.test_state is None
+
+    def test_a_command_naming_no_cargo_target_never_blocks(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.smoke._fetch_deleted_files",
+            lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+        completed = self._assignment()
+        config = self._config("npm test")
+        repo = config.repo("widgets")
+
+        blocked = smoke._gate_config_drift_target_deleted(
+            completed, config, repo=repo, touched=[],
+        )
+
+        assert blocked is False
+        assert completed.test_state is None
+
+
+class TestConfigDriftRows:
+    """`coord.board_doctor.config_drift_rows` — the Detect-step sweep
+    source feeding this cause into the board doctor."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(repos=[Repo(name="widgets", github="acme/widgets")], machines=[])
+
+    def test_a_confirmed_dangling_target_produces_a_config_drift_row(self) -> None:
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2695,
+            issue_title="issue-2695-remove-panel",
+            assignment_id="aid-2695",
+            status="done",
+            branch="issue-2695-remove-panel",
+            type="work",
+            test_state="failed",
+            test_reason=(
+                "error: no example target named `win_panel` in `quadraui` package"
+            ),
+        )
+        board = Board(completed=[assignment])
+
+        rows = config_drift_rows(
+            board, self._config(),
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        [row] = rows
+        assert row.queue == "config-drift"
+        assert row.key == "widgets#2695"
+        assert row.cause == queue_diagnose.CAUSE_CONFIG_DRIFT
+        assert "win_panel" in row.evidence[0]
+
+    def test_a_configured_command_surfaces_the_exact_one_line_patch(self) -> None:
+        # When the repo's TODAY-configured command still names the same
+        # target, the evidence is `plan_config_drift_fix`'s own alert
+        # message — the exact one-line coordinator.yml patch — not just a
+        # generic "confirmed deleted" note.
+        config = Config(
+            repos=[
+                Repo(
+                    name="widgets", github="acme/widgets",
+                    ci_command="cargo clippy --workspace --example win_panel",
+                ),
+            ],
+            machines=[],
+        )
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2695,
+            issue_title="issue-2695-remove-panel",
+            assignment_id="aid-2695",
+            status="done",
+            branch="issue-2695-remove-panel",
+            type="work",
+            test_state="failed",
+            test_reason=(
+                "error: no example target named `win_panel` in `quadraui` package"
+            ),
+        )
+        board = Board(completed=[assignment])
+
+        [row] = config_drift_rows(
+            board, config,
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        assert "--example win_panel" in row.evidence[0]
+        assert "repos[widgets].ci_command" in row.evidence[0]
+
+    def test_an_ordinary_failure_produces_no_row(self) -> None:
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2696,
+            issue_title="issue-2696-x",
+            assignment_id="aid-2696",
+            status="done",
+            branch="issue-2696-x",
+            type="work",
+            test_state="failed",
+            test_reason="FAILED tests/test_panel.py::test_render - AssertionError",
+        )
+        board = Board(completed=[assignment])
+
+        rows = config_drift_rows(
+            board, self._config(),
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        assert rows == []
+
+    def test_a_dangling_target_the_diff_does_not_delete_produces_no_row(self) -> None:
+        # The deleted-files lookup confirms SOMETHING was deleted, but not
+        # the target the error names — a real regression, not drift.
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2697,
+            issue_title="issue-2697-x",
+            assignment_id="aid-2697",
+            status="done",
+            branch="issue-2697-x",
+            type="work",
+            test_state="failed",
+            test_reason=(
+                "error: no example target named `win_panel` in `quadraui` package"
+            ),
+        )
+        board = Board(completed=[assignment])
+
+        rows = config_drift_rows(
+            board, self._config(),
+            diff_lookup=lambda repo_github, branch: ["examples/unrelated.rs"],
+        )
+
+        assert rows == []
+
+    def test_a_passing_row_produces_no_row(self) -> None:
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2698,
+            issue_title="issue-2698-x",
+            assignment_id="aid-2698",
+            status="done",
+            branch="issue-2698-x",
+            type="work",
+            test_state="passed",
+        )
+        board = Board(completed=[assignment])
+
+        rows = config_drift_rows(
+            board, self._config(),
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        assert rows == []
+
+
+class TestPlanConfigDriftFix:
+    """`coord.board_doctor_policy.plan_config_drift_fix` — acceptance #3:
+    the fix path edits only the matched token, and the opt-in gate decides
+    whether it is actually applied or only alerted."""
+
+    @staticmethod
+    def _config(*, autofix: bool) -> Config:
+        return Config(
+            repos=[
+                Repo(
+                    name="widgets", github="acme/widgets",
+                    board_doctor=BoardDoctorRepoConfig(config_drift_autofix=autofix),
+                ),
+            ],
+            machines=[],
+        )
+
+    def test_opted_in_with_a_single_match_applies_the_patch(self) -> None:
+        plan = board_doctor_policy_mod.plan_config_drift_fix(
+            "widgets",
+            command="cargo clippy --workspace --example win_panel -- -D warnings",
+            source="repos[widgets].ci_command",
+            token="--example win_panel",
+            config=self._config(autofix=True),
+        )
+
+        assert plan.enabled is True
+        assert plan.patched_command == "cargo clippy --workspace -- -D warnings"
+        assert "removed" in plan.alert_message
+
+    def test_opted_out_never_applies_but_still_alerts_with_the_one_line_patch(
+        self,
+    ) -> None:
+        plan = board_doctor_policy_mod.plan_config_drift_fix(
+            "widgets",
+            command="cargo clippy --workspace --example win_panel -- -D warnings",
+            source="repos[widgets].ci_command",
+            token="--example win_panel",
+            config=self._config(autofix=False),
+        )
+
+        assert plan.enabled is False
+        assert plan.patched_command is None
+        assert "--example win_panel" in plan.alert_message
+        assert "repos[widgets].ci_command" in plan.alert_message
+
+    def test_opted_in_but_the_token_is_absent_is_a_no_op_plus_alert(self) -> None:
+        plan = board_doctor_policy_mod.plan_config_drift_fix(
+            "widgets",
+            command="cargo clippy --workspace -- -D warnings",
+            source="repos[widgets].ci_command",
+            token="--example win_panel",
+            config=self._config(autofix=True),
+        )
+
+        assert plan.enabled is True
+        assert plan.patched_command is None
+        assert "--example win_panel" in plan.alert_message
+
+    def test_opted_in_but_the_token_is_ambiguous_is_a_no_op_plus_alert(self) -> None:
+        command = (
+            "cargo clippy --example win_panel && cargo build --example win_panel"
+        )
+        plan = board_doctor_policy_mod.plan_config_drift_fix(
+            "widgets",
+            command=command,
+            source="repos[widgets].ci_command",
+            token="--example win_panel",
+            config=self._config(autofix=True),
+        )
+
+        assert plan.enabled is True
+        assert plan.patched_command is None

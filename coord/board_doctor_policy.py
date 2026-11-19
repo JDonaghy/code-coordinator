@@ -208,6 +208,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 _log = logging.getLogger(__name__)
@@ -1556,6 +1557,93 @@ def _stale_race_tier_enabled(repo_name: str, config: "Config") -> bool:
         return False
     repo = config.repo(repo_name)
     return bool(repo is not None and repo.board_doctor.stale_race)
+
+
+NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR = "COORD_BOARD_DOCTOR_NO_CONFIG_DRIFT_AUTOFIX"
+"""Process-wide kill switch read by :func:`_config_drift_autofix_enabled`
+(#4035) — mirrors :data:`NO_STALE_RACE_ENV_VAR` and friends."""
+
+
+def _config_drift_autofix_enabled(repo_name: str, config: "Config") -> bool:
+    """Whether the #4035 config-drift autofix disposition may WRITE for
+    *repo_name* — same three-gate shape as :func:`_stale_race_tier_enabled`,
+    but the per-repo polarity of ``auto_refile``/``auto_split``: this
+    writes ``coordinator.yml``, a strictly more consequential action than
+    ordering an existing retry, so it needs an explicit, per-repo opt-in
+    rather than participating by default.
+
+    1. :data:`NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR` — a process-wide kill switch.
+    2. ``board_doctor.config_drift_autofix`` — the fleet-wide config switch.
+    3. ``repos[].board_doctor.config_drift_autofix`` — the per-repo opt-in,
+       default ``False`` (:class:`~coord.models.BoardDoctorRepoConfig`).
+
+    ``False`` here never means "no config drift exists" — see
+    :func:`plan_config_drift_fix`, which still computes and returns the
+    one-line patch as an alert regardless of this switch; it means only
+    that nothing may apply that patch automatically.
+    """
+    if os.environ.get(NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR):
+        return False
+    if not config.board_doctor.config_drift_autofix:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.config_drift_autofix)
+
+
+@dataclass(frozen=True)
+class ConfigDriftFix:
+    """One #4035 fix-path decision for a single dangling cargo target.
+
+    ``patched_command`` is the exact *token*-removed command text, set
+    ONLY when the autofix disposition is enabled for the repo AND the
+    token was found exactly once in the command (see
+    :func:`coord.smoke.remove_dangling_target_token` — ambiguous or
+    absent matches refuse rather than guess). Whenever it is ``None``, a
+    human must act on ``alert_message`` instead — which is always
+    populated, independent of ``enabled``, so the row is never left
+    silently unexplained.
+    """
+
+    enabled: bool
+    patched_command: str | None
+    alert_message: str
+
+
+def plan_config_drift_fix(
+    repo_name: str, *, command: str, source: str, token: str, config: "Config",
+) -> ConfigDriftFix:
+    """Decide the #4035 fix-path outcome for one dangling *token* found in
+    *command* (*source* names where that command comes from, e.g.
+    ``"repos[quadraui].ci_command"`` — :class:`coord.smoke.SmokeCommand.
+    source`).
+
+    Never mutates anything — this only COMPUTES the patch; applying it to
+    the live, symlinked ``coordinator.yml`` and committing the change in
+    the ``coord-settings`` repo is the caller's job. Edits exactly the
+    matched *token* (:func:`coord.smoke.remove_dangling_target_token`),
+    never anything else in *command* — a *token* that is absent, or
+    appears more than once, produces no ``patched_command`` at all, only
+    the alert naming the exact one-line patch for a human to apply.
+    """
+    from coord.smoke import remove_dangling_target_token  # noqa: PLC0415
+
+    enabled = _config_drift_autofix_enabled(repo_name, config)
+    patched = remove_dangling_target_token(command, token) if enabled else None
+
+    if patched is not None:
+        alert_message = (
+            f"{repo_name}: removed the dangling `{token}` from {source} "
+            f"(#4035) — new command: `{patched}`"
+        )
+    else:
+        alert_message = (
+            f"{repo_name}: {source} still runs `{token}`, naming a target "
+            f"this branch's own diff deletes (#4035). Remove `{token}` "
+            f"from {source} in coordinator.yml to clear this."
+        )
+    return ConfigDriftFix(
+        enabled=enabled, patched_command=patched, alert_message=alert_message,
+    )
 
 
 def _at_repo_capacity(
