@@ -5834,6 +5834,113 @@ class TestRunSweepFollowthroughWiring:
         assert report.followthrough == []
 
 
+class TestRunSweepRefileWiring:
+    """:func:`run_sweep`'s own split for a `branch-merged-guard` row: it
+    is pulled out of the tier loop and handed to *refile_sweep* ONLY when
+    it is actually eligible to be refiled THIS call (``auto_refile`` AND
+    the row's own repo opted in via ``board_doctor.auto_refile: true``) —
+    a repo that has not opted in (the fleet default) keeps seeing the row
+    on the ordinary alert/mechanical path instead of it vanishing from
+    both `report.decisions` and `report.refile`."""
+
+    def test_opted_in_row_bypasses_the_tier_loop(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        rows = [
+            _row("quadraui#1", "merge-conflict"),
+            guard_row := StuckRow(
+                queue="drive-queue", key="quadraui#2467", state=STATE_BLOCKED,
+                cause=CAUSE_BRANCH_MERGED_GUARD, confidence="high",
+            ),
+        ]
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: (rows, Board()),
+        )
+        captured_refile_rows: list = []
+
+        def _fake_refile_sweep(refile_rows, *, config, board, dry_run):
+            captured_refile_rows.extend(refile_rows)
+            return ["sentinel-disposition"]
+
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_refile=True),
+        )
+        config = Config(repos=[repo], machines=[])
+
+        report = board_doctor_mod.run_sweep(
+            config=config,
+            tier_of=lambda cause: TIER_ALERT,
+            alert_dispatcher=lambda row: True,
+            refile_sweep=_fake_refile_sweep,
+        )
+
+        # Only the non-guard row reached the tier loop.
+        assert [d.key for d in report.decisions] == ["quadraui#1"]
+        # The opted-in guard row was handed to the dedicated pass instead.
+        assert captured_refile_rows == [guard_row]
+        assert report.refile == ["sentinel-disposition"]
+        assert report.rows_observed == 2
+
+    def test_not_opted_in_row_stays_on_the_alert_path(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        guard_row = StuckRow(
+            queue="drive-queue", key="quadraui#2467", state=STATE_BLOCKED,
+            cause=CAUSE_BRANCH_MERGED_GUARD, confidence="high",
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([guard_row], Board()),
+        )
+        refile_called = []
+
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),  # no repo entry => not opted in
+            tier_of=lambda cause: TIER_ALERT,
+            alert_dispatcher=lambda row: True,
+            refile_sweep=lambda *a, **k: refile_called.append(1) or [],
+        )
+
+        # The row stayed on the ordinary tier loop — it still alerts and
+        # still lands in `touched`, so a live escalation for it is never
+        # dismissed by `clear_absent_rows` — rather than vanishing from
+        # both `report.decisions` and `report.refile`.
+        assert [d.key for d in report.decisions] == ["quadraui#2467"]
+        assert refile_called == []
+        assert report.refile == []
+
+    def test_auto_refile_false_disarms_the_pass(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        guard_row = StuckRow(
+            queue="drive-queue", key="quadraui#2467", state=STATE_BLOCKED,
+            cause=CAUSE_BRANCH_MERGED_GUARD, confidence="high",
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([guard_row], Board()),
+        )
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_refile=True),
+        )
+        refile_called = []
+
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[repo], machines=[]),
+            tier_of=lambda cause: TIER_ALERT,
+            alert_dispatcher=lambda row: True,
+            auto_refile=False,
+            refile_sweep=lambda *a, **k: refile_called.append(1) or [],
+        )
+
+        assert refile_called == []
+        assert report.refile == []
+        assert [d.key for d in report.decisions] == ["quadraui#2467"]
+
+
 class TestRunSweepMechanicalCausesFilter:
     """``mechanical_causes`` (the tight-cadence entry point) must drop
     every row outside the named set BEFORE classification — never merely
@@ -7072,6 +7179,11 @@ class TestRunRefileSweep:
         assert 2739 in by_issue
         assert by_issue[2739]["after_json"] == ["quadraui#2400"]
         assert by_issue[2468]["after_json"] == ["quadraui#2739"]
+        # #2467 was the head of the queue (position 0) — the refile must
+        # inherit that slot, not get appended behind the whole queue
+        # (which would put its own dependent, #2468, ahead of it).
+        assert by_issue[2739]["position"] == 0
+        assert by_issue[2468]["position"] == 1
 
     def test_remainder_present_closes_the_issue_as_done(self, monkeypatch) -> None:
         self._stub_get_issue(monkeypatch)
