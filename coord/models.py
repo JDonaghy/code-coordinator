@@ -124,6 +124,17 @@ class BoardDoctorRepoConfig:
     auto_refile_enabled` is the single function that reads this alongside
     the fleet-wide kill switch (`Config.board_doctor.auto_refile`) and its
     `COORD_BOARD_DOCTOR_NO_AUTO_REFILE` env-var override.
+
+    ``auto_split`` is this repo's opt-in to the #4034 auto-split
+    disposition: a drive-queue row that gave up on the #2972 fix-round
+    ceiling whose latest review's remaining blocking finding(s) all
+    describe scope that was never built (not a defect in what landed) —
+    the shape quadraui#2531/#2599 needed an operator to split by hand.
+    `False` (the default) leaves such a row exactly as before: the doctor
+    alerts but never writes. `coord.board_doctor_followthrough.
+    auto_split_enabled` is the single function that reads this alongside
+    the fleet-wide kill switch (`Config.board_doctor.auto_split`) and its
+    `COORD_BOARD_DOCTOR_NO_AUTO_SPLIT` env-var override.
     """
 
     investigate: bool = False
@@ -132,6 +143,7 @@ class BoardDoctorRepoConfig:
     followthrough: bool = False
     followthrough_auto_queue: bool = False
     auto_refile: bool = False
+    auto_split: bool = False
 
 
 @dataclass

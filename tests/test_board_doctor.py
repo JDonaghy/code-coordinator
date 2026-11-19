@@ -13,6 +13,7 @@ re-acted on, and ``dry_run=True`` mutates nothing.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -3252,6 +3253,14 @@ class TestParseBoardDoctorLogAndBackoffKnobs:
     def test_fixit_leg_budget_rejects_non_integer(self) -> None:
         with pytest.raises(ConfigError, match="fixit_leg_budget"):
             _parse_board_doctor({"fixit_leg_budget": "3"})
+
+    def test_auto_split_defaults_true_and_parses(self) -> None:
+        assert _parse_board_doctor(None).auto_split is True
+        assert _parse_board_doctor({"auto_split": False}).auto_split is False
+
+    def test_auto_split_rejects_non_boolean(self) -> None:
+        with pytest.raises(ConfigError, match="auto_split"):
+            _parse_board_doctor({"auto_split": "yes"})
 
 
 class TestBoardDoctorLogKnobsTakeEffectWithoutRestart:
@@ -7420,3 +7429,465 @@ class TestRunRefileDirect:
         assert "Refiled from #2467 for execution" in body
         assert "issue-2467-*" in body
         assert "#3376" in body
+
+
+class TestClassifySplitFindings:
+    """:func:`coord.board_doctor_followthrough.classify_split_findings` —
+    #4034 point 1's own unit tests."""
+
+    def test_a_missing_scope_only_set_is_eligible(self) -> None:
+        verdict = ft.classify_split_findings([
+            "nothing in the crate consumes `ItemsWindow` in layout or paint",
+            "the new flag is not implemented in the CLI parser",
+        ])
+        assert verdict.eligible is True
+        assert len(verdict.findings) == 2
+
+    def test_an_issue_resolution_partial_naming_the_gap_is_eligible(self) -> None:
+        verdict = ft.classify_split_findings([
+            "ISSUE_RESOLUTION: partial — the dashboard half never landed",
+        ])
+        assert verdict.eligible is True
+
+    def test_any_wrong_code_finding_blocks_the_split(self) -> None:
+        verdict = ft.classify_split_findings([
+            "nothing in the crate consumes `ItemsWindow` in layout or paint",
+            "`coord/board_doctor.py:120` reads the wrong field and corrupts "
+            "the written row",
+        ])
+        assert verdict.eligible is False
+        assert "delivered code" in verdict.reason
+
+    def test_a_nit_only_set_is_not_eligible(self) -> None:
+        """An empty blocking-findings set (nit-only reviews never add to
+        this list — #3835's Finisher tier handles them, never this
+        disposition) has nothing to classify."""
+        verdict = ft.classify_split_findings([])
+        assert verdict.eligible is False
+        assert verdict.findings == ()
+
+    def test_blank_findings_are_ignored_not_misread_as_missing_scope(self) -> None:
+        verdict = ft.classify_split_findings(["   ", ""])
+        assert verdict.eligible is False
+
+
+class TestSplitBlockingFindings:
+    """:func:`coord.board_doctor_followthrough.split_blocking_findings`."""
+
+    def test_splits_one_finding_per_top_level_bullet(self) -> None:
+        text = (
+            "- (from #4033) first finding, with\n"
+            "  a continuation line.\n"
+            "- (from #4037) second finding."
+        )
+        findings = ft.split_blocking_findings(text)
+        assert len(findings) == 2
+        assert findings[0].startswith("- (from #4033) first finding")
+        assert "continuation line" in findings[0]
+        assert findings[1].startswith("- (from #4037) second finding")
+
+    def test_no_bullets_returns_the_whole_text_as_one_finding(self) -> None:
+        assert ft.split_blocking_findings("just prose, no list") == ["just prose, no list"]
+
+    def test_blank_text_returns_nothing(self) -> None:
+        assert ft.split_blocking_findings("   ") == []
+
+
+class TestAutoSplitEnabled:
+    """:func:`coord.board_doctor_followthrough.auto_split_enabled` — the
+    #4034 opt-in gate: ``board_doctor.auto_split: true`` fleet-wide AND the
+    per-repo opt-in."""
+
+    def test_disabled_by_default(self) -> None:
+        repo = Repo(name="quadraui", github="acme/quadraui")
+        config = Config(repos=[repo], machines=[])
+        assert ft.auto_split_enabled("quadraui", config) is False
+
+    def test_enabled_when_both_opt_in(self) -> None:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_split=True),
+        )
+        config = Config(repos=[repo], machines=[])
+        assert ft.auto_split_enabled("quadraui", config) is True
+
+    def test_fleet_kill_switch_disarms_a_repo_that_opted_in(self) -> None:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_split=True),
+        )
+        config = Config(
+            repos=[repo], machines=[], board_doctor=BoardDoctorConfig(auto_split=False),
+        )
+        assert ft.auto_split_enabled("quadraui", config) is False
+
+    def test_env_var_kill_switch(self, monkeypatch) -> None:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_split=True),
+        )
+        config = Config(repos=[repo], machines=[])
+        monkeypatch.setenv("COORD_BOARD_DOCTOR_NO_AUTO_SPLIT", "1")
+        assert ft.auto_split_enabled("quadraui", config) is False
+
+
+class TestBuildAutoSplitCandidate:
+    """:func:`coord.board_doctor.build_auto_split_candidate` — the real
+    :class:`~coord.board_doctor_followthrough.AutoSplitCandidate` builder."""
+
+    def test_pulls_issue_epic_and_queue_snapshot(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        def fake_get_issue(repo, number):
+            if number == 2531:
+                return {
+                    "number": 2531, "title": "ItemsWindow index-space fix",
+                    "body": "Do A.", "milestone": {"title": "M1"},
+                    "labels": [{"name": "backend:rust"}],
+                }
+            raise AssertionError(f"unexpected issue number {number}")
+
+        monkeypatch.setattr("coord.github_ops.get_issue", fake_get_issue)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_parent", lambda repo, number: {"number": 50},
+        )
+        entry = QueueEntry(
+            repo="quadraui", issue=2531, position=2, state=STATE_BLOCKED,
+            after=("quadraui#2400",), machine="precision",
+        )
+
+        candidate = board_doctor_mod.build_auto_split_candidate(
+            "quadraui", 2531, config=Config(repos=[], machines=[]), entry=entry,
+            findings=("no consumer of ItemsWindow",),
+        )
+
+        assert candidate.repo_name == "quadraui" and candidate.issue_number == 2531
+        assert candidate.title == "ItemsWindow index-space fix"
+        assert candidate.epic_number == 50
+        assert candidate.milestone == "M1"
+        assert candidate.labels == ("backend:rust",)
+        assert candidate.queue_position == 2
+        assert candidate.queue_after == ("quadraui#2400",)
+        assert candidate.queue_machine == "precision"
+        assert candidate.findings == ("no consumer of ItemsWindow",)
+
+
+class _FakeAutoSplitWriter:
+    def __init__(self, *, new_number: int = 2744) -> None:
+        self.new_number = new_number
+        self.created: list[tuple[str, str]] = []
+        self.commented: list[tuple[int, str]] = []
+        self.bodies: dict[int, str] = {}
+        self.linked: list[tuple[int, int]] = []
+
+    def create_issue(self, repo_name, *, title, body, milestone, labels=()):
+        self.created.append((title, body))
+        return self.new_number
+
+    def add_child(self, repo_name, *, epic, child, after):
+        self.linked.append((epic, child))
+
+    def get_issue_body(self, repo_name, number):
+        return self.bodies.get(number, "")
+
+    def set_issue_body(self, repo_name, number, body):
+        self.bodies[number] = body
+
+    def close_issue(self, repo_name, number, *, comment):
+        raise AssertionError("auto-split must never close the original")
+
+    def comment_issue(self, repo_name, number, *, body):
+        self.commented.append((number, body))
+
+
+class TestRunAutoSplitForRow:
+    """:func:`coord.board_doctor.run_auto_split_for_row` — the real wiring
+    between a ceiling-blocked drive-queue row and
+    :func:`coord.board_doctor_followthrough.run_auto_split` (#4034). This is
+    the issue's own end-to-end acceptance: a ceiling row with one
+    missing-scope finding produces a follow-up issue, a rescoped body, a
+    review reset and a requeued row, with no operator call."""
+
+    REPO = "quadraui"
+    ISSUE = 2531
+
+    @staticmethod
+    def _config(*, opted_in: bool = True) -> Config:
+        repo = Repo(
+            name="quadraui", github="acme/quadraui",
+            board_doctor=BoardDoctorRepoConfig(auto_split=opted_in),
+        )
+        return Config(repos=[repo], machines=[])
+
+    def _stub_github(self, monkeypatch, *, epic_number: int | None = None) -> None:
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda repo, number: {
+                "number": number, "title": "ItemsWindow index-space fix",
+                "body": "## What\n\nFix the index math.\n\n## Acceptance\n\n"
+                "- `src/items.rs` consumers all use the fixed index\n",
+            },
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue_parent",
+            lambda repo, number: {"number": epic_number} if epic_number else None,
+        )
+
+    def _stub_review(self, monkeypatch, *, assignment_id: str = "review-1") -> None:
+        review = Assignment(
+            machine_name="precision", repo_name=self.REPO, issue_number=self.ISSUE,
+            issue_title="T", assignment_id=assignment_id, status="done",
+            branch=f"issue-{self.ISSUE}-fix", dispatched_at=1.0, finished_at=2.0,
+            type="review", review_of_assignment_id="work-1",
+        )
+        self._board = Board(active=[], completed=[review])
+        monkeypatch.setattr(
+            "coord.review.fetch_review_findings_from_github",
+            lambda repo_github, issue_number, aid: SimpleNamespace(
+                verdict="request-changes",
+                body=(
+                    "## Blocking findings\n\n"
+                    "- nothing in the crate consumes `ItemsWindow` in "
+                    "layout or paint\n"
+                ),
+            ),
+        )
+
+    def test_files_a_follow_up_rescopes_resets_and_requeues(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        self._stub_github(monkeypatch)
+        self._stub_review(monkeypatch)
+        state.enqueue_drive_queue(self.REPO, self.ISSUE, after=["quadraui#2400"])
+        writer = _FakeAutoSplitWriter(new_number=2744)
+        reset_calls: list[tuple[str, int]] = []
+
+        disposition = board_doctor_mod.run_auto_split_for_row(
+            self.REPO, self.ISSUE, config=self._config(), board=self._board,
+            writer=writer, reset_review=lambda r, n: reset_calls.append((r, n)),
+        )
+
+        assert disposition is not None
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_FILED
+        assert disposition.follow_ups == [2744]
+
+        # A follow-up issue was filed quoting the missing-scope finding.
+        [(title, body)] = writer.created
+        assert title == "ItemsWindow index-space fix (split from #2531)"
+        assert "nothing in the crate consumes" in body
+        assert ft.AUTO_SPLIT_MARKER.format(issue=self.ISSUE) in body
+
+        # The original was rescoped with a dated note, never closed.
+        rescoped = writer.bodies[self.ISSUE]
+        assert "Rescoped" in rescoped
+        assert "#2744" in rescoped
+
+        # The review stage was reset — no operator call.
+        assert reset_calls == [(self.REPO, self.ISSUE)]
+
+        # A pointer comment landed on the original.
+        assert writer.commented and writer.commented[0][0] == self.ISSUE
+
+        # The original row was re-added unchanged, and the follow-up is
+        # queued right behind it.
+        rows = state.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert self.ISSUE in by_issue
+        assert by_issue[self.ISSUE]["after_json"] == ["quadraui#2400"]
+        assert 2744 in by_issue
+        assert by_issue[2744]["after_json"] == [f"quadraui#{self.ISSUE}"]
+
+    def test_a_repo_without_opt_in_declines(self, monkeypatch) -> None:
+        self._stub_github(monkeypatch)
+        self._stub_review(monkeypatch)
+        state.enqueue_drive_queue(self.REPO, self.ISSUE)
+        import coord.board_doctor as board_doctor_mod
+
+        disposition = board_doctor_mod.run_auto_split_for_row(
+            self.REPO, self.ISSUE, config=self._config(opted_in=False), board=self._board,
+        )
+
+        assert disposition is None
+
+    def test_a_wrong_code_finding_declines_rather_than_splitting(self, monkeypatch) -> None:
+        self._stub_github(monkeypatch)
+        self._stub_review(monkeypatch)
+        monkeypatch.setattr(
+            "coord.review.fetch_review_findings_from_github",
+            lambda repo_github, issue_number, aid: SimpleNamespace(
+                verdict="request-changes",
+                body=(
+                    "## Blocking findings\n\n"
+                    "- `src/items.rs:40` reads the wrong field and corrupts "
+                    "the index\n"
+                ),
+            ),
+        )
+        state.enqueue_drive_queue(self.REPO, self.ISSUE)
+        import coord.board_doctor as board_doctor_mod
+
+        disposition = board_doctor_mod.run_auto_split_for_row(
+            self.REPO, self.ISSUE, config=self._config(), board=self._board,
+        )
+
+        assert disposition is None
+
+    def test_no_live_queue_row_declines(self, monkeypatch) -> None:
+        self._stub_github(monkeypatch)
+        self._stub_review(monkeypatch)
+        import coord.board_doctor as board_doctor_mod
+
+        disposition = board_doctor_mod.run_auto_split_for_row(
+            self.REPO, self.ISSUE, config=self._config(), board=self._board,
+        )
+
+        assert disposition is None
+
+    def test_adds_to_the_epics_sub_issues_checklist_when_present(self, monkeypatch) -> None:
+        self._stub_github(monkeypatch, epic_number=50)
+        self._stub_review(monkeypatch)
+        state.enqueue_drive_queue(self.REPO, self.ISSUE)
+        writer = _FakeAutoSplitWriter(new_number=2744)
+        writer.bodies[50] = "Epic body.\n\n## Sub-issues\n- #2531\n\n## Notes\nkeep me\n"
+        import coord.board_doctor as board_doctor_mod
+
+        disposition = board_doctor_mod.run_auto_split_for_row(
+            self.REPO, self.ISSUE, config=self._config(), board=self._board,
+            writer=writer, reset_review=lambda r, n: None,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_FILED
+        assert writer.linked == [(50, 2744)]
+        epic_body = writer.bodies[50]
+        assert "#2744" in epic_body
+        assert "#2531" in epic_body  # the original's own row is preserved
+        assert "keep me" in epic_body  # #4034: add-child must not strip rows
+
+
+class TestRunAutoSplitDirect:
+    """:func:`coord.board_doctor_followthrough.run_auto_split` exercised
+    directly (not through :func:`run_auto_split_for_row`) — the depth limit
+    and write-failure paths :class:`TestRunAutoSplitForRow` does not touch."""
+
+    @staticmethod
+    def _candidate(**overrides) -> "ft.AutoSplitCandidate":
+        base = dict(
+            repo_name="quadraui", issue_number=2531, title="Index-space fix",
+            body="Do A.", github_repo="acme/quadraui",
+            findings=("no consumer of `ItemsWindow` in layout or paint",),
+        )
+        base.update(overrides)
+        return ft.AutoSplitCandidate(**base)
+
+    def test_depth_limit_pages_instead_of_recursing(self) -> None:
+        candidate = self._candidate(
+            body=f"B\n{ft.AUTO_SPLIT_MARKER.format(issue=1)}",
+        )
+        writer = _FakeAutoSplitWriter()
+        paged: list[tuple[str, str]] = []
+
+        disposition = ft.run_auto_split(
+            candidate, writer=writer,
+            alert=lambda subject, body: paged.append((subject, body)),
+            record=lambda entry: None,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_DEPTH_PAGED
+        assert writer.created == []
+        assert len(paged) == 1
+
+    def test_write_failure_alerts_with_what_was_filed_so_far(self) -> None:
+        candidate = self._candidate()
+        writer = _FakeAutoSplitWriter(new_number=2744)
+
+        def boom_set_body(repo_name, number, body):
+            raise RuntimeError("gh is down")
+
+        writer.set_issue_body = boom_set_body
+        alerted: list[tuple[str, str]] = []
+        recorded: list[dict] = []
+
+        disposition = ft.run_auto_split(
+            candidate, writer=writer,
+            alert=lambda subject, body: alerted.append((subject, body)),
+            record=recorded.append,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_WRITE_FAILED
+        assert disposition.follow_ups == [2744]
+        assert alerted and "#2744" in alerted[0][1]
+        assert recorded and recorded[0]["action"] == ft.ACTION_AUTO_SPLIT_WRITE_FAILED
+
+    def test_dry_run_writes_nothing(self) -> None:
+        candidate = self._candidate()
+        writer = _FakeAutoSplitWriter()
+
+        disposition = ft.run_auto_split(
+            candidate, writer=writer, alert=lambda *a: None,
+            record=lambda entry: (_ for _ in ()).throw(
+                AssertionError("dry_run must not record"),
+            ),
+            dry_run=True,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_FILED
+        assert writer.created == []
+
+
+class TestTryAutoSplit:
+    """:func:`coord.board_doctor_policy._try_auto_split` — the confirmed-
+    success wiring :func:`coord.board_doctor_policy._investigate` consults
+    before paging a human for a ceiling-blocked row (#4034)."""
+
+    def test_true_only_when_the_disposition_confirms_filed(self, monkeypatch) -> None:
+        import coord.board_doctor_policy as board_doctor_policy_mod
+
+        monkeypatch.setattr(
+            "coord.commands._common.resolve_and_load_config",
+            lambda *a, **k: Config(repos=[], machines=[]),
+        )
+        monkeypatch.setattr("coord.state.build_board", lambda: Board(active=[], completed=[]))
+        monkeypatch.setattr(
+            "coord.board_doctor.run_auto_split_for_row",
+            lambda *a, **k: ft.Disposition(
+                repo_name="quadraui", issue_number=2531,
+                action=ft.ACTION_AUTO_SPLIT_FILED, cause=ft.AUTO_SPLIT_CAUSE,
+            ),
+        )
+
+        assert board_doctor_policy_mod._try_auto_split("quadraui", 2531) is True
+
+    def test_false_when_the_disposition_is_a_write_failure(self, monkeypatch) -> None:
+        """A disposition object coming back is not the same as it having
+        confirmed success (#2096) — a write-failed split must still fall
+        through to the caller's own alert fallback."""
+        import coord.board_doctor_policy as board_doctor_policy_mod
+
+        monkeypatch.setattr(
+            "coord.commands._common.resolve_and_load_config",
+            lambda *a, **k: Config(repos=[], machines=[]),
+        )
+        monkeypatch.setattr("coord.state.build_board", lambda: Board(active=[], completed=[]))
+        monkeypatch.setattr(
+            "coord.board_doctor.run_auto_split_for_row",
+            lambda *a, **k: ft.Disposition(
+                repo_name="quadraui", issue_number=2531,
+                action=ft.ACTION_AUTO_SPLIT_WRITE_FAILED, cause=ft.AUTO_SPLIT_CAUSE,
+            ),
+        )
+
+        assert board_doctor_policy_mod._try_auto_split("quadraui", 2531) is False
+
+    def test_false_when_not_eligible_at_all(self, monkeypatch) -> None:
+        import coord.board_doctor_policy as board_doctor_policy_mod
+
+        monkeypatch.setattr(
+            "coord.commands._common.resolve_and_load_config",
+            lambda *a, **k: Config(repos=[], machines=[]),
+        )
+        monkeypatch.setattr("coord.state.build_board", lambda: Board(active=[], completed=[]))
+        monkeypatch.setattr(
+            "coord.board_doctor.run_auto_split_for_row", lambda *a, **k: None,
+        )
+
+        assert board_doctor_policy_mod._try_auto_split("quadraui", 2531) is False

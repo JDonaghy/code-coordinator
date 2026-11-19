@@ -43,6 +43,7 @@ import os
 import re
 import time as _time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from coord.milestone_order import (
@@ -51,7 +52,9 @@ from coord.milestone_order import (
     WorkOrderNode,
     parse_sub_issues,
     parse_work_order,
+    render_sub_issues,
     render_work_order,
+    replace_sub_issues_section,
     replace_work_order_section,
 )
 from coord.preflight_size import detect_cross_backend_scope
@@ -1727,3 +1730,472 @@ def pending_refiles(decisions: Sequence[Mapping[str, Any]]) -> dict[str, int]:
                 pass
             break
     return pending
+
+
+# ── Auto-split (#4034) ───────────────────────────────────────────────────────
+#
+# A row that has given up on the #2972 fix-round ceiling (#3454/#3756) would
+# otherwise just page a human (`_alert_fallback`, `coord.board_doctor_policy.
+# _investigate`). When its LATEST review's remaining blocking finding(s) all
+# describe work that was never built — "not addressed", "no consumer", "not
+# implemented", or an `ISSUE_RESOLUTION: partial` naming the gap — rather than
+# a defect in what landed, no further fix round can ever close it: the worker
+# would just relearn the same missing-scope finding. This disposition is the
+# quadraui#2531/#2599 remedy an operator used to perform by hand:
+#
+# 1. **Classify** (:func:`classify_split_findings`) the remaining blocking
+#    findings. Eligible only when EVERY one reads as missing scope; any
+#    finding that reads as a defect in delivered code refuses the split
+#    outright, and an empty set (nothing blocking) has nothing to classify.
+# 2. **File** (:func:`run_auto_split`) a follow-up issue whose body quotes
+#    the missing-scope findings verbatim, with a `## Files` section drawn
+#    from the paths those findings cite, and swap it into the original's
+#    epic's `## Sub-issues` checklist (if any) with `{after: #orig}`.
+# 3. **Rescope** the original with a dated note and drop the moved part from
+#    its own `## Acceptance`.
+# 4. **Reset** the original's review stage and **requeue** it unchanged
+#    (same position, same `after=`), with the follow-up queued right behind
+#    it — never left for an operator to notice.
+#
+# Depth limit: an issue whose body already carries :data:`AUTO_SPLIT_MARKER`
+# is itself a split product. A missing-scope finding against ONE of those
+# pages a human instead of recursing.
+
+#: Process-wide kill switch, mirroring :data:`NO_AUTO_REFILE_ENV_VAR`.
+NO_AUTO_SPLIT_ENV_VAR = "COORD_BOARD_DOCTOR_NO_AUTO_SPLIT"
+
+#: Hidden marker stamped into every follow-up this disposition files. Its
+#: presence is what trips the depth limit.
+AUTO_SPLIT_MARKER = "<!-- coord:auto-split-of={issue} -->"
+_AUTO_SPLIT_MARKER_RE = re.compile(r"<!--\s*coord:auto-split-of=#?(\d+)\s*-->")
+
+ACTION_AUTO_SPLIT_FILED = "auto-split-filed"
+ACTION_AUTO_SPLIT_WRITE_FAILED = "auto-split-write-failed"
+ACTION_AUTO_SPLIT_DEPTH_PAGED = "auto-split-depth-paged"
+
+#: #4034's own `StuckRow`/decision-log `cause` string (`coord.board_doctor`
+#: has no `CAUSE_*` constant for this — the row's REAL cause is whatever
+#: `queue_diagnose` already diagnosed it as; this is a disposition name,
+#: not a classification, the same relationship `cause="branch-merged-guard"`
+#: has to :func:`run_refile`'s own candidates).
+AUTO_SPLIT_CAUSE = "ceiling-missing-scope"
+
+
+def auto_split_enabled(repo_name: str, config: Any) -> bool:
+    """Whether the auto-split disposition may act for *repo_name* (#4034).
+
+    Three independent gates, same shape as :func:`auto_refile_enabled`:
+    :data:`NO_AUTO_SPLIT_ENV_VAR`, the fleet-wide ``board_doctor.auto_split``
+    switch, and the per-repo ``repos[].board_doctor.auto_split`` opt-in
+    (default off).
+    """
+    if os.environ.get(NO_AUTO_SPLIT_ENV_VAR):
+        return False
+    if not config.board_doctor.auto_split:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.auto_split)
+
+
+def is_auto_split_product(body: str | None) -> bool:
+    """True when *body* carries :data:`AUTO_SPLIT_MARKER`."""
+    return bool(body and _AUTO_SPLIT_MARKER_RE.search(body))
+
+
+#: Phrases a remaining blocking finding uses when it is pointing at scope
+#: that was never built, never at a defect in what landed (#4034's own
+#: vocabulary, drawn from the quadraui#2531/#2599 findings this disposition
+#: was written to resolve without an operator).
+_MISSING_SCOPE_RE = re.compile(
+    r"not addressed|no consumer|not implemented|nothing\b[^.\n]*\bconsumes\b",
+    re.IGNORECASE,
+)
+#: A reviewer's own `ISSUE_RESOLUTION: partial` naming the remaining gap
+#: (#3502's marker) is the same shape as the phrases above — the finding is
+#: reporting unbuilt scope, not a defect.
+_ISSUE_RESOLUTION_PARTIAL_RE = re.compile(r"ISSUE_RESOLUTION:\s*partial\b", re.IGNORECASE)
+
+#: A top-level markdown bullet starts a new finding — mirrors the rendering
+#: every review this disposition classifies already uses (one finding per
+#: ``-``/``*`` bullet, optionally continuing onto indented lines).
+_TOP_BULLET_RE = re.compile(r"^[-*]\s+", re.MULTILINE)
+
+
+def is_missing_scope_finding(text: str) -> bool:
+    """Whether *text* (one blocking finding, verbatim) reads as unbuilt
+    scope rather than a defect in delivered code (#4034 point 1).
+    """
+    return bool(_MISSING_SCOPE_RE.search(text) or _ISSUE_RESOLUTION_PARTIAL_RE.search(text))
+
+
+def split_blocking_findings(text: str) -> list[str]:
+    """Split a review's "## Blocking findings" text
+    (:func:`coord.review.extract_blocking_section`'s own return value) into
+    individual findings, one per top-level bullet.
+
+    A body with no top-level bullet at all (free prose, no markdown list)
+    is returned as a single finding — the whole text, since there is no
+    reliable boundary to split on. Returns ``[]`` for blank/whitespace-only
+    input.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    starts = [m.start() for m in _TOP_BULLET_RE.finditer(cleaned)]
+    if not starts:
+        return [cleaned]
+    starts.append(len(cleaned))
+    return [
+        cleaned[a:b].strip()
+        for a, b in zip(starts, starts[1:])
+        if cleaned[a:b].strip()
+    ]
+
+
+@dataclass(frozen=True)
+class SplitClassification:
+    """:func:`classify_split_findings`'s verdict: may this ceiling row be
+    auto-split, and why (or why not)."""
+
+    eligible: bool
+    reason: str
+    findings: tuple[str, ...] = ()
+
+
+def classify_split_findings(findings: Sequence[str]) -> SplitClassification:
+    """Classify a ceiling-blocked row's remaining blocking findings (#4034
+    point 1).
+
+    Eligible only when EVERY finding reads as missing scope
+    (:func:`is_missing_scope_finding`) — a single finding that reads as a
+    defect in delivered code refuses the split outright (that shape
+    belongs to the investigator tier, never a split), and an empty
+    *findings* has nothing to classify (a nit-only review belongs to the
+    #3835 Finisher tier, not here, and never reaches this far in the first
+    place since it never generates further fix rounds).
+    """
+    cleaned = tuple(f.strip() for f in findings if f and f.strip())
+    if not cleaned:
+        return SplitClassification(
+            eligible=False,
+            reason="no blocking findings to classify — nothing to split",
+        )
+    missing = tuple(f for f in cleaned if is_missing_scope_finding(f))
+    if len(missing) != len(cleaned):
+        wrong = next(f for f in cleaned if not is_missing_scope_finding(f))
+        return SplitClassification(
+            eligible=False,
+            reason=(
+                "at least one remaining blocking finding describes "
+                "delivered code rather than missing scope, so this "
+                f"belongs to the investigator tier, not a split: {wrong[:200]!r}"
+            ),
+        )
+    return SplitClassification(
+        eligible=True,
+        reason="every remaining blocking finding describes missing scope",
+        findings=missing,
+    )
+
+
+#: A backtick-quoted path (optionally with a trailing `:line` or `:a-b`
+#: range, which is dropped) — the shape every lesson/finding in this fleet
+#: already cites a file in (see this issue's own "Lessons from siblings").
+_FILE_REF_RE = re.compile(r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)(?::\d+(?:-\d+)?)?`")
+
+
+def extract_file_refs(findings: Sequence[str]) -> list[str]:
+    """Every distinct backtick-quoted file path cited across *findings*, in
+    first-seen order — the follow-up's own ``## Files`` declaration
+    (#4034 point 2)."""
+    seen: list[str] = []
+    for finding in findings:
+        for m in _FILE_REF_RE.finditer(finding):
+            path = m.group(1)
+            if path not in seen:
+                seen.append(path)
+    return seen
+
+
+@dataclass(frozen=True)
+class AutoSplitCandidate:
+    """Everything :func:`run_auto_split` needs about one ceiling-blocked row
+    (#4034) — both the GitHub-side context for filing the follow-up and the
+    drive-queue row's own snapshot for re-adding the ORIGINAL unchanged
+    (same position, same ``after=`` edges — unlike a refile, the original's
+    own issue number never moves)."""
+
+    repo_name: str
+    issue_number: int
+    title: str
+    body: str
+    findings: tuple[str, ...]
+    labels: tuple[str, ...] = ()
+    milestone: str | None = None
+    epic_number: int | None = None
+    github_repo: str = ""
+    queue_position: int | None = None
+    queue_after: tuple[str, ...] = ()
+    queue_machine: str = ""
+    queue_hold_after: bool = False
+    queue_hold_reason: str = ""
+    queue_resume_when: str = ""
+    queue_hold_scope: str = "entry"
+    queue_max_fix_rounds: int | None = None
+    queue_no_acceptance: bool = False
+    queue_plan_destructive: bool = False
+
+    @property
+    def github_slug(self) -> str:
+        """Mirrors :attr:`RefileCandidate.github_slug` exactly."""
+        return self.github_repo or self.repo_name
+
+
+def _auto_split_follow_up_body(candidate: AutoSplitCandidate) -> tuple[str, list[str]]:
+    """Render the follow-up's body: its "What" and "Acceptance" are the
+    quoted missing-scope findings (#4034 point 2 — "its 'What' comes from
+    the blocking findings, quoted" / "its acceptance is the original
+    acceptance items those findings say are unmet"). Lacking a reliable way
+    to tell WHICH of the original's own acceptance bullets each finding
+    means, the findings themselves stand in as the acceptance text too —
+    never less coverage than the findings already describe. Returns the
+    rendered body and the file paths extracted from the findings, which the
+    caller also needs to rescope the original's own ``## Acceptance``.
+    """
+    files = extract_file_refs(candidate.findings)
+    findings_block = "\n\n".join(candidate.findings)
+    parts = [
+        f"Split from #{candidate.issue_number} by the board doctor (#4034): "
+        "its last review's remaining blocking finding(s), quoted below, "
+        "name scope that was never built — not a defect in the delivered "
+        "code.",
+        "## What\n\n" + findings_block,
+        "## Acceptance\n\n" + findings_block,
+    ]
+    if files:
+        parts.append("## Files\n\n" + "\n".join(f"- {f}" for f in files))
+    parts.append(AUTO_SPLIT_MARKER.format(issue=candidate.issue_number))
+    return "\n\n".join(parts), files
+
+
+def _splice_sub_issue(body: str, *, child: int, after: Sequence[int]) -> str:
+    """Add *child* to *body*'s ``## Sub-issues`` checklist with the given
+    ``after=`` annotation, preserving every existing row (#4034 point 4).
+
+    Reuses ``coord milestone add-child``'s own parse/render round trip
+    (:func:`coord.milestone_order.parse_sub_issues`/:func:`render_sub_issues`/
+    :func:`replace_sub_issues_section`) rather than a hand-rolled splice, so
+    a hand-written row's own description text is never at risk of being
+    silently dropped — the body is re-parsed afterward by the caller
+    (:func:`run_auto_split`, via :meth:`FollowThroughWriter.set_issue_body`'s
+    read-back) to confirm it still parses.
+    """
+    try:
+        current = parse_sub_issues(body)
+    except WorkOrderError:
+        current = WorkOrder(nodes=())
+    nodes = list(current.nodes)
+    if any(n.issue_number == child for n in nodes):
+        return body
+    nodes.append(
+        WorkOrderNode(issue_number=child, group=None, after=tuple(after), checked=False)
+    )
+    new_block = render_sub_issues(WorkOrder(nodes=tuple(nodes)))
+    return replace_sub_issues_section(body, new_block)
+
+
+def _file_auto_split_follow_up(
+    candidate: AutoSplitCandidate, writer: FollowThroughWriter,
+) -> tuple[int, list[str]]:
+    """File the follow-up and, if the original had an epic, add it to that
+    epic's ``## Sub-issues`` checklist as ``{after: #orig}``. Returns the
+    new issue number and the file paths its body cites.
+    """
+    title = f"{candidate.title} (split from #{candidate.issue_number})"
+    body, files = _auto_split_follow_up_body(candidate)
+    new_number = writer.create_issue(
+        candidate.github_slug, title=title, body=body,
+        milestone=candidate.milestone, labels=candidate.labels,
+    )
+    if candidate.epic_number is not None:
+        writer.add_child(
+            candidate.github_slug, epic=candidate.epic_number,
+            child=new_number, after=(candidate.issue_number,),
+        )
+        epic_body = writer.get_issue_body(candidate.github_slug, candidate.epic_number)
+        updated = _splice_sub_issue(
+            epic_body, child=new_number, after=(candidate.issue_number,),
+        )
+        if updated != epic_body:
+            writer.set_issue_body(candidate.github_slug, candidate.epic_number, updated)
+    return new_number, files
+
+
+#: A `## Acceptance` (or `## Acceptance criteria`) heading, same leniency a
+#: review's own section parser gives its headings.
+_ACCEPTANCE_HEADING_RE = re.compile(
+    r"^#{1,6}[ \t]*Acceptance(?:\s+criteria)?\b.*$", re.IGNORECASE | re.MULTILINE,
+)
+_ANY_HEADING_RE = re.compile(r"^#{1,6}[ \t]+\S", re.MULTILINE)
+
+
+def _rescope_original_body(
+    body: str, *, new_number: int, findings: Sequence[str], moved_files: Sequence[str],
+) -> str:
+    """Rescope the original's body for #4034 point 3: a dated note at the
+    top naming where the gap moved, and the moved part dropped from its own
+    ``## Acceptance`` (a bullet line is dropped only when it names one of
+    *moved_files* — the same mechanical, never-guessed matching #2247's own
+    declared-file overlap uses, so a bullet this can't confidently tie to
+    the moved part is left in place rather than risking a silent loss of
+    coverage).
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    gap = findings[0].strip() if findings else "scope named by the last review"
+    gap = gap[:160] + ("…" if len(gap) > 160 else "")
+    note = f"**Rescoped {today}:** {gap} — moved to #{new_number}.\n\n"
+
+    m = _ACCEPTANCE_HEADING_RE.search(body)
+    if m is None or not moved_files:
+        return note + body
+    start = m.end()
+    nxt = _ANY_HEADING_RE.search(body, start)
+    end = nxt.start() if nxt else len(body)
+    section = body[start:end]
+    lines = section.splitlines(keepends=True)
+    kept = [line for line in lines if not any(f in line for f in moved_files)]
+    if len(kept) == len(lines):
+        return note + body
+    return note + body[:start] + "".join(kept) + body[end:]
+
+
+def _requeue_auto_split(candidate: AutoSplitCandidate, new_number: int) -> None:
+    """Re-add the ORIGINAL row unchanged (same position, same ``after=``,
+    no overlap re-prediction — its own declared footprint has not
+    changed), then queue the follow-up right behind it (#4034 points 5-6).
+
+    Confirms every write with a read-back, same discipline
+    :func:`_requeue_refile` applies — an unconfirmed rewrite is not a
+    rewrite (#2096).
+    """
+    from coord.drive_queue import entry_key  # noqa: PLC0415
+    from coord.state import dequeue_drive_queue, enqueue_drive_queue, get_drive_queue_entry  # noqa: PLC0415
+
+    orig_key = entry_key(candidate.repo_name, candidate.issue_number)
+
+    dequeue_drive_queue(candidate.repo_name, candidate.issue_number, operator=False)
+    enqueue_drive_queue(
+        candidate.repo_name, candidate.issue_number,
+        machine=candidate.queue_machine or None,
+        after=list(candidate.queue_after),
+        position=candidate.queue_position,
+        hold_after=candidate.queue_hold_after,
+        hold_reason=candidate.queue_hold_reason,
+        resume_when=candidate.queue_resume_when,
+        hold_scope=candidate.queue_hold_scope,
+        max_fix_rounds=candidate.queue_max_fix_rounds,
+        no_acceptance=candidate.queue_no_acceptance,
+        plan_destructive=candidate.queue_plan_destructive,
+    )
+    if get_drive_queue_entry(candidate.repo_name, candidate.issue_number) is None:
+        raise RuntimeError(
+            f"auto-split re-queued {orig_key} but the row did not read "
+            "back from the drive queue"
+        )
+
+    enqueue_drive_queue(candidate.repo_name, new_number, after=[orig_key])
+    if get_drive_queue_entry(candidate.repo_name, new_number) is None:
+        raise RuntimeError(
+            f"auto-split filed #{new_number} but it did not read back "
+            "from the drive queue"
+        )
+
+
+def _default_reset_review(repo_name: str, issue_number: int) -> None:
+    """No-op placeholder — a production caller (`coord.board_doctor`) always
+    passes its own *reset_review*, threaded with the live `board`/`config`
+    :func:`coord.diagnose.diagnose_stage` needs, which this module does not
+    carry. Kept so :func:`run_auto_split` has a harmless default for a
+    caller (mostly tests) that doesn't care about the review stage reset.
+    """
+
+
+def run_auto_split(
+    candidate: AutoSplitCandidate,
+    *,
+    writer: FollowThroughWriter,
+    alert: Callable[[str, str], None],
+    record: Callable[[dict], None] = _default_record,
+    dry_run: bool = False,
+    requeue: Callable[[AutoSplitCandidate, int], None] = _requeue_auto_split,
+    reset_review: Callable[[str, int], None] = _default_reset_review,
+) -> Disposition:
+    """Resolve one ceiling-blocked, missing-scope-only row end to end
+    (#4034). *candidate* is assumed already classified eligible
+    (:func:`classify_split_findings`) — this function only guards the depth
+    limit, files, rescopes, resets and requeues.
+
+    With *dry_run*, nothing is written, alerted or recorded, mirroring
+    :func:`run_refile`'s own contract.
+    """
+    key = f"{candidate.repo_name}#{candidate.issue_number}"
+    disposition = Disposition(
+        repo_name=candidate.repo_name, issue_number=candidate.issue_number,
+        action="", dry_run=dry_run, cause=AUTO_SPLIT_CAUSE,
+    )
+
+    def _finish(action: str) -> Disposition:
+        disposition.action = action
+        if not dry_run:
+            record(disposition.as_record())
+        return disposition
+
+    if is_auto_split_product(candidate.body):
+        disposition.reasons.append(
+            "issue is itself an auto-split product whose own split-off part "
+            "hit a missing-scope finding again"
+        )
+        if not dry_run:
+            alert(
+                f"{key}: auto-split product hit a missing-scope finding again",
+                f"{key} was filed by the board-doctor auto-split and its "
+                "own remaining blocking finding(s) still read as missing "
+                "scope. Not recursing — a human needs to look.",
+            )
+        return _finish(ACTION_AUTO_SPLIT_DEPTH_PAGED)
+
+    if dry_run:
+        disposition.action = ACTION_AUTO_SPLIT_FILED
+        return disposition
+
+    new_number: int | None = None
+    try:
+        new_number, moved_files = _file_auto_split_follow_up(candidate, writer)
+        disposition.follow_ups.append(new_number)
+        disposition.follow_up_keys["auto_split"] = new_number
+        rescoped = _rescope_original_body(
+            candidate.body, new_number=new_number,
+            findings=candidate.findings, moved_files=moved_files,
+        )
+        writer.set_issue_body(candidate.github_slug, candidate.issue_number, rescoped)
+        reset_review(candidate.repo_name, candidate.issue_number)
+        requeue(candidate, new_number)
+        writer.comment_issue(
+            candidate.github_slug, candidate.issue_number,
+            body=(
+                f"Board-doctor auto-split (#4034): the remaining blocking "
+                "review finding(s) named scope that was never built, not "
+                f"a defect in what landed. Split out as #{new_number} and "
+                "requeued right behind it."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — every write failure must alert
+        disposition.reasons.append(f"write failed: {exc}")
+        alert(
+            f"{key}: auto-split write failed",
+            f"Writing stopped at: {exc}\nFiled so far: "
+            + (f"#{new_number}" if new_number is not None else "none"),
+        )
+        return _finish(ACTION_AUTO_SPLIT_WRITE_FAILED)
+
+    return _finish(ACTION_AUTO_SPLIT_FILED)

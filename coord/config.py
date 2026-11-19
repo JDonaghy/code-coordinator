@@ -1661,6 +1661,11 @@ class BoardDoctorConfig:
     disposition, mirroring ``followthrough`` exactly: a repo must still opt
     in via ``repos[].board_doctor.auto_refile``
     (``BoardDoctorRepoConfig.auto_refile``, default ``False``).
+
+    ``auto_split`` (#4034) is the fleet-wide switch for the auto-split
+    disposition, mirroring ``auto_refile`` exactly: a repo must still opt
+    in via ``repos[].board_doctor.auto_split``
+    (``BoardDoctorRepoConfig.auto_split``, default ``False``).
     """
 
     investigate: bool = True
@@ -1675,6 +1680,7 @@ class BoardDoctorConfig:
     fixit_leg_budget: int = 1
     outcome_grace_hours: float = 3.0
     auto_refile: bool = True
+    auto_split: bool = True
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3772,6 +3778,11 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         if not isinstance(auto_refile, bool):
             raise ConfigError("board_doctor.auto_refile must be a boolean")
         cfg.auto_refile = auto_refile
+    if "auto_split" in raw:
+        auto_split = raw["auto_split"]
+        if not isinstance(auto_split, bool):
+            raise ConfigError("board_doctor.auto_split must be a boolean")
+        cfg.auto_split = auto_split
     return cfg
 
 
@@ -4259,6 +4270,13 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 f"repos[{repo_index}].board_doctor.auto_refile must be a boolean"
             )
         cfg.auto_refile = auto_refile
+    if "auto_split" in raw:
+        auto_split = raw["auto_split"]
+        if not isinstance(auto_split, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.auto_split must be a boolean"
+            )
+        cfg.auto_split = auto_split
     return cfg
 
 

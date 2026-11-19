@@ -1417,12 +1417,15 @@ class TestInvestigate:
             fake_ceiling_blocked,
         )
 
-        def boom_if_called(path, **kwargs):
-            raise AssertionError(
-                "config must not be resolved once the ceiling check blocks"
-            )
-
-        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
+        # #4034: once the ceiling blocks, `_investigate` tries the
+        # auto-split disposition before falling back to the alert tier —
+        # that lookup resolves ITS OWN config, independently of the
+        # dispatch path below (never opted in here, since no repo is
+        # declared, so it declines and `_investigate` still falls through
+        # to its own alert without ever calling `dispatch_sweep_action`).
+        monkeypatch.setattr(
+            common, "resolve_and_load_config", lambda *a, **k: Config(repos=[], machines=[]),
+        )
 
         def dispatch_must_not_be_called(*args, **kwargs):
             raise AssertionError(
@@ -1536,12 +1539,13 @@ class TestInvestigate:
             lambda repo_name, issue_number: True,
         )
 
-        def boom_if_called(path, **kwargs):
-            raise AssertionError(
-                "config must not be resolved once the ceiling check blocks"
-            )
-
-        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
+        # #4034: see `test_falls_back_to_the_alert_tier_when_the_fix_round_
+        # ceiling_blocks_it`'s own comment — the auto-split lookup resolves
+        # its own config, but declines (no repo declared) and never
+        # dispatches anything.
+        monkeypatch.setattr(
+            common, "resolve_and_load_config", lambda *a, **k: Config(repos=[], machines=[]),
+        )
 
         def dispatch_must_not_be_called(*args, **kwargs):
             raise AssertionError(
@@ -1581,12 +1585,11 @@ class TestInvestigate:
             lambda repo_name, issue_number: True,
         )
 
-        def boom_if_called(path, **kwargs):
-            raise AssertionError(
-                "config must not be resolved once the ceiling check blocks"
-            )
-
-        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
+        # #4034: see `test_falls_back_to_the_alert_tier_when_the_fix_round_
+        # ceiling_blocks_it`'s own comment.
+        monkeypatch.setattr(
+            common, "resolve_and_load_config", lambda *a, **k: Config(repos=[], machines=[]),
+        )
 
         def dispatch_must_not_be_called(*args, **kwargs):
             raise AssertionError(
@@ -2272,12 +2275,11 @@ class TestFixitRebudgetGlobalCap:
             lambda repo_name, issue_number: True,
         )
 
-        def boom(*args, **kwargs):
-            raise AssertionError(
-                "config must not be resolved once the shared cap refuses"
-            )
-
-        monkeypatch.setattr(common, "resolve_and_load_config", boom)
+        # #4034: see `test_falls_back_to_the_alert_tier_when_the_fix_round_
+        # ceiling_blocks_it`'s own comment.
+        monkeypatch.setattr(
+            common, "resolve_and_load_config", lambda *a, **k: Config(repos=[], machines=[]),
+        )
 
         investigate_row = _row(
             "acme/widgets#40",
