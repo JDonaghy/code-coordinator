@@ -2078,6 +2078,13 @@ def _try_auto_split(repo_name: str, issue_number: int) -> bool:
     so returning `True` for it here would both double-alert AND tell the
     caller a human page never fired for a row that, in fact, still needs
     one).
+
+    Only `ConfigError` is caught here; `build_auto_split_candidate`'s own
+    live-GitHub reads (``get_issue``/``get_issue_parent``) and
+    `run_auto_split_for_row`'s review-stage reset can both raise beyond
+    that. The caller wraps this call in `_run_mechanical_action` so any of
+    those exceptions is reported and reads as "declined" rather than
+    aborting the whole sweep.
     """
     from coord.board_doctor import run_auto_split_for_row  # noqa: PLC0415
     from coord.board_doctor_followthrough import ACTION_AUTO_SPLIT_FILED  # noqa: PLC0415
@@ -2179,7 +2186,9 @@ def _investigate(row: StuckRow) -> bool:
     ceiling_bypassed = False
     if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
         if not _fixit_rebudget_eligible(row, repo_name, issue_number):
-            if _try_auto_split(repo_name, issue_number):
+            if _run_mechanical_action(
+                "auto_split", row, lambda: _try_auto_split(repo_name, issue_number),
+            ):
                 return True
             click.echo(
                 f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
