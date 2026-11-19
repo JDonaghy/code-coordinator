@@ -6163,3 +6163,239 @@ class TestDispatchPlanLeg:
                 now=clock.__next__,
                 timeout_seconds=20.0,
             )
+
+
+class TestCeilingBlockedClassifiesByLastFailingGate:
+    """#4033: a drive-queue row that already gave up on the #2972 fix-round
+    ceiling gets no further diagnosis pass and no further relaunch, so the
+    cause this one classification names is the only chance any
+    auto-dispatcher or alert ever gets to point at the real blocker. A
+    standing merge conflict must not win over a currently-failing gate just
+    because `_rule_conflict` runs ahead of the gate/CI rules for an
+    ordinary row — once nothing will retry this row, a standing conflict
+    is only the real story when nothing else is also wrong.
+    """
+
+    @staticmethod
+    def _ceiling_blocked_entry(issue: int) -> QueueEntry:
+        from coord.drive_queue import STATE_BLOCKED
+
+        return QueueEntry(
+            repo="acme/widgets",
+            issue=issue,
+            state=STATE_BLOCKED,
+            attempts=3,
+            last_reason=(
+                "fix-round ceiling reached across relaunches (#2972): giving up"
+            ),
+        )
+
+    def test_a_ceiling_row_whose_last_smoke_failed_classifies_by_the_smoke_failure(
+        self,
+    ) -> None:
+        # quadraui#2695's shape: a dell64 smoke stage failing identically
+        # every round, with the branch ALSO conflicting with develop
+        # (secondary, per the incident's own read).
+        live = LiveState(
+            pr_number=42,
+            pr_state="OPEN",
+            mergeable=False,
+            gate_ready=False,
+            gate_blockers=("test: no example target named win_panel",),
+        )
+        diagnosis = queue_diagnose.diagnose(self._ceiling_blocked_entry(2695), live)
+
+        assert diagnosis.cause != queue_diagnose.CAUSE_MERGE_CONFLICT
+        assert diagnosis.cause == queue_diagnose.CAUSE_GATE_BLOCKED
+        assert any(
+            "no example target named win_panel" in line for line in diagnosis.evidence
+        )
+
+    def test_a_ceiling_row_whose_last_review_requested_changes_classifies_by_the_review_block(
+        self,
+    ) -> None:
+        # quadraui#2531's shape: a review `request-changes` with a blocking
+        # finding left after the last fix round, with the branch ALSO
+        # carrying a standing conflict.
+        live = LiveState(
+            pr_number=43,
+            pr_state="OPEN",
+            mergeable=False,
+            gate_ready=False,
+            gate_blockers=("review: review required but not approved",),
+        )
+        diagnosis = queue_diagnose.diagnose(self._ceiling_blocked_entry(2531), live)
+
+        assert diagnosis.cause != queue_diagnose.CAUSE_MERGE_CONFLICT
+        assert diagnosis.cause == queue_diagnose.CAUSE_GATE_BLOCKED
+        assert any(
+            "review required but not approved" in line for line in diagnosis.evidence
+        )
+
+    def test_a_pure_standing_conflict_with_nothing_else_wrong_still_classifies_as_conflict(
+        self,
+    ) -> None:
+        # The conflict-fix mechanical action still has a real job here —
+        # only reclassify away from it when a real gate is ALSO failing.
+        live = LiveState(
+            pr_number=44,
+            pr_state="OPEN",
+            mergeable=False,
+            gate_ready=True,
+            gate_blockers=(),
+        )
+        diagnosis = queue_diagnose.diagnose(self._ceiling_blocked_entry(9001), live)
+
+        assert diagnosis.cause == queue_diagnose.CAUSE_MERGE_CONFLICT
+
+    def test_a_non_ceiling_blocked_row_keeps_leading_with_the_conflict(self) -> None:
+        # A row that WILL get another diagnosis pass is unaffected by this
+        # reordering — naming the conflict first is still a safe, cheap
+        # first move there, and a later pass catches a gate still failing
+        # once the conflict clears.
+        from coord.drive_queue import STATE_BLOCKED
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2700,
+            state=STATE_BLOCKED,
+            attempts=1,
+            last_reason="checks failed: build (failure)",
+        )
+        live = LiveState(
+            pr_number=45,
+            pr_state="OPEN",
+            mergeable=False,
+            gate_ready=False,
+            gate_blockers=("test: no example target named win_panel",),
+        )
+        diagnosis = queue_diagnose.diagnose(entry, live)
+
+        assert diagnosis.cause == queue_diagnose.CAUSE_MERGE_CONFLICT
+
+
+class TestCeilingBlockedGateBlockedRowRoutesToTheMatchingHandler:
+    """#4033: once the diagnosis correctly names the failing gate instead
+    of the standing conflict, the EXISTING cause-routing table
+    (`coord.board_doctor_policy.policy_tier_of`) already sends it to the
+    fixit-leg investigate tier rather than the mechanical conflict-fix
+    allowlist action — the classification fix alone is enough to reach the
+    right handler, with no new dispatcher to wire up."""
+
+    def test_gate_blocked_ceiling_row_dispatches_the_fixit_leg_not_conflict_fix(
+        self,
+    ) -> None:
+        from coord.board_doctor_policy import policy_tier_of
+        from coord.drive_queue import STATE_BLOCKED
+
+        entry = QueueEntry(
+            repo="acme/widgets",
+            issue=2695,
+            state=STATE_BLOCKED,
+            attempts=3,
+            last_reason=(
+                "fix-round ceiling reached across relaunches (#2972): giving up"
+            ),
+        )
+        episode = {
+            "key": entry.key, "state": STATE_BLOCKED, "diagnoses": 0,
+            "diagnosed_cause": "",
+        }
+
+        class _Probe:
+            def probe(self, entry_):
+                return LiveState(
+                    pr_number=42,
+                    pr_state="OPEN",
+                    mergeable=False,
+                    gate_ready=False,
+                    gate_blockers=("test: no example target named win_panel",),
+                )
+
+        diagnoses = queue_diagnose.run_pass([entry], [episode], probe=_Probe())
+        rows = drive_queue_rows(diagnoses)
+
+        [row] = rows
+        assert row.cause == queue_diagnose.CAUSE_GATE_BLOCKED
+
+        fixit = _Recorder()
+        conflict_fix = _Recorder()
+        alert = _Recorder()
+        sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers={
+                queue_diagnose.CAUSE_GATE_BLOCKED: fixit,
+                queue_diagnose.CAUSE_MERGE_CONFLICT: conflict_fix,
+            },
+            alert_dispatcher=alert,
+        )
+
+        assert fixit.count == 1
+        assert conflict_fix.count == 0
+        assert alert.count == 0
+
+
+class TestCoveringEscalationMustNameAConcreteAction:
+    """#4033: `write_drive_escalation` must not defer to a covering,
+    different-stage escalation that names no `proposed_command` at all —
+    deferring there would leave the row with no alert and no actionable
+    next step, the exact silent gap the #2972 ceiling's own fallback alert
+    hit every hour against a cover with nothing behind it."""
+
+    def test_a_covering_escalation_with_no_proposed_command_is_not_deferred_to(
+        self,
+    ) -> None:
+        from coord.board_doctor_policy import write_drive_escalation
+
+        state.record_drive_escalation(
+            "acme/widgets",
+            3001,
+            stage="plan.blocked",
+            reason="plan.blocked: waiting on a dependency",
+            gate_readings="",
+            proposed_command="",
+        )
+
+        result = write_drive_escalation(
+            "acme/widgets",
+            3001,
+            stage="board-doctor:drive-queue",
+            reason="board-doctor: drive-queue row stuck",
+            gate_readings="queue=drive-queue | cause=gate-blocked",
+            proposed_command="coord status",
+        )
+
+        assert result is True
+        escalation = state.get_drive_escalation("acme/widgets", 3001)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+        assert escalation["proposed_command"] == "coord status"
+
+    def test_a_covering_escalation_with_a_real_proposed_command_is_still_deferred_to(
+        self,
+    ) -> None:
+        from coord.board_doctor_policy import write_drive_escalation
+
+        state.record_drive_escalation(
+            "acme/widgets",
+            3002,
+            stage="plan.blocked",
+            reason="plan.blocked: waiting on a dependency",
+            gate_readings="",
+            proposed_command="coord plan --dry-run",
+        )
+
+        result = write_drive_escalation(
+            "acme/widgets",
+            3002,
+            stage="board-doctor:drive-queue",
+            reason="board-doctor: drive-queue row stuck",
+            gate_readings="queue=drive-queue | cause=gate-blocked",
+            proposed_command="coord status",
+        )
+
+        assert result == ALERT_SKIPPED
+        escalation = state.get_drive_escalation("acme/widgets", 3002)
+        assert escalation is not None
+        assert escalation["stage"] == "plan.blocked"

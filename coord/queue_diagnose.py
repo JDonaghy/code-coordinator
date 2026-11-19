@@ -59,7 +59,11 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from coord.drive_queue import QueueEntry, is_unreachable_wait_shape
+from coord.drive_queue import (
+    QueueEntry,
+    is_fix_round_ceiling_blocked,
+    is_unreachable_wait_shape,
+)
 from coord.models import (
     is_needs_decomposition_reason,
     is_premise_refusal_reason,
@@ -878,6 +882,48 @@ _RULES = (
 )
 
 
+#: The rule order used once a row has exhausted its fix-round budget and
+#: will not be relaunched or retried by anything else in the fleet. Reached
+#: through :func:`diagnose` only when `coord.drive_queue.
+#: is_fix_round_ceiling_blocked` reads true for *entry* — never a second,
+#: independently-decided ceiling check (the same predicate
+#: `coord.board_doctor` and `coord.drive_queue` itself already answer to).
+#:
+#: Identical to :data:`_RULES` except :func:`_rule_conflict` moves from
+#: ahead of the CI/gate rules to just behind them. For an ordinary row that
+#: distinction does not matter — another diagnosis pass is coming, so
+#: naming the conflict first (and letting the mechanical conflict-fix leg
+#: run) is a safe, cheap first move regardless of what else is also wrong.
+#: A ceiling-blocked row gets no such follow-up pass: it is diagnosed once
+#: and then left alone (or alerted on) until an operator intervenes. Naming
+#: a standing conflict as the cause there, while a currently-failing
+#: smoke/CI/review gate is the actual reason nothing has progressed, points
+#: every downstream consumer — the auto-dispatcher, the operator reading
+#: the alert — at the wrong fix: the conflict-fix leg has no way to touch a
+#: real build/test/review failure, so it reruns forever while the real
+#: blocker goes unmentioned. Putting the gate/CI rules first here means the
+#: cause named is whichever gate is *actually* still failing; a standing
+#: conflict is only reported when nothing else is — i.e. when the conflict
+#: really is the thing blocking progress.
+_RULES_CEILING_BLOCKED = (
+    _rule_terminal_park,
+    _rule_pr_merged,
+    _rule_pr_closed,
+    _rule_dead_leg,
+    _rule_no_pr,
+    _rule_integration_red,
+    _rule_ci_red,
+    _rule_ci_pending,
+    _rule_review_stale,
+    _rule_test_stale,
+    _rule_gate_blocked,
+    _rule_conflict,
+    _rule_agent_unreachable,
+    _rule_nothing_blocking,
+    _rule_ci_green,
+)
+
+
 # ── the diagnosis ────────────────────────────────────────────────────────────
 
 
@@ -919,9 +965,20 @@ def diagnose(
     The stated reason is read exactly once, at the end, and only to ask
     whether the evidence still supports it.  It never selects, orders or
     breaks ties between causes.
+
+    Rule order is :data:`_RULES_CEILING_BLOCKED` instead of :data:`_RULES`
+    whenever *entry* already reads `coord.drive_queue.
+    is_fix_round_ceiling_blocked` — see that data's own docstring for why
+    a row nothing will retry needs its standing conflict ranked behind a
+    currently-failing gate rather than ahead of it.
     """
+    rules = (
+        _RULES_CEILING_BLOCKED
+        if is_fix_round_ceiling_blocked(entry.state, entry.last_reason)
+        else _RULES
+    )
     verdict: tuple[str, str, str] | None = None
-    for rule in _RULES:
+    for rule in rules:
         verdict = rule(entry, live)
         if verdict is not None:
             break
