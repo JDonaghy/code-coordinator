@@ -808,7 +808,7 @@ def build_refile_candidate(
         labels=labels,
         milestone=milestone.get("title"),
         epic_number=epic_number,
-        queue_position=int(getattr(entry, "position", 0) or 0) or None,
+        queue_position=int(getattr(entry, "position", 0) or 0),
         queue_after=tuple(getattr(entry, "after", ()) or ()),
         queue_machine=str(getattr(entry, "machine", "") or ""),
         queue_hold_after=bool(getattr(entry, "hold_after", False)),
@@ -4649,6 +4649,25 @@ def sweep(
     return report
 
 
+def _branch_merged_guard_row_opted_in(row: StuckRow, config: Any) -> bool:
+    """Whether *row* (cause :data:`CAUSE_BRANCH_MERGED_GUARD`) may be
+    pulled out of the ordinary alert/mechanical path for refiling.
+
+    Parses the row's drive-queue key for its repo and defers to
+    :func:`coord.board_doctor_followthrough.auto_refile_enabled`. An
+    unparseable key reads as "not opted in" — the row then stays in
+    :func:`run_sweep`'s *other_rows*, the same fail-safe posture as a repo
+    that never set ``board_doctor.auto_refile: true``.
+    """
+    from coord.drive_queue import parse_key  # noqa: PLC0415
+
+    parsed = parse_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, _issue_number = parsed
+    return board_doctor_followthrough.auto_refile_enabled(repo_name, config)
+
+
 def run_sweep(
     *,
     config,
@@ -4781,11 +4800,27 @@ def run_sweep(
         ),
     )
     followthrough_rows = [r for r in rows if r.cause == CAUSE_MERGED_PARTIAL]
-    refile_rows = [r for r in rows if r.cause == CAUSE_BRANCH_MERGED_GUARD]
-    other_rows = [
-        r for r in rows
-        if r.cause not in (CAUSE_MERGED_PARTIAL, CAUSE_BRANCH_MERGED_GUARD)
-    ]
+    # A `branch-merged-guard` row is pulled out of *other_rows* ONLY when
+    # it is actually going to be refiled this call (the fleet-wide
+    # *auto_refile* switch AND the row's own repo opted in via
+    # `board_doctor.auto_refile: true`) — a repo that has not opted in
+    # (the fleet default) keeps seeing this row on the ordinary
+    # alert/mechanical path instead, so it neither vanishes from the
+    # report nor has `clear_absent_rows` read the vanishing as "resolved"
+    # and dismiss its live escalation.
+    refile_rows: list[StuckRow] = []
+    other_rows: list[StuckRow] = []
+    for r in rows:
+        if r.cause == CAUSE_MERGED_PARTIAL:
+            continue
+        if (
+            r.cause == CAUSE_BRANCH_MERGED_GUARD
+            and auto_refile
+            and _branch_merged_guard_row_opted_in(r, config)
+        ):
+            refile_rows.append(r)
+        else:
+            other_rows.append(r)
     if mechanical_causes is not None:
         other_rows = [r for r in other_rows if r.cause in mechanical_causes]
         followthrough_rows = []
