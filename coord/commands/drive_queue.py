@@ -3577,6 +3577,21 @@ def drive_queue_sweep(
                         }
                         for f in report.followthrough
                     ],
+                    "refile": [
+                        {
+                            "repo": f.repo_name,
+                            "issue": f.issue_number,
+                            "action": f.action,
+                            "follow_ups": list(f.follow_ups),
+                            "follow_up_keys": {
+                                str(k): v for k, v in f.follow_up_keys.items()
+                            },
+                            "reasons": list(f.reasons),
+                            "rendered_plan": f.rendered_plan,
+                        }
+                        for f in report.refile
+                    ],
+                    "refile_closed": list(report.refile_closed),
                     "dropped_predicted_after_edges": list(
                         report.dropped_predicted_after_edges
                     ),
@@ -3588,6 +3603,8 @@ def drive_queue_sweep(
     if (
         not report.decisions
         and not report.followthrough
+        and not report.refile
+        and not report.refile_closed
         and not report.dropped_predicted_after_edges
     ):
         if mechanical_only:
@@ -3641,6 +3658,31 @@ def drive_queue_sweep(
             )
         for reason in f.reasons:
             click.echo(f"  reason: {reason}")
+    # #4038: `branch-merged-guard` auto-refile runs its own plan-leg/write
+    # pipeline too, same "not a Decision row" shape as the follow-through
+    # block above — reported in its own section rather than folded into
+    # it, since the two causes resolve differently (step 4's deferred
+    # close has no `merged-partial` analogue).
+    for f in report.refile:
+        click.echo(f"\ndrive-queue:{f.repo_name}#{f.issue_number} branch-merged-guard auto-refile:")
+        click.echo(f"  action={f.action}")
+        if f.rendered_plan:
+            for line in f.rendered_plan.splitlines():
+                click.echo(f"  {line}")
+        filed_numbers = list(f.follow_up_keys.values()) or list(f.follow_ups)
+        if f.action == board_doctor_followthrough.ACTION_REFILE_FILED and filed_numbers:
+            click.echo(
+                "  refiled as: " + ", ".join(f"#{n}" for n in filed_numbers)
+            )
+        for reason in f.reasons:
+            click.echo(f"  reason: {reason}")
+    if report.refile_closed:
+        click.echo("\nrefile(s) superseded this round (replacement observed closed):")
+        for outcome in report.refile_closed:
+            click.echo(
+                f"  {outcome.get('key')} -> #{outcome.get('refile_issue')} "
+                f"({outcome.get('action')})"
+            )
     # Its own section, independent of the tier loop and the follow-through
     # pass above: a dropped predicted `after=` edge is neither a `Decision`
     # nor a `Disposition`, and may be the ONLY thing this round touched —
@@ -3650,16 +3692,16 @@ def drive_queue_sweep(
         for note in report.dropped_predicted_after_edges:
             click.echo(f"  {note}")
     if dry_run:
-        if report.followthrough:
+        if report.followthrough or report.refile:
             click.echo(
                 "--dry-run: no auto-action/mechanical fix was dispatched and no "
-                "convergence state was persisted; the merged-partial row(s) above "
-                "still dispatched a real, read-only plan leg to render their plan "
-                "— nothing was written to GitHub"
+                "convergence state was persisted; the merged-partial/refile "
+                "row(s) above still dispatched a real, read-only plan leg to "
+                "render their plan — nothing was written to GitHub"
             )
         else:
             click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
-    elif report.decisions or report.followthrough:
+    elif report.decisions or report.followthrough or report.refile or report.refile_closed:
         click.echo(
             f"{report.rows_observed} row(s) observed and decided — read the log later with "
             "`coord drive-queue doctor-log`"

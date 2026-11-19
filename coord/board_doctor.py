@@ -549,6 +549,18 @@ def stranded_prereq_rows(entries: Sequence[Any], *, config: Any) -> list[StuckRo
 #: is involved, so there is nothing for that classifier to diagnose).
 CAUSE_MERGED_PARTIAL = "merged-partial"
 
+#: The one cause :func:`branch_merged_guard_rows` ever mints (#4038) — an
+#: OPEN drive-queue row the #3376 structural dispatch-liveness gate refused
+#: permanently because one of the issue's own ``issue-{N}-*`` branches
+#: already merged (`coord.dispatch_liveness.
+#: is_branch_merged_guard_refusal_reason`). Distinct from
+#: :data:`CAUSE_MERGED_PARTIAL`: that row's worker actually ran and
+#: declared ``ISSUE_RESOLUTION: partial``; THIS row's worker never ran at
+#: all — the guard refused the dispatch before any assignment existed —
+#: so there is no PR, review, or diff to build a plan leg prompt from,
+#: only the issue's own body.
+CAUSE_BRANCH_MERGED_GUARD = "branch-merged-guard"
+
 #: How long :func:`dispatch_plan_leg` waits for the follow-through's
 #: read-only plan leg to finish before giving up. A `claude -p` session
 #: grepping one repo, not a build — generous but still bounded, so a hung
@@ -594,6 +606,48 @@ def merged_partial_rows(entries: Sequence[Any]) -> list[StuckRow]:
                 key=entry.key,
                 state=entry.state,
                 cause=CAUSE_MERGED_PARTIAL,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=evidence,
+                fresh=True,
+            )
+        )
+    return rows
+
+
+def branch_merged_guard_rows(entries: Sequence[Any]) -> list[StuckRow]:
+    """One :class:`StuckRow` per `blocked` drive-queue row the #3376 guard
+    refused permanently because its own branch already merged (#4038) —
+    the feed :func:`run_refile_sweep` resolves.
+
+    Pure, like :func:`merged_partial_rows`: whether the issue is STILL open
+    is checked live, right before anything is dispatched
+    (:func:`run_refile_sweep`), not here. Marker-based
+    (`coord.dispatch_liveness.is_branch_merged_guard_refusal_reason`), the
+    SAME recognition :func:`coord.drive_queue._reconcile_running` already
+    uses to route this one `(#1844)`-shaped refusal to `blocked` rather
+    than treat it as a transient death — one question ("is this row stuck
+    on the #3376 branch-merged guard specifically"), one answer (#2096).
+    """
+    from coord.dispatch_liveness import (  # noqa: PLC0415
+        is_branch_merged_guard_refusal_reason,
+    )
+    from coord.drive_queue import STATE_BLOCKED  # noqa: PLC0415
+
+    rows: list[StuckRow] = []
+    for entry in entries:
+        if entry.state != STATE_BLOCKED:
+            continue
+        if not is_branch_merged_guard_refusal_reason(entry.last_reason):
+            continue
+        evidence = (f"drive_queue.state={entry.state}",)
+        if entry.last_reason:
+            evidence += (f"last_reason={entry.last_reason}",)
+        rows.append(
+            StuckRow(
+                queue="drive-queue",
+                key=entry.key,
+                state=entry.state,
+                cause=CAUSE_BRANCH_MERGED_GUARD,
                 confidence=queue_diagnose.CONFIDENCE_HIGH,
                 evidence=evidence,
                 fresh=True,
@@ -717,10 +771,61 @@ def build_partial_merge(
     )
 
 
+def build_refile_candidate(
+    repo_name: str, issue_number: int, *, config: Any, entry: Any,
+) -> board_doctor_followthrough.RefileCandidate:
+    """Real (best-effort) :class:`~coord.board_doctor_followthrough.
+    RefileCandidate` builder for a live `branch-merged-guard` row (#4038).
+
+    *entry* is the row's own :class:`~coord.drive_queue.QueueEntry` — the
+    snapshot :func:`~coord.board_doctor_followthrough._requeue_refile`
+    needs to move the drive-queue row onto the new issue number unchanged
+    (same position, same ``after=`` edges, same machine pin/hold gate).
+    Unlike :func:`build_partial_merge`, there is no completed `work`
+    assignment to pull an ``ISSUE_RESOLUTION`` from — the #3376 guard
+    refused the dispatch before one ever ran — so only the issue's own
+    body feeds the plan leg.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    github_repo = _github_slug(repo_name, config)
+
+    issue = github_ops.get_issue(github_repo, issue_number)
+    milestone = issue.get("milestone") or {}
+    labels = tuple(
+        name for label in (issue.get("labels") or [])
+        if (name := label.get("name"))
+    )
+    parent = github_ops.get_issue_parent(github_repo, issue_number)
+    epic_number = parent.get("number") if parent else None
+
+    return board_doctor_followthrough.RefileCandidate(
+        repo_name=repo_name,
+        github_repo=github_repo,
+        issue_number=issue_number,
+        title=issue.get("title") or "",
+        body=issue.get("body") or "",
+        labels=labels,
+        milestone=milestone.get("title"),
+        epic_number=epic_number,
+        queue_position=int(getattr(entry, "position", 0) or 0) or None,
+        queue_after=tuple(getattr(entry, "after", ()) or ()),
+        queue_machine=str(getattr(entry, "machine", "") or ""),
+        queue_hold_after=bool(getattr(entry, "hold_after", False)),
+        queue_hold_reason=str(getattr(entry, "hold_reason", "") or ""),
+        queue_resume_when=str(getattr(entry, "resume_when", "") or ""),
+        queue_hold_scope=str(getattr(entry, "hold_scope", "entry") or "entry"),
+        queue_max_fix_rounds=getattr(entry, "max_fix_rounds", None),
+        queue_no_acceptance=bool(getattr(entry, "no_acceptance", False)),
+        queue_plan_destructive=bool(getattr(entry, "plan_destructive", False)),
+    )
+
+
 def dispatch_plan_leg(
     prompt: str,
     *,
-    partial: board_doctor_followthrough.PartialMerge,
+    partial: board_doctor_followthrough.PartialMerge
+    | board_doctor_followthrough.RefileCandidate,
     config: Any,
     status_fetcher: Callable[..., Any] | None = None,
     text_fetcher: Callable[[str, str], str | None] | None = None,
@@ -730,7 +835,13 @@ def dispatch_plan_leg(
     poll_interval_seconds: float = PLAN_LEG_POLL_INTERVAL_SECONDS,
 ) -> board_doctor_followthrough.PlanLegResult:
     """Real ``plan_leg`` seam for :func:`coord.board_doctor_followthrough.
-    run_followthrough` (#3945).
+    run_followthrough` (#3945) AND :func:`coord.board_doctor_followthrough.
+    run_refile` (#4038) — both pass only the four attributes this function
+    actually reads (``repo_name``/``issue_number``/``title``/
+    ``github_slug``), which :class:`~coord.board_doctor_followthrough.
+    PartialMerge` and :class:`~coord.board_doctor_followthrough.
+    RefileCandidate` both carry, so one dispatcher serves both rather than
+    two near-duplicates that could silently drift (#2096).
 
     Dispatches an ordinary ``type="plan"`` headless leg through the agent
     (:func:`coord.dispatch.dispatch`, never an in-process call) with a
@@ -796,7 +907,7 @@ def dispatch_plan_leg(
         repo_name=partial.repo_name,
         issue_number=partial.issue_number,
         issue_title=partial.title,
-        rationale="board-doctor merged-partial follow-through plan leg",
+        rationale="board-doctor follow-through/refile plan leg",
         briefing="Begin.",
         type="plan",
         system_prompt=prompt,
@@ -1013,6 +1124,194 @@ def _load_pending_followthrough(
             plan=plan, follow_up_keys=follow_up_keys,
         )
     return None
+
+
+#: Default ceiling on how many eligible ``branch-merged-guard`` rows
+#: :func:`run_refile_sweep` will actually dispatch a plan leg for in ONE
+#: call — same rationale as :data:`DEFAULT_FOLLOWTHROUGH_ROWS_PER_SWEEP`.
+DEFAULT_REFILE_ROWS_PER_SWEEP = 3
+
+
+def run_refile_sweep(
+    rows: Sequence[StuckRow],
+    *,
+    config: Any,
+    board: Board | None = None,
+    dry_run: bool = False,
+    plan_leg_dispatcher: Callable[..., board_doctor_followthrough.PlanLegResult] = (
+        dispatch_plan_leg
+    ),
+    writer: board_doctor_followthrough.FollowThroughWriter | None = None,
+    issue_open: Callable[[str, int], bool] | None = None,
+    max_rows: int = DEFAULT_REFILE_ROWS_PER_SWEEP,
+) -> list[board_doctor_followthrough.Disposition]:
+    """Resolve every eligible ``branch-merged-guard`` row in *rows*, up to
+    *max_rows* of them (#4038). Mirrors :func:`run_followthrough_sweep`'s
+    own shape — see its docstring for the parts duplicated verbatim here
+    (*board*'s lazy build, *writer*'s real default, the open-check
+    fail-closed-by-skip posture).
+
+    A row whose key no longer resolves to a real
+    :class:`~coord.drive_queue.QueueEntry` is skipped rather than acted
+    on: :func:`~coord.board_doctor_followthrough.run_refile`'s own write
+    path dequeues the original row the moment it successfully files a
+    replacement, so a row that is STILL in *rows* (collected earlier this
+    same sweep) but already gone from a FRESH queue read means a previous
+    iteration of this very loop — or a concurrent writer — already
+    resolved it; retrying would refile it a second time.
+    """
+    from coord.drive_queue import entries_from_rows  # noqa: PLC0415
+    from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+    from coord.state import list_drive_queue  # noqa: PLC0415
+
+    if board is None:
+        from coord.state import build_board  # noqa: PLC0415
+
+        board = build_board()
+
+    is_open = issue_open or _issue_open
+    row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
+    entries_by_key = {e.key: e for e in entries_from_rows(list_drive_queue())}
+
+    dispositions: list[board_doctor_followthrough.Disposition] = []
+    dispatched = 0
+    for row in rows:
+        if dispatched >= max_rows:
+            break
+        if row.cause != CAUSE_BRANCH_MERGED_GUARD or row.suppressed:
+            continue
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            continue
+        repo_name, issue_number = parsed
+        if not board_doctor_followthrough.auto_refile_enabled(repo_name, config):
+            continue
+        github_repo = _github_slug(repo_name, config)
+        try:
+            if not is_open(github_repo, issue_number):
+                continue
+        except Exception:  # noqa: BLE001 — a flaky open-check must not sink the sweep
+            continue
+
+        entry = entries_by_key.get(row.key)
+        if entry is None:
+            continue
+
+        candidate = build_refile_candidate(
+            repo_name, issue_number, config=config, entry=entry,
+        )
+        disposition = board_doctor_followthrough.run_refile(
+            candidate,
+            plan_leg=lambda prompt, _c=candidate: plan_leg_dispatcher(
+                prompt, partial=_c, config=config,
+            ),
+            writer=row_writer,
+            alert=lambda subject, body, _r=repo_name, _n=issue_number: _followthrough_notify(
+                _r, _n, "board-doctor:refile-alert", subject, body,
+            ),
+            dry_run=dry_run,
+        )
+        dispositions.append(disposition)
+        dispatched += 1
+    return dispositions
+
+
+def _issue_closed_default(repo_name: str, issue_number: int) -> bool:
+    from coord import github_ops  # noqa: PLC0415
+
+    return github_ops.issue_is_closed(repo_name, issue_number)
+
+
+def run_pending_refile_close_sweep(
+    *,
+    config: Any,
+    dry_run: bool = False,
+    issue_closed: Callable[[str, int], bool] | None = None,
+    writer: board_doctor_followthrough.FollowThroughWriter | None = None,
+    decisions: Sequence[Mapping[str, Any]] | None = None,
+    record: Callable[[dict], None] | None = None,
+) -> list[dict]:
+    """Close every original issue a previous #4038 refile pointed away
+    from, the first round this sweep observes its own replacement issue
+    closed — step 4 of #4038's refile: "comment the pointer on #N. Once
+    the refile merges, close #N as superseded. Don't leave that close for
+    an operator."
+
+    Independent of :func:`run_refile_sweep` and of *rows*/`collect_rows`
+    entirely: the drive-queue row for the ORIGINAL issue is gone the
+    moment a refile files successfully (:func:`~coord.board_doctor_
+    followthrough._requeue_refile` dequeues it), so nothing about this
+    issue is visible to the ordinary row walk any more — the only durable
+    trace is the decision log entry :func:`~coord.board_doctor_
+    followthrough.run_refile` wrote, which
+    :func:`~coord.board_doctor_followthrough.pending_refiles` reads back.
+
+    *decisions*, when given, is the FULL decision log to scan (tests pass
+    a fixed list); the default reads it fresh via :func:`coord.state.
+    board_doctor_decisions` with no filter, since a pending refile can be
+    for ANY repo/issue, not one this call already knows about.
+    """
+    from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        board_doctor_decisions,
+        record_board_doctor_decision,
+    )
+
+    is_closed = issue_closed or _issue_closed_default
+    row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
+    do_record = record or record_board_doctor_decision
+    all_decisions = decisions if decisions is not None else board_doctor_decisions()
+
+    results: list[dict] = []
+    for key, refile_issue in board_doctor_followthrough.pending_refiles(
+        all_decisions
+    ).items():
+        parsed = _parse_row_key(key)
+        if parsed is None:
+            continue
+        repo_name, issue_number = parsed
+        github_repo = _github_slug(repo_name, config)
+        try:
+            closed = is_closed(github_repo, refile_issue)
+        except Exception:  # noqa: BLE001 — a flaky read must not sink this pass
+            continue
+        if not closed:
+            continue
+        outcome: dict[str, Any] = {"key": key, "refile_issue": refile_issue}
+        if dry_run:
+            outcome["action"] = "would-close"
+            results.append(outcome)
+            continue
+        try:
+            row_writer.close_issue(
+                github_repo, issue_number,
+                comment=(
+                    f"Superseded by #{refile_issue} — refiled for execution "
+                    "and the replacement has merged."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — recorded, not raised; a flaky close retries next sweep
+            outcome["action"] = "close-failed"
+            outcome["error"] = str(exc)
+            results.append(outcome)
+            continue
+        outcome["action"] = board_doctor_followthrough.ACTION_REFILE_SUPERSEDED
+        do_record({
+            "queue": "drive-queue",
+            "key": key,
+            "cause": CAUSE_BRANCH_MERGED_GUARD,
+            "action": board_doctor_followthrough.ACTION_REFILE_SUPERSEDED,
+            "dry_run": False,
+            "plan_leg_assignment_id": None,
+            "follow_ups": [refile_issue],
+            "follow_up_keys": {"refile": refile_issue},
+            "deduped": {},
+            "queued": {},
+            "reasons": [],
+            "evidence": [],
+        })
+        results.append(outcome)
+    return results
 
 
 #: Default ceiling on how many eligible ``merged-partial`` rows
@@ -1321,6 +1620,19 @@ class SweepReport:
     #: at all — it runs over the raw queue, independent of `collect_rows`'
     #: own classification walk.
     dropped_predicted_after_edges: list[str] = field(default_factory=list)
+    #: #4038: one :class:`~coord.board_doctor_followthrough.Disposition`
+    #: per ``branch-merged-guard`` row :func:`run_refile_sweep` acted on
+    #: this round — same "not a tier/auto_dispatchers/convergence decision"
+    #: shape as *followthrough* above, kept in its own list rather than
+    #: folded into it since the two causes resolve differently (step 4's
+    #: deferred close has no `merged-partial` analogue) and a CLI reader
+    #: must be able to label each correctly rather than guess from
+    #: `action` strings.
+    refile: list[board_doctor_followthrough.Disposition] = field(default_factory=list)
+    #: #4038: one dict per previously-filed refile
+    #: :func:`run_pending_refile_close_sweep` closed as superseded this
+    #: round, because its own replacement issue was observed closed.
+    refile_closed: list[dict] = field(default_factory=list)
 
 
 def merge_queue_rows(
@@ -2215,6 +2527,50 @@ def _reclassify_blocked_on_prereq(
                         f"is itself {dep_state} — fixing this row means "
                         f"fixing {dep}, not dispatching another leg here "
                         "(#4003)",
+                    ),
+                )
+        reclassified.append(row)
+    return reclassified
+
+
+def _reclassify_branch_merged_guard(
+    rows: list[StuckRow], entries_by_key: Mapping[str, Any],
+) -> list[StuckRow]:
+    """Relabel ANY `blocked` drive-queue row whose entry's own
+    `last_reason` names the #3376 branch-merged guard specifically (#4038),
+    regardless of what cause the episode walk above already settled on.
+
+    Unlike every other `_reclassify_*` pass in this module, this does not
+    restrict itself to a narrow "safe" incoming cause set and does not
+    require `row.fresh`: `coord.dispatch_liveness.
+    is_branch_merged_guard_refusal_reason`'s marker is a deterministic,
+    permanent fact about the row (the guard refuses the exact same
+    dispatch again on every retry — see the marker's own docstring), not a
+    live probe reading that can go stale between when an episode settled
+    and now — `entries_by_key` is this sweep's own fresh
+    `list_drive_queue()` read, not the row's possibly-stale stored
+    evidence — so there is no narrower cause set to protect and no
+    freshness bar to clear: whatever the episode walk concluded, THIS
+    marker always wins.
+    """
+    from coord.dispatch_liveness import (  # noqa: PLC0415
+        is_branch_merged_guard_refusal_reason,
+    )
+
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        if row.queue == "drive-queue" and row.cause != CAUSE_BRANCH_MERGED_GUARD:
+            entry = entries_by_key.get(row.key)
+            if entry is not None and is_branch_merged_guard_refusal_reason(
+                entry.last_reason
+            ):
+                row = replace(
+                    row,
+                    cause=CAUSE_BRANCH_MERGED_GUARD,
+                    evidence=row.evidence + (
+                        "drive_queue: last_reason names the #3376 "
+                        f"branch-merged guard specifically (#4038) — "
+                        f"{entry.last_reason}",
                     ),
                 )
         reclassified.append(row)
@@ -3394,6 +3750,18 @@ def _collect_rows_with_board(
         row for row in merged_partial_rows(entries) if row.key not in covered_keys
     )
 
+    # #4038: belt-and-braces alongside `_reclassify_branch_merged_guard`
+    # above — a row whose `blocked` transition never opened a `block_log`
+    # episode at all (or whose episode was marked resolved while the row
+    # itself stayed blocked) never reaches the reclassifier, since that
+    # pass only relabels a row the episode walk already produced. This
+    # catches exactly that orphan, the same way `merged_partial_rows`
+    # above catches its own orphan shape.
+    covered_keys = frozenset(row.key for row in rows)
+    rows.extend(
+        row for row in branch_merged_guard_rows(entries) if row.key not in covered_keys
+    )
+
     # #3888: the episode/merge-queue walk above only ever covers a
     # `blocked`/`parked` transition or a merge-queue row — this is the
     # three-shape sweep over the whole queue that catches everything else.
@@ -3444,6 +3812,7 @@ def _collect_rows_with_board(
         rows, entries_by_key, board=board, board_view=board_view,
     )
     rows = _reclassify_blocked_on_prereq(rows, entries_by_key)
+    rows = _reclassify_branch_merged_guard(rows, entries_by_key)
     rows = _confirm_merge_pending_stuck(rows, merge_entries, board=board, config=config)
     rows = _reclassify_merge_never_attempted(
         rows, merge_entries, board=board, config=config,
@@ -4299,6 +4668,11 @@ def run_sweep(
     mechanical_causes: frozenset[str] | None = None,
     drop_predicted_after_edges: bool = True,
     predicted_after_edges_sweep: Callable[..., list[str]] = sweep_predicted_after_edges,
+    auto_refile: bool = True,
+    refile_sweep: Callable[..., list[board_doctor_followthrough.Disposition]] = (
+        run_refile_sweep
+    ),
+    refile_close_sweep: Callable[..., list[dict]] = run_pending_refile_close_sweep,
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -4382,6 +4756,20 @@ def run_sweep(
     window. A failure here is advisory-only, same posture as the
     no-progress pass in :func:`_collect_rows_with_board`: it never takes
     the rest of this report down.
+
+    #4038: ``branch-merged-guard`` rows are pulled out of *rows* the same
+    way ``merged-partial`` rows are, and resolved by *refile_sweep*
+    (default :func:`run_refile_sweep`) onto :attr:`SweepReport.refile`,
+    gated by *auto_refile* — the same kind of fleet-wide kill switch
+    *followthrough* is (:func:`coord.board_doctor_followthrough.
+    auto_refile_enabled` is still consulted per-row on top of this).
+    *refile_close_sweep* (default :func:`run_pending_refile_close_sweep`)
+    additionally runs every plain (non-mechanical) call regardless of
+    whether THIS round observed any ``branch-merged-guard`` row at all —
+    step 4 of a refile already filed in some EARLIER round has no row of
+    its own left to be driven by (the original's drive-queue row is gone
+    the moment the refile files successfully), so it reports onto
+    :attr:`SweepReport.refile_closed` independently of *rows*/*refile_rows*.
     """
     board_doctor_cfg = getattr(config, "board_doctor", None)
     rows, board = _collect_rows_with_board(
@@ -4393,10 +4781,15 @@ def run_sweep(
         ),
     )
     followthrough_rows = [r for r in rows if r.cause == CAUSE_MERGED_PARTIAL]
-    other_rows = [r for r in rows if r.cause != CAUSE_MERGED_PARTIAL]
+    refile_rows = [r for r in rows if r.cause == CAUSE_BRANCH_MERGED_GUARD]
+    other_rows = [
+        r for r in rows
+        if r.cause not in (CAUSE_MERGED_PARTIAL, CAUSE_BRANCH_MERGED_GUARD)
+    ]
     if mechanical_causes is not None:
         other_rows = [r for r in other_rows if r.cause in mechanical_causes]
         followthrough_rows = []
+        refile_rows = []
     resolved_capacity_check = (
         default_investigate_capacity(config)
         if capacity_check is _CAPACITY_CHECK_UNSET
@@ -4431,6 +4824,23 @@ def run_sweep(
         report.followthrough = followthrough_sweep(
             followthrough_rows, config=config, board=board, dry_run=dry_run,
         )
+    if auto_refile and refile_rows:
+        report.refile = refile_sweep(
+            refile_rows, config=config, board=board, dry_run=dry_run,
+        )
+    if auto_refile and mechanical_causes is None:
+        try:
+            report.refile_closed = refile_close_sweep(config=config, dry_run=dry_run)
+        except Exception:  # noqa: BLE001 — advisory only
+            # Same posture as *predicted_after_edges_sweep* just below: a
+            # failed pending-close check never takes the rest of this
+            # report down, and the pending state it reads is durable (the
+            # decision log), so a skipped round just means the close
+            # happens next sweep.
+            _log.warning(
+                "board-doctor: pending refile-close sweep failed this round",
+                exc_info=True,
+            )
     if drop_predicted_after_edges and mechanical_causes is None:
         try:
             report.dropped_predicted_after_edges = predicted_after_edges_sweep(

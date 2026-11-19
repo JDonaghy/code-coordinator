@@ -247,6 +247,17 @@ class Disposition:
     #: resumed) — serialized into `as_record`'s `evidence` so a write
     #: failure's resumable state survives into the durable log (#4007).
     plan: FollowThroughPlan | None = None
+    #: The decision log's `cause` column (#4038). Defaults to
+    #: ``"merged-partial"`` — every caller before #4038 built this
+    #: dataclass for exactly one cause (`coord.board_doctor.
+    #: CAUSE_MERGED_PARTIAL`'s own string value, duplicated here as a raw
+    #: literal rather than imported since `coord.board_doctor` imports
+    #: THIS module, not the other way round) — so an existing caller that
+    #: never sets this field records byte-for-byte what it always did.
+    #: :func:`run_refile` is the one other caller, and passes
+    #: ``"branch-merged-guard"`` (`coord.board_doctor.
+    #: CAUSE_BRANCH_MERGED_GUARD`'s own string value, same reason).
+    cause: str = "merged-partial"
 
     def as_record(self) -> dict[str, Any]:
         evidence = list(self.reasons)
@@ -261,7 +272,7 @@ class Disposition:
         return {
             "queue": "drive-queue",
             "key": f"{self.repo_name}#{self.issue_number}",
-            "cause": "merged-partial",
+            "cause": self.cause,
             "action": self.action,
             "dry_run": self.dry_run,
             "plan_leg_assignment_id": self.plan_leg_assignment_id,
@@ -279,6 +290,7 @@ class FollowThroughWriter(Protocol):
 
     def create_issue(
         self, repo_name: str, *, title: str, body: str, milestone: str | None,
+        labels: Sequence[str] = (),
     ) -> int: ...
 
     def add_child(
@@ -290,6 +302,12 @@ class FollowThroughWriter(Protocol):
     def set_issue_body(self, repo_name: str, number: int, body: str) -> None: ...
 
     def close_issue(self, repo_name: str, number: int, *, comment: str) -> None: ...
+
+    #: #4038: a pointer comment that does NOT close anything — `run_refile`
+    #: posts the refile's `#N` onto the original issue, which stays open
+    #: until the refile itself is observed closed (see
+    #: :func:`coord.board_doctor.run_pending_refile_close_sweep`).
+    def comment_issue(self, repo_name: str, number: int, *, body: str) -> None: ...
 
 
 @dataclass
@@ -323,10 +341,13 @@ class GitHubFollowThroughWriter:
 
     def create_issue(
         self, repo_name: str, *, title: str, body: str, milestone: str | None,
+        labels: Sequence[str] = (),
     ) -> int:
         from coord import github_ops  # noqa: PLC0415
 
-        result = github_ops.create_issue(repo_name, title, body, milestone=milestone)
+        result = github_ops.create_issue(
+            repo_name, title, body, labels=list(labels) or None, milestone=milestone,
+        )
         return int(result["number"])
 
     def add_child(
@@ -378,6 +399,11 @@ class GitHubFollowThroughWriter:
                 f"close_issue({repo_name}#{number}) returned without error "
                 f"but the issue reads {state!r}, not confirmed closed"
             )
+
+    def comment_issue(self, repo_name: str, number: int, *, body: str) -> None:
+        from coord import github_ops  # noqa: PLC0415
+
+        github_ops.post_issue_comment(repo_name, number, body)
 
 
 # ── Gating ───────────────────────────────────────────────────────────────────
@@ -1244,3 +1270,460 @@ def _splice_epic_checklists(body: str, nodes: Sequence[WorkOrderNode]) -> str:
         n for n in nodes if n.issue_number not in set(existing.issue_numbers)
     ))
     return replace_work_order_section(body, render_work_order(merged, checkbox=False))
+
+
+# ── #4038: auto-refile a #3376 branch-merged-guard refusal ──────────────────
+#
+# A `branch-merged-guard` drive-queue row is an OPEN issue the #3376
+# structural dispatch-liveness gate refuses permanently because one of its
+# own `issue-{N}-*` branches already merged — the row can never be
+# relaunched, since the guard refuses the SAME dispatch again on every
+# retry, yet the issue's own remaining work (if any) is not on the default
+# branch. This disposition resolves it:
+#
+# 1. **Plan leg.** :func:`build_refile_plan_leg_prompt` composes a
+#    read-only prompt (issue body only — unlike `merged-partial`, no PR
+#    ever merged for THIS issue, so there is no review/diff/resolution
+#    text to inject); the injected *plan_leg* callable runs it and
+#    :func:`parse_refile_plan` reads the JSON verdict out of it.
+# 2. **Remainder present** (``remainder_on_default_branch=True``): nothing
+#    to refile — close the issue as done.
+# 3. **Remainder absent**: file one new issue (same title plus "(refile of
+#    #N)", same labels/milestone, body carrying the refile note required
+#    by #4038), swap it into the epic's `## Sub-issues`/`## Work order`
+#    slot the original occupied (if any), move the ORIGINAL drive-queue
+#    row onto the new issue number (same position, same `after=` edges),
+#    re-point every queued dependent's `after=` the same way #3984's split
+#    repoint does, then comment the pointer on the original — WITHOUT
+#    closing it yet.
+# 4. **Deferred close.** :func:`coord.board_doctor.
+#    run_pending_refile_close_sweep` runs on every sweep independent of
+#    this row's own cause (the drive-queue row is gone the moment step 3
+#    moves it) and closes the original as superseded the first tick it
+#    observes the refile issue itself closed — never left for an operator.
+#
+# Depth limit: an issue whose body already carries :data:`REFILE_MARKER` is
+# itself a refile product. If its own branch later merges into another
+# #3376 refusal, this pages a human instead of recursing.
+
+#: Process-wide kill switch, mirroring :data:`NO_FOLLOWTHROUGH_ENV_VAR`.
+NO_AUTO_REFILE_ENV_VAR = "COORD_BOARD_DOCTOR_NO_AUTO_REFILE"
+
+#: Hidden marker stamped into every issue this disposition files. Its
+#: presence is what trips the depth limit.
+REFILE_MARKER = "<!-- coord:refile-of={issue} -->"
+_REFILE_MARKER_RE = re.compile(r"<!--\s*coord:refile-of=#?(\d+)\s*-->")
+
+ACTION_REFILE_FILED = "refile-filed"
+ACTION_REFILE_ALL_LANDED = "refile-all-landed"
+ACTION_REFILE_PLAN_FAILED = "refile-plan-failed"
+ACTION_REFILE_WRITE_FAILED = "refile-write-failed"
+ACTION_REFILE_DEPTH_PAGED = "refile-depth-paged"
+#: Minted only by :func:`coord.board_doctor.run_pending_refile_close_sweep`
+#: — the deferred step-4 close, never by :func:`run_refile` itself.
+ACTION_REFILE_SUPERSEDED = "refile-superseded-closed"
+
+#: Marker prefix for the one ``evidence`` string an :data:`ACTION_REFILE_FILED`
+#: disposition carries — which real issue number the original was refiled
+#: as, so a later, independent sweep pass can find it again without a
+#: second, divergent "what did we file" record. Same piggyback-on-``evidence``
+#: rationale as :data:`PENDING_FOLLOWTHROUGH_EVIDENCE_PREFIX`'s own docstring.
+PENDING_REFILE_CLOSE_EVIDENCE_PREFIX = "pending-refile-close-json="
+
+
+def auto_refile_enabled(repo_name: str, config: Any) -> bool:
+    """Whether the auto-refile disposition may act for *repo_name* (#4038).
+
+    Three independent gates, same shape as :func:`followthrough_enabled`:
+    :data:`NO_AUTO_REFILE_ENV_VAR`, the fleet-wide ``board_doctor.
+    auto_refile`` switch, and the per-repo ``repos[].board_doctor.
+    auto_refile`` opt-in (default off).
+    """
+    if os.environ.get(NO_AUTO_REFILE_ENV_VAR):
+        return False
+    if not config.board_doctor.auto_refile:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.auto_refile)
+
+
+def is_refile_product(body: str | None) -> bool:
+    """True when *body* carries :data:`REFILE_MARKER`."""
+    return bool(body and _REFILE_MARKER_RE.search(body))
+
+
+@dataclass(frozen=True)
+class RefileCandidate:
+    """Everything :func:`run_refile` needs about one `branch-merged-guard`
+    row — both the GitHub-side context for filing the replacement and the
+    drive-queue row's own snapshot (``queue_*``) for moving it onto the new
+    issue number unchanged (#4038's "same position, same edges").
+    """
+
+    repo_name: str
+    issue_number: int
+    title: str
+    body: str
+    merged_branch: str = ""
+    labels: tuple[str, ...] = ()
+    milestone: str | None = None
+    epic_number: int | None = None
+    github_repo: str = ""
+    queue_position: int | None = None
+    queue_after: tuple[str, ...] = ()
+    queue_machine: str = ""
+    queue_hold_after: bool = False
+    queue_hold_reason: str = ""
+    queue_resume_when: str = ""
+    queue_hold_scope: str = "entry"
+    queue_max_fix_rounds: int | None = None
+    queue_no_acceptance: bool = False
+    queue_plan_destructive: bool = False
+
+    @property
+    def github_slug(self) -> str:
+        """Mirrors :attr:`PartialMerge.github_slug` exactly."""
+        return self.github_repo or self.repo_name
+
+
+class RefilePlanError(ValueError):
+    """The refile plan leg's output could not be read as a refile verdict."""
+
+
+@dataclass(frozen=True)
+class RefilePlan:
+    """The refile plan leg's verdict: is the remainder this issue describes
+    already on the default branch (nothing to refile), or still missing
+    (needs a fresh issue)?
+    """
+
+    remainder_on_default_branch: bool
+    evidence: str = ""
+
+
+_REFILE_PLAN_SCHEMA = (
+    '{"remainder_on_default_branch": true, "evidence": '
+    '"<file:line / grep result / test showing the remainder is (or is not) '
+    'already on the default branch>"}'
+)
+
+
+def build_refile_plan_leg_prompt(candidate: RefileCandidate) -> str:
+    """The read-only plan leg's prompt for *candidate*.
+
+    Unlike :func:`build_plan_leg_prompt` (`merged-partial`), no PR ever
+    merged for THIS issue — the #3376 guard refused dispatch before any
+    worker ever ran — so there is no review/diff/``ISSUE_RESOLUTION`` text
+    to inject; only the issue's own body, which is also where #4038's
+    acceptance step ("where the issue lists acceptance tests or files,
+    check them") lives.
+    """
+    branch = candidate.merged_branch or f"issue-{candidate.issue_number}-*"
+    sections = [
+        "You are a READ-ONLY planner. Do not edit, commit or push anything. "
+        f"You are checked out at the default branch HEAD. "
+        f"{candidate.repo_name}#{candidate.issue_number}'s own branch "
+        f"({branch}) already merged, but a structural dispatch-liveness "
+        "guard (#3376) refuses to dispatch this issue again regardless of "
+        "what remains — so if any of its described work is still missing, "
+        "it needs a FRESH issue number to be driven under.",
+        "Check the issue body below against the live code — its own "
+        "acceptance criteria and/or `## Files` list, if it names any — and "
+        "decide whether the remainder it describes is ALREADY on the "
+        "default branch (nothing left to do) or still missing (needs a "
+        "fresh issue).",
+        "Reply with exactly one JSON object in this shape and nothing "
+        "else:\n" + _REFILE_PLAN_SCHEMA,
+        f"## Issue #{candidate.issue_number}: {candidate.title}\n\n{candidate.body}",
+    ]
+    return "\n\n".join(sections)
+
+
+def parse_refile_plan(text: str) -> RefilePlan:
+    """Parse the plan leg's output into a :class:`RefilePlan`.
+
+    Shares :func:`_extract_json`'s fenced-or-bare JSON extraction with
+    :func:`parse_plan` — same tolerance for a plan leg that wraps its
+    answer in prose or a code fence.
+    """
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        raise RefilePlanError("refile plan must be a JSON object")
+    remainder_on_default_branch = data.get("remainder_on_default_branch")
+    if not isinstance(remainder_on_default_branch, bool):
+        raise RefilePlanError(
+            "`remainder_on_default_branch` must be a boolean"
+        )
+    return RefilePlan(
+        remainder_on_default_branch=remainder_on_default_branch,
+        evidence=str(data.get("evidence") or ""),
+    )
+
+
+def _refile_note(original_issue: int) -> str:
+    """The note #4038 requires at the top of every refiled body."""
+    return (
+        f"Refiled from #{original_issue} for execution: #{original_issue} "
+        f"has a merged `issue-{original_issue}-*` branch, so the #3376 "
+        "guard can't dispatch it again."
+    )
+
+
+def _file_refile(candidate: RefileCandidate, writer: FollowThroughWriter) -> int:
+    """File the replacement issue and, if the original had an epic, swap it
+    into that epic's sub-issue slot. Returns the new issue number.
+
+    The epic swap is a plain text substitution of ``#{old}`` for ``#{new}``
+    across the WHOLE epic body (confirmed by :meth:`FollowThroughWriter.
+    set_issue_body`'s own read-back) — simpler and safer than re-rendering
+    the ``## Work order``/``## Sub-issues`` checklist from a parsed
+    :class:`WorkOrder` (:func:`_splice_epic_checklists`'s own rationale for
+    why that loses a hand-written row's prose), and sufficient for "add the
+    new issue in its place": the old reference is gone, the new one is
+    exactly where it was.
+    """
+    title = f"{candidate.title} (refile of #{candidate.issue_number})"
+    body = (
+        f"{_refile_note(candidate.issue_number)}\n\n{candidate.body}\n\n"
+        + REFILE_MARKER.format(issue=candidate.issue_number)
+    )
+    new_number = writer.create_issue(
+        candidate.github_slug, title=title, body=body,
+        milestone=candidate.milestone, labels=candidate.labels,
+    )
+    if candidate.epic_number is not None:
+        writer.add_child(
+            candidate.github_slug, epic=candidate.epic_number,
+            child=new_number, after=(),
+        )
+        epic_body = writer.get_issue_body(candidate.github_slug, candidate.epic_number)
+        updated = epic_body.replace(
+            f"#{candidate.issue_number}", f"#{new_number}",
+        )
+        if updated != epic_body:
+            writer.set_issue_body(candidate.github_slug, candidate.epic_number, updated)
+    return new_number
+
+
+def _requeue_refile(candidate: RefileCandidate, new_number: int) -> None:
+    """Move the drive-queue row from *candidate*'s old key onto
+    *new_number*, inheriting its exact position and edges, then re-point
+    every queued dependent's ``after=`` the same way #3984's split repoint
+    does (:func:`coord.decomposition_chat._repoint_queued_dependents_at_split`)
+    — without this, a dependent chained on the original would read its
+    disappearance from the queue as "pre-req satisfied" and launch before
+    the refile has landed.
+
+    Confirms every write with a read-back, same discipline
+    :func:`coord.decomposition_chat._repoint_queued_dependents_at_split`
+    applies — an unconfirmed rewrite is not a rewrite (#2096). Raises
+    (never swallows) on the first row that doesn't read back; the caller
+    (:func:`run_refile`) treats that as a write failure to alert on, same
+    as every other step in this disposition.
+    """
+    from coord.drive_queue import entry_key, rewrite_after_for_split  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        dequeue_drive_queue,
+        enqueue_drive_queue,
+        get_drive_queue_entry,
+        list_drive_queue,
+    )
+
+    old_key = entry_key(candidate.repo_name, candidate.issue_number)
+    new_key = entry_key(candidate.repo_name, new_number)
+
+    dequeue_drive_queue(candidate.repo_name, candidate.issue_number, operator=False)
+    enqueue_drive_queue(
+        candidate.repo_name, new_number,
+        machine=candidate.queue_machine or None,
+        after=list(candidate.queue_after),
+        position=candidate.queue_position,
+        hold_after=candidate.queue_hold_after,
+        hold_reason=candidate.queue_hold_reason,
+        resume_when=candidate.queue_resume_when,
+        hold_scope=candidate.queue_hold_scope,
+        max_fix_rounds=candidate.queue_max_fix_rounds,
+        no_acceptance=candidate.queue_no_acceptance,
+        plan_destructive=candidate.queue_plan_destructive,
+    )
+    if get_drive_queue_entry(candidate.repo_name, new_number) is None:
+        raise RuntimeError(
+            f"refiled {old_key} as #{new_number} but the new row did not "
+            "read back from the drive queue"
+        )
+
+    for row in list_drive_queue():
+        current_after = [str(a) for a in (row.get("after_json") or [])]
+        if old_key not in current_after:
+            continue
+        dep_repo = str(row.get("repo_name") or "")
+        dep_issue = int(row.get("issue_number") or 0)
+        new_after = rewrite_after_for_split(current_after, old_key, [new_key])
+        enqueue_drive_queue(
+            dep_repo, dep_issue,
+            machine=row.get("machine") or None,
+            after=new_after,
+            hold_after=bool(row.get("hold_after")),
+            hold_reason=str(row.get("hold_reason") or ""),
+            resume_when=str(row.get("resume_when") or ""),
+            hold_scope=str(row.get("hold_scope") or "entry"),
+            max_fix_rounds=row.get("max_fix_rounds"),
+            no_acceptance=bool(row.get("no_acceptance")),
+            plan_destructive=bool(row.get("plan_destructive")),
+        )
+        confirmed = get_drive_queue_entry(dep_repo, dep_issue)
+        confirmed_after = (
+            [str(a) for a in (confirmed.get("after_json") or [])]
+            if confirmed is not None else None
+        )
+        if confirmed is None or sorted(confirmed_after) != sorted(new_after):
+            raise RuntimeError(
+                f"refiled {old_key} as #{new_number} but re-pointing queued "
+                f"dependent {dep_repo}#{dep_issue} did not read back the "
+                "new after= list"
+            )
+
+
+def run_refile(
+    candidate: RefileCandidate,
+    *,
+    plan_leg: Callable[[str], PlanLegResult],
+    writer: FollowThroughWriter,
+    alert: Callable[[str, str], None],
+    record: Callable[[dict], None] = _default_record,
+    dry_run: bool = False,
+    requeue: Callable[[RefileCandidate, int], None] = _requeue_refile,
+) -> Disposition:
+    """Resolve one `branch-merged-guard` row end to end (#4038).
+
+    With *dry_run* the plan leg still runs (it is read-only) and its
+    verdict is rendered, but nothing is written, alerted or recorded —
+    same contract :func:`run_followthrough`'s own *dry_run* gives.
+    """
+    key = f"{candidate.repo_name}#{candidate.issue_number}"
+    disposition = Disposition(
+        repo_name=candidate.repo_name, issue_number=candidate.issue_number,
+        action="", dry_run=dry_run, cause="branch-merged-guard",
+    )
+
+    def _finish(action: str) -> Disposition:
+        disposition.action = action
+        if not dry_run:
+            record(disposition.as_record())
+        return disposition
+
+    if is_refile_product(candidate.body):
+        disposition.reasons.append(
+            "issue is itself a refile product whose own branch merged "
+            "into a #3376 guard refusal again"
+        )
+        if not dry_run:
+            alert(
+                f"{key}: refile product's branch guard-refused again",
+                f"{key} was filed by the board-doctor auto-refile and its "
+                "own branch already merged into another #3376 guard "
+                "refusal. Not recursing — a human needs to look.",
+            )
+        return _finish(ACTION_REFILE_DEPTH_PAGED)
+
+    result = plan_leg(build_refile_plan_leg_prompt(candidate))
+    disposition.plan_leg_assignment_id = result.assignment_id
+    try:
+        plan = parse_refile_plan(result.output)
+    except RefilePlanError as exc:
+        disposition.reasons.append(str(exc))
+        if not dry_run:
+            alert(f"{key}: refile plan unreadable", str(exc))
+        return _finish(ACTION_REFILE_PLAN_FAILED)
+
+    disposition.rendered_plan = (
+        f"remainder_on_default_branch={plan.remainder_on_default_branch}\n"
+        f"evidence: {plan.evidence}"
+    )
+
+    if dry_run:
+        disposition.action = (
+            ACTION_REFILE_ALL_LANDED if plan.remainder_on_default_branch
+            else ACTION_REFILE_FILED
+        )
+        return disposition
+
+    if plan.remainder_on_default_branch:
+        try:
+            writer.close_issue(
+                candidate.github_slug, candidate.issue_number,
+                comment=(
+                    "Board-doctor auto-refile: the remainder this issue "
+                    "described is already on the default branch — "
+                    f"closing as done. {plan.evidence}"
+                ).rstrip(),
+            )
+        except Exception as exc:  # noqa: BLE001 — every write failure must alert
+            disposition.reasons.append(f"close failed: {exc}")
+            alert(f"{key}: refile close failed", str(exc))
+            return _finish(ACTION_REFILE_WRITE_FAILED)
+        return _finish(ACTION_REFILE_ALL_LANDED)
+
+    try:
+        new_number = _file_refile(candidate, writer)
+        disposition.follow_ups.append(new_number)
+        disposition.follow_up_keys["refile"] = new_number
+        requeue(candidate, new_number)
+        writer.comment_issue(
+            candidate.github_slug, candidate.issue_number,
+            body=(
+                f"Refiled as #{new_number} for execution: the #3376 guard "
+                "can't dispatch this issue again now that its "
+                f"`issue-{candidate.issue_number}-*` branch has already "
+                f"merged. This issue will close once #{new_number} merges."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — every write failure must alert
+        disposition.reasons.append(f"write failed: {exc}")
+        alert(
+            f"{key}: refile write failed",
+            f"Writing stopped at: {exc}\nFiled so far: "
+            + (", ".join(f"#{n}" for n in disposition.follow_ups) or "none"),
+        )
+        return _finish(ACTION_REFILE_WRITE_FAILED)
+
+    disposition.reasons.append(
+        PENDING_REFILE_CLOSE_EVIDENCE_PREFIX
+        + json.dumps({"refile_issue": new_number})
+    )
+    return _finish(ACTION_REFILE_FILED)
+
+
+def pending_refiles(decisions: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """``key -> refile_issue`` for every :data:`ACTION_REFILE_FILED` row in
+    *decisions* not yet superseded (#4038).
+
+    *decisions* is the FULL decision log (oldest first, same order
+    :func:`coord.state.board_doctor_decisions` returns), not pre-filtered
+    by action — the only way to tell a key's refile is ALREADY superseded
+    is to see that a later entry for the same key recorded
+    :data:`ACTION_REFILE_SUPERSEDED` (or anything else) instead. Mirrors
+    :func:`coord.board_doctor._load_pending_followthrough`'s own
+    "latest entry overall, not latest filtered by action" rule exactly,
+    for the same reason.
+    """
+    latest: dict[str, Mapping[str, Any]] = {}
+    for entry in decisions:
+        key = entry.get("key")
+        if key:
+            latest[str(key)] = entry
+    pending: dict[str, int] = {}
+    for key, entry in latest.items():
+        if entry.get("action") != ACTION_REFILE_FILED:
+            continue
+        prefix = PENDING_REFILE_CLOSE_EVIDENCE_PREFIX
+        for item in reversed(entry.get("evidence") or []):
+            if not (isinstance(item, str) and item.startswith(prefix)):
+                continue
+            try:
+                payload = json.loads(item[len(prefix):])
+                pending[key] = int(payload["refile_issue"])
+            except Exception:  # noqa: BLE001 — a corrupt payload reads as "nothing pending"
+                pass
+            break
+    return pending
