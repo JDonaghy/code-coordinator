@@ -7743,12 +7743,56 @@ class TestRunAutoSplitForRow:
 
         assert disposition is None
 
+    def test_a_reset_that_cannot_stop_the_live_session_is_a_write_failure(
+        self, monkeypatch,
+    ) -> None:
+        """#4034 review (#2096): `diagnose_stage(reset=True)` has non-raising
+        failure paths — it can report `needs_reset=True` without actually
+        clearing the review stage (e.g. it could not stop the live
+        session). The mere absence of an exception from that call must not
+        read as "reset and requeue succeeded"; it has to surface as
+        `ACTION_AUTO_SPLIT_WRITE_FAILED`, with the original never requeued
+        behind a review stage that is still blocking it."""
+        self._stub_github(monkeypatch)
+        self._stub_review(monkeypatch)
+        state.enqueue_drive_queue(self.REPO, self.ISSUE)
+        writer = _FakeAutoSplitWriter(new_number=2744)
+        import coord.board_doctor as board_doctor_mod
+        from coord.diagnose import DiagnoseResult
+
+        monkeypatch.setattr(
+            "coord.diagnose.diagnose_stage",
+            lambda board, config, repo, issue, stage, reset, dry_run: DiagnoseResult(
+                repo_name=repo, issue_number=issue, stage=stage,
+                recovered=False, needs_reset=True,
+                findings=["could not stop the live session"],
+            ),
+        )
+
+        disposition = board_doctor_mod.run_auto_split_for_row(
+            self.REPO, self.ISSUE, config=self._config(), board=self._board,
+            writer=writer,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_WRITE_FAILED
+        # The original was never re-added behind a still-blocked review.
+        rows = state.list_drive_queue()
+        assert len([r for r in rows if r["issue_number"] == self.ISSUE]) == 1
+
     def test_adds_to_the_epics_sub_issues_checklist_when_present(self, monkeypatch) -> None:
         self._stub_github(monkeypatch, epic_number=50)
         self._stub_review(monkeypatch)
         state.enqueue_drive_queue(self.REPO, self.ISSUE)
         writer = _FakeAutoSplitWriter(new_number=2744)
-        writer.bodies[50] = "Epic body.\n\n## Sub-issues\n- #2531\n\n## Notes\nkeep me\n"
+        # #4034 review: a hand-written, checkbox-free row carrying its own
+        # trailing prose must come back byte-for-byte, not rewritten as a
+        # bare `- [ ] #2531` — `_splice_epic_checklists` guards exactly
+        # this (unlike a hand-rolled parse/render round trip through
+        # `WorkOrderNode`, which has no free-text field to carry it).
+        writer.bodies[50] = (
+            "Epic body.\n\n## Sub-issues\n- #2531 — tranche 2 of #101\n\n"
+            "## Notes\nkeep me\n"
+        )
         import coord.board_doctor as board_doctor_mod
 
         disposition = board_doctor_mod.run_auto_split_for_row(
@@ -7760,7 +7804,9 @@ class TestRunAutoSplitForRow:
         assert writer.linked == [(50, 2744)]
         epic_body = writer.bodies[50]
         assert "#2744" in epic_body
-        assert "#2531" in epic_body  # the original's own row is preserved
+        # The original's hand-written row survives byte-for-byte, prose and all.
+        assert "- #2531 — tranche 2 of #101" in epic_body
+        assert "- [ ] #2531" not in epic_body  # not rewritten into the checkbox grammar
         assert "keep me" in epic_body  # #4034: add-child must not strip rows
 
 
@@ -7833,6 +7879,51 @@ class TestRunAutoSplitDirect:
         assert disposition.action == ft.ACTION_AUTO_SPLIT_FILED
         assert writer.created == []
 
+    def test_malformed_epic_sub_issues_fails_write_rather_than_wiping_it(self) -> None:
+        """#4034 review: a `## Sub-issues` section that merely fails to
+        parse (here, the SAME issue number declared twice) must not come
+        back as a single bare row replacing every existing one —
+        `_splice_epic_checklists` raises, and `run_auto_split` must report
+        that as a write failure, with the epic body left untouched."""
+        candidate = self._candidate(epic_number=50)
+        writer = _FakeAutoSplitWriter(new_number=2744)
+        writer.bodies[50] = "Epic body.\n\n## Sub-issues\n- #10\n- #10\n"
+        alerted: list[tuple[str, str]] = []
+        recorded: list[dict] = []
+
+        disposition = ft.run_auto_split(
+            candidate, writer=writer,
+            alert=lambda subject, body: alerted.append((subject, body)),
+            record=recorded.append,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_WRITE_FAILED
+        assert alerted
+        # The malformed section was never overwritten with a lossy rewrite.
+        assert writer.bodies[50] == "Epic body.\n\n## Sub-issues\n- #10\n- #10\n"
+
+    def test_epic_with_no_checklist_at_all_fails_rather_than_wiping_it(self) -> None:
+        """#4034 review: an epic body with neither `## Work order` nor
+        `## Sub-issues` has nowhere to splice an `{after: #orig}` edge
+        that still parses, since `#orig` itself is never declared in a
+        brand-new section — this must surface as a write failure, with
+        the epic body never set to the unparseable result, rather than
+        landing a checklist `parse_sub_issues` can no longer read."""
+        candidate = self._candidate(epic_number=50)
+        writer = _FakeAutoSplitWriter(new_number=2744)
+        writer.bodies[50] = "Epic body.\n\nNo checklist here.\n"
+        alerted: list[tuple[str, str]] = []
+
+        disposition = ft.run_auto_split(
+            candidate, writer=writer,
+            alert=lambda subject, body: alerted.append((subject, body)),
+            record=lambda entry: None,
+        )
+
+        assert disposition.action == ft.ACTION_AUTO_SPLIT_WRITE_FAILED
+        assert alerted
+        assert writer.bodies[50] == "Epic body.\n\nNo checklist here.\n"
+
 
 class TestTryAutoSplit:
     """:func:`coord.board_doctor_policy._try_auto_split` — the confirmed-
@@ -7891,3 +7982,44 @@ class TestTryAutoSplit:
         )
 
         assert board_doctor_policy_mod._try_auto_split("quadraui", 2531) is False
+
+
+class TestTryAutoSplitExceptionShielding:
+    """#4034 review: `_try_auto_split` only catches `ConfigError` itself,
+    but `_investigate`'s own call site (and `coord.board_doctor.sweep`'s
+    bare `performed = dispatcher(row)` beyond it) has no shield of its
+    own — an uncaught exception there would abort the WHOLE sweep. A
+    GitHub blip out of `build_auto_split_candidate` or the review-stage
+    reset must instead read as a declined split and fall through to
+    `_alert_fallback`, exactly like any other decline."""
+
+    def test_an_exception_out_of_try_auto_split_does_not_escape_investigate(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor_policy as board_doctor_policy_mod
+
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+        monkeypatch.setattr(
+            board_doctor_policy_mod, "_try_auto_split",
+            lambda repo_name, issue_number: (_ for _ in ()).throw(
+                RuntimeError("GitHub 503"),
+            ),
+        )
+        alerted: list[str] = []
+        monkeypatch.setattr(
+            board_doctor_policy_mod, "_alert_fallback",
+            lambda row: alerted.append(row.key),
+        )
+
+        # `gate-blocked` is not one of `_FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES`,
+        # so `_fixit_rebudget_eligible` declines and `_investigate` reaches
+        # `_try_auto_split` on the ceiling-blocked path.
+        row = _row("acme/widgets#2695", queue_diagnose.CAUSE_GATE_BLOCKED, fresh=True)
+
+        dispatched = board_doctor_policy_mod._investigate(row)
+
+        assert dispatched is False
+        assert alerted == ["acme/widgets#2695"]

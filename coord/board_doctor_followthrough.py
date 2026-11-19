@@ -52,9 +52,7 @@ from coord.milestone_order import (
     WorkOrderNode,
     parse_sub_issues,
     parse_work_order,
-    render_sub_issues,
     render_work_order,
-    replace_sub_issues_section,
     replace_work_order_section,
 )
 from coord.preflight_size import detect_cross_backend_scope
@@ -1272,7 +1270,9 @@ def _splice_epic_checklists(body: str, nodes: Sequence[WorkOrderNode]) -> str:
     merged = WorkOrder(nodes=existing.nodes + tuple(
         n for n in nodes if n.issue_number not in set(existing.issue_numbers)
     ))
-    return replace_work_order_section(body, render_work_order(merged, checkbox=False))
+    result = replace_work_order_section(body, render_work_order(merged, checkbox=False))
+    parse_work_order(result)  # raises WorkOrderError on an undeclared `after` target
+    return result
 
 
 # ── #4038: auto-refile a #3376 branch-merged-guard refusal ──────────────────
@@ -1978,32 +1978,6 @@ def _auto_split_follow_up_body(candidate: AutoSplitCandidate) -> tuple[str, list
     return "\n\n".join(parts), files
 
 
-def _splice_sub_issue(body: str, *, child: int, after: Sequence[int]) -> str:
-    """Add *child* to *body*'s ``## Sub-issues`` checklist with the given
-    ``after=`` annotation, preserving every existing row (#4034 point 4).
-
-    Reuses ``coord milestone add-child``'s own parse/render round trip
-    (:func:`coord.milestone_order.parse_sub_issues`/:func:`render_sub_issues`/
-    :func:`replace_sub_issues_section`) rather than a hand-rolled splice, so
-    a hand-written row's own description text is never at risk of being
-    silently dropped — the body is re-parsed afterward by the caller
-    (:func:`run_auto_split`, via :meth:`FollowThroughWriter.set_issue_body`'s
-    read-back) to confirm it still parses.
-    """
-    try:
-        current = parse_sub_issues(body)
-    except WorkOrderError:
-        current = WorkOrder(nodes=())
-    nodes = list(current.nodes)
-    if any(n.issue_number == child for n in nodes):
-        return body
-    nodes.append(
-        WorkOrderNode(issue_number=child, group=None, after=tuple(after), checked=False)
-    )
-    new_block = render_sub_issues(WorkOrder(nodes=tuple(nodes)))
-    return replace_sub_issues_section(body, new_block)
-
-
 def _file_auto_split_follow_up(
     candidate: AutoSplitCandidate, writer: FollowThroughWriter,
 ) -> tuple[int, list[str]]:
@@ -2023,8 +1997,9 @@ def _file_auto_split_follow_up(
             child=new_number, after=(candidate.issue_number,),
         )
         epic_body = writer.get_issue_body(candidate.github_slug, candidate.epic_number)
-        updated = _splice_sub_issue(
-            epic_body, child=new_number, after=(candidate.issue_number,),
+        updated = _splice_epic_checklists(
+            epic_body or "",
+            (WorkOrderNode(issue_number=new_number, after=(candidate.issue_number,)),),
         )
         if updated != epic_body:
             writer.set_issue_body(candidate.github_slug, candidate.epic_number, updated)

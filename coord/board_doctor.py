@@ -963,7 +963,21 @@ def run_auto_split_for_row(
     def _default_reset_review(_repo: str, _issue: int) -> None:
         from coord.diagnose import diagnose_stage  # noqa: PLC0415
 
-        diagnose_stage(board, config, _repo, _issue, "review", reset=True, dry_run=dry_run)
+        res = diagnose_stage(board, config, _repo, _issue, "review", reset=True, dry_run=dry_run)
+        # #2096: `diagnose_stage(reset=True)` has non-raising failure paths
+        # (`_reset_review_stage` can neither stop the live session nor
+        # confirm the row delete persisted) that leave the review stage
+        # untouched while returning normally — the mere absence of an
+        # exception is not proof the reset happened. Derive the verdict
+        # from the result instead of the call succeeding, and raise so
+        # `run_auto_split`'s own try/except records
+        # `ACTION_AUTO_SPLIT_WRITE_FAILED` rather than requeuing the
+        # original with its `request-changes` review still in place.
+        if not dry_run and (res.needs_reset or not res.recovered):
+            raise RuntimeError(
+                f"review-stage reset for {_repo}#{_issue} did not complete: "
+                + ("; ".join(res.findings) or "reset reported not recovered")
+            )
 
     return board_doctor_followthrough.run_auto_split(
         candidate,
