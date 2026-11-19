@@ -905,23 +905,25 @@ _RULES = (
 #: cause named is whichever gate is *actually* still failing; a standing
 #: conflict is only reported when nothing else is — i.e. when the conflict
 #: really is the thing blocking progress.
-_RULES_CEILING_BLOCKED = (
-    _rule_terminal_park,
-    _rule_pr_merged,
-    _rule_pr_closed,
-    _rule_dead_leg,
-    _rule_no_pr,
-    _rule_integration_red,
-    _rule_ci_red,
-    _rule_ci_pending,
-    _rule_review_stale,
-    _rule_test_stale,
-    _rule_gate_blocked,
-    _rule_conflict,
-    _rule_agent_unreachable,
-    _rule_nothing_blocking,
-    _rule_ci_green,
-)
+#:
+#: Derived from :data:`_RULES` itself — moving :func:`_rule_conflict` to
+#: just after :func:`_rule_gate_blocked` — rather than hand-copied, so a
+#: rule added to/removed from :data:`_RULES` later can never silently fail
+#: to apply here too (the hardest population to notice a missing rule in,
+#: since nothing re-diagnoses a ceiling-blocked row a second time).
+def _reorder_rules_for_ceiling_blocked(
+    rules: tuple[Callable[[QueueEntry, LiveState], tuple[str, str, str] | None], ...],
+) -> tuple[Callable[[QueueEntry, LiveState], tuple[str, str, str] | None], ...]:
+    without_conflict = tuple(rule for rule in rules if rule is not _rule_conflict)
+    insert_at = without_conflict.index(_rule_gate_blocked) + 1
+    return (
+        *without_conflict[:insert_at],
+        _rule_conflict,
+        *without_conflict[insert_at:],
+    )
+
+
+_RULES_CEILING_BLOCKED = _reorder_rules_for_ceiling_blocked(_RULES)
 
 
 # ── the diagnosis ────────────────────────────────────────────────────────────
@@ -962,15 +964,22 @@ def diagnose(
 ) -> Diagnosis:
     """Derive *entry*'s real blocker from *live*.  **Pure — no I/O, no clock.**
 
-    The stated reason is read exactly once, at the end, and only to ask
-    whether the evidence still supports it.  It never selects, orders or
-    breaks ties between causes.
+    Below the rule-table selection (#4033, next paragraph), the stated
+    reason is read exactly once more, at the end, and only to ask whether
+    the evidence still supports it — it never selects, orders or breaks
+    ties between causes within whichever table ends up in play.
 
-    Rule order is :data:`_RULES_CEILING_BLOCKED` instead of :data:`_RULES`
-    whenever *entry* already reads `coord.drive_queue.
-    is_fix_round_ceiling_blocked` — see that data's own docstring for why
-    a row nothing will retry needs its standing conflict ranked behind a
-    currently-failing gate rather than ahead of it.
+    Which TABLE is in play is itself one last_reason-driven read, made
+    once, before the rule loop runs: :data:`_RULES_CEILING_BLOCKED`
+    instead of :data:`_RULES` whenever *entry* already reads
+    `coord.drive_queue.is_fix_round_ceiling_blocked` — see that data's own
+    docstring for why a row nothing will retry needs its standing conflict
+    ranked behind a currently-failing gate rather than ahead of it. This
+    is a coarser, earlier decision than the per-cause tie-breaking the
+    previous paragraph rules out — picking a global order to try, not
+    selecting a cause directly — the same way :func:`_rule_terminal_park`
+    (#3979) already reads ``last_reason`` from inside a single rule to
+    classify, without this function itself picking a cause.
     """
     rules = (
         _RULES_CEILING_BLOCKED

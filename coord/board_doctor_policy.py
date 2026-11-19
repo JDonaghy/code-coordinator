@@ -3574,27 +3574,49 @@ def _is_relaunch_shaped_remedy(proposed_command: str) -> bool:
 def _covering_escalation_remedy_refused_now(
     existing: Mapping[str, Any], row: StuckRow,
 ) -> bool:
-    """#3999: true when *existing* — a covering escalation for a DIFFERENT
-    stage than *row*'s own board-doctor alert — names a relaunch remedy
-    that THIS row's own fresh evidence already proves would be refused.
+    """#3999/#4033: true when *existing* — a covering escalation for a
+    DIFFERENT stage than *row*'s own board-doctor alert — names a relaunch
+    remedy that is already known to be a dead end for *row*.
 
-    Both halves are required: *existing*'s own ``proposed_command`` must
-    be relaunch-shaped (:func:`_is_relaunch_shaped_remedy` — otherwise its
+    *existing*'s own ``proposed_command`` must be relaunch-shaped
+    (:func:`_is_relaunch_shaped_remedy`) in every case — otherwise its
     remedy (a retry, an override, a human decision) is orthogonal to
-    whether checks are red and must not be second-guessed from here), AND
-    *row* must be :attr:`StuckRow.fresh` evidence of exactly the shape
-    that makes a relaunch unsafe to even attempt right now — a live-red
-    check combined with the branch's OWN diff already reading green
-    (:data:`queue_diagnose.CAUSE_INTEGRATION_RED`) or red
-    (:data:`queue_diagnose.CAUSE_CI_RED`); a stale/non-fresh row, or one
-    whose cause says nothing about the PR's checks at all, proves nothing
-    about whether *existing*'s remedy still works and must not override
-    it (#3777's same "new evidence only" bar `_fixit_rebudget_environmental`
-    applies).
+    whether checks are red and must not be second-guessed from here. Given
+    that, either of two independent reasons proves the relaunch dead:
+
+    1. *row* is :attr:`StuckRow.fresh` evidence of exactly the shape that
+       makes a relaunch unsafe to even attempt right now — a live-red
+       check combined with the branch's OWN diff already reading green
+       (:data:`queue_diagnose.CAUSE_INTEGRATION_RED`) or red
+       (:data:`queue_diagnose.CAUSE_CI_RED`). A stale/non-fresh row, or
+       one whose cause says nothing about the PR's checks at all, proves
+       nothing about whether *existing*'s remedy still works here (#3777's
+       same "new evidence only" bar `_fixit_rebudget_environmental`
+       applies).
+    2. *row*'s own issue already gave up on the #2972/#3454 fix-round
+       ceiling (`coord.drive_queue.fix_round_ceiling_blocked_for_issue`).
+       A relaunch-shaped command is exactly `_requeue_command`'s ``remove``
+       + ``add`` pair, and that helper's own docstring states plainly that
+       the pair does NOT reset the ceiling's own budget — so proposing it
+       as "the" remedy for a row the ceiling has already given up on is a
+       dead end by construction, independent of *row*'s cause/freshness:
+       a diagnosed gate-blocked or merge-conflict cause still means the
+       ceiling's own remedy never runs again (#4033 — the hours-long
+       silent gap `_covering_escalation_names_concrete_action` alone could
+       not close, because `_requeue_command`'s output is never blank).
     """
-    if not row.fresh or row.cause not in _CI_SHAPED_INVESTIGATE_CAUSES:
+    command = str(existing.get("proposed_command") or "")
+    if not _is_relaunch_shaped_remedy(command):
         return False
-    return _is_relaunch_shaped_remedy(str(existing.get("proposed_command") or ""))
+    if row.fresh and row.cause in _CI_SHAPED_INVESTIGATE_CAUSES:
+        return True
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, issue_number = parsed
+    return fix_round_ceiling_blocked_for_issue(repo_name, issue_number)
 
 
 def _covering_escalation_names_concrete_action(existing: Mapping[str, Any]) -> bool:
@@ -3639,12 +3661,15 @@ def write_drive_escalation(
     row existed at all. Given a row that does name an action, the skip case
     returns :data:`ALERT_SKIPPED` — UNLESS *row* is given and
     :func:`_covering_escalation_remedy_refused_now` confirms the covering
-    escalation's own remedy is a relaunch this row's fresh evidence
-    already proves would be refused (#3999): a dead end never "covers"
-    anything, and leaving it in place would leave the row un-alerted
-    forever rather than just until the stuck cause resolves, so this
-    upgrades (overwrites) it with the real cause/evidence instead of
-    skipping. *row* is ``None`` for `_followthrough_notify`'s own calls
+    escalation's own remedy is a relaunch already known to be a dead end
+    for *row* — either because *row*'s fresh evidence already proves the
+    relaunch unsafe (#3999), or because *row*'s own issue already gave up
+    on the #2972/#3454 fix-round ceiling, which a relaunch does not reset
+    (#4033): a dead end never "covers" anything, and leaving it in place
+    would leave the row un-alerted forever rather than just until the
+    stuck cause resolves, so this upgrades (overwrites) it with the real
+    cause/evidence instead of skipping. *row* is ``None`` for
+    `_followthrough_notify`'s own calls
     (no `StuckRow` to check), which keeps today's skip-only behavior.
     Otherwise records (or renews) the row and returns only once the write
     is confirmed by reading it back — a clean `record_drive_escalation`
@@ -3658,29 +3683,30 @@ def write_drive_escalation(
 
     try:
         existing = get_drive_escalation(repo_name, issue_number)
-        covering = existing is not None and existing.get("stage") != stage
-        if covering and not _covering_escalation_names_concrete_action(existing):
-            click.echo(
-                f"warning: board-doctor NOT deferring to a covering "
-                f"{existing.get('stage')!r} escalation for "
-                f"{repo_name}#{issue_number} — it names no "
-                "proposed_command at all, so it covers nothing; recording "
-                "this row's own cause/evidence instead",
-                err=True,
-            )
-        elif covering:
-            if row is None or not _covering_escalation_remedy_refused_now(existing, row):
+        if existing is not None and existing.get("stage") != stage:
+            if not _covering_escalation_names_concrete_action(existing):
+                click.echo(
+                    f"warning: board-doctor NOT deferring to a covering "
+                    f"{existing.get('stage')!r} escalation for "
+                    f"{repo_name}#{issue_number} — it names no "
+                    "proposed_command at all, so it covers nothing; recording "
+                    "this row's own cause/evidence instead",
+                    err=True,
+                )
+            elif row is None or not _covering_escalation_remedy_refused_now(existing, row):
                 return ALERT_SKIPPED
-            click.echo(
-                f"warning: board-doctor overriding a covering "
-                f"{existing.get('stage')!r} escalation for "
-                f"{repo_name}#{issue_number} — its own remedy "
-                f"({existing.get('proposed_command')!r}) names a relaunch "
-                f"this row's fresh {row.cause} evidence already shows would "
-                "be refused (#3999); recording the real cause instead of "
-                "leaving a dead end as cover",
-                err=True,
-            )
+            else:
+                click.echo(
+                    f"warning: board-doctor overriding a covering "
+                    f"{existing.get('stage')!r} escalation for "
+                    f"{repo_name}#{issue_number} — its own remedy "
+                    f"({existing.get('proposed_command')!r}) names a relaunch "
+                    f"already known to be a dead end for this row (its fresh "
+                    f"{row.cause} evidence, or its issue having already given "
+                    "up on the fix-round ceiling — #3999/#4033); recording the "
+                    "real cause instead of leaving a dead end as cover",
+                    err=True,
+                )
         record_drive_escalation(
             repo_name,
             issue_number,
@@ -3718,14 +3744,16 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
     than ``True``, because no board-doctor alert exists to suppress future
     ones — `drive_escalations` holds one row per issue, so the covering
     escalation may be dismissed by its own writer at any time, and the
-    next sweep must then be free to file this row's alert itself. #3999:
-    passing *row* through to :func:`write_drive_escalation` lets THAT
-    skip be bypassed too, but only for the narrow case
+    next sweep must then be free to file this row's alert itself. #3999/
+    #4033: passing *row* through to :func:`write_drive_escalation` lets
+    THAT skip be bypassed too, but only for the narrow case
     :func:`_covering_escalation_remedy_refused_now` confirms — a covering
-    escalation whose own remedy is a relaunch this row's fresh evidence
-    already proves would be refused never actually "covers" anything, so
-    leaving it in place would dead-end the row rather than defer to a
-    cover that could still resolve on its own.
+    escalation whose own remedy is a relaunch already known to be a dead
+    end for *row* (its fresh evidence proves the relaunch unsafe, or its
+    issue already gave up on the fix-round ceiling a relaunch cannot
+    reset) never actually "covers" anything, so leaving it in place would
+    dead-end the row rather than defer to a cover that could still resolve
+    on its own.
 
     Never raises: an escalation write failing must not take the sweep
     down with it, the same contract

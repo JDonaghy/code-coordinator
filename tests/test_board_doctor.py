@@ -62,7 +62,14 @@ from coord.config import (
     PreflightGuardRepoConfig,
     _parse_board_doctor,
 )
-from coord.drive_queue import BoardView, IssueFacts, QueueEntry, STATE_MERGED_PARTIAL, STATE_WAITING
+from coord.drive_queue import (
+    BoardView,
+    IssueFacts,
+    QueueEntry,
+    STATE_BLOCKED,
+    STATE_MERGED_PARTIAL,
+    STATE_WAITING,
+)
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
 from coord.queue_diagnose import LiveState
 from coord.smoke import (
@@ -6178,8 +6185,6 @@ class TestCeilingBlockedClassifiesByLastFailingGate:
 
     @staticmethod
     def _ceiling_blocked_entry(issue: int) -> QueueEntry:
-        from coord.drive_queue import STATE_BLOCKED
-
         return QueueEntry(
             repo="acme/widgets",
             issue=issue,
@@ -6253,8 +6258,6 @@ class TestCeilingBlockedClassifiesByLastFailingGate:
         # reordering — naming the conflict first is still a safe, cheap
         # first move there, and a later pass catches a gate still failing
         # once the conflict clears.
-        from coord.drive_queue import STATE_BLOCKED
-
         entry = QueueEntry(
             repo="acme/widgets",
             issue=2700,
@@ -6273,67 +6276,89 @@ class TestCeilingBlockedClassifiesByLastFailingGate:
 
         assert diagnosis.cause == queue_diagnose.CAUSE_MERGE_CONFLICT
 
-
-class TestCeilingBlockedGateBlockedRowRoutesToTheMatchingHandler:
-    """#4033: once the diagnosis correctly names the failing gate instead
-    of the standing conflict, the EXISTING cause-routing table
-    (`coord.board_doctor_policy.policy_tier_of`) already sends it to the
-    fixit-leg investigate tier rather than the mechanical conflict-fix
-    allowlist action — the classification fix alone is enough to reach the
-    right handler, with no new dispatcher to wire up."""
-
-    def test_gate_blocked_ceiling_row_dispatches_the_fixit_leg_not_conflict_fix(
+    def test_ceiling_blocked_rule_order_has_every_rule_the_ordinary_order_has(
         self,
     ) -> None:
-        from coord.board_doctor_policy import policy_tier_of
-        from coord.drive_queue import STATE_BLOCKED
+        # `_RULES_CEILING_BLOCKED` is derived from `_RULES` (moving
+        # `_rule_conflict` after `_rule_gate_blocked`), not hand-copied —
+        # this guards against the two ever silently drifting apart again
+        # if a rule is added to/removed from `_RULES` later.
+        assert set(queue_diagnose._RULES) == set(queue_diagnose._RULES_CEILING_BLOCKED)
+        assert len(queue_diagnose._RULES) == len(queue_diagnose._RULES_CEILING_BLOCKED)
 
-        entry = QueueEntry(
-            repo="acme/widgets",
-            issue=2695,
-            state=STATE_BLOCKED,
-            attempts=3,
-            last_reason=(
-                "fix-round ceiling reached across relaunches (#2972): giving up"
+
+class TestCeilingBlockedGateBlockedRowRoutesToTheMatchingHandlerAndStillAlerts:
+    """#4033: once the diagnosis correctly names the failing gate instead
+    of the standing conflict, the EXISTING cause-routing table
+    (`coord.board_doctor_policy.policy_tier_of`/`AUTO_DISPATCHERS`) already
+    sends it to the fixit-leg investigate tier rather than the mechanical
+    conflict-fix allowlist action — no new dispatcher needs wiring up.
+
+    This exercises the REAL `AUTO_DISPATCHERS[CAUSE_GATE_BLOCKED]` entry
+    (`_investigate`, through its own `_register_investigate_action`
+    gating) and the REAL `write_drive_escalation`, not fakes standing in
+    for either: `_investigate` itself consults
+    `coord.drive_queue.fix_round_ceiling_blocked_for_issue` before
+    anything else and — because `gate-blocked` is not one of the three
+    `_FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES` — correctly declines to spend
+    another fix-it leg on a row that already gave up on the #2972
+    ceiling, falling back to the alert tier instead. The real production
+    shape this issue is about is that fallback alert then getting
+    silently skipped behind the ceiling's own covering escalation (a
+    `remove && add` relaunch command that `_requeue_command`'s own
+    docstring says never resets the ceiling) — so the assertion that
+    matters is not just "a handler ran", it is "a real alert for the real
+    cause landed," which only holds once `write_drive_escalation`'s dead-
+    cover check also refuses a relaunch-shaped remedy for an issue that
+    is itself ceiling-blocked.
+    """
+
+    def test_gate_blocked_ceiling_row_declines_another_leg_and_still_alerts_for_real(
+        self, monkeypatch,
+    ) -> None:
+        from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+
+        # The #2972 ceiling escalation a real `plan.blocked`-shaped tick
+        # would already have on file for this issue (`coord.commands.
+        # drive_queue._blocked_escalation_command` falling through to
+        # `_requeue_command`) — a DIFFERENT stage than the board-doctor
+        # alert below, and it names a command, so the pre-#4033 dead-cover
+        # check alone (blank `proposed_command` only) would still defer to
+        # it forever.
+        state.record_drive_escalation(
+            "acme/widgets",
+            2695,
+            stage="drive-queue",
+            reason="fix-round ceiling reached across relaunches (#2972)",
+            gate_readings="",
+            proposed_command=(
+                "coord drive-queue remove acme/widgets 2695 && "
+                "coord drive-queue add acme/widgets 2695"
             ),
         )
-        episode = {
-            "key": entry.key, "state": STATE_BLOCKED, "diagnoses": 0,
-            "diagnosed_cause": "",
-        }
 
-        class _Probe:
-            def probe(self, entry_):
-                return LiveState(
-                    pr_number=42,
-                    pr_state="OPEN",
-                    mergeable=False,
-                    gate_ready=False,
-                    gate_blockers=("test: no example target named win_panel",),
-                )
-
-        diagnoses = queue_diagnose.run_pass([entry], [episode], probe=_Probe())
-        rows = drive_queue_rows(diagnoses)
-
-        [row] = rows
-        assert row.cause == queue_diagnose.CAUSE_GATE_BLOCKED
-
-        fixit = _Recorder()
-        conflict_fix = _Recorder()
-        alert = _Recorder()
-        sweep(
-            rows,
-            tier_of=policy_tier_of,
-            auto_dispatchers={
-                queue_diagnose.CAUSE_GATE_BLOCKED: fixit,
-                queue_diagnose.CAUSE_MERGE_CONFLICT: conflict_fix,
-            },
-            alert_dispatcher=alert,
+        row = _row(
+            "acme/widgets#2695", queue_diagnose.CAUSE_GATE_BLOCKED,
+            fresh=True,
         )
 
-        assert fixit.count == 1
-        assert conflict_fix.count == 0
-        assert alert.count == 0
+        dispatched = AUTO_DISPATCHERS[queue_diagnose.CAUSE_GATE_BLOCKED](row)
+
+        # No second fix-it leg — the ceiling correctly still blocks it.
+        assert dispatched is False
+
+        # But the row is NOT left silently uncovered: the real alert
+        # fired with the row's own cause, overriding the dead relaunch
+        # cover instead of deferring to it.
+        escalation = state.get_drive_escalation("acme/widgets", 2695)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+        assert "gate-blocked" in escalation["gate_readings"]
 
 
 class TestCoveringEscalationMustNameAConcreteAction:
