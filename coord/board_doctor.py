@@ -2006,6 +2006,12 @@ class SweepReport:
     #: *followthrough*/*refile* above: waiting for (or acting on) live CI
     #: is not a cause this sweep converges or alerts on.
     conflict_fix_ceiling_pending: list[dict] = field(default_factory=list)
+    #: #4048: one dict per :class:`ConfigDriftCandidate`
+    #: :func:`run_config_drift_fix_sweep` attempted this round —
+    #: ``{"repo", "issue", "applied", "requeued", "refunded", "detail"}``.
+    #: Same "not a tier/auto_dispatchers/convergence decision" shape as
+    #: *conflict_fix_ceiling_pending* above.
+    config_drift_fix: list[dict] = field(default_factory=list)
 
 
 def merge_queue_rows(
@@ -2443,26 +2449,56 @@ def smoke_no_verdict_rows(board: Board) -> list[StuckRow]:
     return list(seen.values())
 
 
-def config_drift_rows(
+@dataclass(frozen=True)
+class ConfigDriftCandidate:
+    """One #4035/#4048 config-drift classification — everything both the
+    Detect-step row (:func:`config_drift_rows`) and the Apply-step sweep
+    (:func:`run_config_drift_fix_sweep`) need, built exactly once per
+    (repo, issue) so the two never re-derive (and risk disagreeing on) the
+    same (kind, name)/token/command/plan from two independent parses
+    (#2096, "one question, one answer")."""
+
+    repo_name: str
+    issue_number: int
+    kind: str
+    name: str
+    token: str
+    command: str
+    source: str
+    plan: Any  # coord.board_doctor_policy.ConfigDriftFix
+    #: #4048: how many WORK-LIKE legs for this issue failed/blocked on this
+    #: EXACT (kind, name) signature — "the work legs whose only failure
+    #: was the drift signature" the issue's own Refund step gives back via
+    #: :func:`coord.board_doctor_permissions.sweep_raise_fixit_budget`'s
+    #: *increment*. Counts every matching leg, including the issue's
+    #: unconditional initial one — #3998's own documented direction for
+    #: this kind of imprecision ("harmless... it can only hand out a few
+    #: EXTRA rounds... never fewer") applies here too: refunding one round
+    #: more than `coord.drive_queue.remaining_fix_rounds`'s own
+    #: ``fix_rounds_spent`` formula would count is the safe side to err on.
+    rounds_consumed: int
+
+
+def config_drift_candidates(
     board: Board,
     config: Any,
     *,
     diff_lookup: Callable[[str, str], list[str]] | None = None,
-) -> list[StuckRow]:
-    """One :class:`StuckRow` per issue whose Test-stage verdict names a
-    cargo target this branch's OWN diff deletes entirely (#4035's Detect
-    step) — quadraui#2695's shape: the fleet config still runs a command
-    naming a target the branch legitimately removed, so the identical
-    failure repeats every round no matter what a worker does to the
-    branch's own code.
+) -> list[ConfigDriftCandidate]:
+    """One :class:`ConfigDriftCandidate` per issue whose Test-stage verdict
+    names a cargo target this branch's OWN diff deletes entirely (#4035's
+    Detect step) — quadraui#2695's shape: the fleet config still runs a
+    command naming a target the branch legitimately removed, so the
+    identical failure repeats every round no matter what a worker does to
+    the branch's own code.
 
     *diff_lookup* defaults to :func:`coord.smoke._fetch_deleted_files` —
     injectable so a test never needs a live ``gh`` call. Mirrors
     :func:`smoke_no_verdict_rows`'s own shape: walks ``board.active +
     board.completed`` directly (never a second ``build_board`` call),
     reads ``assignment.test_reason``/``.branch`` straight off the row the
-    normal Test-stage write already populated, and dedupes to ONE row per
-    issue.
+    normal Test-stage write already populated, and dedupes to ONE
+    candidate per issue.
 
     Classification is :func:`coord.queue_diagnose.classify_config_drift` —
     the SAME function :mod:`coord.smoke`'s own pre-smoke gate
@@ -2480,18 +2516,17 @@ def config_drift_rows(
     the diff would keep minting the same row every sweep even after an
     operator (or the autofix path) removes the token from
     ``coordinator.yml`` — the exact "a snapshot too stale to contradict
-    anything" shape epic #2096 names. So a row is minted ONLY when the
-    repo's TODAY-resolved command (:func:`coord.smoke.
+    anything" shape epic #2096 names. So a candidate is minted ONLY when
+    the repo's TODAY-resolved command (:func:`coord.smoke.
     resolve_smoke_command`) still carries the matching token; once it
-    does, the evidence line is :func:`coord.board_doctor_policy.
-    plan_config_drift_fix`'s own ``alert_message`` — the exact one-line
-    coordinator.yml patch a human (or, opted in, the doctor itself) would
-    apply.
+    does, ``plan`` (:func:`coord.board_doctor_policy.
+    plan_config_drift_fix`) carries both the alert message a human (or,
+    opted in, the doctor itself) would apply AND the opt-in/patch
+    decision :func:`run_config_drift_fix_sweep` acts on.
     """
     from coord.board_doctor_policy import plan_config_drift_fix  # noqa: PLC0415
     from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
     from coord.queue_diagnose import (  # noqa: PLC0415
-        CAUSE_CONFIG_DRIFT,
         classify_config_drift,
         extract_dangling_cargo_target,
     )
@@ -2505,7 +2540,7 @@ def config_drift_rows(
 
     lookup = diff_lookup if diff_lookup is not None else _fetch_deleted_files
 
-    seen: dict[str, StuckRow] = {}
+    seen: dict[str, ConfigDriftCandidate] = {}
     for assignment in (*board.active, *board.completed):
         if assignment.type not in WORK_LIKE_TYPES:
             continue
@@ -2556,16 +2591,347 @@ def config_drift_rows(
             assignment.repo_name, command=command_obj.command,
             source=command_obj.source, token=token, config=config,
         )
-        seen[key] = StuckRow(
-            queue="config-drift",
-            key=key,
-            state="blocked",
-            cause=CAUSE_CONFIG_DRIFT,
-            confidence=queue_diagnose.CONFIDENCE_HIGH,
-            evidence=(plan.alert_message,),
-            fresh=True,
+        rounds_consumed = sum(
+            1
+            for other in (*board.active, *board.completed)
+            if other.repo_name == assignment.repo_name
+            and other.issue_number == assignment.issue_number
+            and other.type in WORK_LIKE_TYPES
+            and other.test_state in ("failed", TEST_STATE_BLOCKED)
+            and extract_dangling_cargo_target(other.test_reason or "")
+            == (kind, name)
+        )
+        seen[key] = ConfigDriftCandidate(
+            repo_name=assignment.repo_name,
+            issue_number=assignment.issue_number,
+            kind=kind,
+            name=name,
+            token=token,
+            command=command_obj.command,
+            source=command_obj.source,
+            plan=plan,
+            rounds_consumed=rounds_consumed,
         )
     return list(seen.values())
+
+
+def config_drift_rows(
+    board: Board,
+    config: Any,
+    *,
+    diff_lookup: Callable[[str, str], list[str]] | None = None,
+) -> list[StuckRow]:
+    """One :class:`StuckRow` per :class:`ConfigDriftCandidate`
+    (:func:`config_drift_candidates`) — the Detect-step sweep source
+    feeding :data:`queue_diagnose.CAUSE_CONFIG_DRIFT` into the board
+    doctor. ``evidence`` is always the candidate's own ``plan.
+    alert_message`` — the exact one-line coordinator.yml patch — whether
+    or not this repo has opted into the #4048 Apply step
+    (:func:`run_config_drift_fix_sweep`): an opted-out repo's row rides
+    the ordinary alert tier straight to a human with that same message;
+    an opted-in repo's row is pulled out of the alert tier entirely once
+    (and only once) :func:`run_sweep` confirms the Apply step actually
+    landed this round.
+    """
+    return [
+        StuckRow(
+            queue="config-drift",
+            key=f"{candidate.repo_name}#{candidate.issue_number}",
+            state="blocked",
+            cause=queue_diagnose.CAUSE_CONFIG_DRIFT,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(candidate.plan.alert_message,),
+            fresh=True,
+        )
+        for candidate in config_drift_candidates(
+            board, config, diff_lookup=diff_lookup,
+        )
+    ]
+
+
+@dataclass(frozen=True)
+class ConfigDriftApplyResult:
+    """:func:`apply_config_drift_fix_to_coord_settings`'s return shape."""
+
+    applied: bool
+    detail: str
+
+
+def _config_drift_git(repo_dir: Any, *args: str) -> tuple[bool, str]:
+    """One read/write ``git`` invocation against *repo_dir*, never raising.
+
+    Local to this module rather than imported from
+    :mod:`coord.health.checks.config_drift` (that module's own ``_git`` is
+    private, and deliberately read-only — see its docstring, "Report
+    only — never ``git push``" — the opposite contract this function
+    exists for), so this module's entire mutating git surface stays
+    visible in one place.
+    """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), *args],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "").strip()
+    return True, result.stdout
+
+
+def apply_config_drift_fix_to_coord_settings(
+    *,
+    config_path: Any,
+    command: str,
+    token: str,
+    patched_command: str,
+    repo_name: str,
+    issue_number: int,
+) -> ConfigDriftApplyResult:
+    """#4048: remove *token* from *command* in the live, symlinked
+    ``coordinator.yml`` *config_path* resolves to, and commit that one-line
+    removal in its ``coord-settings`` checkout.
+
+    *config_path* is resolved the same way :func:`coord.health.checks.
+    config_drift.probe_config_drift` resolves it — ``Path.resolve()``,
+    never a bare ``Path.exists()`` on the symlink itself, since the
+    canonical config path has flipped between a plain file and a symlink
+    before (that check's own docstring) and this must survive either
+    shape.
+
+    Edits ONLY the matched *token*, and only when both it and the exact
+    *command* text that names it appear in the file EXACTLY once —
+    mirroring :func:`coord.smoke.remove_dangling_target_token`'s own
+    refusal discipline one level up, at the file-text level rather than
+    the in-memory command string: a *token* already cleared by an earlier
+    round (or a human), or one ambiguous because some OTHER repo's command
+    in the same file happens to name it too, is left for a human rather
+    than guessed at. Writes nothing at all when either check refuses.
+
+    Editing and committing directly in the checkout `~/.coord/
+    coordinator.yml` resolves into already IS "fast-forwarding the daemon
+    host's checkout" (#4048's own wording for this step): there is no
+    second, separate checkout to advance — the resolved path already
+    belongs to the one checkout this very daemon's ``coord serve`` reads
+    on every reload, so the commit this function makes takes effect
+    immediately with no further step. ``git push`` is best-effort only:
+    :func:`coord.health.checks.config_drift.probe_config_drift` (#3120)
+    already monitors "committed but unpushed" as its own standing health
+    signal, so a push failure here (no network, no configured upstream)
+    never undoes the commit that already cleared the live config this
+    host reads, and is reported in ``detail`` rather than flipping
+    ``applied`` to ``False``.
+
+    Never raises: every refusal — an unresolvable path, an ambiguous or
+    already-cleared token/command, a failed ``git add``/``commit`` — comes
+    back as ``applied=False`` with an explanatory ``detail``, the same
+    "report, never crash the caller" posture every other sweep write in
+    this module takes.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    try:
+        real_path = Path(config_path).expanduser().resolve()
+    except OSError as exc:
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=f"could not resolve {config_path!r}: {type(exc).__name__}: {exc}",
+        )
+    if not real_path.exists():
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=f"{config_path} does not resolve to an existing file — nothing to patch",
+        )
+
+    text = real_path.read_text()
+    token_count = text.count(token)
+    if token_count != 1:
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=(
+                f"{repo_name}#{issue_number}: `{token}` appears "
+                f"{token_count} time(s) in {real_path} — refusing an "
+                "ambiguous or already-cleared edit"
+            ),
+        )
+    command_count = text.count(command)
+    if command_count != 1:
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=(
+                f"{repo_name}#{issue_number}: the command naming `{token}` "
+                f"does not appear exactly once in {real_path} "
+                f"({command_count} match(es)) — refusing to guess which "
+                "occurrence to edit"
+            ),
+        )
+
+    new_text = text.replace(command, patched_command, 1)
+    real_path.write_text(new_text)
+
+    repo_dir = real_path.parent
+    ok, detail = _config_drift_git(repo_dir, "add", "--", str(real_path))
+    if not ok:
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=(
+                f"{repo_name}#{issue_number}: edited {real_path} but "
+                f"`git add` failed: {detail} — the working tree is left "
+                "modified for a human to commit or revert by hand"
+            ),
+        )
+    commit_message = (
+        f"board-doctor: clear config drift for {repo_name}#{issue_number} "
+        f"(remove dangling `{token}`)"
+    )
+    ok, detail = _config_drift_git(repo_dir, "commit", "-m", commit_message)
+    if not ok:
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=(
+                f"{repo_name}#{issue_number}: edited {real_path} but "
+                f"`git commit` failed: {detail} — the working tree is "
+                "left modified for a human to commit or revert by hand"
+            ),
+        )
+
+    push_ok, push_detail = _config_drift_git(repo_dir, "push")
+    result_detail = (
+        f"{repo_name}#{issue_number}: committed the removal of `{token}` "
+        f"in {real_path} ({commit_message!r})"
+    )
+    if not push_ok:
+        result_detail += (
+            f"; push failed, left for a human or the #3120 config_drift "
+            f"health check to flag: {push_detail}"
+        )
+    return ConfigDriftApplyResult(applied=True, detail=result_detail)
+
+
+def run_config_drift_fix_sweep(
+    candidates: Sequence[ConfigDriftCandidate],
+    *,
+    config: Any,
+    config_path: Any = None,
+    apply_fn: Callable[..., ConfigDriftApplyResult] | None = None,
+) -> list[dict]:
+    """#4048: for every *candidates* entry whose repo has opted into
+    ``board_doctor.config_drift_autofix`` AND whose command resolved a
+    *patched_command* (``candidate.plan.enabled and candidate.plan.
+    patched_command is not None`` — :func:`coord.board_doctor_policy.
+    plan_config_drift_fix`'s own decision, never re-derived here):
+
+    1. **Apply** (:func:`apply_config_drift_fix_to_coord_settings`, or
+       *apply_fn* in a test) — edit the ONE matched *token* out of the
+       live, symlinked ``coordinator.yml`` and commit (push best-effort).
+    2. **Refund + requeue**, only once the Apply step above actually
+       landed: reset the row's Test-stage verdict
+       (:func:`coord.state.reset_work_test_state`, confirmed against a
+       fresh :func:`coord.state.test_reset_candidates` re-read — #2096,
+       never trusting the write call's own row-matched count — the same
+       pattern :func:`coord.drive_queue.requeue_after_conflict_fix` uses
+       for the identical "the prior verdict no longer covers what's on the
+       branch now" reason), then give back *candidate.rounds_consumed*
+       fix rounds (:func:`coord.board_doctor_permissions.
+       sweep_raise_fixit_budget`), whose own remove-then-re-add puts the
+       row back at its ORIGINAL position with its ORIGINAL ``after=``/
+       machine/hold edges intact — #4048's "requeue the row at its
+       position with its edges".
+
+    A refused/failed Apply (an ambiguous or already-cleared token, a
+    failed ``git`` call) or an unconfirmed Test-stage reset stops here
+    with NO refund/requeue — :func:`run_sweep` only withdraws a row from
+    the ordinary alert path once THIS function reports it fully
+    ``requeued``, so a failed attempt leaves the row's convergence
+    counter and any live escalation untouched rather than silently
+    dismissing them (#4036 review: "pulling these rows out... makes their
+    escalation vanish").
+
+    Every candidate *candidates* names whose opt-in/patch precondition
+    does not hold (``plan.enabled`` is ``False``, or no *patched_command*
+    was computed) is skipped entirely — no dict reported for it, no call
+    made — so this function only ever reports on the subset it actually
+    attempted.
+
+    Returns one dict per candidate attempted — ``{"repo", "issue",
+    "applied", "requeued", "refunded", "detail"}`` — reported onto
+    :attr:`SweepReport.config_drift_fix` rather than :attr:`SweepReport.
+    decisions`, the same "not a tier/auto_dispatchers/convergence
+    decision" shape *followthrough*/*refile*/*conflict_fix_ceiling_pending*
+    already use.
+    """
+    from coord.board_doctor_permissions import (  # noqa: PLC0415
+        sweep_raise_fixit_budget,
+    )
+    from coord.config import resolve_config_path  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        reset_work_test_state,
+        test_reset_candidates,
+    )
+
+    apply = apply_fn or apply_config_drift_fix_to_coord_settings
+    resolved_config_path = (
+        config_path if config_path is not None else resolve_config_path()
+    )
+
+    results: list[dict] = []
+    for candidate in candidates:
+        if not (candidate.plan.enabled and candidate.plan.patched_command is not None):
+            continue
+        repo_name = candidate.repo_name
+        issue_number = candidate.issue_number
+
+        outcome = apply(
+            config_path=resolved_config_path,
+            command=candidate.command,
+            token=candidate.token,
+            patched_command=candidate.plan.patched_command,
+            repo_name=repo_name,
+            issue_number=issue_number,
+        )
+        requeued = False
+        refunded = False
+        detail = outcome.detail
+        if outcome.applied:
+            reset_work_test_state(repo_name, issue_number)
+            still_set = [
+                f"{aid} ({typ})"
+                for aid, typ, test_state in test_reset_candidates(
+                    repo_name, issue_number,
+                )
+                if test_state is not None
+            ]
+            if still_set:
+                detail = (
+                    f"{outcome.detail}; the pre-fix Test-stage verdict "
+                    "could not be confirmed cleared on re-read for "
+                    f"{', '.join(still_set)} — leaving the fix-round "
+                    "budget and the queue row untouched for a later sweep"
+                )
+            else:
+                budget_outcome = sweep_raise_fixit_budget(
+                    repo_name, issue_number, config,
+                    increment=max(candidate.rounds_consumed, 1),
+                )
+                requeued = bool(budget_outcome.get("raised"))
+                refunded = requeued
+                detail = (
+                    f"{outcome.detail}; Test-stage verdict cleared; "
+                    f"{budget_outcome.get('detail', '')}"
+                )
+        results.append({
+            "repo": repo_name,
+            "issue": issue_number,
+            "applied": bool(outcome.applied),
+            "requeued": requeued,
+            "refunded": refunded,
+            "detail": detail,
+        })
+    return results
 
 
 def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:
@@ -5601,6 +5967,8 @@ def run_sweep(
     conflict_fix_ceiling_sweep: Callable[..., list[dict]] = (
         run_conflict_fix_ceiling_pending_sweep
     ),
+    config_drift_autofix_apply: bool = True,
+    config_drift_fix_sweep: Callable[..., list[dict]] = run_config_drift_fix_sweep,
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -5698,6 +6066,28 @@ def run_sweep(
     its own left to be driven by (the original's drive-queue row is gone
     the moment the refile files successfully), so it reports onto
     :attr:`SweepReport.refile_closed` independently of *rows*/*refile_rows*.
+
+    #4048: *config_drift_fix_sweep* (default :func:`run_config_drift_fix_sweep`)
+    attempts the #4048 Apply+Refund+requeue steps for every
+    :data:`queue_diagnose.CAUSE_CONFIG_DRIFT` candidate whose repo has
+    opted into ``board_doctor.config_drift_autofix`` — gated by
+    *config_drift_autofix_apply*, the same kind of fleet-wide kill switch
+    *auto_refile*/*followthrough* are, AND a hard ``dry_run`` skip (never
+    ``config_drift_fix_sweep(..., dry_run=...)``, mirroring
+    *conflict_fix_ceiling_sweep*'s own posture): unlike every other pass
+    here, this one commits to a SEPARATE git checkout
+    (``coord-settings``), which has no dry-run mode of its own to thread
+    through, so a dry-run caller must see zero mutation there, not a
+    best-effort one. Runs BEFORE :func:`sweep` (not after, unlike
+    *conflict_fix_ceiling_sweep*): a :class:`StuckRow` this round's own
+    attempt just resolved (``requeued=True``) is withdrawn from *rows*
+    before it ever reaches the tier/alert path, exactly the way
+    ``merged-partial``/``branch-merged-guard`` rows are withdrawn above —
+    but, per :func:`run_config_drift_fix_sweep`'s own docstring, ONLY the
+    keys this round confirms resolved, never every opted-in candidate
+    regardless of outcome: a failed attempt leaves its row's convergence
+    counter and any live escalation untouched instead of silently
+    dismissing them.
     """
     board_doctor_cfg = getattr(config, "board_doctor", None)
     rows, board = _collect_rows_with_board(
@@ -5745,6 +6135,39 @@ def run_sweep(
         if conflict_fix_ceiling_requeue and mechanical_causes is None
         else frozenset()
     )
+    # #4048: run the Apply+Refund+requeue attempt BEFORE `sweep()` sees
+    # *rows* at all — never after, unlike *conflict_fix_ceiling_sweep*
+    # (which only ever waits on live CI, never mutates a second git
+    # checkout) — a hard `dry_run` skip, same reasoning as that pass's own
+    # posture but one notch stricter: this one commits outside the board
+    # entirely, so a dry-run caller must see zero mutation there.
+    config_drift_fix_results: list[dict] = []
+    if config_drift_autofix_apply and mechanical_causes is None and not dry_run:
+        try:
+            config_drift_fix_results = config_drift_fix_sweep(
+                config_drift_candidates(board, config), config=config,
+            )
+        except Exception:  # noqa: BLE001 — advisory, same posture as the
+            # other best-effort passes in this function: a failed attempt
+            # this round never takes the rest of this report down, and the
+            # row stays exactly as `config_drift_rows` found it for the
+            # next sweep to retry.
+            _log.warning(
+                "board-doctor: config-drift autofix sweep failed this round",
+                exc_info=True,
+            )
+    # Only a key THIS round's attempt actually confirmed `requeued=True`
+    # is withdrawn from the ordinary alert path below — never every
+    # opted-in candidate regardless of outcome (#4036 review: pulling a
+    # row out on a merely-attempted, not confirmed-resolved, action makes
+    # its escalation vanish and dismisses any live one). A failed/refused
+    # attempt leaves its row exactly where `config_drift_rows` put it, so
+    # the alert tier's one-line-patch message still reaches a human.
+    config_drift_resolved_keys = frozenset(
+        f"{outcome['repo']}#{outcome['issue']}"
+        for outcome in config_drift_fix_results
+        if outcome.get("requeued")
+    )
     for r in rows:
         if r.cause == CAUSE_MERGED_PARTIAL:
             continue
@@ -5754,6 +6177,11 @@ def run_sweep(
             and _branch_merged_guard_row_opted_in(r, config)
         ):
             refile_rows.append(r)
+            continue
+        if (
+            r.cause == queue_diagnose.CAUSE_CONFIG_DRIFT
+            and r.key in config_drift_resolved_keys
+        ):
             continue
         if r.cause == queue_diagnose.CAUSE_CI_PENDING and r.queue == "drive-queue":
             from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
@@ -5826,6 +6254,7 @@ def run_sweep(
     # meaning the whole board, not just this call's own narrowed subset.
     if mechanical_causes is None:
         report.rows_observed = len(rows)
+    report.config_drift_fix = config_drift_fix_results
     if followthrough and followthrough_rows:
         report.followthrough = followthrough_sweep(
             followthrough_rows, config=config, board=board, dry_run=dry_run,

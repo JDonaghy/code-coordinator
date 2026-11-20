@@ -3598,6 +3598,7 @@ def drive_queue_sweep(
                     "conflict_fix_ceiling_pending": list(
                         report.conflict_fix_ceiling_pending
                     ),
+                    "config_drift_fix": list(report.config_drift_fix),
                 }
             )
         )
@@ -3610,6 +3611,7 @@ def drive_queue_sweep(
         and not report.refile_closed
         and not report.dropped_predicted_after_edges
         and not report.conflict_fix_ceiling_pending
+        and not report.config_drift_fix
     ):
         if mechanical_only:
             # #4027 review: this invocation deliberately dropped every
@@ -3706,6 +3708,20 @@ def drive_queue_sweep(
                 f"  {outcome.get('repo')}#{outcome.get('issue')} "
                 f"requeued={outcome.get('requeued')}: {outcome.get('detail')}"
             )
+    # #4048: a `config-drift` row with its repo opted into
+    # `board_doctor.config_drift_autofix` is resolved by its own
+    # apply/refund/requeue pass rather than the tier/`Decision` loop
+    # above — its own section, same "may be the ONLY thing this round
+    # touched" shape as *conflict_fix_ceiling_pending* above.
+    if report.config_drift_fix:
+        click.echo("\nconfig-drift autofix row(s):")
+        for outcome in report.config_drift_fix:
+            click.echo(
+                f"  {outcome.get('repo')}#{outcome.get('issue')} "
+                f"applied={outcome.get('applied')} "
+                f"requeued={outcome.get('requeued')} "
+                f"refunded={outcome.get('refunded')}: {outcome.get('detail')}"
+            )
     if dry_run:
         if report.followthrough or report.refile:
             click.echo(
@@ -3722,6 +3738,7 @@ def drive_queue_sweep(
         or report.refile
         or report.refile_closed
         or report.conflict_fix_ceiling_pending
+        or report.config_drift_fix
     ):
         click.echo(
             f"{report.rows_observed} row(s) observed and decided — read the log later with "
