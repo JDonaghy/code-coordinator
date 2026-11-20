@@ -2207,7 +2207,9 @@ def config_drift_target_in_command(
     finds in *command* whose source file *deleted_paths* shows the diff
     removes entirely (#4035's pre-smoke check) — ``None`` when *command*
     names no cargo target at all, or names one *deleted_paths* does not
-    confirm as deleted."""
+    confirm as deleted. Only the FIRST dangling target: a diff that
+    deletes two examples the command still names needs two Detect/Prevent
+    cycles to clear, one token at a time."""
     deleted = list(deleted_paths)
     for kind, name, token in cargo_target_flags_in_command(command):
         if cargo_target_touches_path(kind, name, deleted):
