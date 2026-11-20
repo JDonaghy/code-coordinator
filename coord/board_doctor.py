@@ -1525,10 +1525,25 @@ def run_refile_sweep(
     same sweep) but already gone from a FRESH queue read means a previous
     iteration of this very loop — or a concurrent writer — already
     resolved it; retrying would refile it a second time.
+
+    A row can also reach *rows* more than once in the SAME call (e.g. a
+    `block_log` episode's own `premise-refusal` history reclassified to
+    `branch-merged-guard` alongside the belt-and-braces orphan scan both
+    surfacing the same key) — the `entry is None` guard above does not
+    catch that, since *entries_by_key* is one fresh snapshot read ONCE
+    before this loop, not re-read per row, so a SECOND row for the same
+    key still finds the stale, not-yet-dequeued entry. *already_refiled*
+    (seeded from :func:`~coord.board_doctor_followthrough.pending_refiles`,
+    the SAME durable "has this key already been refiled" answer
+    :func:`run_pending_refile_close_sweep` reads, rather than a second,
+    independent one) closes that gap: it is checked before EVERY dispatch
+    and updated the moment one lands, so a second row for a key this very
+    loop just filed sees it pending too, and a row revisited in a LATER,
+    independent sweep call sees the durable record from the one before.
     """
     from coord.drive_queue import entries_from_rows  # noqa: PLC0415
     from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
-    from coord.state import list_drive_queue  # noqa: PLC0415
+    from coord.state import board_doctor_decisions, list_drive_queue  # noqa: PLC0415
 
     if board is None:
         from coord.state import build_board  # noqa: PLC0415
@@ -1538,6 +1553,9 @@ def run_refile_sweep(
     is_open = issue_open or _issue_open
     row_writer = writer or board_doctor_followthrough.GitHubFollowThroughWriter()
     entries_by_key = {e.key: e for e in entries_from_rows(list_drive_queue())}
+    already_refiled: dict[str, int] = dict(
+        board_doctor_followthrough.pending_refiles(board_doctor_decisions())
+    )
 
     dispositions: list[board_doctor_followthrough.Disposition] = []
     dispatched = 0
@@ -1563,6 +1581,25 @@ def run_refile_sweep(
         if entry is None:
             continue
 
+        existing_refile = already_refiled.get(row.key)
+        if existing_refile is not None:
+            # Reuse, don't file again — and never `record()` this: doing so
+            # would overwrite the `ACTION_REFILE_FILED` entry `pending_refiles`
+            # itself reads back, making this key invisible to
+            # `run_pending_refile_close_sweep` on the next pass.
+            dispositions.append(
+                board_doctor_followthrough.Disposition(
+                    repo_name=repo_name, issue_number=issue_number,
+                    action=board_doctor_followthrough.ACTION_REFILE_ALREADY_FILED,
+                    dry_run=dry_run, cause=CAUSE_BRANCH_MERGED_GUARD,
+                    follow_ups=[existing_refile],
+                    reasons=[
+                        f"already refiled as #{existing_refile}; not filing again"
+                    ],
+                )
+            )
+            continue
+
         candidate = build_refile_candidate(
             repo_name, issue_number, config=config, entry=entry,
         )
@@ -1578,6 +1615,10 @@ def run_refile_sweep(
             dry_run=dry_run,
         )
         dispositions.append(disposition)
+        if disposition.action == board_doctor_followthrough.ACTION_REFILE_FILED:
+            new_number = disposition.follow_up_keys.get("refile")
+            if new_number is not None:
+                already_refiled[row.key] = new_number
         dispatched += 1
     return dispositions
 
