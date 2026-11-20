@@ -138,6 +138,9 @@ class TestPolicyTierOf:
         # reuses the SAME "merge" action `CAUSE_MERGE_PENDING_STUCK`
         # already does. #3944 adds a thirteenth: a `waiting` row stranded
         # on an open, unqueued `after=` pre-req gets the pre-req enqueued.
+        # #4045 adds a fourteenth: a row whose live gates already name a
+        # dispatchable `next_action` that nothing has performed gets that
+        # action re-derived fresh and performed directly.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
             queue_diagnose.CAUSE_PR_MERGED: "mark_done",
@@ -152,6 +155,7 @@ class TestPolicyTierOf:
             queue_diagnose.CAUSE_TEST_STALE: "restage",
             board_doctor_policy.CAUSE_MERGE_NEVER_ATTEMPTED: "merge",
             CAUSE_STRANDED_PREREQ: "drive_queue_add",
+            board_doctor_policy.CAUSE_NEXT_ACTION_UNPERFORMED: "restage",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:

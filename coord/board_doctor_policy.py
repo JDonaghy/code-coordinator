@@ -223,6 +223,7 @@ from coord.board_doctor import (
     CAUSE_LATCH_STALE_MERGEABLE,
     CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_MERGE_PENDING_STUCK,
+    CAUSE_NEXT_ACTION_UNPERFORMED,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
     TIER_ALERT,
@@ -825,6 +826,105 @@ def _restage_test_stale_row(row: StuckRow) -> bool:
     return _restage_stale_gate_row(row, stage="test")
 
 
+def _perform_next_action_unperformed(row: StuckRow) -> bool:
+    """#4045: re-derive *row*'s live :class:`~coord.entry_truth.EntryTruth`
+    right before acting — never trusting :func:`coord.board_doctor.
+    next_action_unperformed_rows`'s own classification, which can be a
+    sweep or more stale — and perform whichever gated primitive its FRESH
+    ``next_action`` names: ``restage`` (review or test), ``merge``, or
+    ``mark_done``. Registered against :data:`coord.board_doctor.
+    CAUSE_NEXT_ACTION_UNPERFORMED` under the nominal action name
+    ``"restage"`` (#4045's own motivating quadraui#2744 case, a stuck
+    ``dispatch_review``) — every branch below still re-authorizes its REAL
+    action through :func:`coord.board_doctor_permissions.
+    dispatch_investigator_action` (``authorize_investigator_action`` ->
+    ``authorize_sweep_action``) before touching the board, so the nominal
+    registration name never grants anything the real call would not
+    already permit on its own (#2096: one question, one answer, asked
+    again at the real call site, not a second judgment this module invents).
+
+    Returns ``True`` only once the matching wrapper confirms it actually
+    acted. A live truth that no longer names a dispatchable ``next_action``
+    at all — reality moved on between classification and this call: an
+    operator already acted (exactly the quadraui#2744 incident's own
+    resolution, `coord review <leg>` run by hand), or a leg is now in
+    flight — is a confirmed no-op, never a false success. Any OTHER
+    exception — `reconcile_entry`, and every primitive the four verbs below
+    reach, are live-GitHub/network-bound — is caught by
+    :func:`_run_mechanical_action` rather than aborting the sweep.
+    """
+    def _body() -> bool:
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, issue_number = parsed
+
+        resolved = _resolve_board_and_config_for_mechanical_action(
+            repo_name, issue_number, action="next_action_unperformed",
+        )
+        if resolved is None:
+            return False
+        board, config = resolved
+
+        from coord import github_ops as gh_ops  # noqa: PLC0415
+        from coord.entry_truth import (  # noqa: PLC0415
+            NEXT_ACTION_DISPATCH_REVIEW,
+            NEXT_ACTION_DISPATCH_TEST,
+            NEXT_ACTION_MARK_DONE,
+            NEXT_ACTION_MERGE,
+            reconcile_entry,
+        )
+
+        truth = reconcile_entry(board, config, repo_name, issue_number, gh_ops=gh_ops)
+
+        if truth.next_action == NEXT_ACTION_DISPATCH_REVIEW:
+            action_name = "restage(review)"
+            result = dispatch_investigator_action(
+                "restage", repo_name, issue_number, board, config,
+                stage="review", reason=_SWEEP_REASON, actor="sweep",
+            )
+            acted = result["acted"]
+        elif truth.next_action == NEXT_ACTION_DISPATCH_TEST:
+            action_name = "restage(test)"
+            result = dispatch_investigator_action(
+                "restage", repo_name, issue_number, board, config,
+                stage="test", reason=_SWEEP_REASON, actor="sweep",
+            )
+            acted = result["acted"]
+        elif truth.next_action == NEXT_ACTION_MERGE:
+            action_name = "merge"
+            # #3902: `allow_fix_dispatch=False` — see `_merge_pending_
+            # stuck_row`'s own comment on the identical call: this cause is
+            # not routed through `InvestigateCapacityGate`/the per-repo
+            # `fixit_leg_budget`, so `investigator_merge`'s own post-merge
+            # fan-out must not spend a worker leg on this call's behalf.
+            result = dispatch_investigator_action(
+                "merge", repo_name, issue_number, board, config, gh_ops,
+                reason=_SWEEP_REASON, actor="sweep", allow_fix_dispatch=False,
+            )
+            acted = result["acted"]
+        elif truth.next_action == NEXT_ACTION_MARK_DONE:
+            action_name = "mark_done"
+            result = dispatch_investigator_action(
+                "mark_done", repo_name, issue_number, board, config,
+                reason=_SWEEP_REASON, actor="sweep",
+            )
+            acted = result["acted"]
+        else:
+            return _warn_noop(
+                "next_action_unperformed", repo_name, issue_number,
+                f"live gates now read next_action={truth.next_action!r} — "
+                "no longer a dispatchable action; reality moved on since "
+                "this row was classified",
+            )
+
+        if not acted:
+            return _warn_noop(action_name, repo_name, issue_number, result["detail"])
+        return True
+
+    return _run_mechanical_action("next_action_unperformed", row, _body)
+
+
 def _redispatch_head_unmoved_conflict_fix(row: StuckRow) -> bool:
     """#3887 case 3, pairs with #3871: re-dispatch the ordinary
     conflict-fix for a `HUMAN_REQUIRED` row whose last attempt completed
@@ -1258,6 +1358,16 @@ _register_auto_action(
     CAUSE_MERGE_NEVER_ATTEMPTED,
     "merge",
     _merge_pending_stuck_row,
+)
+# #4045: a row whose live gates already name a dispatchable `next_action`
+# that nothing has performed — `_perform_next_action_unperformed` re-derives
+# that `next_action` fresh and routes to the matching `restage`/`merge`/
+# `mark_done` primitive itself; see its own docstring for why "restage" is
+# the nominal registration name here.
+_register_auto_action(
+    CAUSE_NEXT_ACTION_UNPERFORMED,
+    "restage",
+    _perform_next_action_unperformed,
 )
 
 

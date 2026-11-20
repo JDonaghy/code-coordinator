@@ -526,6 +526,180 @@ def stranded_prereq_rows(entries: Sequence[Any], *, config: Any) -> list[StuckRo
     return rows
 
 
+# ── Next-action-unperformed (#4045) ──────────────────────────────────────────
+#
+# A row whose LIVE gates already name a dispatchable `next_action`
+# (`coord.entry_truth.reconcile_entry`, via `coord.queue_diagnose.
+# live_entry_truth`) and nothing has performed it is a stall this doctor can
+# name AND fix mechanically, through the normal gated commands every other
+# consumer of `next_action` already uses (`coord.review.dispatch_review`,
+# `coord.merge_queue.process`, ...). The motivating incident (quadraui#2744,
+# 2026-11-19): a fix leg's smoke passed; its review ran and requested
+# changes, but the verdict bound to the chain root rather than the fix leg
+# itself (claude-coordinator#4029/#4044) — so the fix leg's OWN gates kept
+# reading `next_action=dispatch_review` for ~50 minutes with no leg in
+# flight and nothing performing it, while this sweep's existing
+# `stranded_prereq_rows` walk reported the unrelated, alert-only
+# `CAUSE_STRANDED_PREREQ_BLOCKED` instead — the row's `after=` text was
+# stale, not its actual blocker.
+
+#: #4045: the one cause :func:`next_action_unperformed_rows` ever mints.
+CAUSE_NEXT_ACTION_UNPERFORMED = "next-action-unperformed"
+
+#: How long a row may sit with a live, dispatchable `next_action` and no leg
+#: in flight before this sweep acts on it (#4045) — a much tighter floor
+#: than :attr:`coord.config.BoardDoctorConfig.no_progress_minutes`'s
+#: hour-scale default: `coord.entry_truth.reconcile_entry` is a sharp,
+#: direct read of "what should happen next", not the coarser no-progress
+#: shapes that threshold also gates.
+NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS = 20 * 60.0
+
+#: Live `gh`/gate probes :func:`next_action_unperformed_rows` may spend per
+#: sweep — the same cost-containment :data:`_NO_PROGRESS_PROBE_CAP` applies
+#: to its own walk, for the identical reason: fanning out one
+#: `reconcile_entry` call per aged-out row all at once is the synchronized-
+#: poll shape #3536/#3888 already had to guard against elsewhere in this
+#: module.
+_NEXT_ACTION_UNPERFORMED_PROBE_CAP = 25
+
+
+def next_action_unperformed_rows(
+    entries: Sequence[Any],
+    *,
+    covered_keys: Collection[str],
+    truth_of: Callable[[Any], "EntryTruth | None"],
+    board_view: Any = None,
+    stale_after_seconds: float = NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS,
+    probe_cap: int = _NEXT_ACTION_UNPERFORMED_PROBE_CAP,
+    now: float | None = None,
+) -> list[StuckRow]:
+    """One :class:`StuckRow` per row whose live gates already name a
+    dispatchable ``next_action`` that nothing has performed (#4045).
+
+    *truth_of* is the ONE live read this classifier trusts — production
+    wiring binds it to `coord.queue_diagnose.live_entry_truth` against the
+    real board/config/``gh_ops``; a test can inject a canned
+    :class:`~coord.entry_truth.EntryTruth` directly, never paying for a real
+    `gh` round trip. Its exceptions are caught here (a probe failure must
+    never crash the sweep, the same posture :func:`no_progress_rows` takes
+    for its own probe) and a ``None`` return (no probe asked, or one that
+    failed) reads as "nothing to say", never "nothing to do".
+
+    Eligible rows: every *entries* row not already in *covered_keys*
+    (another pass already explained it) and not in a terminal
+    (:data:`coord.drive_queue.STATE_DONE_LIKE`) state. A ``waiting`` row is
+    additionally required to have EVERY ``after=`` pre-req already landed —
+    the same board-level check :func:`_no_progress_shape`'s own ``waiting``
+    branch makes, via *board_view*. This is the one case this cause can
+    collide with :data:`CAUSE_STRANDED_PREREQ_BLOCKED`'s own classification
+    of the SAME row (a stale, textual "waiting on X (open, not queued)"
+    reading that live reality has already moved past) and this cause must
+    win it — see :func:`_collect_rows_with_board`'s own ordering, which runs
+    this pass strictly before :func:`stranded_prereq_rows`. *board_view*
+    being unavailable (the caller's own live-board-view read failed, or
+    nothing was supplied) fails CLOSED for a ``waiting`` row specifically —
+    never promoted without a confirmed "every pre-req landed" reading —
+    while every other state is unaffected by it.
+
+    Age uses the SAME :func:`_no_progress_age_seconds` anchor every other
+    no-progress shape in this module reads (``launched_at`` for ``running``,
+    ``reason_at`` otherwise) — one "how long has this sat here" clock, never
+    a second one this cause invents for itself.
+
+    Only :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_REVIEW`/
+    :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_TEST`/
+    :data:`~coord.entry_truth.NEXT_ACTION_MERGE`/:data:`~coord.entry_truth.
+    NEXT_ACTION_MARK_DONE` are "dispatchable" here.
+    :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_CI_FIX` and
+    :data:`~coord.entry_truth.NEXT_ACTION_CONFLICT_FIX` are deliberately
+    excluded: each already has its own dedicated detection/dispatch path in
+    this module (`queue_diagnose.CAUSE_MERGE_CONFLICT`,
+    :data:`CAUSE_CONFLICT_FIX_HEAD_UNMOVED`), and no safe-tier mechanical
+    primitive exists yet for an unattended CI-fix dispatch FROM this cause —
+    adding one is follow-up work, not a silent extension of this one.
+    :data:`~coord.entry_truth.NEXT_ACTION_ESCALATE`/:data:`~coord.
+    entry_truth.NEXT_ACTION_WAIT`/:data:`~coord.entry_truth.
+    NEXT_ACTION_UNKNOWN` all mean either "a human already owns this" or "a
+    leg is in flight" (`reconcile_entry`'s own worker-status check already
+    resolves to ``WAIT`` whenever one is, so a leg genuinely in flight is
+    never read as dispatchable here) — never this cause's concern.
+    """
+    from coord.drive_queue import STATE_DONE_LIKE, STATE_WAITING  # noqa: PLC0415
+    from coord.entry_truth import (  # noqa: PLC0415
+        NEXT_ACTION_DISPATCH_REVIEW,
+        NEXT_ACTION_DISPATCH_TEST,
+        NEXT_ACTION_MARK_DONE,
+        NEXT_ACTION_MERGE,
+    )
+
+    dispatchable = frozenset(
+        {
+            NEXT_ACTION_DISPATCH_REVIEW,
+            NEXT_ACTION_DISPATCH_TEST,
+            NEXT_ACTION_MERGE,
+            NEXT_ACTION_MARK_DONE,
+        }
+    )
+    stamp = _utcnow().timestamp() if now is None else now
+    dep_states = {e.key: e.state for e in entries}
+
+    def _after_prereqs_landed(entry: Any) -> bool:
+        if board_view is None:
+            return False
+        facts_of = board_view.facts
+        for dep in entry.after:
+            facts = facts_of(dep)
+            if facts.landed or (facts.already_done and not facts.reopened):
+                continue
+            if dep_states.get(dep) in STATE_DONE_LIKE:
+                continue
+            return False
+        return True
+
+    rows: list[StuckRow] = []
+    probes_spent = 0
+    for entry in entries:
+        if entry.key in covered_keys:
+            continue
+        if entry.state in STATE_DONE_LIKE:
+            continue
+        if entry.state == STATE_WAITING and not _after_prereqs_landed(entry):
+            continue
+        age = _no_progress_age_seconds(entry, now=stamp)
+        if age is None or age < stale_after_seconds:
+            continue
+        if probes_spent >= probe_cap:
+            continue
+        probes_spent += 1
+        try:
+            truth = truth_of(entry)
+        except Exception:  # noqa: BLE001 — a probe failure must never crash the sweep
+            _log.debug(
+                "board-doctor: next-action-unperformed probe failed for %s",
+                entry.key, exc_info=True,
+            )
+            continue
+        if truth is None or truth.next_action not in dispatchable:
+            continue
+        rows.append(
+            StuckRow(
+                queue="drive-queue",
+                key=entry.key,
+                state=entry.state,
+                cause=CAUSE_NEXT_ACTION_UNPERFORMED,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=(
+                    f"coord.entry_truth: live gates read "
+                    f"next_action={truth.next_action!r} "
+                    f"({truth.next_action_reason}) for over {age / 60.0:g}m "
+                    "with no leg in flight — nothing has performed it",
+                ),
+                fresh=True,
+            )
+        )
+    return rows
+
+
 # ── Merged-partial follow-through (#3945) ───────────────────────────────────
 #
 # The disposition itself — plan-leg prompt/parse/validate, write/record
@@ -4299,6 +4473,32 @@ def _collect_rows_with_board(
     covered_keys = frozenset(row.key for row in rows)
     rows.extend(
         row for row in config_drift_rows(board, config) if row.key not in covered_keys
+    )
+
+    # #4045: a row whose LIVE gates already name a dispatchable
+    # `next_action` that nothing has performed — run strictly BEFORE
+    # `stranded_prereq_rows` below, so `covered_keys` gives this cause
+    # precedence over `CAUSE_STRANDED_PREREQ_BLOCKED` for the one row shape
+    # the two can collide on (see `next_action_unperformed_rows`'s own
+    # docstring): a `waiting` row whose stored "waiting on X (open, not
+    # queued)" text is stale because every named pre-req has since landed,
+    # while this row's OWN gates read a live, dispatchable `next_action`.
+    covered_keys = frozenset(row.key for row in rows)
+
+    def _next_action_truth_of(entry: Any) -> "EntryTruth | None":
+        from coord import github_ops  # noqa: PLC0415
+
+        return queue_diagnose.live_entry_truth(
+            entry, board, config, gh_ops=github_ops,
+        )
+
+    rows.extend(
+        next_action_unperformed_rows(
+            entries,
+            covered_keys=covered_keys,
+            truth_of=_next_action_truth_of,
+            board_view=board_view,
+        )
     )
 
     # #3944: a `waiting` row stranded on an open, unqueued `after=` pre-req
