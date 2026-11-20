@@ -2712,6 +2712,36 @@ def apply_config_drift_fix_to_coord_settings(
     in the same file happens to name it too, is left for a human rather
     than guessed at. Writes nothing at all when either check refuses.
 
+    Two more guards run BEFORE any of that, both refusing rather than
+    writing — a write that lands on either is exactly the live-incident
+    shape #2096/#2861 already name for this checkout:
+
+    * **Dirty.** ``git status --porcelain -- <real_path>`` must be empty
+      first. An operator mid-edit of the live
+      ``~/.coord/coordinator.yml`` symlink already has an uncommitted
+      change sitting in this exact file; overwriting it with
+      ``read_text()``/``write_text()`` would silently fold that
+      in-progress (possibly broken) edit into this function's own
+      one-token commit. Refuses rather than guessing which lines are
+      "theirs".
+    * **Stale.** The checkout must not be behind its ``@{upstream}``,
+      checked the same way :func:`coord.commands.repo._guard_settings_fresh`
+      guards a config WRITE (best-effort ``git fetch`` first, then
+      ``git rev-list --left-right --count``) — never trusting the
+      existing remote-tracking ref alone, since the whole point is "the
+      remote moved and nobody here noticed". Unlike that CLI guard this
+      never raises: no upstream configured, or the fetch itself failing,
+      is reported as unknown and left to proceed (an offline daemon host
+      must not wedge), but a confirmed nonzero `behind` count refuses —
+      committing onto a stale base would land a push failure that
+      silently refunds a fix round while the fleet's canonical config
+      has already diverged.
+
+    The commit itself is pathspec-limited to *real_path* (``git commit
+    -- <real_path>``, not a bare ``git commit``), so even if something
+    else were staged in the checkout, only this one file's change is
+    swept into the commit this function makes.
+
     Editing and committing directly in the checkout `~/.coord/
     coordinator.yml` resolves into already IS "fast-forwarding the daemon
     host's checkout" (#4048's own wording for this step): there is no
@@ -2747,6 +2777,72 @@ def apply_config_drift_fix_to_coord_settings(
             detail=f"{config_path} does not resolve to an existing file — nothing to patch",
         )
 
+    repo_dir = real_path.parent
+
+    # ── Guard: refuse onto an already-dirty tracked file (#4048 review) ──
+    # A human mid-edit of the live symlink has an uncommitted change
+    # sitting in exactly this file; `read_text()`/`write_text()` below
+    # would silently fold that in-progress edit into this function's own
+    # commit. Check BEFORE reading/writing anything.
+    dirty_ok, dirty_out = _config_drift_git(
+        repo_dir, "status", "--porcelain", "--", str(real_path),
+    )
+    if not dirty_ok:
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=(
+                f"{repo_name}#{issue_number}: could not check whether "
+                f"{real_path} is already dirty: {dirty_out}"
+            ),
+        )
+    if dirty_out.strip():
+        return ConfigDriftApplyResult(
+            applied=False,
+            detail=(
+                f"{repo_name}#{issue_number}: refusing — {real_path} "
+                f"already has an uncommitted change ({dirty_out.strip()!r}); "
+                "a human may be mid-edit and this would overwrite it rather "
+                "than commit a clean one-token removal"
+            ),
+        )
+
+    # ── Guard: refuse onto a checkout behind its upstream (#4048 review) ─
+    # Mirrors `coord.commands.repo._guard_settings_fresh`: fetch first
+    # (the failure mode is "the remote moved and nobody here noticed"),
+    # then compare HEAD to `@{upstream}`. Unknown (no upstream, no
+    # network) is never a refusal — only a CONFIRMED nonzero `behind`
+    # count is, since committing onto that base makes the later `git
+    # push` fail non-fast-forward while this function still reports
+    # `applied=True`.
+    _config_drift_git(repo_dir, "fetch", "--quiet")
+    upstream_ok, upstream_out = _config_drift_git(
+        repo_dir, "rev-parse", "--abbrev-ref", "@{upstream}",
+    )
+    if upstream_ok and upstream_out.strip():
+        upstream = upstream_out.strip()
+        counts_ok, counts_out = _config_drift_git(
+            repo_dir, "rev-list", "--left-right", "--count", f"{upstream}...HEAD",
+        )
+        if counts_ok:
+            parts = counts_out.split()
+            if len(parts) == 2:
+                try:
+                    behind = int(parts[0])
+                except ValueError:
+                    behind = 0
+                if behind:
+                    return ConfigDriftApplyResult(
+                        applied=False,
+                        detail=(
+                            f"{repo_name}#{issue_number}: refusing — "
+                            f"{repo_dir} is {behind} commit(s) behind "
+                            f"{upstream}; committing onto a stale checkout "
+                            "would diverge from the fleet's canonical "
+                            f"config. Run `git -C {repo_dir} pull --ff-only` "
+                            "first."
+                        ),
+                    )
+
     text = real_path.read_text()
     token_count = text.count(token)
     if token_count != 1:
@@ -2773,7 +2869,6 @@ def apply_config_drift_fix_to_coord_settings(
     new_text = text.replace(command, patched_command, 1)
     real_path.write_text(new_text)
 
-    repo_dir = real_path.parent
     ok, detail = _config_drift_git(repo_dir, "add", "--", str(real_path))
     if not ok:
         return ConfigDriftApplyResult(
@@ -2788,7 +2883,9 @@ def apply_config_drift_fix_to_coord_settings(
         f"board-doctor: clear config drift for {repo_name}#{issue_number} "
         f"(remove dangling `{token}`)"
     )
-    ok, detail = _config_drift_git(repo_dir, "commit", "-m", commit_message)
+    ok, detail = _config_drift_git(
+        repo_dir, "commit", "-m", commit_message, "--", str(real_path),
+    )
     if not ok:
         return ConfigDriftApplyResult(
             applied=False,
@@ -2873,7 +2970,7 @@ def run_config_drift_fix_sweep(
         test_reset_candidates,
     )
 
-    apply = apply_fn or apply_config_drift_fix_to_coord_settings
+    apply_impl = apply_fn or apply_config_drift_fix_to_coord_settings
     resolved_config_path = (
         config_path if config_path is not None else resolve_config_path()
     )
@@ -2885,7 +2982,7 @@ def run_config_drift_fix_sweep(
         repo_name = candidate.repo_name
         issue_number = candidate.issue_number
 
-        outcome = apply(
+        outcome = apply_impl(
             config_path=resolved_config_path,
             command=candidate.command,
             token=candidate.token,

@@ -1684,12 +1684,13 @@ def _config_drift_autofix_enabled(repo_name: str, config: "Config") -> bool:
     3. ``repos[].board_doctor.config_drift_autofix`` — the per-repo opt-in,
        default ``False`` (:class:`~coord.models.BoardDoctorRepoConfig`).
 
-    Today this decides only :func:`plan_config_drift_fix`'s
-    ``ConfigDriftFix.enabled``/``patched_command`` fields and the wording
-    of its ``alert_message`` — nothing yet writes ``coordinator.yml`` or
-    commits in ``coord-settings`` for either outcome, so ``True`` here
-    does not mean a patch gets applied automatically; a human still acts
-    on ``alert_message`` either way.
+    Feeds :func:`plan_config_drift_fix`'s ``ConfigDriftFix.enabled``/
+    ``patched_command`` fields and the wording of its ``alert_message``.
+    ``True`` here is what :func:`coord.board_doctor.
+    run_config_drift_fix_sweep` reads to decide whether to actually write
+    ``coordinator.yml`` and commit in ``coord-settings`` (#4048) —
+    ``False`` instead routes the row to the ordinary alert tier with the
+    one-line patch in ``alert_message`` for a human to apply by hand.
     """
     if os.environ.get(NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR):
         return False
@@ -1707,13 +1708,12 @@ class ConfigDriftFix:
     ONLY when the autofix disposition is enabled for the repo AND the
     token was found exactly once in the command (see
     :func:`coord.smoke.remove_dangling_target_token` — ambiguous or
-    absent matches refuse rather than guess). Nothing in this codebase
-    reads ``patched_command`` today — there is no action yet that writes
-    it back to the live, symlinked ``coordinator.yml`` or commits in the
-    ``coord-settings`` repo, so a human must always act on
-    ``alert_message`` instead, which is always populated, independent of
-    ``enabled``, so the row is never left silently unexplained, and never
-    claims the patch was applied.
+    absent matches refuse rather than guess). :func:`coord.board_doctor.
+    run_config_drift_fix_sweep` reads ``patched_command`` and writes it
+    back to the live, symlinked ``coordinator.yml``, committing in the
+    ``coord-settings`` repo, whenever it is set (#4048). ``alert_message``
+    is always populated too, independent of ``enabled`` — the opted-out
+    path's only outcome — so the row is never left silently unexplained.
     """
 
     enabled: bool
@@ -1730,14 +1730,17 @@ def plan_config_drift_fix(
     source`).
 
     Never mutates anything, and never claims to have: this only COMPUTES
-    the patch. Nothing writes it back to the live, symlinked
-    ``coordinator.yml`` or commits the change in the ``coord-settings``
-    repo, so ``alert_message`` always describes the patch
+    the patch — writing it back to the live, symlinked
+    ``coordinator.yml`` and committing in the ``coord-settings`` repo is
+    :func:`coord.board_doctor.run_config_drift_fix_sweep`'s job, gated on
+    ``enabled``. ``alert_message`` always describes the patch
     PROSPECTIVELY — "apply this" rather than "applied this" — regardless
-    of ``enabled``. Edits exactly the matched *token* (:func:`coord.smoke.
-    remove_dangling_target_token`), never anything else in *command* — a
-    *token* that is absent, or appears more than once, produces no
-    ``patched_command`` at all, only the alert naming the exact one-line
+    of ``enabled``, since it is also what the opted-out path shows a
+    human instead of applying it automatically. Edits exactly the matched
+    *token* (:func:`coord.smoke.remove_dangling_target_token`), never
+    anything else in *command* — a *token* that is absent, or appears
+    more than once, produces no ``patched_command`` at all, only the
+    alert naming the exact one-line
     patch for a human to apply.
     """
     from coord.smoke import remove_dangling_target_token  # noqa: PLC0415
