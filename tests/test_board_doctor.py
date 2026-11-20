@@ -32,6 +32,7 @@ from coord.board_doctor import (
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
     CAUSE_STRANDED_PREREQ_BLOCKED,
+    IDLE_FLEET_ROOT_QUEUE,
     MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS,
     MECHANICAL_SWEEP_COUNTER_NAMESPACE,
     MERGE_PENDING_STALE_AFTER_SECONDS,
@@ -40,6 +41,7 @@ from coord.board_doctor import (
     TIER_AUTO,
     StuckRow,
     _ceiling_blocked_ci_pending_candidates,
+    _episode_stuck_row,
     _reclassify_branch_merged_guard,
     _reclassify_ceiling_blocked,
     _reclassify_checks_stale_race,
@@ -52,6 +54,7 @@ from coord.board_doctor import (
     dispatch_plan_leg,
     drive_queue_rows,
     drop_stale_predicted_after_edges,
+    idle_fleet_root_rows,
     merge_queue_rows,
     merged_partial_rows,
     no_progress_rows,
@@ -5398,6 +5401,248 @@ class TestMergedPartialRows:
         rows = board_doctor_mod.collect_rows(config=config)
 
         assert any(r.key == "quadraui#2180" and r.cause == CAUSE_MERGED_PARTIAL for r in rows)
+
+
+class TestCollectRowsOnlySweepsLiveQueueRows:
+    """#4039: a row removed from the live drive-queue must stop producing
+    a `StuckRow` the moment it leaves — never resurrected from a
+    `block_log` episode `needs_diagnosis` has already concluded (and so
+    never re-probes), which is the exact shape that kept
+    quadraui#2467/#2537 showing up in every hourly sweep log for hours
+    after they were removed from the queue.
+    """
+
+    def _episode(self, key: str) -> dict:
+        return {
+            "key": key,
+            "state": STATE_PARKED,
+            "diagnosed_cause": queue_diagnose.CAUSE_PREMISE_REFUSAL,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+            "diagnosis_evidence": ("last_reason: premise-refusal park",),
+            "resolved": False,
+            "diagnoses": 1,
+        }
+
+    def _collect(self, monkeypatch, *, live_entry: QueueEntry | None) -> list[StuckRow]:
+        import coord.board_doctor as board_doctor_mod
+
+        key = "quadraui#2467"
+        episode = self._episode(key)
+        monkeypatch.setattr(board_doctor_mod, "merge_queue_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "merged_partial_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "no_progress_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "smoke_no_verdict_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "stranded_prereq_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "branch_merged_guard_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "config_drift_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod.queue_diagnose, "run_pass", lambda *a, **k: [])
+        monkeypatch.setattr("coord.block_log.episodes", lambda *a, **k: [episode])
+        monkeypatch.setattr("coord.block_log.read_events", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "coord.commands.drive_queue._fetch_board_view_with_retry",
+            lambda: (_ for _ in ()).throw(RuntimeError("no board view in this test")),
+        )
+        monkeypatch.setattr("coord.commands.drive_queue._local_host_id", lambda: "host")
+        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda: [])
+        monkeypatch.setattr(
+            "coord.health.aggregate.local_fleet_health_block", lambda *a, **k: {},
+        )
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: [])
+        monkeypatch.setattr("coord.state.baseline_red_merge_blocked", lambda *a, **k: False)
+        monkeypatch.setattr("coord.state.baseline_red_streaks", lambda: {})
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+        live_entries = [live_entry] if live_entry is not None else []
+        monkeypatch.setattr(
+            "coord.state.list_drive_queue",
+            lambda: [live_entry.__dict__] if live_entry is not None else [],
+        )
+        monkeypatch.setattr(
+            "coord.drive_queue.entries_from_rows", lambda rows: live_entries,
+        )
+        monkeypatch.setattr(
+            "coord.drive_queue.read_systemd_max_parallel_flags", lambda: {},
+        )
+
+        config = Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[])
+        return board_doctor_mod.collect_rows(config=config)
+
+    def test_a_row_removed_from_the_live_queue_yields_nothing(self, monkeypatch) -> None:
+        rows = self._collect(monkeypatch, live_entry=None)
+
+        assert rows == []
+
+    def test_a_row_still_live_is_still_rebuilt_from_its_settled_episode(
+        self, monkeypatch,
+    ) -> None:
+        """Control: the same settled-episode reconstruction this fix
+        gates must still fire for a row that genuinely IS still in the
+        queue — #4039 narrows `_episode_stuck_row`'s reach, it must not
+        remove it."""
+        live_entry = QueueEntry(repo="quadraui", issue=2467, state=STATE_PARKED)
+
+        rows = self._collect(monkeypatch, live_entry=live_entry)
+
+        assert any(
+            r.key == "quadraui#2467" and r.cause == queue_diagnose.CAUSE_PREMISE_REFUSAL
+            for r in rows
+        )
+
+
+class TestIdleFleetRootRows:
+    """#4039: a repo with 0 `running`/`waiting` drive-queue rows collapses
+    every row :func:`coord.drive_queue.detect_unreachable_waits` already
+    excludes as a mere dependent down to just the root(s) it names, one
+    :class:`StuckRow` per root — never one per dependent."""
+
+    def _root_entry(self, repo: str, issue: int) -> QueueEntry:
+        from coord.models import PREMISE_REFUSAL_MARKER
+
+        return QueueEntry(
+            repo=repo, issue=issue, state=STATE_PARKED,
+            last_reason=f"blocked {PREMISE_REFUSAL_MARKER} missing prerequisite",
+            # `detect_unreachable_waits` applies `UNREACHABLE_WAIT_MIN_
+            # DEFERRALS`'s grace window to the `attempts == 0` shape (a
+            # few ticks before a fresh park counts as "stuck a while") —
+            # past it, same as a root that has actually sat for hours.
+            deferrals=10,
+        )
+
+    def test_two_roots_with_26_blocked_dependents_yield_two_alerts_not_26(self) -> None:
+        """The 2026-11-19 quadraui incident shape: two roots, 26 rows
+        total queued behind them (24 dependents + the 2 roots
+        themselves)."""
+        repo = "quadraui"
+        root_a = self._root_entry(repo, 2695)
+        root_b = self._root_entry(repo, 2531)
+        entries = [root_a, root_b]
+        for i in range(24):
+            root = root_a if i % 2 == 0 else root_b
+            entries.append(
+                QueueEntry(
+                    repo=repo, issue=3000 + i, state=STATE_BLOCKED, after=(root.key,),
+                    last_reason=f"waiting on {root.key} (open, not queued)",
+                )
+            )
+
+        alerts = idle_fleet_root_rows(entries)
+
+        assert len(entries) == 26
+        assert {a.key for a in alerts} == {root_a.key, root_b.key}
+        assert all(a.queue == IDLE_FLEET_ROOT_QUEUE for a in alerts)
+        assert all(a.cause == queue_diagnose.CAUSE_PREMISE_REFUSAL for a in alerts)
+        for alert in alerts:
+            assert any("12 row(s) queued directly behind this root" in e for e in alert.evidence)
+
+    def test_a_removed_row_yields_nothing(self) -> None:
+        """A row no longer in *entries* — removed from the live queue —
+        leaves no trace at all, root or dependent."""
+        assert idle_fleet_root_rows([]) == []
+
+    def test_a_repo_with_any_running_or_waiting_row_is_not_idle(self) -> None:
+        repo = "quadraui"
+        root = self._root_entry(repo, 2695)
+        busy = QueueEntry(repo=repo, issue=1, state=STATE_RUNNING)
+        dep = QueueEntry(repo=repo, issue=2, state=STATE_BLOCKED, after=(root.key,))
+
+        assert idle_fleet_root_rows([root, busy, dep]) == []
+
+    def test_a_cause_this_epic_already_auto_fixes_is_not_double_alerted(self) -> None:
+        """`CAUSE_NEVER_DISPATCHED` already has a registered `requeue`
+        handler (`coord.board_doctor_policy`'s mechanical tier) that acts
+        on the root directly — a second, redundant page adds nothing."""
+        from coord.drive_queue import detect_unreachable_waits
+
+        repo = "quadraui"
+        # No terminal-park marker, past the grace window — the plain
+        # #2944 never-dispatched shape, confirmed below as a control.
+        root = QueueEntry(repo=repo, issue=2695, state=STATE_PARKED, deferrals=10)
+        dep = QueueEntry(repo=repo, issue=2, state=STATE_BLOCKED, after=(root.key,))
+        [wait] = detect_unreachable_waits([root, dep])
+        assert wait.cause == queue_diagnose.CAUSE_NEVER_DISPATCHED
+
+        assert idle_fleet_root_rows([root, dep]) == []
+
+    def test_a_repo_with_no_unreachable_wait_root_is_not_idle(self) -> None:
+        """A `blocked` row that is NOT in the #2944 guaranteed-false-wait
+        shape (e.g. genuinely waiting on a live gate) never gets a root
+        alert — only `detect_unreachable_waits`'s own set does."""
+        repo = "quadraui"
+        gate_blocked = QueueEntry(
+            repo=repo, issue=5, state=STATE_BLOCKED, attempts=1,
+            last_reason="a required check is failing right now",
+        )
+
+        assert idle_fleet_root_rows([gate_blocked]) == []
+
+    def test_a_repo_with_no_rows_at_all_is_not_idle(self) -> None:
+        repo = "quadraui"
+        done = QueueEntry(repo=repo, issue=1, state="done")
+
+        assert idle_fleet_root_rows([done]) == []
+
+
+class TestPostIdleFleetRootAlert:
+    """#4039: :func:`coord.notify.post_idle_fleet_root_alert` — the
+    delivery half, independent of `drive_escalations`."""
+
+    def _row(self) -> StuckRow:
+        return StuckRow(
+            queue=IDLE_FLEET_ROOT_QUEUE, key="quadraui#2695", state=STATE_PARKED,
+            cause=queue_diagnose.CAUSE_PREMISE_REFUSAL,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=("quadraui: 0 running/waiting drive-queue rows", "12 row(s) queued behind this root"),
+        )
+
+    def test_posts_one_comment_naming_the_cause_and_count(self, monkeypatch) -> None:
+        from coord import notify
+
+        config = Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[])
+        monkeypatch.setattr(
+            "coord.commands._common.resolve_and_load_config", lambda *a, **k: config,
+        )
+        posted = {}
+
+        def _fake_post(repo_github, issue_number, body):
+            posted["repo_github"] = repo_github
+            posted["issue_number"] = issue_number
+            posted["body"] = body
+
+        monkeypatch.setattr(notify.github_ops, "post_issue_comment", _fake_post)
+
+        result = notify.post_idle_fleet_root_alert(self._row())
+
+        assert result is True
+        assert posted["repo_github"] == "acme/quadraui"
+        assert posted["issue_number"] == 2695
+        assert "premise-refusal" in posted["body"]
+        assert "12 row(s) queued behind this root" in posted["body"]
+
+    def test_an_unresolvable_repo_slug_returns_false_not_an_exception(
+        self, monkeypatch,
+    ) -> None:
+        from coord import notify
+
+        config = Config(repos=[], machines=[])
+        monkeypatch.setattr(
+            "coord.commands._common.resolve_and_load_config", lambda *a, **k: config,
+        )
+
+        assert notify.post_idle_fleet_root_alert(self._row()) is False
+
+    def test_a_failed_gh_post_returns_false_not_an_exception(self, monkeypatch) -> None:
+        from coord import notify
+
+        config = Config(repos=[Repo(name="quadraui", github="acme/quadraui")], machines=[])
+        monkeypatch.setattr(
+            "coord.commands._common.resolve_and_load_config", lambda *a, **k: config,
+        )
+
+        def _raise(*a, **k):
+            raise RuntimeError("gh exploded")
+
+        monkeypatch.setattr(notify.github_ops, "post_issue_comment", _raise)
+
+        assert notify.post_idle_fleet_root_alert(self._row()) is False
 
 
 class TestBuildPartialMerge:

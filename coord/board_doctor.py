@@ -2017,6 +2017,98 @@ def baseline_red_rows(blocked_streaks: Mapping[str, int]) -> list[StuckRow]:
     ]
 
 
+#: #4039: synthetic queue for the one-row-per-root alert a repo idling
+#: entirely behind one or more unreachable-wait roots gets — distinct from
+#: the root's own ordinary ``queue="drive-queue"`` row so the two keep
+#: separate convergence/backoff counters (`sweep`'s ``touched`` set is
+#: keyed on ``(queue, key)``, never ``key`` alone) and so `run_sweep` can
+#: route it to its own delivery path
+#: (:func:`coord.notify.post_idle_fleet_root_alert`) instead of the
+#: ordinary per-row escalation.
+IDLE_FLEET_ROOT_QUEUE = "idle-fleet-root"
+
+
+def idle_fleet_root_rows(entries: Sequence[Any]) -> list[StuckRow]:
+    """One :class:`StuckRow` per root a whole repo sits idle behind (#4039).
+
+    2026-11-19's quadraui incident: from ~08:45 to ~14:30 the queue had 0
+    `running`/`waiting` rows and 26 `blocked` rows that all traced back,
+    through their own ``after=`` chains, to two root rows (#2695, #2531).
+    Each root's OWN per-row cause is alert-eligible and does eventually
+    escalate through the ordinary walk — but only on that cause's own
+    convergence/backoff clock, which can legitimately stay quiet for
+    hours even while the WHOLE repo's dispatch capacity sits idle behind
+    it, and the 24 non-root rows never get a row of their own at all (they
+    are correctly waiting on an unsatisfied ``after=``, not independently
+    stuck). The only signal visible that whole window was the queue
+    tick's own ``nothing eligible to launch`` line — true, but silent
+    about *why*, and not a page.
+
+    Deliberately reuses :func:`coord.drive_queue.detect_unreachable_waits`
+    — the SAME predicate that already backs `coord drive-queue status`'s
+    own ``alert:`` line and :mod:`coord.health.checks.wedged_drive_queue`'s
+    ``coord doctor`` WARN — rather than re-walking ``after=`` chains here:
+    that function already excludes a row blocked SOLELY on an
+    unsatisfiable ``after=`` pre-req unconditionally, "leaving only the
+    root that actually needs a human" (its own docstring), and already
+    carries a `.cause` derived from the identical ``last_reason`` markers
+    `coord.queue_diagnose`'s own terminal-park rule trusts. Re-deriving
+    either of those here, independently, is exactly the split-brain #2096
+    warns against — one question (which row is the root, and why), one
+    answer, asked the same way everywhere.
+
+    *entries* is the live, this-sweep drive-queue read (never a stored
+    diagnosis) — "a repo has no running/waiting rows" must be observed
+    fresh every call, the same posture :func:`_collect_rows_with_board`
+    already takes for everything else it classifies live.
+
+    Only emits a row for a root whose cause :func:`default_tier_of` says
+    is alert-tier — a cause this epic already auto-fixes (e.g.
+    :data:`queue_diagnose.CAUSE_NEVER_DISPATCHED`'s own ``requeue``
+    handler) needs no second, redundant page; its own handler already acts
+    on the root directly, which is exactly "no handler in this epic will
+    fix automatically" read the other way round. ``UnreachableWait.cause``
+    is always one of :mod:`coord.drive_queue`'s
+    ``UNREACHABLE_WAIT_CAUSE_*`` strings, kept byte-for-byte identical to
+    the matching :mod:`coord.queue_diagnose` ``CAUSE_*`` constant by that
+    module's own design (see its docstring) — so handing it to
+    :func:`default_tier_of` directly, with no translation step, is safe.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        STATE_RUNNING,
+        STATE_WAITING,
+        detect_unreachable_waits,
+    )
+
+    by_repo: dict[str, list[Any]] = {}
+    for entry in entries:
+        by_repo.setdefault(entry.repo, []).append(entry)
+
+    rows: list[StuckRow] = []
+    for repo_name, repo_entries in by_repo.items():
+        if any(e.state in (STATE_RUNNING, STATE_WAITING) for e in repo_entries):
+            continue
+        for wait in detect_unreachable_waits(repo_entries):
+            if default_tier_of(wait.cause) != TIER_ALERT:
+                continue
+            rows.append(
+                StuckRow(
+                    queue=IDLE_FLEET_ROOT_QUEUE,
+                    key=wait.key,
+                    state=wait.state,
+                    cause=wait.cause,
+                    confidence=queue_diagnose.CONFIDENCE_HIGH,
+                    evidence=(
+                        f"{repo_name}: 0 running/waiting drive-queue rows",
+                        f"{wait.dependents} row(s) queued directly behind this root",
+                        f"last_reason: {wait.last_reason}",
+                    ),
+                    fresh=False,
+                )
+            )
+    return rows
+
+
 #: Assignment types `coord.state.reset_work_test_state`/`test_reset_candidates`
 #: can clear with no `assignment_id` (`coord.state._test_reset_where`). A
 #: `test-author`/`mock-author` row parked on the same mute-leg tally needs
@@ -4029,9 +4121,29 @@ def _collect_rows_with_board(
     refreshed_rows, settled_episodes = _refresh_ceiling_blocked_settled_rows(
         settled_episodes, entries_by_key=entries_by_key, probe=probe, trigger=trigger
     )
+    # #4039: `_episode_stuck_row` rebuilds a row from `block_log`'s stored
+    # diagnosis alone — it has no way to tell a row still open on the live
+    # queue from one an operator (or an auto-dispatcher) has since removed,
+    # because nothing here ever writes an `EVENT_RESOLVE` record back to
+    # `block_log` when a row leaves the queue by any path other than the
+    # queue's own resolution bookkeeping. Gate it on the SAME live
+    # `entries_by_key` read `run_pass` already uses to drop a diagnosed-
+    # episode-with-no-live-row (`queue_diagnose.run_pass`'s own "left the
+    # queue" branch) and `_refresh_ceiling_blocked_settled_rows` above
+    # already uses for its own ceiling check — one live-presence check,
+    # not three independent ones that could disagree. Without this, a
+    # removed row's episode never sees `resolved` and keeps producing the
+    # exact same `StuckRow` every sweep, so `sweep`'s `clear_absent_rows`
+    # never observes it absent and its convergence counter/alert back-off
+    # runs forever against a row that no longer exists.
+    live_settled_episodes = [
+        ep for ep in settled_episodes if str(ep.get("key") or "") in entries_by_key
+    ]
     rows = drive_queue_rows(diagnoses)
     rows.extend(refreshed_rows)
-    rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
+    rows.extend(
+        row for ep in live_settled_episodes if (row := _episode_stuck_row(ep)) is not None
+    )
     merge_entries = load_merge_queue()
     rows.extend(
         merge_queue_rows(
@@ -4180,6 +4292,11 @@ def _collect_rows_with_board(
 
         rows = [_suppress_if_blocked(row) for row in rows]
         rows.extend(baseline_red_rows(blocked_streaks))
+
+    # #4039: a live, ledger-only read over *entries* — independent of
+    # every reclassifier above, so it runs regardless of where in this
+    # walk it lands.
+    rows.extend(idle_fleet_root_rows(entries))
     return rows, board
 
 
@@ -5374,11 +5491,40 @@ def run_sweep(
         if capacity_check is _CAPACITY_CHECK_UNSET
         else capacity_check
     )
+
+    routed_alert_dispatcher = alert_dispatcher
+    if alert_dispatcher is not None:
+
+        def _route_alert(row: StuckRow) -> bool | str:
+            """#4039: an :data:`IDLE_FLEET_ROOT_QUEUE` row never goes
+            through *alert_dispatcher* (``board_doctor_policy.
+            escalation_alert_dispatcher`` in production) — that writer
+            keys `drive_escalations` on ``(repo, issue)`` alone, and the
+            root's OWN ordinary ``queue="drive-queue"`` row already owns
+            that exact slot for the SAME cause, so a second writer there
+            would almost always find itself "covered" and skip —
+            precisely the quiet window this cause exists to page
+            through. :func:`coord.notify.post_idle_fleet_root_alert`
+            posts to the root issue directly instead, an independent
+            channel with no such collision. Every other queue keeps
+            going through *alert_dispatcher* exactly as before — and
+            *alert_dispatcher* being ``None`` (the no-op default) is left
+            completely untouched above, so `sweep`'s own ``"no-dispatcher"``
+            bookkeeping for that case is unaffected by this routing.
+            """
+            if row.queue == IDLE_FLEET_ROOT_QUEUE:
+                from coord import notify  # noqa: PLC0415
+
+                return notify.post_idle_fleet_root_alert(row)
+            return alert_dispatcher(row)
+
+        routed_alert_dispatcher = _route_alert
+
     report = sweep(
         other_rows,
         tier_of=tier_of,
         auto_dispatchers=auto_dispatchers,
-        alert_dispatcher=alert_dispatcher,
+        alert_dispatcher=routed_alert_dispatcher,
         dry_run=dry_run,
         convergence_limit=convergence_limit,
         escalation_resolver=escalation_resolver,
