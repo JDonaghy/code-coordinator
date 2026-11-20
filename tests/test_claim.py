@@ -829,11 +829,15 @@ def test_any_matching_branch_merged_true_when_pr_merged(monkeypatch) -> None:
     read `True` even though `_default_branch_lookup`'s own filtered list
     would come back empty for the same input."""
     import coord.claim as claim_mod
+    from coord import github_ops
 
     monkeypatch.setattr(
         "coord.github_ops._gh",
         _gh_stub_with_matching_refs(["issue-9-done"], "main", {"issue-9-done": 0}),
     )
+    # #4061: "merged" for this guard is decided by a confirmed merged PR,
+    # never bare `ahead_by == 0` ancestry — mock the PR state explicitly.
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: True)
     assert claim_mod.any_matching_branch_merged("acme/api", 9) is True
 
 
@@ -876,15 +880,22 @@ def test_any_matching_branch_merged_false_on_gh_error(monkeypatch) -> None:
 def test_any_matching_branch_merged_scoped_branch_ignores_merged_siblings(
     monkeypatch,
 ) -> None:
-    """#3436/#3442: reproduces vimcode#1156's shape — several MERGED,
-    zero-commit `issue-{N}-*` review-leg branches (cut from the
-    default-branch tip, never diverged) alongside the one real, unmerged
-    work branch. A caller that names the ACTUAL branch in play must get an
+    """#3436/#3442: reproduces vimcode#1156's shape — a zero-commit
+    `issue-{N}-*` review-leg branch (cut from the default-branch tip, never
+    diverged, no PR of its own) alongside the one real, unmerged work
+    branch. A caller that names the ACTUAL branch in play must get an
     answer scoped to just that branch, not "did anything for this issue
     ever merge" — and #3442: the issue-scoped fallback (no ``branch=``)
     must ALSO see past a review-leg sibling now, since it's the fallback a
     plain `coord assign` (nothing dispatched yet, no branch to scope to)
-    actually hits."""
+    actually hits.
+
+    #4061: the review-leg sibling sitting at `ahead_by == 0` with no PR is
+    exactly the zero-commit-residue shape this guard must NOT read as
+    merged, scoped-branch ask or not — an explicit ask about that exact
+    branch gets the same answer as the issue-scoped fallback now that
+    ancestry alone no longer counts.
+    """
     import coord.claim as claim_mod
 
     monkeypatch.setattr(
@@ -903,12 +914,11 @@ def test_any_matching_branch_merged_scoped_branch_ignores_merged_siblings(
     assert claim_mod.any_matching_branch_merged(
         "acme/api", 1156, branch="issue-1156-real-work"
     ) is False
-    # Scoped to the merged sibling itself: correctly reports merged (an
-    # explicit ask about that exact branch is unaffected by the leg-branch
-    # exclusion the issue-scoped fallback applies).
+    # Scoped to the review-leg sibling itself: still NOT merged (#4061) — it
+    # has no merged PR, and `ahead_by == 0` alone no longer counts.
     assert claim_mod.any_matching_branch_merged(
         "acme/api", 1156, branch="issue-1156-review-fix-1"
-    ) is True
+    ) is False
 
 
 def test_any_matching_branch_merged_issue_scoped_ignores_review_and_smoke_legs(
@@ -995,6 +1005,57 @@ def test_any_matching_branch_merged_issue_scoped_ignores_size_triage_leg(
         ),
     )
     assert claim_mod.any_matching_branch_merged("acme/vimcode", 2304) is False
+
+
+def test_any_matching_branch_merged_false_for_zero_commit_work_leg_residue(
+    monkeypatch,
+) -> None:
+    """#4061: quadraui#2539's exact shape — a `type="work"` leg (not an
+    observer-leg tag) that premise-refused, leaving its `issue-{N}-*`
+    branch sitting at the base's tip with no PR ever opened. `ahead_by ==
+    0` alone must not read this as "already merged" — that misread
+    permanently refused every later dispatch for the issue, requiring a
+    refile even though nothing had ever landed."""
+    import coord.claim as claim_mod
+    from coord import github_ops
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(
+            ["issue-2539-shared-remove-the-slot-extra-api-and-col"],
+            "develop",
+            {"issue-2539-shared-remove-the-slot-extra-api-and-col": 0},
+        ),
+    )
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+    # Issue-scoped fallback (no branch dispatched yet, e.g. a plain `coord
+    # assign` right after `clear-refusal`):
+    assert claim_mod.any_matching_branch_merged("acme/vimcode", 2539) is False
+    # Scoped to the exact residue branch (a retry/requeue that already
+    # knows its own branch name):
+    assert claim_mod.any_matching_branch_merged(
+        "acme/vimcode", 2539, branch="issue-2539-shared-remove-the-slot-extra-api-and-col"
+    ) is False
+
+
+def test_any_matching_branch_merged_true_for_squash_merged_branch(monkeypatch) -> None:
+    """#4061: a GENUINELY merged branch must still refuse dispatch — squash
+    merges never bring `ahead_by` to 0 (#3103), so a confirmed merged PR is
+    the only signal this guard needs, and it must still fire."""
+    import coord.claim as claim_mod
+    from coord import github_ops
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(
+            ["issue-122-amend"], "main", {"issue-122-amend": 3}  # never 0, squash
+        ),
+    )
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: True)
+    assert claim_mod.any_matching_branch_merged(
+        "acme/portal", 122, branch="issue-122-amend"
+    ) is True
+    assert claim_mod.any_matching_branch_merged("acme/portal", 122) is True
 
 
 def test_is_observer_leg_branch_matches_review_scoped_review_smoke_and_gate_b() -> None:

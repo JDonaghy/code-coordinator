@@ -8270,3 +8270,89 @@ class TestPullDependencyRetry:
             assert a is not c
         finally:
             server.shutdown()
+
+
+# ── #4061: skip the reap safety-net push for a genuine 0-commit refusal ────
+
+
+#: Mirrors `tests/test_agent_zero_commit.py`'s own `_PREMISE_REFUSAL_
+#: RESULT_LINE` — a worker's final `result` event reporting an
+#: investigated, refuted premise, the exact shape `classify_zero_commit_
+#: outcome` reads as `"premise"`.
+_PREMISE_REFUSAL_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "Investigated the stated dependency: it is false. The '
+    "issue's own stated dependency is only about 8% met, so the premise "
+    'is false -- there is nothing correct to build yet."}'
+)
+
+
+class TestReapPushSkippedForZeroCommitRefusal:
+    """#4061: a leg that exits 0 with nothing to push, and a stated reason
+    why (a premise refusal here), must not leave a zero-commit branch on
+    the remote — pushing it anyway gives #3376's `any_matching_branch_
+    merged` guard a branch that reads as "merged" forever (quadraui#2539).
+    """
+
+    def test_premise_refusal_skips_the_push_and_leaves_no_remote_branch(
+        self, tmp_path: Path,
+    ) -> None:
+        clone, origin = _init_repo_with_origin(tmp_path)
+        server = _server(
+            tmp_path,
+            argv=[
+                sys.executable, "-c", f"print({_PREMISE_REFUSAL_RESULT_LINE!r})",
+            ],
+            repo_path=clone,
+        )
+        try:
+            spec = _spec(
+                clone, issue_number=2539, issue_title="a premise-refuted issue",
+            )
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=10)
+
+            assert final.exit_code == 0
+            assert final.log_path is not None
+            log_text = Path(final.log_path).read_text()
+            assert "# reap: push skipped — 0 commits ahead" in log_text, log_text
+            assert "# reap: push starting" not in log_text
+            assert "# reap: push completed" not in log_text
+            assert final.branch is not None
+
+            refs = subprocess.run(
+                ["git", "for-each-ref", "refs/heads"], cwd=str(origin),
+                check=True, capture_output=True, text=True,
+            ).stdout
+            assert final.branch not in refs
+        finally:
+            server.shutdown()
+
+    def test_plain_zero_commit_exit_with_no_stated_reason_still_pushes(
+        self, tmp_path: Path,
+    ) -> None:
+        """#1797 carve-out: a worker that exits 0 with 0 commits and says
+        NOTHING about why (no premise/needs-decomposition/policy marker —
+        exactly `/bin/true`'s own shape) must still have its push
+        attempted, so a real credential break stays detectable instead of
+        being masked by this skip."""
+        clone, origin = _init_repo_with_origin(tmp_path)
+        server = _server(
+            tmp_path,
+            argv=[sys.executable, "-c", "print('nothing of note')"],
+            repo_path=clone,
+        )
+        try:
+            spec = _spec(
+                clone, issue_number=2540, issue_title="an ordinary issue",
+            )
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=10)
+
+            assert final.exit_code == 0
+            assert final.log_path is not None
+            log_text = Path(final.log_path).read_text()
+            assert "# reap: push skipped" not in log_text, log_text
+            assert "# reap: push starting" in log_text
+        finally:
+            server.shutdown()

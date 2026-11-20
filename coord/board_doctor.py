@@ -758,6 +758,31 @@ CAUSE_MERGED_PARTIAL = "merged-partial"
 #: only the issue's own body.
 CAUSE_BRANCH_MERGED_GUARD = "branch-merged-guard"
 
+#: :func:`run_refile_sweep`'s own action (#4061) for a ``branch-merged-
+#: guard`` row whose LIVE recheck (`coord.claim.any_matching_branch_merged`
+#: — the same predicate the #3376 guard itself consults, re-asked rather
+#: than re-derived, #2096) no longer reports the branch merged. The stored
+#: ``last_reason`` that minted :data:`CAUSE_BRANCH_MERGED_GUARD` can be
+#: stale: it only proves the guard refused dispatch THEN, off whatever
+#: "merged" meant at the time — and before #4061, bare `ahead_by == 0`
+#: ancestry (a branch cut from the base's tip and never advanced — a
+#: premise refusal, a `needs-decomposition` exit, an advisory audit) read
+#: identically to a real landed branch. Nothing had actually landed for
+#: this row, so refiling a replacement issue would be wrong (there is
+#: nothing left on the original to split off) — this requeues the
+#: ORIGINAL issue instead (quadraui#2539).
+ACTION_BRANCH_MERGED_GUARD_FALSE_POSITIVE_REQUEUED = (
+    "branch-merged-guard-false-positive-requeued"
+)
+
+#: Sibling of the above for when the live recheck says "not merged" but the
+#: mechanical requeue itself did not land (a transient `gh`/DB failure, a
+#: gate mid-flight) — the row is left exactly where it was, for the next
+#: sweep or an operator to retry, rather than silently reporting success.
+ACTION_BRANCH_MERGED_GUARD_FALSE_POSITIVE_REQUEUE_FAILED = (
+    "branch-merged-guard-false-positive-requeue-failed"
+)
+
 #: How long :func:`dispatch_plan_leg` waits for the follow-through's
 #: read-only plan leg to finish before giving up. A `claude -p` session
 #: grepping one repo, not a build — generous but still bounded, so a hung
@@ -1517,6 +1542,20 @@ def run_refile_sweep(
     (*board*'s lazy build, *writer*'s real default, the open-check
     fail-closed-by-skip posture).
 
+    #4061: before filing anything, re-checks LIVE whether the issue's
+    branch is still actually merged (`coord.claim.
+    any_matching_branch_merged`, not a second derivation of the same
+    question). A row's `branch-merged-guard` cause only proves the #3376
+    guard refused dispatch for this reason at SOME point — not that the
+    branch is still read as merged now, and not that it ever genuinely was
+    (a zero-commit leg's own residue branch used to read identically to a
+    landed one, #4061). When the live recheck says "not merged", there is
+    no remainder to refile — the row is requeued instead
+    (:data:`ACTION_BRANCH_MERGED_GUARD_FALSE_POSITIVE_REQUEUED`/
+    :data:`ACTION_BRANCH_MERGED_GUARD_FALSE_POSITIVE_REQUEUE_FAILED`),
+    never counted toward *already_refiled*, and `run_refile` is never
+    called for it.
+
     A row whose key no longer resolves to a real
     :class:`~coord.drive_queue.QueueEntry` is skipped rather than acted
     on: :func:`~coord.board_doctor_followthrough.run_refile`'s own write
@@ -1541,6 +1580,7 @@ def run_refile_sweep(
     loop just filed sees it pending too, and a row revisited in a LATER,
     independent sweep call sees the durable record from the one before.
     """
+    from coord.claim import any_matching_branch_merged  # noqa: PLC0415
     from coord.drive_queue import entries_from_rows  # noqa: PLC0415
     from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
     from coord.state import board_doctor_decisions, list_drive_queue  # noqa: PLC0415
@@ -1618,6 +1658,69 @@ def run_refile_sweep(
             continue
 
         seen_keys.add(row.key)
+
+        # #4061: re-ask the SAME guard predicate live, right before acting
+        # on a stored refusal that can be stale — `is_branch_merged_guard_
+        # refusal_reason` only proves the #3376 guard refused dispatch at
+        # SOME point in the past, off whatever "merged" meant then. Before
+        # #4061, bare `ahead_by == 0` ancestry read a zero-commit leg's own
+        # residue branch (never advanced — a premise refusal, a
+        # `needs-decomposition` exit, an advisory audit) identically to a
+        # branch whose real work had genuinely landed. One question
+        # (`coord.claim.any_matching_branch_merged`, #2096), re-asked
+        # rather than re-derived: if it no longer reports this issue's
+        # branch merged, nothing ever landed here, so there is no
+        # remainder to refile — requeue the ORIGINAL issue instead
+        # (quadraui#2539). A flaky recheck fails toward the existing
+        # refile path (`still_merged = True`) rather than guessing a new
+        # action is safe off evidence this call couldn't actually get.
+        try:
+            still_merged = any_matching_branch_merged(github_repo, issue_number)
+        except Exception:  # noqa: BLE001 — see comment above
+            still_merged = True
+        if not still_merged:
+            requeued = dry_run
+            detail = ""
+            if not dry_run:
+                try:
+                    from coord.board_doctor_permissions import (  # noqa: PLC0415
+                        sweep_drive_queue_requeue,
+                    )
+
+                    result = sweep_drive_queue_requeue(repo_name, issue_number)
+                    requeued = bool(result["requeued"])
+                    detail = str(result["detail"])
+                except Exception as exc:  # noqa: BLE001 — a flaky requeue
+                    # must not sink the sweep; the row is left exactly
+                    # where it was for the next sweep or an operator.
+                    detail = str(exc)
+            reason = (
+                "live recheck: coord.claim.any_matching_branch_merged no "
+                "longer reports this issue's branch merged — nothing ever "
+                "landed, so this is requeued instead of refiled"
+            )
+            if not requeued:
+                reason += f" — requeue did not land: {detail}" if detail else (
+                    " — requeue did not land"
+                )
+            false_positive = board_doctor_followthrough.Disposition(
+                repo_name=repo_name, issue_number=issue_number,
+                action=(
+                    ACTION_BRANCH_MERGED_GUARD_FALSE_POSITIVE_REQUEUED
+                    if requeued else
+                    ACTION_BRANCH_MERGED_GUARD_FALSE_POSITIVE_REQUEUE_FAILED
+                ),
+                dry_run=dry_run, cause=CAUSE_BRANCH_MERGED_GUARD,
+                reasons=[reason],
+            )
+            if not dry_run:
+                from coord.state import record_board_doctor_decision  # noqa: PLC0415
+
+                record_board_doctor_decision(false_positive.as_record())
+            dispositions.append(false_positive)
+            dispatched += 1
+            continue
+
         candidate = build_refile_candidate(
             repo_name, issue_number, config=config, entry=entry,
         )
