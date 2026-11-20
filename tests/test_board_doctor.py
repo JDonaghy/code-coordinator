@@ -8086,6 +8086,72 @@ class TestRunRefileSweep:
         )
         assert dispositions == []
 
+    def test_a_row_matched_twice_in_one_sweep_refiles_only_once(
+        self, monkeypatch,
+    ) -> None:
+        """The same key reaching *rows* twice in one call (e.g. a
+        `premise-refusal` episode history reclassified to
+        `branch-merged-guard` AND the orphan belt-and-braces scan both
+        surfacing it) must file exactly one replacement, not one per
+        occurrence — `entries_by_key` is one snapshot read ONCE before the
+        loop, so the second occurrence still finds the stale, not-yet-
+        dequeued original entry."""
+        self._stub_get_issue(monkeypatch)
+        state.enqueue_drive_queue("quadraui", 2467)
+        writer = _FakeRefileWriter(new_number=2739)
+
+        dispositions = run_refile_sweep(
+            [self._row(), self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(False, "B is not on develop"),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 2
+        assert dispositions[0].action == ft.ACTION_REFILE_FILED
+        assert dispositions[0].follow_ups == [2739]
+        assert dispositions[1].action == ft.ACTION_REFILE_ALREADY_FILED
+        assert dispositions[1].follow_ups == [2739]
+        assert len(writer.created) == 1
+
+        rows = state.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert 2467 not in by_issue
+        assert 2739 in by_issue
+
+    def test_a_later_sweep_does_not_refile_the_same_row_again(
+        self, monkeypatch,
+    ) -> None:
+        """Once a key's refile is recorded as
+        :data:`ft.ACTION_REFILE_FILED`, a SEPARATE, later call to
+        :func:`run_refile_sweep` (the durable decision log, not this
+        call's own in-memory state) must still reuse it rather than
+        filing a second one."""
+        self._stub_get_issue(monkeypatch)
+        state.enqueue_drive_queue("quadraui", 2467)
+        writer = _FakeRefileWriter(new_number=2739)
+
+        first = run_refile_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(False, "B is not on develop"),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+        assert first[0].action == ft.ACTION_REFILE_FILED
+
+        # Simulate the row reappearing in a later sweep's own fresh
+        # `rows`/`entries_by_key` (a re-diagnosis pass surfacing the same
+        # key again before the original issue is observed closed).
+        state.enqueue_drive_queue("quadraui", 2467)
+        second = run_refile_sweep(
+            [self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(False, "B is not on develop"),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(second) == 1
+        assert second[0].action == ft.ACTION_REFILE_ALREADY_FILED
+        assert second[0].follow_ups == [2739]
+        assert len(writer.created) == 1
+
 
 class TestRunPendingRefileCloseSweep:
     """:func:`run_pending_refile_close_sweep` — step 4's deferred close:

@@ -1325,6 +1325,15 @@ ACTION_REFILE_DEPTH_PAGED = "refile-depth-paged"
 #: Minted only by :func:`coord.board_doctor.run_pending_refile_close_sweep`
 #: — the deferred step-4 close, never by :func:`run_refile` itself.
 ACTION_REFILE_SUPERSEDED = "refile-superseded-closed"
+#: Minted only by :func:`coord.board_doctor.run_refile_sweep`, BEFORE
+#: :func:`run_refile` is ever called: a row whose key :func:`pending_refiles`
+#: already reports pending is reusing a previous dispatch's own refile, not
+#: filing a fresh one. Never recorded to the durable decision log (would
+#: overwrite the :data:`ACTION_REFILE_FILED` entry :func:`pending_refiles`
+#: itself reads back, making that key invisible to it on the next pass) —
+#: this action exists purely for the returned disposition list's own
+#: visibility.
+ACTION_REFILE_ALREADY_FILED = "refile-already-filed"
 
 #: Marker prefix for the one ``evidence`` string an :data:`ACTION_REFILE_FILED`
 #: disposition carries — which real issue number the original was refiled
