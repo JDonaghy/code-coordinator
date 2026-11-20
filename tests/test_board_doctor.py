@@ -10636,7 +10636,7 @@ class TestLiveBaseSyncFixEvidence:
     def _config() -> Config:
         return Config(repos=[], machines=[])
 
-    def test_no_drive_queue_row_is_not_confirmed(self, monkeypatch) -> None:
+    def test_no_drive_queue_row_is_not_confirmed(self) -> None:
         import coord.board_doctor as board_doctor_mod
 
         confirmed, detail = board_doctor_mod._live_base_sync_fix_evidence(
@@ -10944,20 +10944,25 @@ class TestRunSweepBaseSyncFixCeiling:
             "detail": "dispatched base-sync-fix fix-2726 on laptop",
         }]
 
-    def test_a_prior_escalations_convergence_counter_is_preserved(
+    def test_a_confirmed_dispatch_suppresses_and_preserves_a_prior_escalation(
         self, monkeypatch,
     ) -> None:
-        """Mirrors #4036's own equivalent test: excluding this row from the
-        generic tier/dispatch path must mark it `suppressed=True` (present)
-        rather than drop it outright -- dropping it would let
-        `clear_absent_rows` read the vanish as "resolved" and dismiss a
-        live escalation the row may have earned under an EARLIER cause."""
+        """A row only ever reaches ``suppressed=True`` here on a THIS-round
+        `dispatched=True` confirmation (#4050 review) -- when it does, the
+        suppression must still behave exactly like the #4036 sibling's own
+        equivalent test: excluding the row from the generic tier/dispatch
+        path marks it `suppressed=True` (present) rather than dropping it
+        outright, so a live escalation already earned under the SAME cause
+        is preserved rather than reset to a fresh convergence cycle."""
         import coord.board_doctor as board_doctor_mod
 
         _seed_ceiling_blocked_entry("acme/widgets", 2728)
         key = "acme/widgets#2728"
 
-        sweep([_row(key, "merge-conflict")], tier_of=_always(TIER_ALERT), alert_dispatcher=lambda row: True)
+        sweep(
+            [_row(key, queue_diagnose.CAUSE_INTEGRATION_RED)],
+            tier_of=_always(TIER_ALERT), alert_dispatcher=lambda row: True,
+        )
         assert state.board_doctor_row_state("drive-queue", key)["escalated"] is True
 
         integration_red_row = _row(
@@ -10973,14 +10978,59 @@ class TestRunSweepBaseSyncFixCeiling:
             config=Config(repos=[], machines=[]),
             escalation_resolver=lambda queue, k: resolved.append((queue, k)),
             base_sync_fix_ceiling_sweep=lambda rows, **kw: [{
-                "repo": "acme/widgets", "issue": 2728, "dispatched": False,
-                "detail": "not confirmed yet",
+                "repo": "acme/widgets", "issue": 2728, "dispatched": True,
+                "detail": "dispatched base-sync-fix fix-2728 on laptop",
             }],
         )
 
         assert resolved == []
         row_state = state.board_doctor_row_state("drive-queue", key)
         assert row_state["escalated"] is True
+        # Suppressed, so the counter from the earlier escalation is READ
+        # back (not re-incremented) -- it stays at the count that earlier
+        # `sweep()` call left it at.
+        assert row_state["count"] == 1
+
+    def test_an_unconfirmed_candidate_is_never_suppressed_and_still_reaches_a_human(
+        self, monkeypatch,
+    ) -> None:
+        """#4050 review (blocking): `CAUSE_INTEGRATION_RED` does not
+        self-clear the way `CAUSE_CI_PENDING` does, so a candidate whose
+        premise never reconfirms -- or whose dispatch finds the retry cap
+        already spent -- must stay on the ordinary tier/alert path, not
+        vanish into a permanently-frozen `suppressed=True` with no
+        counter movement and no escalation ever. A NEVER-before-escalated
+        candidate must still converge and reach a human once
+        `convergence_limit` is hit, exactly like a row with no budget-free
+        remedy at all."""
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2904)
+        key = "acme/widgets#2904"
+        integration_red_row = _row(key, queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True)
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([integration_red_row], Board()),
+        )
+
+        alerted: list[str] = []
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            convergence_limit=1,
+            alert_dispatcher=lambda row: alerted.append(row.key) or True,
+            base_sync_fix_ceiling_sweep=lambda rows, **kw: [{
+                "repo": "acme/widgets", "issue": 2904, "dispatched": False,
+                "detail": "not confirmed yet",
+            }],
+        )
+
+        assert alerted == [key]
+        row_state = state.board_doctor_row_state("drive-queue", key)
+        assert row_state["escalated"] is True
+        assert report.base_sync_fix_ceiling_dispatch == [{
+            "repo": "acme/widgets", "issue": 2904, "dispatched": False,
+            "detail": "not confirmed yet",
+        }]
         assert row_state["count"] >= 1
 
     def test_dry_run_never_invokes_the_ceiling_sweep(self, monkeypatch) -> None:

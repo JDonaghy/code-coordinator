@@ -6126,8 +6126,8 @@ def _live_base_sync_fix_evidence(
     Returns ``(confirmed, detail)``:
 
     * ``confirmed=True`` only when the fresh probe's diagnosis STILL
-      reads :data:`queue_diagnose.CAUSE_INTEGRATION_RED` at
-      :data:`queue_diagnose.CONFIDENCE_LOW`-or-better confidence AND the
+      reads :data:`queue_diagnose.CAUSE_INTEGRATION_RED` at a confidence
+      better than :data:`queue_diagnose.CONFIDENCE_LOW` AND the
       SAME probe's :attr:`~coord.queue_diagnose.LiveState.base_moved_note`
       is populated — ``coord gates`` itself positively confirming the
       quadraui#2726 divergence, not merely "a check happens to be red
@@ -6170,7 +6170,7 @@ def _live_base_sync_fix_evidence(
         )
         return False, f"{repo_name}#{issue_number}: live re-probe failed"
 
-    diagnosis = queue_diagnose.diagnose(entry, live, trigger="board_doctor_base_sync_fix")
+    diagnosis = queue_diagnose.diagnose(entry, live, trigger="board-doctor-sweep")
     if diagnosis.cause != queue_diagnose.CAUSE_INTEGRATION_RED:
         return False, (
             f"{repo_name}#{issue_number}: live re-probe no longer confirms "
@@ -6212,10 +6212,20 @@ def _dispatch_base_sync_fix(
     enforces the one-mechanical-attempt-then-human retry cap via
     ``has_prior_conflict_fix`` — this function never re-derives that.
 
-    Returns ``{"dispatched": bool, "detail": str}``, never raises: no
-    merge-queue entry, no capable machine, an already-active conflict-fix,
-    or a spent retry cap are all confirmed no-ops, left for the row's own
-    convergence counter to escalate if they recur.
+    Returns ``{"dispatched": bool, "detail": str}`` for every outcome this
+    function itself decides: no merge-queue entry, no capable machine, an
+    already-active conflict-fix, or a spent retry cap are all confirmed
+    no-ops reported as ``dispatched=False`` rather than raised. This does
+    NOT mean the function can never raise at all — ``authorize_sweep_
+    action`` raises :class:`coord.board_doctor_permissions.
+    SweepPermissionError` by design, and ``load_queue``/``build_board``/
+    ``write_board`` can all raise their own I/O errors; callers already
+    expect that (:func:`run_base_sync_fix_ceiling_sweep` has no `try` of
+    its own, and :func:`run_sweep` wraps its whole call in one). The
+    caller withdraws a row from the tier path only on ``dispatched=True``
+    (:func:`run_sweep`'s own ``base_sync_fix_keys``) — every ``False``
+    outcome here is left for the row's own convergence counter to
+    escalate if it recurs.
     """
     from coord.board_doctor_permissions import authorize_sweep_action  # noqa: PLC0415
     from coord.board_service import write_board  # noqa: PLC0415
@@ -6487,12 +6497,23 @@ def run_sweep(
     branch Test verdict that already read green, CI red only because the
     target branch moved under it) gets a fresh, confirmed-live dispatch of
     the base-sync-fix conflict-fix leg instead of the generic investigate-
-    tier fix-it leg #3454 already refuses it. Same exclusion shape as
-    *conflict_fix_ceiling_sweep*'s own ``CAUSE_CI_PENDING`` rows below
-    (``suppressed=True``, never dropped, runs AFTER :func:`sweep`, hard
-    ``dry_run`` skip, failure is advisory-only) — gated by
-    *base_sync_fix_ceiling_dispatch*, the same kind of fleet-wide kill
-    switch *conflict_fix_ceiling_requeue* is.
+    tier fix-it leg #3454 already refuses it.
+
+    Unlike *conflict_fix_ceiling_sweep*'s ``CAUSE_CI_PENDING`` rows (which
+    self-resolve the moment checks settle, so suppressing every opted-in
+    candidate regardless of outcome just costs a sweep or two), a row
+    diagnosed ``CAUSE_INTEGRATION_RED`` does not self-clear — it stays red
+    until something pushes a new head. So this pass runs BEFORE the row
+    loop below (not after :func:`sweep`, hard ``dry_run`` skip, failure is
+    advisory-only — otherwise the same posture), and only the keys it
+    actually confirmed ``dispatched=True`` (``base_sync_fix_keys``, mirroring
+    *config_drift_resolved_keys* a few lines down) are withdrawn from the
+    tier/alert path as ``suppressed=True``. A candidate whose premise never
+    reconfirms, or whose dispatch finds the retry cap already spent, is
+    left in the ordinary row walk so its convergence counter keeps
+    advancing and still escalates to a human at *convergence_limit* —
+    gated by *base_sync_fix_ceiling_dispatch*, the same kind of fleet-wide
+    kill switch *conflict_fix_ceiling_requeue* is.
     """
     board_doctor_cfg = getattr(config, "board_doctor", None)
     rows, board = _collect_rows_with_board(
@@ -6540,14 +6561,43 @@ def run_sweep(
         if conflict_fix_ceiling_requeue and mechanical_causes is None
         else frozenset()
     )
-    # #4050: same "qualifies for a budget-free lane, suppress rather than
-    # drop" shape as *ceiling_pending_keys* above, for the DIFFERENT
-    # CAUSE_INTEGRATION_RED shape — see this function's own docstring
-    # paragraph and `run_base_sync_fix_ceiling_sweep`'s.
-    base_sync_fix_keys = (
-        frozenset(_ceiling_blocked_integration_red_candidates(rows))
-        if base_sync_fix_ceiling_dispatch and mechanical_causes is None
-        else frozenset()
+    # #4050 review: unlike *ceiling_pending_keys* above, `CAUSE_INTEGRATION_
+    # RED` does not self-clear — a required check red only because the base
+    # moved stays red until something pushes a new head, so a row withdrawn
+    # from the tier/alert path on the cheap candidate filter alone (the
+    # pre-review shape of this block) would be suppressed forever on an
+    # unconfirmed premise or a spent retry cap, with its convergence counter
+    # frozen and no escalation ever reaching a human. `base_sync_fix_keys`
+    # is therefore computed from this pass's own `dispatched=True` outcomes
+    # ONLY, run here BEFORE the row loop below — the same "withdraw only
+    # what this round confirmed" rule `config_drift_resolved_keys` already
+    # applies a few lines down. A candidate whose premise never confirms,
+    # or whose dispatch finds the retry cap already spent, is left in
+    # `other_rows` so its convergence counter keeps advancing and still
+    # escalates at `convergence_limit`.
+    base_sync_fix_results: list[dict] = []
+    if base_sync_fix_ceiling_dispatch and mechanical_causes is None and not dry_run:
+        # Hard `dry_run` skip, same posture as *config_drift_fix_sweep* just
+        # below: this pass always probes live and, on a confirmed premise,
+        # always dispatches a leg, so a dry-run caller must see zero
+        # dispatch and zero suppression from this lane, not a best-effort
+        # one.
+        try:
+            base_sync_fix_results = base_sync_fix_ceiling_sweep(rows, config=config)
+        except Exception:  # noqa: BLE001 — advisory, same posture as the
+            # other best-effort passes in this function: a failed attempt
+            # this round never takes the rest of this report down, and
+            # every candidate stays exactly where `rows` found it for the
+            # next sweep to retry.
+            _log.warning(
+                "board-doctor: base-sync-fix ceiling-blocked dispatch sweep "
+                "failed this round",
+                exc_info=True,
+            )
+    base_sync_fix_keys = frozenset(
+        (outcome["repo"], outcome["issue"])
+        for outcome in base_sync_fix_results
+        if outcome.get("dispatched")
     )
     # #4048: run the Apply+Refund+requeue attempt BEFORE `sweep()` sees
     # *rows* at all — never after, unlike *conflict_fix_ceiling_sweep*
@@ -6676,6 +6726,7 @@ def run_sweep(
     if mechanical_causes is None:
         report.rows_observed = len(rows)
     report.config_drift_fix = config_drift_fix_results
+    report.base_sync_fix_ceiling_dispatch = base_sync_fix_results
     if followthrough and followthrough_rows:
         report.followthrough = followthrough_sweep(
             followthrough_rows, config=config, board=board, dry_run=dry_run,
@@ -6702,24 +6753,6 @@ def run_sweep(
             # (unchanged) for the next sweep to retry.
             _log.warning(
                 "board-doctor: conflict-fix ceiling-pending requeue sweep "
-                "failed this round",
-                exc_info=True,
-            )
-    if base_sync_fix_ceiling_dispatch and base_sync_fix_keys and not dry_run:
-        # #4050: same `dry_run` hard-skip posture as *conflict_fix_ceiling_
-        # sweep* above — this always probes live and, on a confirmed
-        # premise, always dispatches a leg; a dry-run caller must see zero
-        # dispatch, not a best-effort one.
-        try:
-            report.base_sync_fix_ceiling_dispatch = base_sync_fix_ceiling_sweep(
-                rows, config=config,
-            )
-        except Exception:  # noqa: BLE001 — advisory, same posture as the
-            # sibling passes above/below: a failed dispatch attempt this
-            # round never takes the rest of this report down, and the row
-            # stays ceiling-blocked (unchanged) for the next sweep to retry.
-            _log.warning(
-                "board-doctor: base-sync-fix ceiling-blocked dispatch sweep "
                 "failed this round",
                 exc_info=True,
             )
