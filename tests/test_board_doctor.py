@@ -9426,6 +9426,455 @@ class TestPlanConfigDriftFix:
         assert plan.patched_command is None
 
 
+# -- #4048: config-drift Apply step — commit the one-token removal in the
+# coord-settings checkout, then Refund + requeue -------------------------
+
+
+class TestApplyConfigDriftFixToCoordSettings:
+    """`coord.board_doctor.apply_config_drift_fix_to_coord_settings` —
+    acceptance #1: a temporary ``coord-settings`` git repo with a
+    symlinked config. Commits a one-token removal and nothing else, and
+    refuses when the token isn't present or matches more than once."""
+
+    _COMMAND = "cargo clippy --workspace --example win_panel -- -D warnings"
+    _TOKEN = "--example win_panel"
+    _PATCHED = "cargo clippy --workspace -- -D warnings"
+
+    @staticmethod
+    def _git(repo_dir, *args: str) -> str:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), *args],
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout
+
+    def _make_coord_settings_repo(self, tmp_path, *, body: str):
+        import coord.board_doctor as board_doctor_mod  # noqa: F401
+
+        settings_dir = tmp_path / "coord-settings"
+        settings_dir.mkdir()
+        self._git(settings_dir, "init", "-q")
+        self._git(settings_dir, "config", "user.email", "doctor@example.com")
+        self._git(settings_dir, "config", "user.name", "Board Doctor")
+        real_config = settings_dir / "coordinator.yml"
+        real_config.write_text(body)
+        self._git(settings_dir, "add", "coordinator.yml")
+        self._git(settings_dir, "commit", "-q", "-m", "initial")
+
+        symlink_path = tmp_path / "coordinator.yml"
+        symlink_path.symlink_to(real_config)
+        return settings_dir, real_config, symlink_path
+
+    def test_commits_a_one_token_removal_and_nothing_else(self, tmp_path) -> None:
+        from coord.board_doctor import apply_config_drift_fix_to_coord_settings
+
+        settings_dir, real_config, symlink_path = self._make_coord_settings_repo(
+            tmp_path,
+            body=(
+                "repos:\n"
+                "  - name: widgets\n"
+                f"    ci_command: {self._COMMAND}\n"
+            ),
+        )
+        before_log = self._git(settings_dir, "log", "--oneline")
+
+        result = apply_config_drift_fix_to_coord_settings(
+            config_path=symlink_path,
+            command=self._COMMAND,
+            token=self._TOKEN,
+            patched_command=self._PATCHED,
+            repo_name="widgets",
+            issue_number=2695,
+        )
+
+        assert result.applied is True
+        new_text = real_config.read_text()
+        assert self._TOKEN not in new_text
+        assert self._PATCHED in new_text
+        # Nothing but the command line changed.
+        assert new_text == (
+            "repos:\n  - name: widgets\n    ci_command: " + self._PATCHED + "\n"
+        )
+        # Exactly one new commit, touching exactly one file.
+        after_log = self._git(settings_dir, "log", "--oneline")
+        assert after_log.count("\n") == before_log.count("\n") + 1
+        changed = self._git(
+            settings_dir, "show", "--name-only", "--format=", "HEAD",
+        )
+        assert changed.strip() == "coordinator.yml"
+        # The working tree is clean — the removal was committed, nothing
+        # left dangling.
+        status = self._git(settings_dir, "status", "--porcelain")
+        assert status == ""
+
+    def test_refuses_when_the_token_is_absent(self, tmp_path) -> None:
+        from coord.board_doctor import apply_config_drift_fix_to_coord_settings
+
+        settings_dir, real_config, symlink_path = self._make_coord_settings_repo(
+            tmp_path,
+            body="repos:\n  - name: widgets\n    ci_command: cargo clippy --workspace -- -D warnings\n",
+        )
+        before_log = self._git(settings_dir, "log", "--oneline")
+        before_text = real_config.read_text()
+
+        result = apply_config_drift_fix_to_coord_settings(
+            config_path=symlink_path,
+            command=self._COMMAND,
+            token=self._TOKEN,
+            patched_command=self._PATCHED,
+            repo_name="widgets",
+            issue_number=2695,
+        )
+
+        assert result.applied is False
+        assert "0 time(s)" in result.detail
+        assert real_config.read_text() == before_text
+        after_log = self._git(settings_dir, "log", "--oneline")
+        assert after_log == before_log
+
+    def test_refuses_when_the_token_matches_more_than_once(self, tmp_path) -> None:
+        from coord.board_doctor import apply_config_drift_fix_to_coord_settings
+
+        body = (
+            "repos:\n"
+            "  - name: widgets\n"
+            f"    ci_command: {self._COMMAND}\n"
+            "  - name: other\n"
+            f"    ci_command: {self._COMMAND}\n"
+        )
+        settings_dir, real_config, symlink_path = self._make_coord_settings_repo(
+            tmp_path, body=body,
+        )
+        before_log = self._git(settings_dir, "log", "--oneline")
+
+        result = apply_config_drift_fix_to_coord_settings(
+            config_path=symlink_path,
+            command=self._COMMAND,
+            token=self._TOKEN,
+            patched_command=self._PATCHED,
+            repo_name="widgets",
+            issue_number=2695,
+        )
+
+        assert result.applied is False
+        assert "2 time(s)" in result.detail
+        assert real_config.read_text() == body
+        after_log = self._git(settings_dir, "log", "--oneline")
+        assert after_log == before_log
+
+
+class TestRunConfigDriftFixSweep:
+    """`coord.board_doctor.run_config_drift_fix_sweep` — the Apply then
+    Refund+requeue orchestration, with the Apply step injected so this
+    never touches a real git checkout."""
+
+    @staticmethod
+    def _candidate(*, enabled: bool, patched_command: str | None):
+        import coord.board_doctor as board_doctor_mod
+
+        plan = board_doctor_policy_mod.ConfigDriftFix(
+            enabled=enabled, patched_command=patched_command,
+            alert_message="apply this patch",
+        )
+        return board_doctor_mod.ConfigDriftCandidate(
+            repo_name="widgets", issue_number=2695, kind="example", name="win_panel",
+            token="--example win_panel",
+            command="cargo clippy --workspace --example win_panel -- -D warnings",
+            source="repos[widgets].ci_command",
+            plan=plan,
+            rounds_consumed=2,
+        )
+
+    def test_opted_out_candidate_is_skipped_entirely(self) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        candidate = self._candidate(enabled=False, patched_command=None)
+        apply_calls = []
+
+        results = board_doctor_mod.run_config_drift_fix_sweep(
+            [candidate], config=Config(repos=[], machines=[]),
+            apply_fn=lambda **kw: apply_calls.append(kw),
+        )
+
+        assert results == []
+        assert apply_calls == []
+
+    def test_applied_and_confirmed_refunds_and_requeues(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+        import coord.board_doctor_permissions as permissions_mod
+        import coord.state as state_mod
+
+        candidate = self._candidate(enabled=True, patched_command="cargo clippy --workspace -- -D warnings")
+
+        reset_calls = []
+        monkeypatch.setattr(
+            state_mod, "reset_work_test_state",
+            lambda *a, **k: reset_calls.append((a, k)) or 1,
+        )
+        monkeypatch.setattr(
+            state_mod, "test_reset_candidates",
+            lambda *a, **k: [("aid-1", "work", None)],
+        )
+        budget_calls = []
+
+        def _fake_raise(repo_name, issue_number, config, *, increment):
+            budget_calls.append((repo_name, issue_number, increment))
+            return {"raised": True, "entry_id": 1, "new_max_fix_rounds": 4, "detail": "raised"}
+
+        monkeypatch.setattr(permissions_mod, "sweep_raise_fixit_budget", _fake_raise)
+
+        def fake_apply(**kwargs):
+            return board_doctor_mod.ConfigDriftApplyResult(applied=True, detail="committed")
+
+        results = board_doctor_mod.run_config_drift_fix_sweep(
+            [candidate], config=Config(repos=[], machines=[]), apply_fn=fake_apply,
+        )
+
+        [outcome] = results
+        assert outcome["applied"] is True
+        assert outcome["requeued"] is True
+        assert outcome["refunded"] is True
+        assert len(reset_calls) == 1
+        assert budget_calls == [("widgets", 2695, candidate.rounds_consumed)]
+
+    def test_unconfirmed_reset_blocks_the_refund(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+        import coord.board_doctor_permissions as permissions_mod
+        import coord.state as state_mod
+
+        candidate = self._candidate(enabled=True, patched_command="cargo clippy --workspace -- -D warnings")
+
+        monkeypatch.setattr(state_mod, "reset_work_test_state", lambda *a, **k: 1)
+        monkeypatch.setattr(
+            state_mod, "test_reset_candidates",
+            lambda *a, **k: [("aid-1", "work", "failed")],
+        )
+        budget_calls = []
+        monkeypatch.setattr(
+            permissions_mod, "sweep_raise_fixit_budget",
+            lambda *a, **k: budget_calls.append((a, k)) or {"raised": True},
+        )
+
+        def fake_apply(**kwargs):
+            return board_doctor_mod.ConfigDriftApplyResult(applied=True, detail="committed")
+
+        results = board_doctor_mod.run_config_drift_fix_sweep(
+            [candidate], config=Config(repos=[], machines=[]), apply_fn=fake_apply,
+        )
+
+        [outcome] = results
+        assert outcome["applied"] is True
+        assert outcome["requeued"] is False
+        assert outcome["refunded"] is False
+        assert budget_calls == []
+
+    def test_apply_failure_never_touches_the_test_stage_or_budget(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+        import coord.board_doctor_permissions as permissions_mod
+        import coord.state as state_mod
+
+        candidate = self._candidate(enabled=True, patched_command="cargo clippy --workspace -- -D warnings")
+
+        reset_calls = []
+        monkeypatch.setattr(
+            state_mod, "reset_work_test_state",
+            lambda *a, **k: reset_calls.append(1) or 1,
+        )
+        budget_calls = []
+        monkeypatch.setattr(
+            permissions_mod, "sweep_raise_fixit_budget",
+            lambda *a, **k: budget_calls.append(1) or {"raised": True},
+        )
+
+        def fake_apply(**kwargs):
+            return board_doctor_mod.ConfigDriftApplyResult(
+                applied=False, detail="ambiguous token",
+            )
+
+        results = board_doctor_mod.run_config_drift_fix_sweep(
+            [candidate], config=Config(repos=[], machines=[]), apply_fn=fake_apply,
+        )
+
+        [outcome] = results
+        assert outcome["applied"] is False
+        assert outcome["requeued"] is False
+        assert outcome["refunded"] is False
+        assert reset_calls == []
+        assert budget_calls == []
+
+
+class TestRunSweepConfigDriftFix:
+    """`coord.board_doctor.run_sweep`'s own #4048 wiring: quadraui#2695's
+    board shape (every failing round the same drift signature) is
+    refunded, its Test-stage verdict reset, and the row put back to
+    ``waiting`` — ONLY once the Apply step actually commits; opted out,
+    nothing is written and the alert carries the exact one-line patch."""
+
+    @staticmethod
+    def _config(*, autofix: bool) -> Config:
+        return Config(
+            repos=[
+                Repo(
+                    name="widgets", github="acme/widgets",
+                    board_doctor=BoardDoctorRepoConfig(config_drift_autofix=autofix),
+                ),
+            ],
+            machines=[],
+        )
+
+    @staticmethod
+    def _candidate(config: Config):
+        import coord.board_doctor as board_doctor_mod
+
+        plan = board_doctor_policy_mod.plan_config_drift_fix(
+            "widgets",
+            command="cargo clippy --workspace --example win_panel -- -D warnings",
+            source="repos[widgets].ci_command",
+            token="--example win_panel",
+            config=config,
+        )
+        return board_doctor_mod.ConfigDriftCandidate(
+            repo_name="widgets", issue_number=2695, kind="example", name="win_panel",
+            token="--example win_panel",
+            command="cargo clippy --workspace --example win_panel -- -D warnings",
+            source="repos[widgets].ci_command",
+            plan=plan,
+            rounds_consumed=2,
+        )
+
+    @staticmethod
+    def _row(candidate) -> StuckRow:
+        return StuckRow(
+            queue="config-drift", key="widgets#2695", state="blocked",
+            cause=queue_diagnose.CAUSE_CONFIG_DRIFT, confidence="high",
+            evidence=(candidate.plan.alert_message,), fresh=True,
+        )
+
+    def test_opted_in_and_confirmed_refunds_resets_and_requeues(
+        self, monkeypatch, coord_db,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        config = self._config(autofix=True)
+        candidate = self._candidate(config)
+        row = self._row(candidate)
+
+        # quadraui#2695's shape: a ceiling-blocked drive-queue row whose
+        # every observed round failed on the SAME drift signature.
+        state.enqueue_drive_queue("widgets", 2695, max_fix_rounds=2)
+        state.update_drive_queue_entry(
+            "widgets", 2695, state=STATE_BLOCKED, last_reason="(#2972) ceiling",
+        )
+        for i in range(3):
+            aid = f"aid-2695-{i}"
+            coord_db.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title, branch, type, status) "
+                "VALUES (?, 'm1', 'widgets', 2695, 't', 'issue-2695-remove-panel', "
+                "'work', 'done')",
+                (aid,),
+            )
+            coord_db.commit()
+            state.record_test_verdict(
+                assignment_id=aid, test_state="failed",
+                test_reason=(
+                    "error: no example target named `win_panel` in `quadraui` "
+                    "package"
+                ),
+            )
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([row], Board()),
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "config_drift_candidates", lambda *a, **k: [candidate],
+        )
+        applied_calls = []
+
+        def fake_apply(**kwargs):
+            applied_calls.append(kwargs)
+            return board_doctor_mod.ConfigDriftApplyResult(applied=True, detail="committed")
+
+        def _fix_sweep(candidates, *, config):
+            return board_doctor_mod.run_config_drift_fix_sweep(
+                candidates, config=config, apply_fn=fake_apply,
+            )
+
+        alerted = []
+        report = board_doctor_mod.run_sweep(
+            config=config,
+            tier_of=lambda cause: TIER_ALERT,
+            alert_dispatcher=lambda r: alerted.append(r) or True,
+            config_drift_fix_sweep=_fix_sweep,
+        )
+
+        assert len(applied_calls) == 1
+        [outcome] = report.config_drift_fix
+        assert outcome["applied"] is True
+        assert outcome["requeued"] is True
+        assert outcome["refunded"] is True
+        # The row never reached the ordinary alert path — resolved, not
+        # merely attempted.
+        assert alerted == []
+        assert report.decisions == []
+        # Every leg's Test-stage verdict actually cleared.
+        for i in range(3):
+            assert state.load_assignment_test_state(f"aid-2695-{i}") is None
+        # The fix-round ceiling is refunded and the row is back to
+        # `waiting`, at its position with its declaration intact.
+        entry = state.get_drive_queue_entry("widgets", 2695)
+        assert entry is not None
+        assert entry["state"] == STATE_WAITING
+        assert entry["max_fix_rounds"] == 2 + candidate.rounds_consumed
+
+    def test_opted_out_writes_nothing_and_alerts_with_the_patch(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        config = self._config(autofix=False)
+        candidate = self._candidate(config)
+        row = self._row(candidate)
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([row], Board()),
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "config_drift_candidates", lambda *a, **k: [candidate],
+        )
+        apply_calls = []
+
+        def must_not_apply(**kwargs):
+            apply_calls.append(kwargs)
+            return board_doctor_mod.ConfigDriftApplyResult(applied=True, detail="committed")
+
+        def _fix_sweep(candidates, *, config):
+            return board_doctor_mod.run_config_drift_fix_sweep(
+                candidates, config=config, apply_fn=must_not_apply,
+            )
+
+        alerted = []
+        report = board_doctor_mod.run_sweep(
+            config=config,
+            tier_of=lambda cause: TIER_ALERT,
+            alert_dispatcher=lambda r: alerted.append(r) or True,
+            config_drift_fix_sweep=_fix_sweep,
+        )
+
+        # Not opted in, so the Apply step is never even attempted.
+        assert apply_calls == []
+        assert report.config_drift_fix == []
+        # The row stayed on the ordinary alert path and alerted with the
+        # exact one-line patch.
+        assert [r.key for r in alerted] == ["widgets#2695"]
+        assert alerted[0].evidence == (candidate.plan.alert_message,)
+        assert "--example win_panel" in candidate.plan.alert_message
+
+
 # -- #4036: conflict-fix on a ceiling-blocked row, verified, finished to a
 # requeue ----------------------------------------------------------------
 
