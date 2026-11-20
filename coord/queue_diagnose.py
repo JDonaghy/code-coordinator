@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 __all__ = [
+    "CAUSE_CONFIG_DRIFT",
     "CAUSE_INTEGRATION_RED",
     "CAUSE_NEEDS_DECOMPOSITION",
     "CAUSE_NEVER_DISPATCHED",
