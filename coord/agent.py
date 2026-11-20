@@ -12181,7 +12181,71 @@ class AgentServer:
             )
             if assignment.worktree_path and not _is_size_triage_leg:
                 wt_path = Path(assignment.worktree_path)
-                if wt_path.exists() and exit_code == 0:
+                # #4061: a leg that exits 0 with nothing to push (a premise
+                # refusal, a `needs-decomposition` exit, an advisory audit)
+                # has a branch sitting at its base's tip — pushing it anyway
+                # gives #3376's `any_matching_branch_merged` guard a branch
+                # that reads as "merged" (an ancestor of the default branch)
+                # forever, permanently refusing every later dispatch for the
+                # issue (quadraui#2539). There is nothing of this leg's own
+                # to push, so skip it rather than create that residue in the
+                # first place.
+                #
+                # #1797 carve-out: this must NOT subsume the plain "worker
+                # exited 0, made 0 commits, and said nothing about why"
+                # shape — that is exactly ADVISORY's own #448 territory,
+                # and `test_push_failure_with_zero_commits_is_failed_not_
+                # advisory` pins down that THAT shape's push must still be
+                # attempted, because a real credential break looks
+                # identical to "nothing to do" until the push is actually
+                # tried. So this only skips when the worker's own result
+                # text carries one of the structured "I concluded there is
+                # genuinely nothing to do" markers `classify_zero_commit_
+                # outcome`/`DELIVERABLE_ANALYSIS_LABEL` already recognise
+                # elsewhere in this method (#3164/#3931/#2188) — never a
+                # bare absence of commits with no stated reason, and never
+                # a truncated run (`_TRUNCATION_STOP_REASONS`), which is a
+                # failure shape, not a considered "nothing to do" one.
+                _push_skip_reason: str | None = None
+                if (wt_path.exists() and exit_code == 0
+                        and assignment.spec.type in _ZERO_COMMIT_TYPES):
+                    _ahead_pre_push = self._commits_ahead(
+                        wt_path, assignment.spec.branch or "main"
+                    )
+                    if (_ahead_pre_push == 0
+                            and not (_worker_summary is not None
+                                      and _worker_summary.stop_reason
+                                      in _TRUNCATION_STOP_REASONS)):
+                        if DELIVERABLE_ANALYSIS_LABEL in (
+                            assignment.spec.issue_labels or []
+                        ):
+                            _push_skip_reason = "0 commits ahead"
+                        elif _worker_summary is not None:
+                            from coord.models import (  # noqa: PLC0415
+                                parse_issue_resolution,
+                            )
+                            from coord.worker_events import (  # noqa: PLC0415
+                                classify_zero_commit_outcome,
+                            )
+
+                            _pre_push_resolution = parse_issue_resolution(
+                                _worker_summary.result_text
+                            ).value
+                            if classify_zero_commit_outcome(
+                                _worker_summary.result_text,
+                                issue_resolution=_pre_push_resolution,
+                            ) is not None:
+                                _push_skip_reason = "0 commits ahead"
+
+                if _push_skip_reason is not None:
+                    try:
+                        with open(assignment.log_path, "a", encoding="utf-8") as reopen:
+                            reopen.write(
+                                f"\n# reap: push skipped — {_push_skip_reason}\n"
+                            )
+                    except OSError:
+                        pass
+                elif wt_path.exists() and exit_code == 0:
                     # #3869: a history-rewrite leg (today, only
                     # `conflict-fix`) may have rebased the branch — a plain
                     # `git push` is then always rejected non-fast-forward,

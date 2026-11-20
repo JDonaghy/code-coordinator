@@ -522,16 +522,32 @@ def any_matching_branch_merged(
     this filter a single zero-commit `issue-{N}-review-*`/`issue-{N}-smoke-
     *` leg branch still reads the WHOLE issue as merged and permanently
     refuses dispatch — the same bug #3436 fixed for the branch-known case,
-    reopened for the branch-unknown one. Reuses the exact merge-detection
-    `_drop_merged_branches` already performs for claim detection (PR-merged
-    OR `ahead_by == 0` ancestry, survives squash merges — #3103): this is
-    just "did filtering drop anything", with the fail-open direction
-    flipped to match a REFUSAL predicate rather than a claim-signal — no
-    matching branch at all, or any lookup failure, returns `False` ("not
+    reopened for the branch-unknown one.
+
+    #4061: unlike `_drop_merged_branches` (claim detection, semantics
+    unchanged by this), "merged" here means a **confirmed merged PR**
+    (`github_ops.pr_is_merged` — survives squash merges, #3103) — never
+    bare `ahead_by == 0` ancestry. That ancestry signal is right for claim
+    detection, where keeping a branch around a little too long just delays
+    a duplicate dispatch. For this REFUSAL predicate the cost of a false
+    positive is unbounded: #3376 then refuses every future dispatch for the
+    issue, permanently, because `ahead_by == 0` cannot tell "this branch's
+    own commits already landed in the base" apart from "this branch was cut
+    from the base's tip and never advanced" (a premise refusal, a
+    `needs-decomposition` exit, an advisory audit) — both are, from
+    GitHub's compare API, simply "branch tip is an ancestor of the base",
+    indistinguishable after the fact (quadraui#2539: a work leg's own
+    zero-commit residue branch read as "merged" and blocked every later
+    dispatch for the issue). Requiring a merged PR gives up the one rare
+    case of a branch landed by a direct push with no PR at all, in exchange
+    for never again confusing zero-commit residue with real, landed work.
+    No matching branch at all, or any lookup failure, returns `False` ("not
     merged, don't refuse dispatch on this"), never `True`.
     """
+    from coord import github_ops  # noqa: PLC0415
+
     if branch is not None:
-        return not _drop_merged_branches(repo_github, [branch])
+        return github_ops.pr_is_merged(repo_github, branch)
     branches = [
         b
         for b in list_matching_remote_branches(repo_github, issue_number)
@@ -539,8 +555,7 @@ def any_matching_branch_merged(
     ]
     if not branches:
         return False
-    unmerged = set(_drop_merged_branches(repo_github, branches))
-    return any(b not in unmerged for b in branches)
+    return any(github_ops.pr_is_merged(repo_github, b) for b in branches)
 
 
 def _repo_default_branch(repo_github: str) -> str | None:
