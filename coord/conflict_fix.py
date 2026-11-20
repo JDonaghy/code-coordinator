@@ -67,6 +67,21 @@ stale-rebase worker verifies its own premise — see
 that refusal: the merge gate correctly kept refusing forever, and the
 drive-queue's own resume sweep kept burning its budget relaunching into
 the identical, unfixable-by-relaunch block (claude-coordinator#3519).
+
+#4050: a fifth no-mechanical-conflict shape, dispatched by
+``coord.board_doctor``'s own sweep for a drive-queue row that is BOTH
+ceiling-blocked (#2972/#3454) AND currently diagnosed
+``coord.queue_diagnose.CAUSE_INTEGRATION_RED`` — a PR with no textual
+conflict and a branch Test verdict that already reads green, whose
+required CI is red only because the target branch moved under it
+(quadraui#2726). ``dispatch_conflict_fix(..., base_sync_fix=True)`` sends
+a worker authorized to bring the target in and fix exactly that breakage
+— see :func:`build_base_sync_fix_briefing`. Before this, the only remedy
+for that cause was ``coord.ci_fix.dispatch_ci_fix``, a ``type="work"``
+fix-it leg that competes for the same #2972 fix-round budget as every
+other investigate-tier dispatch; a row that had already spent that
+budget got no further attempt at all even though the cause was
+positively confirmed, not a guess.
 """
 
 from __future__ import annotations
@@ -793,6 +808,211 @@ def already_upstream_verdict_in_text(text: str | None) -> bool:
     if not text:
         return False
     return ALREADY_UPSTREAM_MARKER in _decode_worker_text(text)
+
+
+# ── #4050: base-sync fix (a SEMANTIC conflict with the CI merge ref) ──────
+#
+# `queue_diagnose.CAUSE_INTEGRATION_RED` names a PR with no textual
+# conflict at all — GitHub reports it mergeable, and this branch's own
+# latest Test-gate verdict already reads green — whose required CI is red
+# anyway, because GitHub's checks build the merge REF (this branch plus the
+# target's CURRENT tip) while the Test stage built the branch alone
+# (quadraui#2726: develop gained `CellGridController`'s required
+# `CellGrid` fields while a sibling PR's own branch sat untouched; the
+# combination failed to compile, every CI workflow went red, and the branch
+# itself stayed green forever). `coord.ci_fix.dispatch_ci_fix` already
+# remedies this cause, but as a ``type="work"`` fix-it leg — it competes for
+# the per-repo #2972 fix-round budget like any other investigate-tier
+# dispatch, and a row that has already spent that budget (#3454's "stop —
+# remove+add only" give-up) gets no further attempt at all, even though the
+# cause is positively confirmed, not a guess (the quadraui#2726 incident
+# itself: four fix-it legs against a budget of three, the row ceiling-
+# blocked with `next_action: dispatch_ci_fix` and `merge: READY`, and
+# nothing further dispatched until a human merged develop by hand).
+#
+# This section gives that one evidence-backed shape a `type="conflict-fix"`
+# dispatch instead — the SAME budget-free lane #4036 already established
+# for a ceiling-blocked row a conflict-fix leg just pushed a resolution
+# for (`coord.board_doctor._ceiling_blocked_ci_pending_candidates`/
+# `run_conflict_fix_ceiling_pending_sweep`): never `WORK_LIKE_TYPES`, so it
+# neither spends a #2972 fix round nor is refused by #3454's ceiling check
+# (that check is something every CALLER of `dispatch_conflict_fix`
+# consults for itself — see `coord.drive_queue.fix_round_ceiling_blocked_
+# for_issue` — and the sweep this dispatches from is deliberately the one
+# caller that does NOT, because being ceiling-blocked is the very thing
+# that qualifies a row for this lane; see
+# `coord.board_doctor._ceiling_blocked_integration_red_candidates`).
+#
+# Unlike the stale-rebase briefing above, this worker is NOT authorized to
+# assume a pure, content-preserving rebase resolves everything: a semantic
+# break needs a worker that can genuinely change code, the same shape as
+# `coord.ci_fix`'s own briefing. What IS narrow here is the premise: the
+# break must be confirmed caused SOLELY by the base's move (the branch's
+# own pre-rebase diff already read green). If reproducing the failure shows
+# otherwise — the branch's own change is independently broken, or no
+# failure reproduces at all — guessing at a fix would mean "resolving"
+# something that was never this cause's problem; the worker refuses
+# instead (see `BASE_SYNC_MISMATCH_MARKER` below), mirroring every other
+# conflict-fix variant's "stop rather than guess" posture.
+
+# Marker a base-sync-fix worker's STUCK: line starts with when the
+# premise that qualified this dispatch — a break caused solely by the
+# target branch's move, not a problem with the branch's own diff — turns
+# out not to hold once it actually reproduces the merged tree. Same
+# convention as STALE_REBASE_MISMATCH_MARKER/REWORD_MISMATCH_MARKER: a
+# fixed, machine-parseable string, not prose.
+BASE_SYNC_MISMATCH_MARKER = "coord:conflict=base-sync-mismatch"
+
+# Title prefix for a base-sync-fix conflict-fix dispatch — visible in the
+# TUI Pipeline row so an operator can tell at a glance this used the
+# #4050 budget-free lane rather than an ordinary investigate-tier fix-it
+# leg.
+BASE_SYNC_FIX_TITLE_PREFIX = "[base-sync-fix]"
+
+BASE_SYNC_FIX_SYSTEM_PROMPT = f"""\
+You are a Claude Code conflict-fix worker. This branch has NO textual merge \
+conflict — GitHub reports it mergeable, and its own latest Test-gate \
+verdict already read green — but a REQUIRED CI check is failing on the \
+PR's merge ref anyway. GitHub's checks build this branch PLUS the target \
+branch's current tip; the Test stage built this branch alone. The target \
+branch moved under you and the combination broke, most often a compile \
+error from a sibling PR's change to a shared type. Your job is to bring \
+the current target branch in, fix exactly that breakage, and push.
+
+Rules:
+- The coordinator denies `gh` and `git push --force` for this worker. \
+Don't try to use them — the harness will reject the call.
+- Stay on the worker's branch — do NOT push to main / develop / target.
+- Use git push --force-with-lease (NOT --force).
+{SESSION_ENDS_ON_TURN_END_RULE}
+- Rebase (not merge) onto the target branch, then reproduce the failure on \
+that combined tree before touching anything. If nothing fails, or the \
+SAME failure already reproduces on the branch's own pre-rebase diff \
+alone, the premise behind this dispatch does not hold — stop with a \
+STUCK: line starting with the exact marker \
+`coord:conflict=base-sync-mismatch` rather than guess at an unrelated fix.
+- Fix ONLY the breakage the base's move introduced — do not use this as a \
+license for a broader refactor.
+- Before you push, run the project's FULL local gate set — build AND \
+test, never just a narrow compile check — and confirm every one of them \
+passes. Merging the target branch can break a guard test (fmt, a \
+line-count ratchet, a README-vs-code truth check, a comment lint, ...) \
+even when the compile error itself is trivial.
+- If you cannot fix the breakage with confidence, stop and say so with a \
+STUCK: line. The coordinator escalates to a human; that is a fine outcome.
+
+Progress reporting:
+- After each significant step (rebased, failure reproduced, fix applied, \
+full gate set green, pushed), output:
+  STATUS: [what you just did] → [what you're about to do] → [confidence]
+- If you stop, output the STUCK: line described above and wait for \
+guidance.\
+"""
+
+
+def build_base_sync_fix_briefing(
+    *,
+    entry: QueuedMerge,
+    repo_path: str,
+    build_command: str | None,
+    test_command: str | None,
+) -> str:
+    """Briefing for a conflict-fix dispatched against
+    :data:`coord.queue_diagnose.CAUSE_INTEGRATION_RED` on a ceiling-blocked
+    row (#4050) — see this module's own "base-sync fix" section header for
+    the full shape and why this is a `type="conflict-fix"` dispatch rather
+    than another `coord.ci_fix` fix-it leg.
+
+    *build_command*/*test_command* come straight off `Config.repo(...)` —
+    whichever of the two is configured is included as its own numbered
+    step, so "the full local gate set" names a concrete command rather
+    than leaving the worker to guess what else besides `test_command`
+    counts as a gate.
+    """
+    test_cmd = test_command or "echo '(no test command configured)'"
+    gate_steps = []
+    if build_command:
+        gate_steps.append(f"`{build_command}`")
+    gate_steps.append(f"`{test_cmd}`")
+    gate_set = " and ".join(gate_steps)
+    lines: list[str] = [
+        f"# Base-sync fix: {entry.repo_github} branch `{entry.branch}`",
+        "",
+        f"Issue: #{entry.issue_number} — {entry.issue_title}",
+        "",
+        f"`{entry.branch}` has no textual merge conflict against "
+        f"`{entry.target_branch}` and its own latest Test-gate verdict "
+        "already read green, but GitHub's required CI is failing on the "
+        "PR's MERGE REF — this branch combined with the target branch's "
+        "CURRENT tip, which the Test stage never builds. The target branch "
+        "moved since this branch forked from it, and the combination "
+        "broke.",
+        f"Last known merge-gate error: {entry.error or 'unknown'}",
+        "",
+        "## Where you are",
+        "",
+        f"You are already in a dedicated git worktree checked out on "
+        f"`{entry.branch}` — the coordinator created it for you. Work HERE.",
+        "",
+        f"Do **NOT** `cd {repo_path}` (that is the machine's shared base "
+        "checkout) and do NOT `git checkout` / `git switch` anywhere. Leaving "
+        f"the base checkout parked on `{entry.branch}` breaks every later "
+        "dispatch against that branch on this machine (#1694).",
+        "",
+        "## Steps",
+        "",
+        "1. `git fetch origin`",
+        f"2. `git rebase origin/{entry.target_branch}` — a rebase, not a "
+        "merge, so this branch stays eligible for GitHub's rebase-merge "
+        "and reproduces the exact tree GitHub's merge-ref CI builds.",
+        "3. If a textual conflict appears during the rebase, this was not "
+        "the semantic-only shape this dispatch was sent for — resolve it "
+        "the same way an ordinary conflict-fix would (keep both sides' "
+        "intent) and continue; a real conflict existing alongside the "
+        "base-move breakage does not invalidate the rest of these steps.",
+        f"4. Run the project's full local gate set — {gate_set} — on the "
+        "now-rebased tree.",
+        "5. If EVERY one of those commands passes, OR the same failure "
+        "already reproduces when you check out the branch's own pre-"
+        "rebase commit in isolation, the premise behind this dispatch "
+        "does not hold (either nothing is actually broken, or the branch's "
+        "own diff is independently broken, not just the combination). "
+        "Stop here — do not guess at a fix, do not push — and end your "
+        "turn with a STUCK: line starting with the exact marker "
+        f"`{BASE_SYNC_MISMATCH_MARKER}` and a one-line reason, e.g.",
+        "",
+        f"    STUCK: {BASE_SYNC_MISMATCH_MARKER} — full gate set already "
+        "passes on the rebased tree, nothing reproduces",
+        "",
+        "6. Otherwise, fix ONLY the breakage the target branch's move "
+        "introduced — most often a compile error from a shared type a "
+        "sibling PR changed underneath this branch. This is not a license "
+        "for a broader refactor.",
+        f"7. Re-run the full local gate set from step 4 — {gate_set} — and "
+        "confirm every one of them passes.",
+        f"8. `git push --force-with-lease origin {entry.branch}`",
+        "9. Exit 0 if push succeeds; non-zero otherwise.",
+        "",
+        "The coordinator reads your STUCK: marker from your transcript, "
+        "not your process exit code (which you cannot control), and "
+        f"escalates to a human on issue #{entry.issue_number} if you stop.",
+        "",
+        "You will NOT use `gh` or `git push --force` — both are denied by",
+        "the harness. The coordinator owns PR retries and issue posting.",
+    ]
+    return "\n".join(lines)
+
+
+def base_sync_mismatch_verdict_in_text(text: str | None) -> bool:
+    """True when a base-sync-fix conflict-fix worker's log carries the
+    :data:`BASE_SYNC_MISMATCH_MARKER` — i.e. it refused because the
+    #4050 "break caused solely by the base's move" premise did not hold
+    once it actually reproduced the merged tree. Mirrors
+    :func:`stale_rebase_mismatch_verdict_in_text`.
+    """
+    if not text:
+        return False
+    return BASE_SYNC_MISMATCH_MARKER in _decode_worker_text(text)
 
 
 # ── #3522: reword-commit (issue_resolution_closing_keyword_in_commit) ──────
@@ -2105,6 +2325,7 @@ def dispatch_conflict_fix(
     after_stale_rebase_mismatch: bool = False,
     after_head_unmoved_fix_assignment_id: str | None = None,
     reword_commit: bool = False,
+    base_sync_fix: bool = False,
     status_fetcher: Callable[..., StatusResult] | None = None,
     machine_pick_out: "list[ConflictFixMachinePick] | None" = None,
 ) -> Assignment | None:
@@ -2261,6 +2482,23 @@ def dispatch_conflict_fix(
     ``ignore_assignment_id`` to :func:`has_prior_conflict_fix` so ONLY an
     earlier, *different* ordinary attempt still counts against the cap.
 
+    ``base_sync_fix=True`` (#4050) dispatches the remedy for
+    :data:`coord.queue_diagnose.CAUSE_INTEGRATION_RED` on a row that has
+    already exhausted the #2972 fix-round ceiling — see this module's own
+    "base-sync fix" section header above for the full shape. Uses
+    :func:`build_base_sync_fix_briefing` instead of the ordinary briefing:
+    broader than the stale-rebase one (it IS authorized to change code,
+    not just rebase), but narrower than an ordinary fix-it leg — confined
+    to the breakage the target branch's move introduced, with a worker-
+    reported :data:`BASE_SYNC_MISMATCH_MARKER` refusal when that premise
+    turns out not to hold. Goes through the SAME retry-cap check as the
+    ordinary (non-``semantic``) path above — a base-sync fix that recurs
+    against the same error after a prior attempt escalates to a human
+    exactly like a recurring mechanical conflict would. The caller (see
+    ``coord.board_doctor._dispatch_base_sync_fix``) is the one that
+    confirms the #2972 ceiling AND re-confirms the cause live immediately
+    before calling this — this function itself never consults either.
+
     #3871: every path above stamps the dispatched Assignment's STORED
     ``briefing`` (never the one sent to the worker) with the entry branch's
     pre-dispatch HEAD SHA — see :data:`DISPATCH_HEAD_SHA_PREFIX` and
@@ -2286,6 +2524,7 @@ def dispatch_conflict_fix(
         not semantic
         and not stale_rebase
         and not reword_commit
+        and not base_sync_fix
         and entry.assignment_type in SEALED_PATH_AUTHOR_TYPES
     )
 
@@ -2349,6 +2588,15 @@ def dispatch_conflict_fix(
         )
         system_prompt = REWORD_COMMIT_FIX_SYSTEM_PROMPT
         title = f"{REWORD_COMMIT_FIX_TITLE_PREFIX} {entry.issue_title}"
+    elif base_sync_fix:
+        briefing = build_base_sync_fix_briefing(
+            entry=entry,
+            repo_path=repo_path,
+            build_command=repo.build_command,
+            test_command=repo.test_command,
+        )
+        system_prompt = BASE_SYNC_FIX_SYSTEM_PROMPT
+        title = f"{BASE_SYNC_FIX_TITLE_PREFIX} {entry.issue_title}"
     elif sealed_author:
         briefing = build_sealed_manifest_conflict_briefing(
             entry=entry,
@@ -2519,6 +2767,11 @@ def dispatch_conflict_fix(
             # remedy from every other conflict-fix flavour without
             # re-deriving it from the title prefix.
             "reword_commit": reword_commit,
+            # #4050: same reasoning — distinguishes the budget-free
+            # base-sync remedy for a ceiling-blocked `integration-red` row
+            # from every other conflict-fix flavour without re-deriving it
+            # from the title prefix.
+            "base_sync_fix": base_sync_fix,
         },
     )
 

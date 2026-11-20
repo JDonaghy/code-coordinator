@@ -984,7 +984,7 @@ def test_a_gh_rate_limit_during_the_gates_probe_never_reads_as_never_dispatched(
     errors: list[str] = []
     (
         branch, gate_ready, blockers, no_assignment_ever, _branch_test_state,
-        _review_stale, _test_stale,
+        _review_stale, _test_stale, _base_moved_note,
     ) = probe._gates(e, errors)  # noqa: SLF001
     assert branch == ""
     assert no_assignment_ever is None
@@ -1094,7 +1094,7 @@ class TestBranchTestStateReadsTheGateDecisionNotTheRawColumn:
         entry = stalled(20, "blocked: whatever", attempts=0)
 
         errors: list[str] = []
-        _, _, _, _, branch_test_state, _, _ = probe._gates(entry, errors)  # noqa: SLF001
+        _, _, _, _, branch_test_state, _, _, _ = probe._gates(entry, errors)  # noqa: SLF001
         assert branch_test_state == "failed"
 
         state = probe.probe(entry)

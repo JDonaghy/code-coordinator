@@ -2012,6 +2012,17 @@ class SweepReport:
     #: Same "not a tier/auto_dispatchers/convergence decision" shape as
     #: *conflict_fix_ceiling_pending* above.
     config_drift_fix: list[dict] = field(default_factory=list)
+    #: #4050: one dict per ceiling-blocked, ``CAUSE_INTEGRATION_RED``
+    #: drive-queue row :func:`run_base_sync_fix_ceiling_sweep` evaluated
+    #: this round — ``{"repo", "issue", "dispatched", "detail"}``. Same
+    #: "not a tier/auto_dispatchers/convergence decision" shape as
+    #: *conflict_fix_ceiling_pending*/*config_drift_fix* above: this cause
+    #: has a positively-confirmed, budget-free remedy the moment the row
+    #: is ceiling-blocked, so it is never handed to the generic
+    #: investigate-tier fix-it-leg dispatcher (which WOULD refuse — see
+    #: #3454 — since that dispatcher's budget is exactly what this row
+    #: already exhausted).
+    base_sync_fix_ceiling_dispatch: list[dict] = field(default_factory=list)
 
 
 def merge_queue_rows(
@@ -6036,6 +6047,285 @@ def run_conflict_fix_ceiling_pending_sweep(
     return results
 
 
+def _ceiling_blocked_integration_red_candidates(
+    rows: Sequence[StuckRow],
+) -> list[tuple[str, int]]:
+    """``(repo_name, issue_number)`` for every FRESH drive-queue row in
+    *rows* that is both ceiling-blocked (#2972) and currently diagnosed
+    :data:`queue_diagnose.CAUSE_INTEGRATION_RED` (#4050) — the quadraui#2726
+    shape: no textual conflict, a branch Test verdict that already read
+    green, and a required CI check failing on the PR's merge ref anyway
+    because the target branch moved under it. The ordinary investigate-
+    tier dispatcher for this cause (``coord.ci_fix.dispatch_ci_fix`` via
+    ``coord.board_doctor_policy``'s ``sweep_dispatch_fixit_leg``) is a
+    ``type="work"`` leg and so is exactly what #3454 refuses once this
+    budget is spent — this is the narrow carve-out :func:`run_base_sync_
+    fix_ceiling_sweep` acts on instead, mirroring :func:`_ceiling_blocked_
+    ci_pending_candidates`'s own shape (#4036) exactly.
+
+    ``fresh`` is required for the same reason as that sibling filter: a
+    :class:`StuckRow` :func:`_episode_stuck_row` rebuilt from a settled
+    ``block_log`` episode can be arbitrarily old, and this must act only
+    on a live probe THIS sweep just took.
+
+    Also requires :data:`coord.queue_diagnose.CONFIDENCE_LOW` be absent —
+    a low-confidence verdict means the live probe that produced it was
+    itself incomplete (``live.probe_errors`` downgraded it), so
+    "this row is integration-red" has not actually been established.
+    :func:`run_base_sync_fix_ceiling_sweep`'s own *evidence_fetcher*
+    re-probe softens, but does not replace, this.
+
+    Deduped — a (repo, issue) can legitimately appear more than once if
+    an earlier pass in :func:`_collect_rows_with_board` also produced a
+    row for it, but this candidate list feeds exactly one dispatch attempt
+    per issue per sweep.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        fix_round_ceiling_blocked_for_issue,
+        parse_key as _parse_row_key,
+    )
+
+    seen: set[tuple[str, int]] = set()
+    candidates: list[tuple[str, int]] = []
+    for row in rows:
+        if (
+            row.queue != "drive-queue"
+            or not row.fresh
+            or row.cause != queue_diagnose.CAUSE_INTEGRATION_RED
+            or row.confidence == queue_diagnose.CONFIDENCE_LOW
+        ):
+            continue
+        parsed = _parse_row_key(row.key)
+        if parsed is None or parsed in seen:
+            continue
+        if not fix_round_ceiling_blocked_for_issue(*parsed):
+            continue
+        seen.add(parsed)
+        candidates.append(parsed)
+    return candidates
+
+
+def _live_base_sync_fix_evidence(
+    repo_name: str, issue_number: int, *, config: Any,
+) -> tuple[bool, str]:
+    """A fresh, single-entry live re-probe for *repo_name*#*issue_number*
+    (#4050), via the SAME :class:`coord.queue_diagnose.GhLiveProbe` the
+    main sweep walk uses (#2096: one question, one answer — never a
+    second, independently-shaped `gh` call).
+
+    This spends a fresh probe and runs it back through :func:`coord.
+    queue_diagnose.diagnose` (the same pure classifier, on the SAME
+    ceiling-blocked rule table :func:`_refresh_ceiling_blocked_settled_
+    rows` already re-probes through) rather than reading raw fields the
+    way :func:`_live_conflict_fix_evidence` does — unlike that sibling,
+    which only needs checks/staleness booleans, #4050's premise is the
+    CAUSE itself, not just one field of it, so confirming the cause is
+    the question that actually needs asking immediately before a dispatch
+    that bypasses #3454's ceiling.
+
+    Returns ``(confirmed, detail)``:
+
+    * ``confirmed=True`` only when the fresh probe's diagnosis STILL
+      reads :data:`queue_diagnose.CAUSE_INTEGRATION_RED` at
+      :data:`queue_diagnose.CONFIDENCE_LOW`-or-better confidence AND the
+      SAME probe's :attr:`~coord.queue_diagnose.LiveState.base_moved_note`
+      is populated — ``coord gates`` itself positively confirming the
+      quadraui#2726 divergence, not merely "a check happens to be red
+      while the branch test happens to read green" (the #4036 review's
+      "never assume the premise" rule, applied to this cause).
+    * ``confirmed=False`` for every other outcome — no drive-queue row,
+      a failed probe, a diagnosis that no longer names this cause, or one
+      that does but with no confirmed ``base_moved_note`` — with a
+      *detail* string explaining which. The caller must never dispatch
+      the budget-free base-sync-fix leg on anything less than a fresh
+      ``True`` here.
+    """
+    from coord.commands.drive_queue import _local_host_id  # noqa: PLC0415
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.drive_queue import QueueEntry  # noqa: PLC0415
+    from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
+    from coord.state import build_board, get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(repo_name, issue_number)
+    if row is None:
+        return False, f"{repo_name}#{issue_number}: no drive-queue row to confirm against"
+    entry = QueueEntry.from_row(row)
+
+    try:
+        board = build_board()
+        local_host = _local_host_id()
+        live_sessions = frozenset(
+            str(r["session_name"]) for r in list_drive_sessions() if r.get("session_name")
+        )
+        fleet_health = local_fleet_health_block([m.name for m in config.machines])
+        probe = queue_diagnose.GhLiveProbe(
+            config=config, board=board, fleet_health=fleet_health,
+            live_sessions=live_sessions, local_host=local_host,
+        )
+        live = probe.probe(entry)
+    except Exception:  # noqa: BLE001 — a failed re-probe reads as "not confirmed"
+        _log.debug(
+            "board-doctor: live-check re-probe failed for %s#%s",
+            repo_name, issue_number, exc_info=True,
+        )
+        return False, f"{repo_name}#{issue_number}: live re-probe failed"
+
+    diagnosis = queue_diagnose.diagnose(entry, live, trigger="board_doctor_base_sync_fix")
+    if diagnosis.cause != queue_diagnose.CAUSE_INTEGRATION_RED:
+        return False, (
+            f"{repo_name}#{issue_number}: live re-probe no longer confirms "
+            f"integration-red (now {diagnosis.cause!r}) — not dispatching a "
+            "base-sync fix on a stale reading"
+        )
+    if diagnosis.confidence == queue_diagnose.CONFIDENCE_LOW:
+        return False, (
+            f"{repo_name}#{issue_number}: live re-probe confidence is too "
+            "low to confirm the cause"
+        )
+    if not live.base_moved_note:
+        return False, (
+            f"{repo_name}#{issue_number}: coord gates does not confirm a "
+            "BASE MOVED divergence on this live read — refusing to spend a "
+            "budget-free fix on an unconfirmed premise"
+        )
+    return True, f"{repo_name}#{issue_number}: confirmed — {live.base_moved_note}"
+
+
+def _dispatch_base_sync_fix(
+    repo_name: str, issue_number: int, *, config: Any,
+) -> dict:
+    """Dispatch the #4050 base-sync-fix conflict-fix leg for *repo_name*
+    #*issue_number*'s live merge-queue entry.
+
+    Mirrors ``coord.board_doctor_permissions.sweep_dispatch_conflict_fix``'s
+    own shape (the mechanical, budget-free dispatcher #3918 already
+    registered for a standing ``CAUSE_MERGE_CONFLICT`` row) but stays
+    inside this module rather than extending that one: this reuses the
+    SAME already-allowlisted ``"conflict_fix_dispatch"``
+    :func:`coord.board_doctor_permissions.authorize_sweep_action` entry —
+    the permission being granted ("this sweep may dispatch a
+    ``type="conflict-fix"`` leg") does not change just because the cause
+    that qualifies the row for it is different, and :data:`coord.
+    board_doctor_permissions.SAFE_TIER_ACTIONS` is a fixed allow-list
+    extended by deliberate edit, not by a second name meaning the same
+    thing. :func:`coord.conflict_fix.dispatch_conflict_fix` itself already
+    enforces the one-mechanical-attempt-then-human retry cap via
+    ``has_prior_conflict_fix`` — this function never re-derives that.
+
+    Returns ``{"dispatched": bool, "detail": str}``, never raises: no
+    merge-queue entry, no capable machine, an already-active conflict-fix,
+    or a spent retry cap are all confirmed no-ops, left for the row's own
+    convergence counter to escalate if they recur.
+    """
+    from coord.board_doctor_permissions import authorize_sweep_action  # noqa: PLC0415
+    from coord.board_service import write_board  # noqa: PLC0415
+    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+    from coord.merge_queue import load_queue  # noqa: PLC0415
+    from coord.network import fetch_status  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    authorize_sweep_action("conflict_fix_dispatch")
+
+    entry = next(
+        (
+            e for e in load_queue()
+            if e.repo_name == repo_name and e.issue_number == issue_number
+        ),
+        None,
+    )
+    if entry is None:
+        return {
+            "dispatched": False,
+            "detail": f"{repo_name}#{issue_number} has no merge-queue entry",
+        }
+
+    board = build_board()
+    fix = dispatch_conflict_fix(
+        entry, board, config, base_sync_fix=True, status_fetcher=fetch_status,
+    )
+    if fix is None:
+        return {
+            "dispatched": False,
+            "detail": (
+                f"{repo_name}#{issue_number}: a base-sync fix could not be "
+                "dispatched (no capable machine, one already active, or "
+                "the retry cap is already spent)"
+            ),
+        }
+    write_board(board)
+    return {
+        "dispatched": True,
+        "detail": (
+            f"{repo_name}#{issue_number}: dispatched base-sync-fix "
+            f"{fix.assignment_id} on {fix.machine_name}"
+        ),
+    }
+
+
+def run_base_sync_fix_ceiling_sweep(
+    rows: Sequence[StuckRow],
+    *,
+    config: Any,
+    evidence_fetcher: Callable[[str, int], tuple[bool, str]] | None = None,
+    dispatcher: Callable[[str, int], dict] | None = None,
+) -> list[dict]:
+    """#4050: for every ceiling-blocked drive-queue row this sweep just
+    diagnosed :data:`queue_diagnose.CAUSE_INTEGRATION_RED` (see
+    :func:`_ceiling_blocked_integration_red_candidates`), re-confirm the
+    cause live and, only on a confirmed premise, dispatch the budget-free
+    base-sync-fix conflict-fix leg (:func:`_dispatch_base_sync_fix`) —
+    never the generic investigate-tier fix-it leg, which #3454 already
+    refuses for a row this ceiling-blocked.
+
+    A candidate's premise is never assumed from the cause label alone:
+    before *dispatcher* is ever called, *evidence_fetcher*'s fresh
+    re-confirmation (:func:`_live_base_sync_fix_evidence` by default) must
+    read ``True`` — a candidate whose evidence does not confirm this is
+    reported ``dispatched=False`` with NO call to *dispatcher* at all, the
+    same "never act on an unconfirmed premise" posture :func:`run_
+    conflict_fix_ceiling_pending_sweep` already applies to its own
+    ``branch_moved`` reading.
+
+    *evidence_fetcher*/*dispatcher* default to :func:`_live_base_sync_fix_
+    evidence`/:func:`_dispatch_base_sync_fix`; both injectable so a test
+    never needs a live `gh` call, a real merge queue, or an HTTP POST.
+
+    Returns one dict per candidate — ``{"repo", "issue", "dispatched",
+    "detail"}`` — reported onto :attr:`SweepReport.
+    base_sync_fix_ceiling_dispatch` rather than :attr:`SweepReport.
+    decisions`: like *conflict_fix_ceiling_pending*, this is not a
+    tier/auto_dispatchers/convergence decision over the row at all.
+    """
+    fetch_evidence = evidence_fetcher or (
+        lambda repo_name, issue_number: _live_base_sync_fix_evidence(
+            repo_name, issue_number, config=config,
+        )
+    )
+    dispatch = dispatcher or (
+        lambda repo_name, issue_number: _dispatch_base_sync_fix(
+            repo_name, issue_number, config=config,
+        )
+    )
+
+    results: list[dict] = []
+    for repo_name, issue_number in _ceiling_blocked_integration_red_candidates(rows):
+        confirmed, detail = fetch_evidence(repo_name, issue_number)
+        if not confirmed:
+            results.append({
+                "repo": repo_name, "issue": issue_number,
+                "dispatched": False, "detail": detail,
+            })
+            continue
+        outcome = dispatch(repo_name, issue_number)
+        results.append({
+            "repo": repo_name,
+            "issue": issue_number,
+            "dispatched": bool(outcome.get("dispatched")),
+            "detail": outcome.get("detail", ""),
+        })
+    return results
+
+
 def run_sweep(
     *,
     config,
@@ -6066,6 +6356,10 @@ def run_sweep(
     ),
     config_drift_autofix_apply: bool = True,
     config_drift_fix_sweep: Callable[..., list[dict]] = run_config_drift_fix_sweep,
+    base_sync_fix_ceiling_dispatch: bool = True,
+    base_sync_fix_ceiling_sweep: Callable[..., list[dict]] = (
+        run_base_sync_fix_ceiling_sweep
+    ),
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -6185,6 +6479,20 @@ def run_sweep(
     regardless of outcome: a failed attempt leaves its row's convergence
     counter and any live escalation untouched instead of silently
     dismissing them.
+
+    #4050: *base_sync_fix_ceiling_sweep* (default :func:`run_base_sync_fix_
+    ceiling_sweep`) is the twin of *conflict_fix_ceiling_sweep* for a
+    DIFFERENT budget-free shape — a ceiling-blocked row diagnosed
+    :data:`queue_diagnose.CAUSE_INTEGRATION_RED` (no textual conflict, a
+    branch Test verdict that already read green, CI red only because the
+    target branch moved under it) gets a fresh, confirmed-live dispatch of
+    the base-sync-fix conflict-fix leg instead of the generic investigate-
+    tier fix-it leg #3454 already refuses it. Same exclusion shape as
+    *conflict_fix_ceiling_sweep*'s own ``CAUSE_CI_PENDING`` rows below
+    (``suppressed=True``, never dropped, runs AFTER :func:`sweep`, hard
+    ``dry_run`` skip, failure is advisory-only) — gated by
+    *base_sync_fix_ceiling_dispatch*, the same kind of fleet-wide kill
+    switch *conflict_fix_ceiling_requeue* is.
     """
     board_doctor_cfg = getattr(config, "board_doctor", None)
     rows, board = _collect_rows_with_board(
@@ -6230,6 +6538,15 @@ def run_sweep(
     ceiling_pending_keys = (
         frozenset(_ceiling_blocked_ci_pending_candidates(rows))
         if conflict_fix_ceiling_requeue and mechanical_causes is None
+        else frozenset()
+    )
+    # #4050: same "qualifies for a budget-free lane, suppress rather than
+    # drop" shape as *ceiling_pending_keys* above, for the DIFFERENT
+    # CAUSE_INTEGRATION_RED shape — see this function's own docstring
+    # paragraph and `run_base_sync_fix_ceiling_sweep`'s.
+    base_sync_fix_keys = (
+        frozenset(_ceiling_blocked_integration_red_candidates(rows))
+        if base_sync_fix_ceiling_dispatch and mechanical_causes is None
         else frozenset()
     )
     # #4048: run the Apply+Refund+requeue attempt BEFORE `sweep()` sees
@@ -6285,6 +6602,13 @@ def run_sweep(
 
             parsed = _parse_row_key(r.key)
             if parsed is not None and parsed in ceiling_pending_keys:
+                other_rows.append(replace(r, suppressed=True))
+                continue
+        if r.cause == queue_diagnose.CAUSE_INTEGRATION_RED and r.queue == "drive-queue":
+            from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+
+            parsed = _parse_row_key(r.key)
+            if parsed is not None and parsed in base_sync_fix_keys:
                 other_rows.append(replace(r, suppressed=True))
                 continue
         other_rows.append(r)
@@ -6378,6 +6702,24 @@ def run_sweep(
             # (unchanged) for the next sweep to retry.
             _log.warning(
                 "board-doctor: conflict-fix ceiling-pending requeue sweep "
+                "failed this round",
+                exc_info=True,
+            )
+    if base_sync_fix_ceiling_dispatch and base_sync_fix_keys and not dry_run:
+        # #4050: same `dry_run` hard-skip posture as *conflict_fix_ceiling_
+        # sweep* above — this always probes live and, on a confirmed
+        # premise, always dispatches a leg; a dry-run caller must see zero
+        # dispatch, not a best-effort one.
+        try:
+            report.base_sync_fix_ceiling_dispatch = base_sync_fix_ceiling_sweep(
+                rows, config=config,
+            )
+        except Exception:  # noqa: BLE001 — advisory, same posture as the
+            # sibling passes above/below: a failed dispatch attempt this
+            # round never takes the rest of this report down, and the row
+            # stays ceiling-blocked (unchanged) for the next sweep to retry.
+            _log.warning(
+                "board-doctor: base-sync-fix ceiling-blocked dispatch sweep "
                 "failed this round",
                 exc_info=True,
             )

@@ -28,6 +28,9 @@ from coord.conflict_fix import (
     ALL_CANDIDATES_UNREACHABLE,
     ALREADY_UPSTREAM_MARKER,
     ASSIGN_POST_FAILED,
+    BASE_SYNC_FIX_SYSTEM_PROMPT,
+    BASE_SYNC_FIX_TITLE_PREFIX,
+    BASE_SYNC_MISMATCH_MARKER,
     CONFLICT_FIX_SYSTEM_PROMPT,
     NO_MACHINE_CONFIGURED,
     REWORD_COMMIT_FIX_SYSTEM_PROMPT,
@@ -43,6 +46,8 @@ from coord.conflict_fix import (
     STALE_REBASE_FIX_TITLE_PREFIX,
     STALE_REBASE_MISMATCH_MARKER,
     already_upstream_verdict_in_text,
+    base_sync_mismatch_verdict_in_text,
+    build_base_sync_fix_briefing,
     build_conflict_fix_briefing,
     build_reword_commit_briefing,
     build_sealed_manifest_conflict_briefing,
@@ -350,6 +355,64 @@ class TestAlreadyUpstreamVerdictInText:
     def test_false_for_ordinary_semantic_marker(self) -> None:
         assert already_upstream_verdict_in_text(
             "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
+        ) is False
+
+
+# ── #4050: base-sync fix (a SEMANTIC conflict with the CI merge ref) ──────
+
+
+class TestBuildBaseSyncFixBriefing:
+    def test_contains_rebase_step_full_gate_set_and_mismatch_marker(self) -> None:
+        briefing = build_base_sync_fix_briefing(
+            entry=_entry(error="required check E0063 failing on the merge ref"),
+            repo_path="/work/api", build_command="cargo build", test_command="pytest -x",
+        )
+        assert "git fetch origin" in briefing
+        assert "git rebase origin/main" in briefing
+        assert "git push --force-with-lease origin issue-1-fix" in briefing
+        assert "cargo build" in briefing
+        assert "pytest -x" in briefing
+        assert BASE_SYNC_MISMATCH_MARKER in briefing
+
+    def test_no_build_command_omits_it_but_keeps_test_command(self) -> None:
+        briefing = build_base_sync_fix_briefing(
+            entry=_entry(), repo_path="/work/api",
+            build_command=None, test_command="pytest",
+        )
+        assert "cargo build" not in briefing
+        assert "pytest" in briefing
+
+    def test_no_test_command_falls_back(self) -> None:
+        briefing = build_base_sync_fix_briefing(
+            entry=_entry(), repo_path="/work/api",
+            build_command=None, test_command=None,
+        )
+        assert "no test command configured" in briefing
+
+    def test_includes_error_context(self) -> None:
+        briefing = build_base_sync_fix_briefing(
+            entry=_entry(error="E0063: missing field `loaded_row_start`"),
+            repo_path="/work/api", build_command=None, test_command="pytest",
+        )
+        assert "E0063: missing field `loaded_row_start`" in briefing
+
+
+class TestBaseSyncMismatchVerdictInText:
+    def test_true_when_marker_present(self) -> None:
+        assert base_sync_mismatch_verdict_in_text(
+            f"STATUS: rebased\nSTUCK: {BASE_SYNC_MISMATCH_MARKER} — full gate "
+            "set already passes on the rebased tree, nothing reproduces"
+        ) is True
+
+    def test_false_when_absent(self) -> None:
+        assert base_sync_mismatch_verdict_in_text("STATUS: pushed\n") is False
+        assert base_sync_mismatch_verdict_in_text(None) is False
+        assert base_sync_mismatch_verdict_in_text("") is False
+
+    def test_false_for_stale_rebase_mismatch_verdict(self) -> None:
+        assert base_sync_mismatch_verdict_in_text(
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ"
         ) is False
 
 
@@ -1508,6 +1571,65 @@ class TestDispatch:
         result = dispatch_conflict_fix(
             entry, board, two_machine_config,
             http_client=client, stale_rebase=True,
+        )
+        assert result is None
+        assert client.calls == []
+
+    def test_base_sync_fix_uses_the_base_sync_briefing_and_title(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#4050: `base_sync_fix=True` sends the base-sync-fix system
+        prompt/title, not the ordinary conflict-fix one -- the worker is
+        told to rebase and fix exactly the breakage the base's move
+        introduced, nothing broader."""
+        client = _FakeHTTPClient({"id": "fix-id-base-sync"})
+        entry = _entry(error="required check E0063 failing on the merge ref")
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop", base_sync_fix=True,
+        )
+        assert result is not None
+        assert result.type == "conflict-fix"
+        assert result.issue_title.startswith(BASE_SYNC_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == BASE_SYNC_FIX_SYSTEM_PROMPT
+        assert BASE_SYNC_MISMATCH_MARKER in payload["briefing"]
+        assert "pytest" in payload["briefing"]
+
+    def test_base_sync_fix_skips_the_sealed_author_branch(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A sealed-author (test-author/mock-author) row still gets the
+        base-sync-fix briefing, not the sealed-manifest one -- #4050's
+        shape has nothing to do with a manifest.yml collision."""
+        client = _FakeHTTPClient({"id": "fix-id-base-sync-sealed"})
+        entry = _entry(assignment_type="test-author")
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop", base_sync_fix=True,
+        )
+        assert result is not None
+        assert result.issue_title.startswith(BASE_SYNC_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] != SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+
+    def test_base_sync_fix_retry_cap_blocks_second_dispatch_on_recurrence(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Same retry-cap machinery as every other conflict-fix flavour: a
+        base-sync fix that recurs against the identical error after a
+        prior attempt does not dispatch again."""
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prev-fix", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        entry = _entry(error="required check E0063 failing on the merge ref")
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, base_sync_fix=True,
         )
         assert result is None
         assert client.calls == []

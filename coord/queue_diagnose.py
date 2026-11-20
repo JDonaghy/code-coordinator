@@ -397,6 +397,20 @@ class LiveState:
     #: to judge staleness could not be read — "could not tell", not
     #: "confirmed not stale".
     test_stale: bool | None = None
+    #: #4050: the branch's Test-gate DECISION's own ``base_moved_note``
+    #: (:func:`coord.gates._base_moved_note`), read straight off the SAME
+    #: ``GateReport`` :func:`GhLiveProbe._gates` already builds for
+    #: ``branch_test_state``/``review_stale``/``test_stale`` above — never
+    #: a second ``build_gate_report`` call. Populated only when that note
+    #: itself is populated: a POSITIVELY CONFIRMED divergence between the
+    #: tested SHA's merge-base and the target branch's current tip, i.e.
+    #: GitHub's merge-ref CI is building a different tree than the one the
+    #: Test stage built (quadraui#2726's shape). ``None`` covers every
+    #: other case — no live gh access, no test decision, the check never
+    #: ran, or a confirmed "the base has not moved" reading — never
+    #: collapsed with a genuine confirmation, same posture as every other
+    #: optional field on this class.
+    base_moved_note: str | None = None
 
     @property
     def read_anything(self) -> bool:
@@ -471,6 +485,17 @@ def _branch_test_line(live: LiveState) -> str:
     return f"coord gates (test decision): branch Test verdict reads {live.branch_test_state!r}"
 
 
+def _base_moved_line(live: LiveState) -> str:
+    """Rendered unconditionally, same posture as :func:`_branch_test_line`/
+    :func:`_staleness_line` — the one place an operator reading ANY cause
+    can see whether ``coord gates``'s own Test decision confirmed a
+    quadraui#2726-shaped divergence between the tree the Test stage built
+    and the tree GitHub's merge-ref CI is building (#4050)."""
+    if live.base_moved_note is None:
+        return "coord gates (base-moved note): not read, or no confirmed divergence"
+    return f"coord gates (base-moved note): {live.base_moved_note}"
+
+
 def _staleness_line(live: LiveState) -> str:
     """Rendered unconditionally, same posture as :func:`_branch_test_line` —
     the one place an operator reading ANY cause can see what the merge
@@ -528,6 +553,7 @@ def _evidence(entry: QueueEntry, live: LiveState) -> list[str]:
         _checks_line(live),
         _gate_line(live),
         _branch_test_line(live),
+        _base_moved_line(live),
         _staleness_line(live),
         _health_line(entry, live),
     ]
@@ -780,12 +806,20 @@ def _rule_integration_red(entry: QueueEntry, live: LiveState) -> tuple[str, str,
     if not failing or live.branch_test_state != "passed":
         return None
     names = ", ".join(sorted(c.name for c in failing)[:3])
-    return (
-        CAUSE_INTEGRATION_RED,
-        CONFIDENCE_HIGH,
+    decisive = (
         f"gh pr checks: failing — {names} — but this branch's own latest "
-        f"Test-gate verdict is {live.branch_test_state!r}",
+        f"Test-gate verdict is {live.branch_test_state!r}"
     )
+    # #4050: when `coord gates` itself confirms the divergence (a
+    # positively-read `base_moved_note`, never a mere absence), fold it into
+    # the SAME decisive string rather than leaving it to `_evidence`'s
+    # unconditional `_base_moved_line` alone — this is the one reading a
+    # ceiling-blocked sweep's own candidate filter treats as load-bearing
+    # (see `coord.board_doctor._live_base_sync_fix_evidence`), so it must be
+    # visible on the decisive line a `block_log` summary actually keeps.
+    if live.base_moved_note:
+        decisive = f"{decisive}; {live.base_moved_note}"
+    return (CAUSE_INTEGRATION_RED, CONFIDENCE_HIGH, decisive)
 
 
 def _rule_ci_red(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
@@ -1177,7 +1211,7 @@ class GhLiveProbe:
         errors: list[str] = []
         (
             branch, gate_ready, gate_blockers, no_assignment_ever, branch_test_state,
-            review_stale, test_stale,
+            review_stale, test_stale, base_moved_note,
         ) = self._gates(entry, errors)
         pr_number, pr_state, mergeable, checks = self._github(entry, branch, errors)
         reachable, has_session, crits = self._health(entry)
@@ -1194,6 +1228,7 @@ class GhLiveProbe:
             probe_errors=tuple(errors),
             no_assignment_ever=no_assignment_ever,
             branch_test_state=branch_test_state,
+            base_moved_note=base_moved_note,
             review_stale=review_stale,
             test_stale=test_stale,
         )
@@ -1201,7 +1236,10 @@ class GhLiveProbe:
     # -- `coord gates`, verbatim ------------------------------------------
     def _gates(
         self, entry: QueueEntry, errors: list[str]
-    ) -> tuple[str, bool | None, list[str], bool | None, str | None, bool | None, bool | None]:
+    ) -> tuple[
+        str, bool | None, list[str], bool | None, str | None, bool | None, bool | None,
+        str | None,
+    ]:
         # #3936 review: `_staleness` now reads off the SAME `GateReport`
         # this builds (via `reconcile_entry`'s own `report=` passthrough)
         # rather than paying for — and risking disagreeing with — a SECOND
@@ -1214,7 +1252,7 @@ class GhLiveProbe:
         # second time; it simply has no report to read a verdict from.
         if self.board is None or self.config is None:
             review_stale, test_stale = self._staleness(entry, errors, report=None)
-            return "", None, [], None, None, review_stale, test_stale
+            return "", None, [], None, None, review_stale, test_stale, None
         try:
             from coord import github_ops  # noqa: PLC0415
             from coord.gates import build_gate_report  # noqa: PLC0415
@@ -1224,7 +1262,7 @@ class GhLiveProbe:
             )
         except Exception as exc:  # noqa: BLE001 — a probe, never a decision
             errors.append(f"coord gates: {type(exc).__name__}: {exc}")
-            return "", None, [], None, None, None, None
+            return "", None, [], None, None, None, None, None
         review_stale, test_stale = self._staleness(entry, errors, report=report)
         # `build_gate_report` returns early, with `report.rows` empty, ONLY
         # when `assignments_for_issue` found nothing on the board for this
@@ -1274,18 +1312,25 @@ class GhLiveProbe:
                 )
                 if row is not None:
                     branch_test_state = row.test_state
+        # #4050: the SAME `test_decision` object `_base_moved_note` is
+        # stamped on, read verbatim — never a second `build_gate_report`
+        # call. `getattr` rather than a direct attribute read because
+        # `test_decision` can be `None` here (no Test gate on this issue at
+        # all), and `GateDecision.base_moved_note` is itself optional on
+        # every pre-#3899 caller's decision object.
+        base_moved_note = getattr(test_decision, "base_moved_note", None)
         decisions = [d for d in report.decisions if getattr(d, "required", False)]
         if not decisions:
             return (
                 str(report.branch or ""), None, [], no_assignment_ever, branch_test_state,
-                review_stale, test_stale,
+                review_stale, test_stale, base_moved_note,
             )
         blockers = [
             f"{d.gate}: {d.reason or 'refused'}" for d in decisions if not d.ok
         ]
         return (
             str(report.branch or ""), not blockers, blockers, no_assignment_ever,
-            branch_test_state, review_stale, test_stale,
+            branch_test_state, review_stale, test_stale, base_moved_note,
         )
 
     # -- #3936: review/test staleness decided from a live EntryTruth -------
