@@ -4997,6 +4997,14 @@ def _ceiling_blocked_ci_pending_candidates(
     rebuilt from a settled ``block_log`` episode can be arbitrarily old,
     and this must act only on a live probe THIS sweep just took.
 
+    Also requires :data:`coord.queue_diagnose.CONFIDENCE_LOW` be absent —
+    the same guard :func:`_reclassify_ceiling_blocked` applies to its own
+    live-clear reclassification: a low-confidence verdict means the live
+    probe that produced it was itself incomplete (``live.probe_errors``
+    downgraded it), so "this row is CI-pending" has not actually been
+    established. :func:`run_conflict_fix_ceiling_pending_sweep`'s own
+    *evidence_fetcher* re-probe softens, but does not replace, this.
+
     Deduped — a (repo, issue) can legitimately appear more than once if
     an earlier pass in :func:`_collect_rows_with_board` also produced a
     row for it, but this candidate list feeds exactly one requeue attempt
@@ -5014,6 +5022,7 @@ def _ceiling_blocked_ci_pending_candidates(
             row.queue != "drive-queue"
             or not row.fresh
             or row.cause != queue_diagnose.CAUSE_CI_PENDING
+            or row.confidence == queue_diagnose.CONFIDENCE_LOW
         ):
             continue
         parsed = _parse_row_key(row.key)
@@ -5026,17 +5035,36 @@ def _ceiling_blocked_ci_pending_candidates(
     return candidates
 
 
-def _live_check_conclusions(
+def _live_conflict_fix_evidence(
     repo_name: str, issue_number: int, *, config: Any,
-) -> tuple[str, ...] | None:
-    """A fresh, single-entry live check read for *repo_name*#*issue_number*,
-    via the SAME :class:`coord.queue_diagnose.GhLiveProbe` the main sweep
-    walk uses (#2096: one question, one answer — never a second,
-    independently-shaped `gh` call). ``None`` on any read failure, an
-    unqueued entry, or a probe that could not confirm the checks at all —
-    the fail-closed "we could not tell" reading :func:`coord.drive_queue.
-    conflict_fix_push_ci_verdict` already treats as "still pending", never
-    as green.
+) -> tuple[tuple[str, ...] | None, bool]:
+    """A fresh, single-entry live read for *repo_name*#*issue_number*, via
+    the SAME :class:`coord.queue_diagnose.GhLiveProbe` the main sweep walk
+    uses (#2096: one question, one answer — never a second,
+    independently-shaped `gh` call).
+
+    Returns ``(checks, branch_moved)``:
+
+    * *checks* — each check's bare ``conclusion`` string, for
+      :func:`coord.drive_queue.conflict_fix_push_ci_verdict`'s own
+      three-way classification. ``None`` on any read failure, an unqueued
+      entry, or a probe that could not confirm the checks at all — the
+      fail-closed "we could not tell" reading that function already treats
+      as "still pending", never as green.
+    * *branch_moved* — #4036 review (blocking finding #5): ``True`` only
+      when the SAME probe's :attr:`~coord.queue_diagnose.LiveState.
+      review_stale`/:attr:`~coord.queue_diagnose.LiveState.test_stale`
+      confirms a recorded review/test verdict no longer covers the
+      branch's CURRENT head — live evidence that something has actually
+      been pushed since this row's ceiling-blocking verdict was recorded,
+      never merely that its checks happen to be in flight for an unrelated
+      reason (nobody has pushed anything new at all). ``False`` on a read
+      failure or an unqueued entry too — "could not tell" must never read
+      as "yes, it moved". The caller (:func:`run_conflict_fix_ceiling_
+      pending_sweep`) must not reset the stage or re-stamp a fresh
+      #2972 fix-round budget without this confirmed ``True`` — pending
+      checks with no confirmed push behind them are exactly the
+      CAUSE_NOTHING_BLOCKING/#3760-Action-1 shape, not this one.
     """
     from coord.commands.drive_queue import _local_host_id  # noqa: PLC0415
     from coord.drive import list_drive_sessions  # noqa: PLC0415
@@ -5046,7 +5074,7 @@ def _live_check_conclusions(
 
     row = get_drive_queue_entry(repo_name, issue_number)
     if row is None:
-        return None
+        return None, False
     entry = QueueEntry.from_row(row)
 
     try:
@@ -5066,27 +5094,40 @@ def _live_check_conclusions(
             "board-doctor: live-check re-probe failed for %s#%s",
             repo_name, issue_number, exc_info=True,
         )
-        return None
-    if live.checks is None:
-        return None
-    return tuple(c.conclusion for c in live.checks)
+        return None, False
+    checks = None if live.checks is None else tuple(c.conclusion for c in live.checks)
+    branch_moved = live.review_stale is True or live.test_stale is True
+    return checks, branch_moved
 
 
 def run_conflict_fix_ceiling_pending_sweep(
     rows: Sequence[StuckRow],
     *,
     config: Any,
-    check_fetcher: Callable[[str, int], tuple[str, ...] | None] | None = None,
+    evidence_fetcher: Callable[[str, int], tuple[tuple[str, ...] | None, bool]] | None = None,
     requeuer: Callable[..., Any] | None = None,
 ) -> list[dict]:
     """#4036: for every ceiling-blocked drive-queue row this sweep just
     diagnosed :data:`queue_diagnose.CAUSE_CI_PENDING` (see
     :func:`_ceiling_blocked_ci_pending_candidates`), re-probe its live
-    checks and hand the verdict to :func:`coord.drive_queue.
+    evidence and hand the verdict to :func:`coord.drive_queue.
     requeue_after_conflict_fix` — the one place that decides whether to
     wait, alert, or actually requeue the row.
 
-    *check_fetcher* defaults to :func:`_live_check_conclusions`;
+    #4036 review (blocking finding #5): a candidate's premise — that a
+    conflict-fix leg actually pushed something — is never ASSUMED from
+    "ceiling-blocked and CI pending" alone; that shape also matches an
+    ordinary row whose checks are simply still running for an unrelated
+    reason. Before *requeuer* is ever called, *evidence_fetcher*'s own
+    ``branch_moved`` reading (:func:`_live_conflict_fix_evidence`'s
+    ``review_stale``/``test_stale``-backed confirmation that the live head
+    has actually moved past the recorded verdict) must read ``True`` — a
+    candidate whose evidence does not confirm this is reported
+    ``requeued=False`` with NO call to *requeuer* at all, so neither the
+    stage reset nor a fresh #2972 fix-round budget is ever granted off a
+    checks-only reading.
+
+    *evidence_fetcher* defaults to :func:`_live_conflict_fix_evidence`;
     *requeuer* defaults to :func:`coord.drive_queue.requeue_after_conflict_fix`
     — both injectable so a test never needs a live `gh` call or a real
     drive-queue/board DB.
@@ -5101,8 +5142,8 @@ def run_conflict_fix_ceiling_pending_sweep(
     from coord.drive_queue import conflict_fix_push_ci_verdict  # noqa: PLC0415
     from coord.drive_queue import requeue_after_conflict_fix as _default_requeuer  # noqa: PLC0415
 
-    fetch_checks = check_fetcher or (
-        lambda repo_name, issue_number: _live_check_conclusions(
+    fetch_evidence = evidence_fetcher or (
+        lambda repo_name, issue_number: _live_conflict_fix_evidence(
             repo_name, issue_number, config=config,
         )
     )
@@ -5110,9 +5151,21 @@ def run_conflict_fix_ceiling_pending_sweep(
 
     results: list[dict] = []
     for repo_name, issue_number in _ceiling_blocked_ci_pending_candidates(rows):
-        checks = fetch_checks(repo_name, issue_number)
-        ci_verdict = conflict_fix_push_ci_verdict(checks or ())
-        outcome = requeue(repo_name, issue_number, ci_verdict=ci_verdict)
+        checks, branch_moved = fetch_evidence(repo_name, issue_number)
+        if not branch_moved:
+            outcome: dict[str, Any] = {
+                "requeued": False,
+                "detail": (
+                    f"{repo_name}#{issue_number}: no live evidence yet that "
+                    "a conflict-fix push moved this branch past its "
+                    "recorded review/test verdict — waiting for that "
+                    "confirmation before resetting the stage or spending a "
+                    "fresh fix-round budget"
+                ),
+            }
+        else:
+            ci_verdict = conflict_fix_push_ci_verdict(checks or ())
+            outcome = requeue(repo_name, issue_number, ci_verdict=ci_verdict)
         results.append({
             "repo": repo_name,
             "issue": issue_number,
@@ -5269,12 +5322,26 @@ def run_sweep(
     refile_rows: list[StuckRow] = []
     other_rows: list[StuckRow] = []
     # #4036: a ceiling-blocked drive-queue row diagnosed `CAUSE_CI_PENDING`
-    # is pulled out the same way `merged-partial`/`branch-merged-guard` rows
-    # are — resolved by *conflict_fix_ceiling_sweep* onto its own report
-    # field below, never by the generic tier/auto_dispatchers path (which
-    # has no dispatcher for "wait for CI" and would otherwise burn the
-    # investigate tier's fix-it-leg budget trying to "fix" a row that is
-    # not broken, just not finished yet).
+    # is resolved by *conflict_fix_ceiling_sweep* onto its own report field
+    # below, never by the generic tier/auto_dispatchers path. That path DOES
+    # have a dispatcher registered for `CAUSE_CI_PENDING`
+    # (`coord.board_doctor_policy`'s investigate tier, `sweep_dispatch_fixit_leg`)
+    # — the exclusion is not "there is nothing to call", it is that this row
+    # is already KNOWN not to need a worker: a conflict-fix leg already
+    # pushed a resolution, so dispatching a fresh investigate-tier fix-it
+    # leg here would spend that per-repo budget "fixing" a row that is not
+    # broken, just waiting on CI to settle. Unlike `merged-partial`/`branch-merged-guard`,
+    # this row is NOT dropped from *other_rows* — it is marked
+    # `suppressed=True` instead (the same #3761 baseline-red carve-out
+    # `sweep()` already honours): it stays `touched`, its convergence
+    # counter is left exactly where it was, and `clear_absent_rows` is NOT
+    # told it disappeared, so a live escalation from an EARLIER cause (the
+    # row may have escalated before this sweep ever reclassified it
+    # CI_PENDING) is never silently dismissed as resolved just because a
+    # conflict-fix push happens to be in flight. Requeuing can take more
+    # than one sweep (pending checks, a re-probe that fails) and this
+    # exclusion must not read as "resolved" on any of those intermediate
+    # rounds.
     ceiling_pending_keys = (
         frozenset(_ceiling_blocked_ci_pending_candidates(rows))
         if conflict_fix_ceiling_requeue and mechanical_causes is None
@@ -5295,6 +5362,7 @@ def run_sweep(
 
             parsed = _parse_row_key(r.key)
             if parsed is not None and parsed in ceiling_pending_keys:
+                other_rows.append(replace(r, suppressed=True))
                 continue
         other_rows.append(r)
     if mechanical_causes is not None:
