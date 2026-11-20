@@ -831,7 +831,7 @@ def _perform_next_action_unperformed(row: StuckRow) -> bool:
     right before acting — never trusting :func:`coord.board_doctor.
     next_action_unperformed_rows`'s own classification, which can be a
     sweep or more stale — and perform whichever gated primitive its FRESH
-    ``next_action`` names: ``restage`` (review or test), ``merge``, or
+    ``next_action`` names: ``restage`` (review), ``merge``, or
     ``mark_done``. Registered against :data:`coord.board_doctor.
     CAUSE_NEXT_ACTION_UNPERFORMED` under the nominal action name
     ``"restage"`` (#4045's own motivating quadraui#2744 case, a stuck
@@ -843,13 +843,20 @@ def _perform_next_action_unperformed(row: StuckRow) -> bool:
     already permit on its own (#2096: one question, one answer, asked
     again at the real call site, not a second judgment this module invents).
 
+    ``NEXT_ACTION_DISPATCH_TEST`` is deliberately absent from the branches
+    below, mirroring its exclusion from :func:`coord.board_doctor.
+    next_action_unperformed_rows`'s own ``dispatchable`` set (see that
+    function's docstring for why) — a fresh truth read reporting it falls
+    straight to the "no longer dispatchable" branch, a confirmed no-op,
+    the same as ``WAIT``/``ESCALATE``/``UNKNOWN``.
+
     Returns ``True`` only once the matching wrapper confirms it actually
     acted. A live truth that no longer names a dispatchable ``next_action``
     at all — reality moved on between classification and this call: an
     operator already acted (exactly the quadraui#2744 incident's own
     resolution, `coord review <leg>` run by hand), or a leg is now in
     flight — is a confirmed no-op, never a false success. Any OTHER
-    exception — `reconcile_entry`, and every primitive the four verbs below
+    exception — `reconcile_entry`, and every primitive the three verbs below
     reach, are live-GitHub/network-bound — is caught by
     :func:`_run_mechanical_action` rather than aborting the sweep.
     """
@@ -869,7 +876,6 @@ def _perform_next_action_unperformed(row: StuckRow) -> bool:
         from coord import github_ops as gh_ops  # noqa: PLC0415
         from coord.entry_truth import (  # noqa: PLC0415
             NEXT_ACTION_DISPATCH_REVIEW,
-            NEXT_ACTION_DISPATCH_TEST,
             NEXT_ACTION_MARK_DONE,
             NEXT_ACTION_MERGE,
             reconcile_entry,
@@ -882,13 +888,6 @@ def _perform_next_action_unperformed(row: StuckRow) -> bool:
             result = dispatch_investigator_action(
                 "restage", repo_name, issue_number, board, config,
                 stage="review", reason=_SWEEP_REASON, actor="sweep",
-            )
-            acted = result["acted"]
-        elif truth.next_action == NEXT_ACTION_DISPATCH_TEST:
-            action_name = "restage(test)"
-            result = dispatch_investigator_action(
-                "restage", repo_name, issue_number, board, config,
-                stage="test", reason=_SWEEP_REASON, actor="sweep",
             )
             acted = result["acted"]
         elif truth.next_action == NEXT_ACTION_MERGE:

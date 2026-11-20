@@ -5016,6 +5016,25 @@ class TestNextActionUnperformedRows:
             )
             assert rows == []
 
+    def test_dispatch_test_is_excluded_even_when_aged_past_the_threshold(self) -> None:
+        # #4045 review: `reconcile_entry`'s `latest_worker_status` check is
+        # scoped to `WORK_LIKE_TYPES` — a `smoke` leg in flight is invisible
+        # to it, so `dispatch_test` must never be treated as dispatchable
+        # here (the restage it would otherwise trigger clears a live
+        # `test_state="running"` marker with no liveness check at all).
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_TEST
+
+        entry = QueueEntry(repo="acme/widgets", issue=2752, state="running", launched_at=0.0)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_DISPATCH_TEST),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
     def test_under_the_threshold_is_not_classified(self) -> None:
         from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
 
@@ -5328,6 +5347,41 @@ class TestNextActionUnperformedDispatcher:
         performed = self._dispatch(row)
 
         assert performed is False
+
+    def test_a_fresh_dispatch_test_truth_is_a_confirmed_noop_never_a_restage(
+        self, monkeypatch,
+    ) -> None:
+        # #4045 review: even if a row were ever classified under this cause
+        # with a next_action that has since read `dispatch_test` (excluded
+        # from the classifier, but re-derived fresh here regardless), this
+        # must fall to the "no longer dispatchable" branch rather than
+        # restaging the Test stage unconditionally — restaging a genuinely
+        # live smoke leg this way wipes its in-flight marker with no
+        # liveness check at all.
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_TEST
+
+        board = Board()
+        config = self._config()
+        self._wire_board_and_config(monkeypatch, board, config)
+        monkeypatch.setattr(
+            "coord.entry_truth.reconcile_entry",
+            lambda *a, **k: SimpleNamespace(
+                next_action=NEXT_ACTION_DISPATCH_TEST,
+                next_action_reason="test required but not yet passed",
+            ),
+        )
+
+        restage_calls: list[tuple] = []
+        monkeypatch.setattr(
+            "coord.board_doctor_policy.dispatch_investigator_action",
+            lambda *a, **k: restage_calls.append((a, k)) or {"acted": True},
+        )
+
+        row = _row("acme/widgets#9998", CAUSE_NEXT_ACTION_UNPERFORMED)
+        performed = self._dispatch(row)
+
+        assert performed is False
+        assert restage_calls == []
 
 
 class TestStrandedPrereqDep:

@@ -607,7 +607,6 @@ def next_action_unperformed_rows(
     a second one this cause invents for itself.
 
     Only :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_REVIEW`/
-    :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_TEST`/
     :data:`~coord.entry_truth.NEXT_ACTION_MERGE`/:data:`~coord.entry_truth.
     NEXT_ACTION_MARK_DONE` are "dispatchable" here.
     :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_CI_FIX` and
@@ -617,17 +616,42 @@ def next_action_unperformed_rows(
     :data:`CAUSE_CONFLICT_FIX_HEAD_UNMOVED`), and no safe-tier mechanical
     primitive exists yet for an unattended CI-fix dispatch FROM this cause —
     adding one is follow-up work, not a silent extension of this one.
+    :data:`~coord.entry_truth.NEXT_ACTION_DISPATCH_TEST` is ALSO excluded,
+    for a sharper reason than the other two: `reconcile_entry`'s
+    ``latest_worker_status`` check (what makes a leg genuinely in flight
+    read as :data:`~coord.entry_truth.NEXT_ACTION_WAIT` instead of
+    dispatchable) comes from `coord.gates.gate_columns_for_issue`, which
+    is scoped to `coord.models.WORK_LIKE_TYPES` — a `smoke` leg in flight
+    is invisible to it. The restage this action would otherwise trigger
+    (`coord.board_doctor_permissions.sweep_restage` with ``stage="test"``,
+    i.e. `sweep_smoke_requeue`) clears a `test_state="running"` marker
+    unconditionally, with none of the liveness check
+    `coord.merge_queue._abandoned_running_marker`/
+    `RUNNING_MARKER_STALE_AFTER` requires before treating that SAME marker
+    as abandoned elsewhere in this codebase — so without this exclusion, a
+    row whose smoke leg is still genuinely running would read as stale
+    here well before an hour, get its in-flight marker wiped, and get a
+    SECOND smoke leg dispatched on top of the first. No safe-tier
+    mechanical primitive exists yet that reuses that liveness check FROM
+    this cause — adding one is follow-up work, not a silent extension of
+    this one.
     :data:`~coord.entry_truth.NEXT_ACTION_ESCALATE`/:data:`~coord.
     entry_truth.NEXT_ACTION_WAIT`/:data:`~coord.entry_truth.
     NEXT_ACTION_UNKNOWN` all mean either "a human already owns this" or "a
-    leg is in flight" (`reconcile_entry`'s own worker-status check already
-    resolves to ``WAIT`` whenever one is, so a leg genuinely in flight is
-    never read as dispatchable here) — never this cause's concern.
+    WORK_LIKE_TYPES leg is in flight" (`reconcile_entry`'s own worker-status
+    check resolves to ``WAIT`` whenever one of THOSE is, so it is never read
+    as dispatchable here) — never this cause's concern. A `review` leg in
+    flight is likewise invisible to that check, but the surviving
+    ``dispatch_review`` action is still safe against it: the primitive it
+    reaches (`coord.review.dispatch_review`/
+    `dispatch_scoped_reviews_for_queue`, via `sweep_restage`'s own
+    ``stage="review"`` branch) refuses outright when a review is already in
+    flight for the same work — the #4002 per-item gate every OTHER review
+    dispatch path already goes through, not a check this cause invents.
     """
     from coord.drive_queue import STATE_DONE_LIKE, STATE_WAITING  # noqa: PLC0415
     from coord.entry_truth import (  # noqa: PLC0415
         NEXT_ACTION_DISPATCH_REVIEW,
-        NEXT_ACTION_DISPATCH_TEST,
         NEXT_ACTION_MARK_DONE,
         NEXT_ACTION_MERGE,
     )
@@ -635,7 +659,6 @@ def next_action_unperformed_rows(
     dispatchable = frozenset(
         {
             NEXT_ACTION_DISPATCH_REVIEW,
-            NEXT_ACTION_DISPATCH_TEST,
             NEXT_ACTION_MERGE,
             NEXT_ACTION_MARK_DONE,
         }
