@@ -8118,6 +8118,37 @@ class TestRunRefileSweep:
         assert 2467 not in by_issue
         assert 2739 in by_issue
 
+    def test_a_row_whose_write_fails_after_minting_is_not_refiled_again(
+        self, monkeypatch,
+    ) -> None:
+        """`run_refile` sets `follow_up_keys["refile"]` the moment the
+        replacement issue is created, before `comment_issue` runs — so a
+        `comment_issue` failure still leaves a real, already-created issue
+        number behind even though the action comes back
+        `ACTION_REFILE_WRITE_FAILED`. A second occurrence of the same key
+        in this same sweep must reuse that number, not mint another one."""
+        self._stub_get_issue(monkeypatch)
+        state.enqueue_drive_queue("quadraui", 2467)
+
+        class _FailCommentWriter(_FakeRefileWriter):
+            def comment_issue(self, repo_name, number, *, body):
+                raise RuntimeError("transient GitHub write failure")
+
+        writer = _FailCommentWriter(new_number=2739)
+
+        dispositions = run_refile_sweep(
+            [self._row(), self._row()], config=self._config(),
+            plan_leg_dispatcher=self._fake_plan_leg(False, "B is not on develop"),
+            writer=writer, issue_open=lambda repo, number: True,
+        )
+
+        assert len(dispositions) == 2
+        assert dispositions[0].action == ft.ACTION_REFILE_WRITE_FAILED
+        assert dispositions[0].follow_ups == [2739]
+        assert dispositions[1].action == ft.ACTION_REFILE_ALREADY_FILED
+        assert dispositions[1].follow_ups == [2739]
+        assert len(writer.created) == 1
+
     def test_a_later_sweep_does_not_refile_the_same_row_again(
         self, monkeypatch,
     ) -> None:
@@ -8151,6 +8182,16 @@ class TestRunRefileSweep:
         assert second[0].action == ft.ACTION_REFILE_ALREADY_FILED
         assert second[0].follow_ups == [2739]
         assert len(writer.created) == 1
+
+        # No second replacement issue was filed, but the manual
+        # re-`enqueue_drive_queue("quadraui", 2467)` above (standing in for
+        # a re-diagnosis pass finding the original row again) is itself
+        # outside `run_refile_sweep`'s control — it leaves both the
+        # original row and the one refile queued, which is the correct
+        # "exactly one refile issue, one queue row per issue" end state.
+        rows = state.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert sorted(by_issue) == [2467, 2739]
 
 
 class TestRunPendingRefileCloseSweep:

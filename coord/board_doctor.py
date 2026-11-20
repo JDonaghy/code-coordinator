@@ -1558,6 +1558,14 @@ def run_refile_sweep(
     )
 
     dispositions: list[board_doctor_followthrough.Disposition] = []
+    #: Keys this call has already dispatched `run_refile` for, regardless
+    #: of outcome. A key lands here the moment it is dispatched, not only
+    #: when it successfully mints a replacement — that is what keeps a
+    #: SECOND occurrence of the same key in this same sweep from running
+    #: a second plan leg / alert even when the first attempt didn't file
+    #: anything (`ACTION_REFILE_PLAN_FAILED`, `ACTION_REFILE_DEPTH_PAGED`,
+    #: or a write failure after the replacement issue was already minted).
+    seen_keys: set[str] = set()
     dispatched = 0
     for row in rows:
         if dispatched >= max_rows:
@@ -1600,6 +1608,16 @@ def run_refile_sweep(
             )
             continue
 
+        if row.key in seen_keys:
+            # Already dispatched for this key earlier in THIS call and it
+            # didn't land a replacement issue (the `already_refiled` check
+            # above would have caught it if it had) — a second plan leg /
+            # alert for the identical key buys nothing and burns a second
+            # slot of `max_rows`. Skip quietly, same as the `entry is None`
+            # guard above.
+            continue
+
+        seen_keys.add(row.key)
         candidate = build_refile_candidate(
             repo_name, issue_number, config=config, entry=entry,
         )
@@ -1615,10 +1633,18 @@ def run_refile_sweep(
             dry_run=dry_run,
         )
         dispositions.append(disposition)
-        if disposition.action == board_doctor_followthrough.ACTION_REFILE_FILED:
-            new_number = disposition.follow_up_keys.get("refile")
-            if new_number is not None:
-                already_refiled[row.key] = new_number
+        # Keyed on whether a replacement issue was actually minted — NOT
+        # on `disposition.action == ACTION_REFILE_FILED`: `run_refile` sets
+        # `follow_up_keys["refile"]` the moment `_file_refile` returns,
+        # before `requeue(...)` or `writer.comment_issue(...)` run, so a
+        # write failure AFTER a successful file still has a real,
+        # already-created issue number here even though the action is
+        # `ACTION_REFILE_WRITE_FAILED`. Missing that would let a second
+        # occurrence of the same key file a second, identical replacement
+        # issue.
+        new_number = disposition.follow_up_keys.get("refile")
+        if new_number is not None:
+            already_refiled[row.key] = new_number
         dispatched += 1
     return dispositions
 
