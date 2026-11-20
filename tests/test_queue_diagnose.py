@@ -500,3 +500,50 @@ def test_needs_decomposition_is_not_auto_or_investigate_eligible():
     assert qd.CAUSE_NEEDS_DECOMPOSITION not in bdp.INVESTIGATE_CAUSES
     assert qd.CAUSE_NEEDS_DECOMPOSITION in bdp.DECOMPOSITION_CAUSES
     assert bdp.policy_tier_of(qd.CAUSE_NEEDS_DECOMPOSITION) == TIER_AUTO
+
+
+# ── `live_entry_truth` (#4045) ───────────────────────────────────────────────
+
+
+def test_live_entry_truth_returns_none_without_gh_ops():
+    """No live access requested at all — never guess a verdict from nothing."""
+    assert qd.live_entry_truth(entry(77), Board(), _config(), gh_ops=None) is None
+
+
+def test_live_entry_truth_returns_none_on_a_raising_probe(monkeypatch):
+    """A probe failure is "could not tell", never a decision — and never
+    an exception a caller has to shield against itself. `reconcile_entry`
+    itself fails closed on an ordinary per-field probe error (see its own
+    docstring), so this exercises the ONE path still able to raise through
+    it — an unexpected failure in `reconcile_entry`'s own derivation."""
+
+    def _raise(*a, **k):
+        raise RuntimeError("unexpected failure")
+
+    monkeypatch.setattr("coord.entry_truth.reconcile_entry", _raise)
+    board = Board(completed=[_work()])
+
+    got = qd.live_entry_truth(entry(77), board, _config(), gh_ops=object())
+
+    assert got is None
+
+
+def test_live_entry_truth_reads_the_same_reconcile_entry_fact_as_staleness(monkeypatch):
+    """The SAME `coord.entry_truth.reconcile_entry` call
+    :meth:`GhLiveProbe._staleness` already makes for
+    :data:`CAUSE_REVIEW_STALE` — never a second, independently-timed
+    derivation of the same facts (#2096)."""
+    _patch_gh_ops(monkeypatch)
+    work = _work()
+    review = _review(work.assignment_id)
+    board = Board(completed=[work, review])
+
+    from coord import github_ops
+    from coord.entry_truth import reconcile_entry
+
+    want = reconcile_entry(board, _config(), REPO, 77, gh_ops=github_ops)
+    got = qd.live_entry_truth(entry(77), board, _config(), gh_ops=github_ops)
+
+    assert got is not None
+    assert got.next_action == want.next_action
+    assert got.review_stale == want.review_stale

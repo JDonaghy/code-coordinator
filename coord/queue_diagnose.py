@@ -71,6 +71,7 @@ from coord.models import (
 )
 
 if TYPE_CHECKING:
+    from coord.entry_truth import EntryTruth
     from coord.gates import GateReport
 
 _log = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ __all__ = [
     "LiveState",
     "diagnose",
     "is_foreign_launch",
+    "live_entry_truth",
     "needs_diagnosis",
     "run_pass",
     "stalled_keys",
@@ -1576,6 +1578,40 @@ class GhLiveProbe:
         # renamed, or hand-written) — we have no reading for it, which is
         # `None` ("could not tell"), never `False` ("it is down").
         return None, has_session, []
+
+
+def live_entry_truth(
+    entry: QueueEntry, board: Any, config: Any, *, gh_ops: Any = None,
+) -> "EntryTruth | None":
+    """The live :class:`~coord.entry_truth.EntryTruth` for *entry*'s own
+    ``(repo, issue)`` (#4045) — the one "what do the live gates say happens
+    next" read :func:`coord.board_doctor.next_action_unperformed_rows`
+    consults, built through the exact same :func:`coord.entry_truth.
+    reconcile_entry` call :meth:`GhLiveProbe._staleness` already makes for
+    :data:`CAUSE_REVIEW_STALE`/:data:`CAUSE_TEST_STALE`, never a second,
+    independently-timed derivation of the same facts (#2096).
+
+    ``None`` — never raised — whenever there is nothing to probe with
+    (*gh_ops* omitted) or the live call itself raises: a probe failure is
+    "could not tell", the same fail-closed reading :func:`~coord.
+    entry_truth.reconcile_entry` itself gives every inconclusive field, and
+    a caller must never read it as "nothing to do" (:data:`~coord.
+    entry_truth.NEXT_ACTION_UNKNOWN`/:data:`~coord.entry_truth.
+    NEXT_ACTION_WAIT` are real, confirmed verdicts `reconcile_entry` returns
+    on success; this is the layer below that, "we never got an answer at
+    all").
+    """
+    if gh_ops is None:
+        return None
+    from coord.entry_truth import reconcile_entry  # noqa: PLC0415
+
+    try:
+        return reconcile_entry(board, config, entry.repo, entry.issue, gh_ops=gh_ops)
+    except Exception:  # noqa: BLE001 — a probe, never a decision
+        _log.debug(
+            "queue_diagnose: live_entry_truth failed for %s", entry.key, exc_info=True,
+        )
+        return None
 
 
 # ── trigger + budget + the pass ──────────────────────────────────────────────

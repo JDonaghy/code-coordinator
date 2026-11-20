@@ -29,6 +29,7 @@ from coord.board_doctor import (
     CAUSE_MERGE_NEVER_ATTEMPTED,
     CAUSE_MERGE_PENDING_STUCK,
     CAUSE_MERGED_PARTIAL,
+    CAUSE_NEXT_ACTION_UNPERFORMED,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
     CAUSE_STRANDED_PREREQ_BLOCKED,
@@ -36,6 +37,7 @@ from coord.board_doctor import (
     MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS,
     MECHANICAL_SWEEP_COUNTER_NAMESPACE,
     MERGE_PENDING_STALE_AFTER_SECONDS,
+    NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS,
     STRANDED_PREREQ_OPT_OUT_LABEL,
     TIER_ALERT,
     TIER_AUTO,
@@ -58,6 +60,7 @@ from coord.board_doctor import (
     idle_fleet_root_rows,
     merge_queue_rows,
     merged_partial_rows,
+    next_action_unperformed_rows,
     no_progress_rows,
     predicted_after_target_drop_reason,
     run_conflict_fix_ceiling_pending_sweep,
@@ -4933,6 +4936,398 @@ class TestSmokeNoVerdictRows:
         [row] = smoke_no_verdict_rows(board)
 
         assert row.key == "acme/widgets#10"
+
+
+class TestNextActionUnperformedRows:
+    """#4045: classify a row whose live gates already name a dispatchable
+    ``next_action`` that nothing has performed — the quadraui#2744 shape
+    (a fix leg's own review bound to the wrong assignment, so its gates kept
+    reading ``next_action=dispatch_review`` for ~50 minutes with no leg in
+    flight) and the quadraui#2528/#2531 ``next_action=merge`` shape.
+    """
+
+    @staticmethod
+    def _truth(next_action: str, reason: str = "x"):
+        return SimpleNamespace(next_action=next_action, next_action_reason=reason)
+
+    def test_dispatch_review_is_classified_once_aged_past_the_threshold(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=2744, state="running", launched_at=0.0,
+        )
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_DISPATCH_REVIEW),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        [row] = rows
+        assert row.key == entry.key
+        assert row.cause == CAUSE_NEXT_ACTION_UNPERFORMED
+        assert row.fresh is True
+        assert "dispatch_review" in row.evidence[-1]
+
+    def test_merge_is_classified_once_aged_past_the_threshold(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        entry = QueueEntry(repo="acme/widgets", issue=2528, state="blocked", reason_at=0.0)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_MERGE),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        [row] = rows
+        assert row.cause == CAUSE_NEXT_ACTION_UNPERFORMED
+        assert "merge" in row.evidence[-1]
+
+    def test_a_leg_in_flight_is_left_alone(self) -> None:
+        # `reconcile_entry`'s own worker-status check already resolves to
+        # WAIT whenever a leg is in flight — never read as dispatchable.
+        from coord.entry_truth import NEXT_ACTION_WAIT
+
+        entry = QueueEntry(repo="acme/widgets", issue=2745, state="running", launched_at=0.0)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_WAIT),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
+    def test_escalate_and_unknown_are_also_left_alone(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_ESCALATE, NEXT_ACTION_UNKNOWN
+
+        entry = QueueEntry(repo="acme/widgets", issue=2746, state="running", launched_at=0.0)
+
+        for action in (NEXT_ACTION_ESCALATE, NEXT_ACTION_UNKNOWN):
+            rows = next_action_unperformed_rows(
+                [entry],
+                covered_keys=frozenset(),
+                truth_of=lambda e, action=action: self._truth(action),
+                now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+            )
+            assert rows == []
+
+    def test_under_the_threshold_is_not_classified(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
+
+        entry = QueueEntry(repo="acme/widgets", issue=2747, state="running", launched_at=0.0)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_DISPATCH_REVIEW),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS - 1.0,
+        )
+
+        assert rows == []
+
+    def test_an_already_covered_key_is_skipped_without_probing(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
+
+        entry = QueueEntry(repo="acme/widgets", issue=2748, state="running", launched_at=0.0)
+        calls: list[str] = []
+
+        def _truth_of(e):
+            calls.append(e.key)
+            return self._truth(NEXT_ACTION_DISPATCH_REVIEW)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset({entry.key}),
+            truth_of=_truth_of,
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+        assert calls == []
+
+    def test_a_done_like_state_is_never_classified(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        entry = QueueEntry(repo="acme/widgets", issue=2749, state="done", reason_at=0.0)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_MERGE),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
+    def test_a_probe_failure_is_a_confirmed_skip_not_a_crash(self) -> None:
+        entry = QueueEntry(repo="acme/widgets", issue=2750, state="running", launched_at=0.0)
+
+        def _raise(e):
+            raise RuntimeError("gh unreachable")
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=_raise,
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
+    def test_a_none_truth_is_read_as_nothing_to_say(self) -> None:
+        entry = QueueEntry(repo="acme/widgets", issue=2751, state="running", launched_at=0.0)
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: None,
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
+    def test_waiting_row_with_every_prereq_landed_overrides_the_stale_stranded_text(
+        self,
+    ) -> None:
+        # The exact collision this cause must win: `last_reason` still
+        # reads the stale "waiting on X (open, not queued)" text
+        # `stranded_prereq_rows` keys off, but the dep has genuinely landed
+        # by now, and this row's OWN gates read a live, dispatchable
+        # `next_action`.
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=2744, state="waiting",
+            after=("acme/widgets#2172",), reason_at=0.0,
+            last_reason="waiting on acme/widgets#2172 (open, not queued)",
+        )
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_MERGE),
+            board_view=BoardView(
+                issues={"acme/widgets#2172": IssueFacts(issue_state="closed")},
+            ),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        [row] = rows
+        assert row.cause == CAUSE_NEXT_ACTION_UNPERFORMED
+
+    def test_waiting_row_with_an_unlanded_prereq_is_left_for_stranded_prereq(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=2174, state="waiting",
+            after=("acme/widgets#2172",), reason_at=0.0,
+            last_reason="waiting on acme/widgets#2172 (open, not queued)",
+        )
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_MERGE),
+            board_view=BoardView(
+                issues={"acme/widgets#2172": IssueFacts(issue_state="open")},
+            ),
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
+    def test_waiting_row_fails_closed_with_no_board_view_supplied(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        entry = QueueEntry(
+            repo="acme/widgets", issue=2175, state="waiting",
+            after=("acme/widgets#2172",), reason_at=0.0,
+            last_reason="waiting on acme/widgets#2172 (open, not queued)",
+        )
+
+        rows = next_action_unperformed_rows(
+            [entry],
+            covered_keys=frozenset(),
+            truth_of=lambda e: self._truth(NEXT_ACTION_MERGE),
+            board_view=None,
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert rows == []
+
+    def test_probe_cap_bounds_how_many_rows_are_probed_per_sweep(self) -> None:
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        entries = [
+            QueueEntry(repo="acme/widgets", issue=2800 + i, state="running", launched_at=0.0)
+            for i in range(3)
+        ]
+        calls: list[str] = []
+
+        def _truth_of(e):
+            calls.append(e.key)
+            return self._truth(NEXT_ACTION_MERGE)
+
+        rows = next_action_unperformed_rows(
+            entries,
+            covered_keys=frozenset(),
+            truth_of=_truth_of,
+            probe_cap=1,
+            now=NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS + 1.0,
+        )
+
+        assert len(calls) == 1
+        assert len(rows) == 1
+
+
+class TestNextActionUnperformedAllowlist:
+    """#4045: the cause is registered on the C2 auto allow-list, never the
+    generic investigate tier — the fix is a direct gated primitive
+    (restage/merge/mark_done), not a fresh fix-it leg."""
+
+    def test_allowlisted_as_restage_never_the_generic_fixit_leg(self) -> None:
+        import coord.board_doctor_policy as board_doctor_policy
+
+        assert board_doctor_policy.ALLOWLIST[CAUSE_NEXT_ACTION_UNPERFORMED] == "restage"
+        assert CAUSE_NEXT_ACTION_UNPERFORMED not in board_doctor_policy.INVESTIGATE_CAUSES
+        assert default_tier_of(CAUSE_NEXT_ACTION_UNPERFORMED) == TIER_AUTO
+
+
+class TestNextActionUnperformedDispatcher:
+    """#4045 acceptance: the auto tier re-derives the row's live gates right
+    before acting and performs the matching gated primitive through the
+    REAL :mod:`coord.board_doctor_permissions` plumbing. Only
+    ``coord.entry_truth.reconcile_entry`` is stubbed (its own derivation is
+    covered end-to-end by ``tests/test_entry_truth.py``); everything below
+    it — ``sweep_restage``'s own "newest completed work leg" pick,
+    ``coord.merge_queue``'s own merge primitives — is the REAL code.
+    """
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+
+    def _wire_board_and_config(self, monkeypatch, board: Board, config: Config) -> None:
+        import coord.board_doctor_policy as policy
+
+        monkeypatch.setattr(
+            policy, "_resolve_board_and_config_for_mechanical_action",
+            lambda *a, **k: (board, config),
+        )
+
+    def _dispatch(self, row: StuckRow) -> bool:
+        from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+        return AUTO_DISPATCHERS[CAUSE_NEXT_ACTION_UNPERFORMED](row)
+
+    def test_dispatches_a_review_of_the_newest_work_leg(self, monkeypatch) -> None:
+        # quadraui#2744 shape: the chain root's own review verdict is
+        # recorded against the ROOT assignment, so the newer fix leg still
+        # reads as never-reviewed.
+        root = Assignment(
+            machine_name="m1", repo_name="acme/widgets", issue_number=2744,
+            issue_title="t", assignment_id="root", type="work", status="done",
+            branch="issue-2744-root", dispatched_at=1.0,
+        )
+        root_review = Assignment(
+            machine_name="m2", repo_name="acme/widgets", issue_number=2744,
+            issue_title="t", assignment_id="root-review", type="review",
+            status="done", review_of_assignment_id="root",
+            review_verdict="request_changes", dispatched_at=2.0,
+        )
+        fix = Assignment(
+            machine_name="m1", repo_name="acme/widgets", issue_number=2744,
+            issue_title="t", assignment_id="fix", type="work", status="done",
+            branch="issue-2744-fix", dispatched_at=3.0,
+        )
+        board = Board(active=[], completed=[root, root_review, fix])
+        config = self._config()
+        self._wire_board_and_config(monkeypatch, board, config)
+
+        from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
+
+        monkeypatch.setattr(
+            "coord.entry_truth.reconcile_entry",
+            lambda *a, **k: SimpleNamespace(
+                next_action=NEXT_ACTION_DISPATCH_REVIEW,
+                next_action_reason="review required but not approved",
+            ),
+        )
+
+        dispatched_against: list[Assignment] = []
+
+        def _fake_dispatch_review(work, b, c):
+            dispatched_against.append(work)
+            work.review_state = "dispatched"
+            return SimpleNamespace(assignment_id="review-fresh")
+
+        monkeypatch.setattr("coord.review.dispatch_review", _fake_dispatch_review)
+
+        row = _row("acme/widgets#2744", CAUSE_NEXT_ACTION_UNPERFORMED)
+        performed = self._dispatch(row)
+
+        assert performed is True
+        assert dispatched_against == [fix]
+
+    def test_runs_the_gated_merge_for_an_approved_green_row(self, monkeypatch) -> None:
+        from coord import merge_queue as mq
+        from coord.entry_truth import NEXT_ACTION_MERGE
+
+        board = Board()
+        config = self._config()
+        self._wire_board_and_config(monkeypatch, board, config)
+
+        entry = mq.QueuedMerge(
+            assignment_id="w1", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-2528-fix", target_branch="main", issue_number=2528,
+            issue_title="t", state=mq.PENDING,
+        )
+        mq.save_queue([entry])
+
+        monkeypatch.setattr(
+            "coord.entry_truth.reconcile_entry",
+            lambda *a, **k: SimpleNamespace(
+                next_action=NEXT_ACTION_MERGE, next_action_reason="all gates clear",
+            ),
+        )
+        monkeypatch.setattr("coord.merge_queue.has_approved_review", lambda *a, **k: True)
+        landed_kind = next(iter(mq.MERGE_LANDED_KINDS))
+        monkeypatch.setattr(
+            "coord.merge_queue.process",
+            lambda *a, **k: [SimpleNamespace(kind=landed_kind, message="merged")],
+        )
+
+        row = _row("acme/widgets#2528", CAUSE_NEXT_ACTION_UNPERFORMED)
+        performed = self._dispatch(row)
+
+        assert performed is True
+
+    def test_a_row_whose_live_gates_no_longer_read_dispatchable_is_a_confirmed_noop(
+        self, monkeypatch,
+    ) -> None:
+        # Reality moved on between classification and this call (e.g. an
+        # operator already dispatched it by hand) — never a false success.
+        from coord.entry_truth import NEXT_ACTION_WAIT
+
+        board = Board()
+        config = self._config()
+        self._wire_board_and_config(monkeypatch, board, config)
+        monkeypatch.setattr(
+            "coord.entry_truth.reconcile_entry",
+            lambda *a, **k: SimpleNamespace(
+                next_action=NEXT_ACTION_WAIT, next_action_reason="a leg is now in flight",
+            ),
+        )
+
+        row = _row("acme/widgets#9999", CAUSE_NEXT_ACTION_UNPERFORMED)
+        performed = self._dispatch(row)
+
+        assert performed is False
 
 
 class TestStrandedPrereqDep:
