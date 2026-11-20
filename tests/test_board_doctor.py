@@ -43,6 +43,8 @@ from coord.board_doctor import (
     TIER_AUTO,
     StuckRow,
     _ceiling_blocked_ci_pending_candidates,
+    _ceiling_blocked_integration_red_candidates,
+    _dispatch_base_sync_fix,
     _episode_stuck_row,
     _reclassify_branch_merged_guard,
     _reclassify_ceiling_blocked,
@@ -64,6 +66,7 @@ from coord.board_doctor import (
     next_action_unperformed_rows,
     no_progress_rows,
     predicted_after_target_drop_reason,
+    run_base_sync_fix_ceiling_sweep,
     run_conflict_fix_ceiling_pending_sweep,
     run_followthrough_sweep,
     run_pending_refile_close_sweep,
@@ -100,7 +103,7 @@ from coord.drive_queue import (
     requeue_after_conflict_fix,
 )
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
-from coord.queue_diagnose import LiveState
+from coord.queue_diagnose import CheckReading, LiveState
 from coord.smoke import (
     ABANDONED_BACKGROUND_SMOKE_MARKER,
     ENVIRONMENTAL_SMOKE_MARKER,
@@ -10562,3 +10565,478 @@ class TestRunSweepConflictFixCeilingPending:
 
         assert called == []
         assert pending_row in captured_other_rows
+
+
+class TestCeilingBlockedIntegrationRedCandidates:
+    """#4050: coord.board_doctor._ceiling_blocked_integration_red_candidates
+    -- the narrow filter that picks out exactly the rows
+    run_base_sync_fix_ceiling_sweep should act on. Mirrors
+    TestCeilingBlockedCiPendingCandidates (#4036) exactly, swapping the
+    cause this carve-out exists for."""
+
+    def test_ceiling_blocked_fresh_integration_red_row_is_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 2726)
+        row = _row("acme/widgets#2726", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True)
+
+        assert _ceiling_blocked_integration_red_candidates([row]) == [
+            ("acme/widgets", 2726),
+        ]
+
+    def test_stale_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 802)
+        row = _row("acme/widgets#802", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=False)
+
+        assert _ceiling_blocked_integration_red_candidates([row]) == []
+
+    def test_not_ceiling_blocked_row_is_not_a_candidate(self) -> None:
+        row = _row("acme/widgets#803", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True)
+
+        assert _ceiling_blocked_integration_red_candidates([row]) == []
+
+    def test_unrelated_cause_on_a_ceiling_blocked_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 804)
+        row = _row("acme/widgets#804", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        assert _ceiling_blocked_integration_red_candidates([row]) == []
+
+    def test_merge_queue_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 805)
+        row = _row(
+            "acme/widgets#805", queue_diagnose.CAUSE_INTEGRATION_RED,
+            queue="merge-queue", fresh=True,
+        )
+
+        assert _ceiling_blocked_integration_red_candidates([row]) == []
+
+    def test_duplicate_rows_for_the_same_issue_dedupe_to_one_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 806)
+        row = _row("acme/widgets#806", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True)
+
+        assert _ceiling_blocked_integration_red_candidates([row, row]) == [
+            ("acme/widgets", 806),
+        ]
+
+    def test_low_confidence_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 807)
+        row = replace(
+            _row("acme/widgets#807", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True),
+            confidence=queue_diagnose.CONFIDENCE_LOW,
+        )
+
+        assert _ceiling_blocked_integration_red_candidates([row]) == []
+
+
+class TestLiveBaseSyncFixEvidence:
+    """#4050: coord.board_doctor._live_base_sync_fix_evidence -- the fresh
+    re-probe that must confirm the premise (cause still integration-red,
+    AND coord gates itself confirms a BASE MOVED divergence) before a
+    budget-free dispatch is ever authorized."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(repos=[], machines=[])
+
+    def test_no_drive_queue_row_is_not_confirmed(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        confirmed, detail = board_doctor_mod._live_base_sync_fix_evidence(
+            "acme/widgets", 2900, config=self._config(),
+        )
+
+        assert confirmed is False
+        assert "no drive-queue row" in detail
+
+    def test_a_probe_failure_is_not_confirmed(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2901)
+        monkeypatch.setattr(
+            queue_diagnose, "GhLiveProbe",
+            lambda **kw: SimpleNamespace(probe=lambda entry: (_ for _ in ()).throw(
+                RuntimeError("gh timed out"),
+            )),
+        )
+
+        confirmed, detail = board_doctor_mod._live_base_sync_fix_evidence(
+            "acme/widgets", 2901, config=self._config(),
+        )
+
+        assert confirmed is False
+        assert "re-probe failed" in detail
+
+    def test_a_live_reading_that_no_longer_confirms_the_cause_is_not_confirmed(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2902)
+        live = LiveState(mergeable=True, gate_ready=True, checks=())
+        monkeypatch.setattr(
+            queue_diagnose, "GhLiveProbe",
+            lambda **kw: SimpleNamespace(probe=lambda entry: live),
+        )
+
+        confirmed, detail = board_doctor_mod._live_base_sync_fix_evidence(
+            "acme/widgets", 2902, config=self._config(),
+        )
+
+        assert confirmed is False
+        assert "no longer confirms integration-red" in detail
+
+    def test_a_confirmed_cause_with_no_base_moved_note_is_not_confirmed(
+        self, monkeypatch,
+    ) -> None:
+        """#4050's own premise: `integration-red` alone (red checks, a
+        green branch Test verdict) is not enough to spend the budget-free
+        lane -- `coord gates` must positively confirm the BASE MOVED
+        divergence too."""
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2903)
+        live = LiveState(
+            checks=(CheckReading(name="ci", conclusion="failure"),),
+            branch_test_state="passed",
+            base_moved_note=None,
+        )
+        monkeypatch.setattr(
+            queue_diagnose, "GhLiveProbe",
+            lambda **kw: SimpleNamespace(probe=lambda entry: live),
+        )
+
+        confirmed, detail = board_doctor_mod._live_base_sync_fix_evidence(
+            "acme/widgets", 2903, config=self._config(),
+        )
+
+        assert confirmed is False
+        assert "does not confirm a BASE MOVED divergence" in detail
+
+    def test_a_confirmed_integration_red_cause_with_a_base_moved_note_is_confirmed(
+        self, monkeypatch,
+    ) -> None:
+        """The quadraui#2726 shape: no textual conflict, the branch's own
+        Test verdict already reads green, CI is red on the merge ref, and
+        `coord gates` positively confirms the base moved."""
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2726)
+        live = LiveState(
+            checks=(CheckReading(name="ci", conclusion="failure"),),
+            branch_test_state="passed",
+            base_moved_note="base moved: 3 commits ahead of the branch point",
+        )
+        monkeypatch.setattr(
+            queue_diagnose, "GhLiveProbe",
+            lambda **kw: SimpleNamespace(probe=lambda entry: live),
+        )
+
+        confirmed, detail = board_doctor_mod._live_base_sync_fix_evidence(
+            "acme/widgets", 2726, config=self._config(),
+        )
+
+        assert confirmed is True
+        assert "base moved: 3 commits" in detail
+
+
+class TestDispatchBaseSyncFix:
+    """#4050: coord.board_doctor._dispatch_base_sync_fix -- finds the live
+    merge-queue entry and dispatches the budget-free base-sync-fix
+    conflict-fix leg via coord.conflict_fix.dispatch_conflict_fix(...,
+    base_sync_fix=True), persisting the board only on a confirmed
+    dispatch."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+
+    @staticmethod
+    def _seed_merge_entry(issue_number: int) -> None:
+        from coord import merge_queue as mq
+
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id=f"w{issue_number}", repo_name="acme/widgets",
+                repo_github="acme/widgets", branch=f"issue-{issue_number}-fix",
+                target_branch="main", issue_number=issue_number,
+                issue_title="t", state=mq.PENDING,
+            ),
+        ])
+
+    def test_no_merge_queue_entry_is_not_dispatched(self) -> None:
+        result = _dispatch_base_sync_fix("acme/widgets", 2904, config=self._config())
+
+        assert result == {
+            "dispatched": False,
+            "detail": "acme/widgets#2904 has no merge-queue entry",
+        }
+
+    def test_dispatch_conflict_fix_declining_is_not_dispatched(self, monkeypatch) -> None:
+        self._seed_merge_entry(2905)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", lambda *a, **k: None)
+
+        result = _dispatch_base_sync_fix("acme/widgets", 2905, config=self._config())
+
+        assert result["dispatched"] is False
+        assert "could not be dispatched" in result["detail"]
+
+    def test_a_confirmed_dispatch_passes_base_sync_fix_and_writes_the_board(
+        self, monkeypatch,
+    ) -> None:
+        self._seed_merge_entry(2726)
+        captured_kwargs: dict = {}
+
+        def _fake_dispatch(entry, board, config, **kwargs):
+            captured_kwargs.update(kwargs)
+            fix = Assignment(
+                machine_name="laptop", repo_name=entry.repo_name,
+                issue_number=entry.issue_number, issue_title="[base-sync-fix] t",
+                assignment_id="fix-2726", status="running", branch=entry.branch,
+                type="conflict-fix",
+            )
+            board.active.append(fix)
+            return fix
+
+        written: list[Board] = []
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _fake_dispatch)
+        monkeypatch.setattr(
+            "coord.board_service.write_board", lambda board: written.append(board),
+        )
+
+        result = _dispatch_base_sync_fix("acme/widgets", 2726, config=self._config())
+
+        assert result == {
+            "dispatched": True,
+            "detail": "acme/widgets#2726: dispatched base-sync-fix fix-2726 on laptop",
+        }
+        assert captured_kwargs["base_sync_fix"] is True
+        assert len(written) == 1
+        assert any(a.assignment_id == "fix-2726" for a in written[0].active)
+
+
+class TestRunBaseSyncFixCeilingSweep:
+    """#4050: coord.board_doctor.run_base_sync_fix_ceiling_sweep -- wires
+    each candidate's fresh evidence confirmation to a dispatch via
+    injected evidence_fetcher/dispatcher doubles, mirroring
+    TestRunConflictFixCeilingPendingSweep (#4036) exactly."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(repos=[], machines=[])
+
+    def test_reports_one_result_per_candidate_using_the_injected_doubles(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 2726)
+        row = _row("acme/widgets#2726", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True)
+
+        fetched: list[tuple[str, int]] = []
+        dispatched: list[tuple[str, int]] = []
+
+        def _fetcher(repo_name, issue_number):
+            fetched.append((repo_name, issue_number))
+            return True, "confirmed"
+
+        def _dispatcher(repo_name, issue_number):
+            dispatched.append((repo_name, issue_number))
+            return {"dispatched": True, "detail": "dispatched fix-2726 on laptop"}
+
+        results = run_base_sync_fix_ceiling_sweep(
+            [row], config=self._config(),
+            evidence_fetcher=_fetcher, dispatcher=_dispatcher,
+        )
+
+        assert fetched == [("acme/widgets", 2726)]
+        assert dispatched == [("acme/widgets", 2726)]
+        assert results == [{
+            "repo": "acme/widgets", "issue": 2726, "dispatched": True,
+            "detail": "dispatched fix-2726 on laptop",
+        }]
+
+    def test_no_candidates_calls_neither_double(self) -> None:
+        row = _row("acme/widgets#808", queue_diagnose.CAUSE_GATE_BLOCKED, fresh=True)
+        called = []
+
+        results = run_base_sync_fix_ceiling_sweep(
+            [row], config=self._config(),
+            evidence_fetcher=lambda *a: called.append(a) or (False, ""),
+            dispatcher=lambda *a: called.append(a) or {"dispatched": False, "detail": ""},
+        )
+
+        assert results == []
+        assert called == []
+
+    def test_a_candidate_with_no_confirmation_is_deferred_without_dispatching(
+        self,
+    ) -> None:
+        """#4036 review's own "never assume the premise" rule, applied to
+        this cause: an unconfirmed evidence read must never reach the
+        dispatcher -- that would spend the budget-free lane on a row
+        whose live gates do not actually confirm the BASE MOVED
+        divergence."""
+        _seed_ceiling_blocked_entry("acme/widgets", 2906)
+        row = _row("acme/widgets#2906", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True)
+        dispatcher_calls = []
+
+        results = run_base_sync_fix_ceiling_sweep(
+            [row], config=self._config(),
+            evidence_fetcher=lambda *a: (False, "not confirmed yet"),
+            dispatcher=lambda *a: dispatcher_calls.append(a) or {
+                "dispatched": True, "detail": "should never be reached",
+            },
+        )
+
+        assert dispatcher_calls == []
+        assert results == [{
+            "repo": "acme/widgets", "issue": 2906, "dispatched": False,
+            "detail": "not confirmed yet",
+        }]
+
+
+class TestRunSweepBaseSyncFixCeiling:
+    """#4050: coord.board_doctor.run_sweep pulls a ceiling-blocked
+    CAUSE_INTEGRATION_RED row out of the generic tier/auto_dispatchers path
+    entirely -- the quadraui#2726 acceptance shape: a row ceiling-blocked
+    (4 work legs against a budget of 3) with `next_action: dispatch_ci_fix`
+    gets the budget-free base-sync-fix lane instead of the #3454 stop."""
+
+    def test_ceiling_blocked_row_skips_the_generic_dispatcher_and_is_dispatched(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2726)
+        integration_red_row = _row(
+            "acme/widgets#2726", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True,
+        )
+        other_row = _row("acme/widgets#2727", queue_diagnose.CAUSE_GATE_BLOCKED, fresh=True)
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([integration_red_row, other_row], Board()),
+        )
+
+        captured_other_rows: list = []
+
+        def _fake_sweep(rows, **kwargs):
+            captured_other_rows.extend(rows)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        def _fake_ceiling_sweep(rows, *, config):
+            assert integration_red_row in rows
+            return [{
+                "repo": "acme/widgets", "issue": 2726, "dispatched": True,
+                "detail": "dispatched base-sync-fix fix-2726 on laptop",
+            }]
+
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            base_sync_fix_ceiling_sweep=_fake_ceiling_sweep,
+        )
+
+        # Never handed to the generic dispatcher: #3454 already refuses a
+        # fresh fix-it leg against a row this ceiling-blocked, so this row
+        # must never reach that path at all -- it is already known to
+        # have a budget-free remedy instead.
+        assert integration_red_row not in captured_other_rows
+        assert other_row in captured_other_rows
+
+        assert report.base_sync_fix_ceiling_dispatch == [{
+            "repo": "acme/widgets", "issue": 2726, "dispatched": True,
+            "detail": "dispatched base-sync-fix fix-2726 on laptop",
+        }]
+
+    def test_a_prior_escalations_convergence_counter_is_preserved(
+        self, monkeypatch,
+    ) -> None:
+        """Mirrors #4036's own equivalent test: excluding this row from the
+        generic tier/dispatch path must mark it `suppressed=True` (present)
+        rather than drop it outright -- dropping it would let
+        `clear_absent_rows` read the vanish as "resolved" and dismiss a
+        live escalation the row may have earned under an EARLIER cause."""
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2728)
+        key = "acme/widgets#2728"
+
+        sweep([_row(key, "merge-conflict")], tier_of=_always(TIER_ALERT), alert_dispatcher=lambda row: True)
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is True
+
+        integration_red_row = _row(
+            "acme/widgets#2728", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True,
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([integration_red_row], Board()),
+        )
+
+        resolved: list[tuple[str, str]] = []
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            escalation_resolver=lambda queue, k: resolved.append((queue, k)),
+            base_sync_fix_ceiling_sweep=lambda rows, **kw: [{
+                "repo": "acme/widgets", "issue": 2728, "dispatched": False,
+                "detail": "not confirmed yet",
+            }],
+        )
+
+        assert resolved == []
+        row_state = state.board_doctor_row_state("drive-queue", key)
+        assert row_state["escalated"] is True
+        assert row_state["count"] >= 1
+
+    def test_dry_run_never_invokes_the_ceiling_sweep(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2729)
+        integration_red_row = _row(
+            "acme/widgets#2729", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True,
+        )
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([integration_red_row], Board()),
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "sweep",
+            lambda rows, **kwargs: board_doctor_mod.SweepReport(sweep_id="s1"),
+        )
+
+        called = []
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            dry_run=True,
+            base_sync_fix_ceiling_sweep=lambda rows, **kw: called.append(rows) or [],
+        )
+
+        assert called == []
+        assert report.base_sync_fix_ceiling_dispatch == []
+
+    def test_opt_out_flag_leaves_the_row_on_the_generic_path(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 2730)
+        integration_red_row = _row(
+            "acme/widgets#2730", queue_diagnose.CAUSE_INTEGRATION_RED, fresh=True,
+        )
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([integration_red_row], Board()),
+        )
+
+        captured_other_rows: list = []
+
+        def _fake_sweep(rows, **kwargs):
+            captured_other_rows.extend(rows)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        called = []
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            base_sync_fix_ceiling_dispatch=False,
+            base_sync_fix_ceiling_sweep=lambda rows, **kw: called.append(rows) or [],
+        )
+
+        assert called == []
+        assert integration_red_row in captured_other_rows
