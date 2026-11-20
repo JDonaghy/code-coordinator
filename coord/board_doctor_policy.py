@@ -1565,22 +1565,22 @@ NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR = "COORD_BOARD_DOCTOR_NO_CONFIG_DRIFT_AUTOFIX"
 
 
 def _config_drift_autofix_enabled(repo_name: str, config: "Config") -> bool:
-    """Whether the #4035 config-drift autofix disposition may WRITE for
-    *repo_name* — same three-gate shape as :func:`_stale_race_tier_enabled`,
-    but the per-repo polarity of ``auto_refile``/``auto_split``: this
-    writes ``coordinator.yml``, a strictly more consequential action than
-    ordering an existing retry, so it needs an explicit, per-repo opt-in
-    rather than participating by default.
+    """Whether *repo_name* has opted in to the #4035 config-drift autofix
+    disposition — same three-gate shape as
+    :func:`_stale_race_tier_enabled`, but the per-repo polarity of
+    ``auto_refile``/``auto_split``.
 
     1. :data:`NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR` — a process-wide kill switch.
     2. ``board_doctor.config_drift_autofix`` — the fleet-wide config switch.
     3. ``repos[].board_doctor.config_drift_autofix`` — the per-repo opt-in,
        default ``False`` (:class:`~coord.models.BoardDoctorRepoConfig`).
 
-    ``False`` here never means "no config drift exists" — see
-    :func:`plan_config_drift_fix`, which still computes and returns the
-    one-line patch as an alert regardless of this switch; it means only
-    that nothing may apply that patch automatically.
+    Today this decides only :func:`plan_config_drift_fix`'s
+    ``ConfigDriftFix.enabled``/``patched_command`` fields and the wording
+    of its ``alert_message`` — nothing yet writes ``coordinator.yml`` or
+    commits in ``coord-settings`` for either outcome, so ``True`` here
+    does not mean a patch gets applied automatically; a human still acts
+    on ``alert_message`` either way.
     """
     if os.environ.get(NO_CONFIG_DRIFT_AUTOFIX_ENV_VAR):
         return False
@@ -1598,10 +1598,13 @@ class ConfigDriftFix:
     ONLY when the autofix disposition is enabled for the repo AND the
     token was found exactly once in the command (see
     :func:`coord.smoke.remove_dangling_target_token` — ambiguous or
-    absent matches refuse rather than guess). Whenever it is ``None``, a
-    human must act on ``alert_message`` instead — which is always
-    populated, independent of ``enabled``, so the row is never left
-    silently unexplained.
+    absent matches refuse rather than guess). Nothing in this codebase
+    reads ``patched_command`` today — there is no action yet that writes
+    it back to the live, symlinked ``coordinator.yml`` or commits in the
+    ``coord-settings`` repo, so a human must always act on
+    ``alert_message`` instead, which is always populated, independent of
+    ``enabled``, so the row is never left silently unexplained, and never
+    claims the patch was applied.
     """
 
     enabled: bool
@@ -1617,13 +1620,16 @@ def plan_config_drift_fix(
     ``"repos[quadraui].ci_command"`` — :class:`coord.smoke.SmokeCommand.
     source`).
 
-    Never mutates anything — this only COMPUTES the patch; applying it to
-    the live, symlinked ``coordinator.yml`` and committing the change in
-    the ``coord-settings`` repo is the caller's job. Edits exactly the
-    matched *token* (:func:`coord.smoke.remove_dangling_target_token`),
-    never anything else in *command* — a *token* that is absent, or
-    appears more than once, produces no ``patched_command`` at all, only
-    the alert naming the exact one-line patch for a human to apply.
+    Never mutates anything, and never claims to have: this only COMPUTES
+    the patch. Nothing writes it back to the live, symlinked
+    ``coordinator.yml`` or commits the change in the ``coord-settings``
+    repo, so ``alert_message`` always describes the patch
+    PROSPECTIVELY — "apply this" rather than "applied this" — regardless
+    of ``enabled``. Edits exactly the matched *token* (:func:`coord.smoke.
+    remove_dangling_target_token`), never anything else in *command* — a
+    *token* that is absent, or appears more than once, produces no
+    ``patched_command`` at all, only the alert naming the exact one-line
+    patch for a human to apply.
     """
     from coord.smoke import remove_dangling_target_token  # noqa: PLC0415
 
@@ -1632,8 +1638,8 @@ def plan_config_drift_fix(
 
     if patched is not None:
         alert_message = (
-            f"{repo_name}: removed the dangling `{token}` from {source} "
-            f"(#4035) — new command: `{patched}`"
+            f"{repo_name}: {source} still runs the dangling `{token}` "
+            f"(#4035) — apply this one-line patch to clear it: `{patched}`"
         )
     else:
         alert_message = (

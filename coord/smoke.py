@@ -2110,9 +2110,14 @@ def _fetch_deleted_files(repo_github: str, branch: str) -> list[str]:
     indistinguishable from one it deleted outright. The PR-files REST
     endpoint does carry one (``added``/``removed``/``modified``/
     ``renamed``), so this goes one level lower to it instead of trying to
-    infer deletion from byte counts. Returns an empty list on any lookup
-    failure, matching `_fetch_touched_files`'s own fail-open posture — the
-    caller then simply finds no config-drift target, never a false one.
+    infer deletion from byte counts. ``--paginate``, like every sibling
+    unpaginated REST listing in :mod:`coord.github_ops`
+    (``list_remote_branch_names``, ``get_repo_milestones``, ...) — GitHub
+    caps an unpaginated page at 30 files, so a PR touching more than that
+    would otherwise silently see only its first page of deletions. Returns
+    an empty list on any lookup failure, matching `_fetch_touched_files`'s
+    own fail-open posture — the caller then simply finds no config-drift
+    target, never a false one.
     """
     pr = None
     try:
@@ -2123,7 +2128,7 @@ def _fetch_deleted_files(repo_github: str, branch: str) -> list[str]:
         return []
     try:
         raw = github_ops._gh(
-            "api", f"repos/{repo_github}/pulls/{pr['number']}/files",
+            "api", "--paginate", f"repos/{repo_github}/pulls/{pr['number']}/files",
             "--jq", '.[] | select(.status=="removed") | .filename',
             caller="smoke._fetch_deleted_files",
         )
@@ -2211,8 +2216,10 @@ def config_drift_target_in_command(
 
 
 def remove_dangling_target_token(command: str, token: str) -> str | None:
-    """Remove *token* from *command*, collapsing the extra whitespace it
-    leaves behind (#4035's fix path).
+    """Remove *token* from *command*, closing only the whitespace gap its
+    removal leaves at that splice point (#4035's fix path) — never
+    touching whitespace anywhere else in *command*, since nothing except
+    the matched *token* may be edited.
 
     Returns ``None`` — never editing *command* at all — when *token*
     does not appear in it, or appears more than once: which exact
@@ -2221,8 +2228,11 @@ def remove_dangling_target_token(command: str, token: str) -> str | None:
     """
     if command.count(token) != 1:
         return None
-    replaced = command.replace(token, "", 1)
-    return re.sub(r"[ \t]{2,}", " ", replaced).strip()
+    index = command.index(token)
+    before = command[:index].rstrip(" \t")
+    after = command[index + len(token):].lstrip(" \t")
+    gap = " " if before and after else ""
+    return f"{before}{gap}{after}".strip()
 
 
 # ── Unroutable reporting (#1672) ────────────────────────────────────────────
@@ -3392,13 +3402,15 @@ def _gate_config_drift_target_deleted(
     running the suite only burns a round on a config fault, repeating
     identically next time.
 
-    Narrow by construction: :func:`config_drift_target_in_command` only
-    even LOOKS at the diff when the resolved command names a cargo target
-    at all (most commands name none, so this is a no-op for them), and
-    only confirms a hit against :func:`_fetch_deleted_files`'s own
-    positive "removed" status — never against *touched* alone, which
-    would also match an ordinary edit to the same file and misclassify a
-    real regression as drift.
+    Narrow by construction, and cheapest-check-first: this never calls
+    :func:`_fetch_deleted_files` (a `gh` round-trip) unless the resolved
+    command already names a cargo target via
+    :func:`cargo_target_flags_in_command` — most commands name none, so
+    this is a no-op for them with zero `gh` traffic. Only once that local
+    filter passes does :func:`config_drift_target_in_command` confirm a
+    hit against `_fetch_deleted_files`'s own positive "removed" status —
+    never against *touched* alone, which would also match an ordinary
+    edit to the same file and misclassify a real regression as drift.
 
     Mirrors `_gate_zero_commit_branch`/`_gate_already_terminal_work`'s own
     shape: records a `blocked` Test verdict (never `failed` — nothing
@@ -3408,6 +3420,14 @@ def _gate_config_drift_target_deleted(
     smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
     command_obj = resolve_smoke_command(repo, smoke_cfg, touched)
     if not command_obj.command:
+        return False
+
+    # Cheap, local filter FIRST (#4035 review): most commands name no
+    # cargo target at all, so this must rule those out before spending a
+    # `gh` round-trip — `_fetch_deleted_files` runs on every Test-stage
+    # dispatch for every repo, and the fleet-wide throttle/backoff (#2809)
+    # pays for every one of those calls whether or not it ever finds drift.
+    if not cargo_target_flags_in_command(command_obj.command):
         return False
 
     deleted = _fetch_deleted_files(repo.github, completed.branch)

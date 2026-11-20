@@ -8168,6 +8168,16 @@ class TestRemoveDanglingTargetToken:
 
         assert smoke.remove_dangling_target_token(command, "--example win_panel") is None
 
+    def test_whitespace_elsewhere_in_the_command_is_left_untouched(self) -> None:
+        # Only the gap the removed token leaves behind may be closed — a
+        # pre-existing double space somewhere else in the command is not
+        # part of the matched token and must survive unedited.
+        command = "cargo clippy  --workspace --example win_panel -- -D warnings"
+
+        result = smoke.remove_dangling_target_token(command, "--example win_panel")
+
+        assert result == "cargo clippy  --workspace -- -D warnings"
+
 
 class TestGateConfigDriftTargetDeleted:
     """`coord.smoke._gate_config_drift_target_deleted` — the Prevent-step
@@ -8233,10 +8243,13 @@ class TestGateConfigDriftTargetDeleted:
         assert completed.test_state is None
 
     def test_a_command_naming_no_cargo_target_never_blocks(self, monkeypatch) -> None:
-        monkeypatch.setattr(
-            "coord.smoke._fetch_deleted_files",
-            lambda repo_github, branch: ["examples/win_panel.rs"],
-        )
+        # Also the #4035 review's cost fix: a command naming no cargo
+        # target at all must rule itself out WITHOUT ever calling the
+        # `gh`-backed `_fetch_deleted_files`.
+        def _unexpected(repo_github: str, branch: str) -> list[str]:
+            raise AssertionError("_fetch_deleted_files must not be called")
+
+        monkeypatch.setattr("coord.smoke._fetch_deleted_files", _unexpected)
         completed = self._assignment()
         config = self._config("npm test")
         repo = config.repo("widgets")
@@ -8257,7 +8270,48 @@ class TestConfigDriftRows:
     def _config() -> Config:
         return Config(repos=[Repo(name="widgets", github="acme/widgets")], machines=[])
 
+    @staticmethod
+    def _config_with_ci_command(ci_command: str) -> Config:
+        return Config(
+            repos=[Repo(name="widgets", github="acme/widgets", ci_command=ci_command)],
+            machines=[],
+        )
+
     def test_a_confirmed_dangling_target_produces_a_config_drift_row(self) -> None:
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2695,
+            issue_title="issue-2695-remove-panel",
+            assignment_id="aid-2695",
+            status="done",
+            branch="issue-2695-remove-panel",
+            type="work",
+            test_state="failed",
+            test_reason=(
+                "error: no example target named `win_panel` in `quadraui` package"
+            ),
+        )
+        board = Board(completed=[assignment])
+
+        rows = config_drift_rows(
+            board,
+            self._config_with_ci_command(
+                "cargo clippy --workspace --example win_panel"
+            ),
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        [row] = rows
+        assert row.queue == "config-drift"
+        assert row.key == "widgets#2695"
+        assert row.cause == queue_diagnose.CAUSE_CONFIG_DRIFT
+        assert "win_panel" in row.evidence[0]
+
+    def test_no_resolvable_command_produces_no_row(self) -> None:
+        # The repo has no ci_command/default_command/test_command at all —
+        # the cause can't be confirmed against anything TODAY, so this
+        # must not mint a row off the stored `test_reason` snapshot alone.
         assignment = Assignment(
             machine_name="m1",
             repo_name="widgets",
@@ -8279,11 +8333,37 @@ class TestConfigDriftRows:
             diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
         )
 
-        [row] = rows
-        assert row.queue == "config-drift"
-        assert row.key == "widgets#2695"
-        assert row.cause == queue_diagnose.CAUSE_CONFIG_DRIFT
-        assert "win_panel" in row.evidence[0]
+        assert rows == []
+
+    def test_a_command_that_no_longer_names_the_token_produces_no_row(self) -> None:
+        # The stored `test_reason` is a stale snapshot: coordinator.yml has
+        # already moved past `--example win_panel` since that round. The
+        # cause must be disconfirmed by TODAY's resolved command, not kept
+        # alive by the stale text (#4035 review — "a snapshot too stale to
+        # contradict anything").
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2695,
+            issue_title="issue-2695-remove-panel",
+            assignment_id="aid-2695",
+            status="done",
+            branch="issue-2695-remove-panel",
+            type="work",
+            test_state="failed",
+            test_reason=(
+                "error: no example target named `win_panel` in `quadraui` package"
+            ),
+        )
+        board = Board(completed=[assignment])
+
+        rows = config_drift_rows(
+            board,
+            self._config_with_ci_command("cargo clippy --workspace"),
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        assert rows == []
 
     def test_a_configured_command_surfaces_the_exact_one_line_patch(self) -> None:
         # When the repo's TODAY-configured command still names the same
@@ -8342,6 +8422,31 @@ class TestConfigDriftRows:
             board, self._config(),
             diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
         )
+
+        assert rows == []
+
+    def test_an_ordinary_failure_never_calls_the_diff_lookup(self) -> None:
+        # The cheap local parse of `test_reason` must rule this out BEFORE
+        # a `gh`-backed `diff_lookup` is ever called (#4035 review: don't
+        # spend fleet-wide `gh` traffic before the cheap filter).
+        assignment = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2696,
+            issue_title="issue-2696-x",
+            assignment_id="aid-2696",
+            status="done",
+            branch="issue-2696-x",
+            type="work",
+            test_state="failed",
+            test_reason="FAILED tests/test_panel.py::test_render - AssertionError",
+        )
+        board = Board(completed=[assignment])
+
+        def _lookup(repo_github: str, branch: str) -> list[str]:
+            raise AssertionError("diff_lookup must not be called")
+
+        rows = config_drift_rows(board, self._config(), diff_lookup=_lookup)
 
         assert rows == []
 
@@ -8410,7 +8515,7 @@ class TestPlanConfigDriftFix:
             machines=[],
         )
 
-    def test_opted_in_with_a_single_match_applies_the_patch(self) -> None:
+    def test_opted_in_with_a_single_match_computes_the_patch(self) -> None:
         plan = board_doctor_policy_mod.plan_config_drift_fix(
             "widgets",
             command="cargo clippy --workspace --example win_panel -- -D warnings",
@@ -8421,7 +8526,12 @@ class TestPlanConfigDriftFix:
 
         assert plan.enabled is True
         assert plan.patched_command == "cargo clippy --workspace -- -D warnings"
-        assert "removed" in plan.alert_message
+        # Nothing applies this patch today — the wording must stay
+        # prospective ("apply this patch"), never claim the edit already
+        # happened (#4035 review).
+        assert "removed" not in plan.alert_message
+        assert "apply" in plan.alert_message
+        assert "cargo clippy --workspace -- -D warnings" in plan.alert_message
 
     def test_opted_out_never_applies_but_still_alerts_with_the_one_line_patch(
         self,

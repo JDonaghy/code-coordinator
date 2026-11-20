@@ -2120,17 +2120,27 @@ def config_drift_rows(
     `gh` failure) never manufactures a hit — it just finds nothing, the
     same fail-open posture every other probe in this module takes.
 
-    Once a row is confirmed, the evidence line is
-    :func:`coord.board_doctor_policy.plan_config_drift_fix`'s own
-    ``alert_message`` whenever the issue's TODAY-configured command still
-    names the SAME target (the common case) — the exact one-line
+    The row's cause must stay FALSIFIABLE by the thing it accuses
+    (#4035 review): ``assignment.test_reason`` is a stored snapshot from
+    whatever round wrote it, so confirming only against that snapshot and
+    the diff would keep minting the same row every sweep even after an
+    operator (or the autofix path) removes the token from
+    ``coordinator.yml`` — the exact "a snapshot too stale to contradict
+    anything" shape epic #2096 names. So a row is minted ONLY when the
+    repo's TODAY-resolved command (:func:`coord.smoke.
+    resolve_smoke_command`) still carries the matching token; once it
+    does, the evidence line is :func:`coord.board_doctor_policy.
+    plan_config_drift_fix`'s own ``alert_message`` — the exact one-line
     coordinator.yml patch a human (or, opted in, the doctor itself) would
-    apply — falling back to a plainer description only when the command
-    has already moved on from the failure's own snapshot of it.
+    apply.
     """
     from coord.board_doctor_policy import plan_config_drift_fix  # noqa: PLC0415
     from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
-    from coord.queue_diagnose import CAUSE_CONFIG_DRIFT, classify_config_drift  # noqa: PLC0415
+    from coord.queue_diagnose import (  # noqa: PLC0415
+        CAUSE_CONFIG_DRIFT,
+        classify_config_drift,
+        extract_dangling_cargo_target,
+    )
     from coord.smoke import (  # noqa: PLC0415
         SmokeTestsConfig,
         TEST_STATE_BLOCKED,
@@ -2152,6 +2162,11 @@ def config_drift_rows(
         key = f"{assignment.repo_name}#{assignment.issue_number}"
         if key in seen:
             continue
+        # Cheap, local filter FIRST (#4035 review): most failures don't
+        # even name a dangling cargo target, so rule those out before
+        # spending a `gh` round-trip on `lookup` below.
+        if extract_dangling_cargo_target(assignment.test_reason) is None:
+            continue
         repo = config.repo(assignment.repo_name)
         if repo is None:
             continue
@@ -2163,36 +2178,37 @@ def config_drift_rows(
             continue
         kind, name = found
 
-        evidence = (
-            f"dangling cargo {kind} target {name!r} — confirmed deleted by "
-            "this branch's own diff (#4035)"
-        )
         smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
         command_obj = resolve_smoke_command(repo, smoke_cfg, deleted)
-        if command_obj.command:
-            token = next(
-                (
-                    tok for k, n, tok in cargo_target_flags_in_command(
-                        command_obj.command,
-                    )
-                    if k == kind and n == name
-                ),
-                None,
-            )
-            if token is not None:
-                plan = plan_config_drift_fix(
-                    assignment.repo_name, command=command_obj.command,
-                    source=command_obj.source, token=token, config=config,
+        if not command_obj.command:
+            continue
+        token = next(
+            (
+                tok for k, n, tok in cargo_target_flags_in_command(
+                    command_obj.command,
                 )
-                evidence = plan.alert_message
+                if k == kind and n == name
+            ),
+            None,
+        )
+        if token is None:
+            # The command resolved TODAY no longer carries the token the
+            # stored `test_reason` complained about — the config may
+            # already have moved on since that snapshot was written, so
+            # this cause can no longer be confirmed against it.
+            continue
 
+        plan = plan_config_drift_fix(
+            assignment.repo_name, command=command_obj.command,
+            source=command_obj.source, token=token, config=config,
+        )
         seen[key] = StuckRow(
             queue="config-drift",
             key=key,
             state="blocked",
             cause=CAUSE_CONFIG_DRIFT,
             confidence=queue_diagnose.CONFIDENCE_HIGH,
-            evidence=(evidence,),
+            evidence=(plan.alert_message,),
             fresh=True,
         )
     return list(seen.values())
