@@ -5301,6 +5301,54 @@ def test_dispatch_scoped_reviews_for_queue_dispatches_after_fix_round(
     assert dispatched[0].review_scope_base_sha == prior.review_head_sha
 
 
+def test_dispatch_scoped_reviews_for_queue_stamps_review_scoped_work_id_on_newest_leg(
+    two_machine_config: Config,
+) -> None:
+    """#4044: a merge-queue-sourced entry's own ``assignment_id`` can lag a
+    round behind — ``coord.merge_queue.refresh_entry_assignment`` only
+    re-keys it to a newer round ON APPROVAL, so a request-changes bounce
+    with a live queue entry (exactly ``_scoped_entry``'s default
+    ``assignment_id="w1"``, the chain root, here) leaves it pointed at the
+    STALE round. The dispatched review's ``review_scoped_work_id`` must
+    still resolve to the actual newest done work leg (``fix1``), not that
+    stale id — else ``propagate_review_verdict`` attributes the eventual
+    verdict to the root instead of the fix round the review actually
+    covered (quadraui#2744/#2531 reproduced this after #4029 covered only
+    the operator ``coord review`` path)."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    fix_round = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[fix-1] t", assignment_id="fix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, fix_round])
+    # Stale on purpose: still keyed to the root, exactly as a live queue
+    # entry reads before `refresh_entry_assignment` ever re-keys it.
+    entry = _scoped_entry(state=mq.PENDING, assignment_id="w1")
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-fr2"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert len(dispatched) == 1
+    # The #3310 claim key must still anchor to the stale round...
+    assert dispatched[0].review_of_assignment_id == "w1"
+    # ...but the dispatch-time-recorded resolution must name the ACTUAL
+    # round under review, not the stale queue-entry id.
+    assert dispatched[0].review_scoped_work_id == "fix1"
+
+
 def test_dispatch_scoped_reviews_for_queue_falls_back_when_fix_still_running(
     two_machine_config: Config,
 ) -> None:

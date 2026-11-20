@@ -6894,6 +6894,35 @@ def dispatch_scoped_review(
             release_review_item_lease(*_item_lease_key)
             _item_lease_key = None
 
+    # #4044: `entry.assignment_id` is NOT reliably the work leg this review
+    # actually covers. `maybe_scoped_review_for_completed_fix`'s synthesized
+    # throwaway entry keys it on the just-finished fix leg, so it's correct
+    # there — but `dispatch_scoped_reviews_for_queue`'s merge-queue sweep
+    # passes a REAL, DB-persisted `QueuedMerge`, and
+    # `coord.merge_queue.refresh_entry_assignment` only re-keys its
+    # `assignment_id` to a newer round ON APPROVAL. A request-changes
+    # bounce with a live queue entry therefore leaves `entry.assignment_id`
+    # pointed at the round `only_bounded_fix_since_review` just confirmed
+    # this delta SUPERSEDES — the review's `review_scoped_work_id` then
+    # names a stale round (often the chain root) instead of the fix leg it
+    # actually reviewed. That stale-but-real id passes
+    # `propagate_review_verdict`'s #4029 validation (it IS a done work leg
+    # on this repo/issue — just not the newest one), so the #4029 guard
+    # never fires and the verdict is attributed to the wrong round.
+    # `newest_done_work_leg` is the same answer the Review gate itself uses
+    # (`coord.review.superseded_review_gap`), so this can never disagree
+    # with what "the current round" means elsewhere — and it resolves to
+    # the identical id `entry.assignment_id` already carries whenever that
+    # id IS current, so this is a no-op for every other caller.
+    _current_work_leg = newest_done_work_leg(
+        board, entry.repo_name, _item_issue,
+    )
+    _review_scoped_work_id = (
+        _current_work_leg.assignment_id
+        if _current_work_leg is not None
+        else entry.assignment_id
+    )
+
     client = http_client or httpx
     try:
         for machine, _same_as_worker in candidates:
@@ -7004,21 +7033,19 @@ def dispatch_scoped_review(
                 # #1476 audit trail.
                 review_scoped=True,
                 review_scope_base_sha=prior_review.review_head_sha,
-                # #4029: the work-like assignment this scoped review
-                # ACTUALLY reviews, as best known at dispatch time.
-                # `entry.assignment_id` usually names the branch's current
-                # work leg, but a request-changes bounce with a live queue
-                # entry can leave it keyed to an EARLIER round —
-                # `mq.refresh_entry_assignment` only re-keys the entry ON
-                # APPROVAL, after a scoped re-review has already dispatched
-                # against it. `propagate_review_verdict` treats this as one
-                # input, not the final answer: it composes it with the
-                # issue's newest done work leg rather than trusting it
+                # #4029/#4044: the work-like assignment this scoped review
+                # ACTUALLY reviews, resolved above via `newest_done_work_leg`
+                # rather than trusted off `entry.assignment_id` directly —
+                # see that computation's comment for why a merge-queue-
+                # sourced entry's `assignment_id` can lag a round behind.
+                # `propagate_review_verdict` still treats this as one input,
+                # not the final answer: it composes it with its own
+                # newest-done-work-leg read rather than trusting it
                 # unconditionally. Deliberately NOT stored in
                 # `review_of_assignment_id` itself, which must keep carrying
                 # the #3310 claim key (`prior_review.review_of_assignment_id`)
                 # so this dispatch's claim still releases correctly.
-                review_scoped_work_id=entry.assignment_id,
+                review_scoped_work_id=_review_scoped_work_id,
             )
             board.active.append(review_assignment)
 
