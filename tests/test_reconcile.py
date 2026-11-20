@@ -895,6 +895,89 @@ class TestReassignPlacementGate:
         assert "no machine declares the capability" in msg
         assert "windows" in msg
 
+    def test_diagnostic_names_the_paused_capability_routed_host_not_the_missing_capability(
+        self,
+    ) -> None:
+        """#4056 review: `route_work_by_capability` excludes PAUSED
+        machines before scoring, so the windows-capable host being paused
+        also surfaces as `unmet_capabilities=("windows",)` — exactly like
+        the genuinely-unconfigured case above. The diagnostic must tell
+        these apart: dell64 DOES declare windows here, it's just paused,
+        so the message must name dell64 as paused, not falsely claim no
+        machine declares the capability at all."""
+        from coord.reconcile import describe_no_candidate_machines
+
+        cfg = self._cfg()
+        failed = _failed(
+            machine_name="precision", repo_name="quadraui",
+            issue_title="[win] Service the control channel",
+        )
+
+        from coord.machine_pause import local_pause  # noqa: PLC0415
+
+        local_pause("dell64")
+        msg = describe_no_candidate_machines(failed, Board(), cfg)
+
+        assert "capability-routed machine 'dell64' is paused" in msg
+        assert "no machine declares the capability" not in msg
+
+    def test_diagnostic_checks_repo_path_before_looks_free(self) -> None:
+        """#4056 review: the pinned machine is configured in
+        coordinator.yml but has no `repo_paths` entry for this repo —
+        `_reassign`'s own `eligible()` would refuse it on that basis, so
+        the diagnostic must name that reason instead of falling through
+        to the misleading "looks free" fallback."""
+        from coord.reconcile import describe_no_candidate_machines
+
+        cfg = self._cfg()
+        cfg.machines.append(
+            Machine(
+                name="offline-win", host="offline-win.tailnet",
+                repos=["quadraui"], repo_paths={}, capabilities=["windows"],
+            )
+        )
+        failed = _failed(machine_name="dell64", repo_name="quadraui")
+
+        msg = describe_no_candidate_machines(
+            failed, Board(), cfg,
+            pinned_machine_fetcher=lambda repo, num: "offline-win",
+        )
+
+        assert "pinned machine 'offline-win' has no repo_paths entry" in msg
+        assert "looks free" not in msg
+
+    def test_diagnostic_checks_fleet_cap_before_looks_free(self) -> None:
+        """#4056 review: the pinned machine has headroom on its OWN cap,
+        but the fleet-wide budget (`concurrency.max_workers`) is
+        exhausted by other machines — `_reassign` itself refuses on the
+        #1417 fleet-wide cap before ever selecting a machine, so the
+        diagnostic must not claim the pinned host "looks free"."""
+        from coord.reconcile import describe_no_candidate_machines
+
+        cfg = self._cfg()
+        assert cfg.concurrency.max_workers == 2
+        board = Board(
+            active=[
+                _failed(
+                    machine_name="precision", status="running",
+                    assignment_id="r1", issue_number=10,
+                ),
+                _failed(
+                    machine_name="precision", status="running",
+                    assignment_id="r2", issue_number=11,
+                ),
+            ]
+        )
+        failed = _failed(machine_name="dell64", repo_name="quadraui")
+
+        msg = describe_no_candidate_machines(
+            failed, board, cfg,
+            pinned_machine_fetcher=lambda repo, num: "dell64",
+        )
+
+        assert "fleet at capacity" in msg
+        assert "looks free" not in msg
+
 
 # ── CLI: `coord retry` ───────────────────────────────────────────────────
 

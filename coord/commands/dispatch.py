@@ -448,6 +448,7 @@ def approve(
             machines=cfg.machines,
             capability_rules=cfg.smoke_tests.capability_rules,
             repo_requires=repo_cfg_for_routing.requires if repo_cfg_for_routing else (),
+            issue_title=p.issue_title,
         )
         if routing is not None and routing.rerouted:
             click.echo(
