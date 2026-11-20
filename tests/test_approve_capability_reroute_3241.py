@@ -222,3 +222,47 @@ class TestApproveCapabilityReroute:
         assert mock_dispatch.call_count == 2
         for call in mock_dispatch.call_args_list:
             assert call.args[0].machine_name == "macmini"
+
+    def test_title_tag_reroute_with_no_capability_file_match(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """#4056: `approve()`'s own pre-pass must thread `issue_title` into
+        `route_work_by_capability` exactly like `dispatch()`'s internal
+        call does — a `[win]`-tagged issue whose `## Files` match no
+        `capability_rules` entry still has to reroute onto the
+        windows-capable host, not stay on the originally proposed
+        macos-only machine."""
+        from coord.models import Proposal
+        from coord.state import save_proposals
+
+        save_proposals(
+            [
+                Proposal(
+                    id=1,
+                    machine_name="macmini",
+                    repo_name="quadraui",
+                    issue_number=2719,
+                    issue_title="[win] Service the control channel",
+                    rationale="work",
+                    files_likely=["quadraui/src/core/shim.rs"],
+                ),
+            ]
+        )
+        config_file = _config_file(tmp_path)
+
+        with patch(
+            "coord.github_ops.get_issue", return_value={"labels": []}
+        ), patch(
+            "coord.dispatch.dispatch_with_retry", return_value={"id": "f-1"}
+        ) as mock_dispatch, patch("coord.dispatch.post_briefing"), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ), patch(
+            "coord.network.fetch_repos",
+            return_value={"quadraui": {"sha": "X", "branch": "main", "dirty": False}},
+        ):
+            result = _invoke_approve(config_file)
+
+        assert result.exit_code == 0, result.output
+        assert "[1] dell64 → quadraui #2719" in result.output
+        args, _ = mock_dispatch.call_args
+        assert args[0].machine_name == "dell64"

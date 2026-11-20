@@ -2434,6 +2434,15 @@ def describe_no_candidate_machines(
 
     running_by_machine = _running_by_machine(board)
 
+    # #1417: the fleet-wide cap blocks every machine regardless of
+    # individual headroom — computed once (before the pin/capability branch
+    # below, which also needs it) so a machine that's personally under its
+    # own cap can still be correctly labeled as blocked by the fleet-wide
+    # budget instead of silently reading as "free".
+    fleet_running = sum(len(v) for v in running_by_machine.values())
+    fleet_cap = config.concurrency.max_workers
+    fleet_full = fleet_running >= fleet_cap
+
     relevant_machines = [
         m for m in config.machines
         if m.can_work_on(failed.repo_name) and m.repo_path(failed.repo_name) is not None
@@ -2454,42 +2463,91 @@ def describe_no_candidate_machines(
     target_name = pinned_machine_name
     target_label = "pinned"
     if not target_name:
-        from coord.dispatch import route_work_by_capability  # noqa: PLC0415
+        from coord.dispatch import (  # noqa: PLC0415
+            backend_capability_from_title,
+            route_work_by_capability,
+        )
 
         repo_cfg_for_routing = config.repo(failed.repo_name)
+        repo_requires_for_routing = (
+            repo_cfg_for_routing.requires if repo_cfg_for_routing is not None else ()
+        )
         capability_routing = route_work_by_capability(
             proposed_machine_name=failed.machine_name,
             repo_name=failed.repo_name,
             files_likely=failed.files_allowed,
             machines=config.machines,
             capability_rules=config.smoke_tests.capability_rules,
-            repo_requires=(
-                repo_cfg_for_routing.requires if repo_cfg_for_routing is not None else ()
-            ),
+            repo_requires=repo_requires_for_routing,
             issue_title=failed.issue_title,
         )
         if capability_routing is not None:
             if capability_routing.unmet_capabilities:
-                # Mirrors `_reassign`'s own refusal: no configured machine
-                # fully declares the capability this diff needs, so
-                # `route_work_by_capability`'s "never zero machines"
-                # fallback named one anyway (fine for a first dispatch's
-                # explicit warning, not for an unattended retry) — name
-                # the real blocker instead of a specific machine.
-                return (
-                    "no machine declares the capability this issue needs "
-                    f"({', '.join(capability_routing.unmet_capabilities)}) — "
-                    "the retry is waiting for one, not falling back to a "
-                    "host that cannot verify it"
+                # `route_work_by_capability` only excludes PAUSED machines
+                # before scoring — so a non-empty `unmet_capabilities` does
+                # NOT mean no configured machine declares the capability;
+                # it may mean the one that does is paused (that candidate
+                # never reached scoring at all). Recompute the same
+                # required-capability set independently so a paused but
+                # otherwise-eligible host is named as paused, not folded
+                # into the generic "no machine declares this" message.
+                from coord.smoke import required_capabilities  # noqa: PLC0415
+
+                required = list(
+                    required_capabilities(
+                        repo_requires_for_routing,
+                        failed.files_allowed,
+                        config.smoke_tests.capability_rules,
+                    )
                 )
-            target_name = capability_routing.machine_name
-            target_label = "capability-routed"
+                backend_capability = backend_capability_from_title(failed.issue_title)
+                if backend_capability and backend_capability not in required:
+                    required.append(backend_capability)
+                fully_capable = [
+                    m for m in config.machines
+                    if m.can_work_on(failed.repo_name)
+                    and m.repo_path(failed.repo_name) is not None
+                    and all(cap in m.capabilities for cap in required)
+                ]
+                paused_capable = next(
+                    (m for m in fully_capable if m.name in paused), None
+                )
+                if paused_capable is not None:
+                    target_name = paused_capable.name
+                    target_label = "capability-routed"
+                else:
+                    # Mirrors `_reassign`'s own refusal: no configured
+                    # machine fully declares the capability this diff
+                    # needs, so `route_work_by_capability`'s "never zero
+                    # machines" fallback named one anyway (fine for a
+                    # first dispatch's explicit warning, not for an
+                    # unattended retry) — name the real blocker instead of
+                    # a specific machine.
+                    return (
+                        "no machine declares the capability this issue needs "
+                        f"({', '.join(capability_routing.unmet_capabilities)}) — "
+                        "the retry is waiting for one, not falling back to a "
+                        "host that cannot verify it"
+                    )
+            else:
+                target_name = capability_routing.machine_name
+                target_label = "capability-routed"
 
     if target_name:
         target = next((m for m in config.machines if m.name == target_name), None)
         waiting = "the retry is waiting for it, not falling back to another host"
         if target is None:
             return f"{target_label} machine {target_name!r} is not configured in coordinator.yml — {waiting}"
+        if not target.can_work_on(failed.repo_name):
+            return (
+                f"{target_label} machine {target.name!r} is not configured to work "
+                f"on repo {failed.repo_name!r} in coordinator.yml — {waiting}"
+            )
+        if target.repo_path(failed.repo_name) is None:
+            return (
+                f"{target_label} machine {target.name!r} has no repo_paths entry "
+                f"for {failed.repo_name!r} in coordinator.yml — {waiting}"
+            )
         if target.name in paused:
             return f"{target_label} machine {target.name!r} is paused — {waiting}"
         if provider_for_capability is not None and not machine_supports_provider(
@@ -2507,20 +2565,21 @@ def describe_no_candidate_machines(
                 f"{target_label} machine {target.name!r} is at capacity "
                 f"({len(target_running)}/{target_cap} running) — {waiting}"
             )
+        if fleet_full:
+            # #1417: this machine has its own headroom, but the fleet-wide
+            # budget is exhausted — that is a real, reportable reason
+            # `_reassign` would have refused, not a loose end that should
+            # fall through to "looks free".
+            return (
+                f"fleet at capacity ({fleet_running}/{fleet_cap} running "
+                f"fleet-wide) — {waiting}"
+            )
         return (
             f"{target_label} machine {target.name!r} looks free — "
             "_reassign must have refused for a different reason (a TOS-"
             "gate refusal, a dispatch-liveness refusal, or a dispatch POST "
             "failure); re-run `coord retry` to try again"
         )
-
-    # #1417: the fleet-wide cap blocks every machine regardless of
-    # individual headroom — computed once so a machine that's personally
-    # under its own cap can still be correctly labeled as blocked by the
-    # fleet-wide budget instead of silently reading as "free".
-    fleet_running = sum(len(v) for v in running_by_machine.values())
-    fleet_cap = config.concurrency.max_workers
-    fleet_full = fleet_running >= fleet_cap
 
     lines: list[str] = []
     has_free_candidate = False
