@@ -55,6 +55,7 @@ from coord.board_doctor import (
     merged_partial_rows,
     no_progress_rows,
     predicted_after_target_drop_reason,
+    run_conflict_fix_ceiling_pending_sweep,
     run_followthrough_sweep,
     run_pending_refile_close_sweep,
     run_refile_sweep,
@@ -64,6 +65,7 @@ from coord.board_doctor import (
     stranded_prereq_rows,
     sweep,
     sweep_predicted_after_edges,
+    _ceiling_blocked_ci_pending_candidates,
 )
 from coord.config import (
     BoardDoctorConfig,
@@ -75,6 +77,9 @@ from coord.config import (
 )
 from coord.drive_queue import (
     BoardView,
+    CONFLICT_FIX_PUSH_CI_GREEN,
+    CONFLICT_FIX_PUSH_CI_PENDING,
+    CONFLICT_FIX_PUSH_CI_RED,
     IssueFacts,
     QueueEntry,
     STATE_BLOCKED,
@@ -82,6 +87,9 @@ from coord.drive_queue import (
     STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
+    conflict_fix_push_ci_verdict,
+    remaining_fix_rounds,
+    requeue_after_conflict_fix,
 )
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
 from coord.queue_diagnose import LiveState
@@ -8576,3 +8584,426 @@ class TestPlanConfigDriftFix:
 
         assert plan.enabled is True
         assert plan.patched_command is None
+
+
+# -- #4036: conflict-fix on a ceiling-blocked row, verified, finished to a
+# requeue ----------------------------------------------------------------
+
+
+class TestConflictFixDoesNotSpendTheFixRoundBudget:
+    """#4036 Budget: a type="conflict-fix" leg is not WORK_LIKE --
+    dispatching one for a ceiling-blocked row must neither consume nor be
+    refused by the #2972 fix-round ceiling, because a conflict is caused
+    by the base branch moving, not by the worker."""
+
+    @staticmethod
+    def _entry(**overrides):
+        from coord import merge_queue as mq
+
+        base = dict(
+            assignment_id="abc123", repo_name="acme/widgets", repo_github="acme/widgets",
+            branch="issue-301-fix", target_branch="main", issue_number=301,
+            issue_title="Fix the thing", state=mq.CONFLICT, pr_number=42,
+            pr_url="https://github.com/acme/widgets/pull/42",
+            error="Merge conflict in foo.py",
+        )
+        base.update(overrides)
+        return mq.QueuedMerge(**base)
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(
+            repos=[Repo(
+                name="acme/widgets", github="acme/widgets",
+                default_branch="main", test_command="pytest",
+            )],
+            machines=[Machine(
+                name="laptop", host="laptop.tail", repos=["acme/widgets"],
+                repo_paths={"acme/widgets": "/work/widgets"},
+            )],
+        )
+
+    def test_dispatching_a_conflict_fix_on_a_ceiling_blocked_row_does_not_increment_fix_rounds(
+        self,
+    ) -> None:
+        from coord.conflict_fix import dispatch_conflict_fix
+
+        _seed_ceiling_blocked_entry("acme/widgets", 301)
+        entry = QueueEntry.from_row(state.get_drive_queue_entry("acme/widgets", 301))
+        # One unconditional work leg plus every fix round the default
+        # budget (`DEFAULT_TICK_MAX_FIX_ROUNDS`) allows, all already spent
+        # -- the row genuinely has nothing left, matching its own stored
+        # `state="blocked"`/`last_reason` (#2972).
+        from coord.drive_queue import DEFAULT_TICK_MAX_FIX_ROUNDS
+
+        facts = IssueFacts(
+            work_leg_count=entry.legs_at_enqueue + 1 + DEFAULT_TICK_MAX_FIX_ROUNDS,
+        )
+
+        before = remaining_fix_rounds(entry, facts, config_default=None)
+        assert before == 0  # already ceiling-blocked -- this row's whole point
+
+        class _FakeHTTPClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict]] = []
+
+            def post(self, url, *, json, timeout):
+                self.calls.append((url, json))
+                return SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"id": "fix-1"},
+                )
+
+        board = Board()
+        fix = dispatch_conflict_fix(
+            self._entry(), board, self._config(),
+            http_client=_FakeHTTPClient(), prefer_machine="laptop",
+        )
+
+        # The dispatch is NOT refused merely because the row's own
+        # drive-queue entry already gave up on the #2972 ceiling --
+        # dispatch_conflict_fix's retry-cap check never consults it.
+        assert fix is not None
+        assert fix.type == "conflict-fix"
+
+        # And the fresh conflict-fix Assignment is not WORK_LIKE, so it
+        # never changes what remaining_fix_rounds reads for this issue --
+        # the ceiling this row already hit stays exactly where it was.
+        after = remaining_fix_rounds(entry, facts, config_default=None)
+        assert after == before == 0
+
+
+class TestConflictFixPushCiVerdict:
+    """#4036 Requeue: classify a just-pushed conflict-fix branch's live
+    checks into red/pending/green -- the one distinction #2377/#3539's
+    `coord drive-queue add` refusal ("its checks are not all green")
+    conflates, which is what stranded the #4036 incident's manual
+    recovery."""
+
+    def test_no_checks_reported_yet_reads_pending(self) -> None:
+        assert conflict_fix_push_ci_verdict(()) == CONFLICT_FIX_PUSH_CI_PENDING
+
+    def test_a_still_running_check_reads_pending_even_if_others_passed(self) -> None:
+        assert (
+            conflict_fix_push_ci_verdict(("success", "pending"))
+            == CONFLICT_FIX_PUSH_CI_PENDING
+        )
+
+    def test_an_unknown_reading_is_never_upgraded_to_green(self) -> None:
+        assert (
+            conflict_fix_push_ci_verdict(("success", "unknown"))
+            == CONFLICT_FIX_PUSH_CI_PENDING
+        )
+
+    def test_a_failed_check_reads_red_even_alongside_a_pending_one(self) -> None:
+        assert (
+            conflict_fix_push_ci_verdict(("pending", "failure"))
+            == CONFLICT_FIX_PUSH_CI_RED
+        )
+
+    def test_every_check_passed_reads_green(self) -> None:
+        assert (
+            conflict_fix_push_ci_verdict(("success", "success"))
+            == CONFLICT_FIX_PUSH_CI_GREEN
+        )
+
+
+class TestRequeueAfterConflictFix:
+    """#4036 Requeue: coord.drive_queue.requeue_after_conflict_fix --
+    pending checks defer with NO mutation (retried later, not dropped);
+    red checks refuse with no mutation; green checks remove-then-re-add
+    the row at its original position/edges and reset the stale smoke/
+    review stage."""
+
+    def test_pending_checks_defer_without_touching_the_queue(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 401)
+        before = state.get_drive_queue_entry("acme/widgets", 401)
+
+        result = requeue_after_conflict_fix(
+            "acme/widgets", 401, ci_verdict=CONFLICT_FIX_PUSH_CI_PENDING,
+        )
+
+        assert result["requeued"] is False
+        assert "retried on a later sweep" in result["detail"]
+        after = state.get_drive_queue_entry("acme/widgets", 401)
+        assert after == before  # untouched -- nothing removed, nothing re-added
+
+    def test_red_checks_refuse_without_touching_the_queue(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 402)
+        before = state.get_drive_queue_entry("acme/widgets", 402)
+
+        result = requeue_after_conflict_fix(
+            "acme/widgets", 402, ci_verdict=CONFLICT_FIX_PUSH_CI_RED,
+        )
+
+        assert result["requeued"] is False
+        assert "alert tier" in result["detail"]
+        after = state.get_drive_queue_entry("acme/widgets", 402)
+        assert after == before
+
+    def test_not_in_the_queue_at_all_is_a_confirmed_no_op(self) -> None:
+        result = requeue_after_conflict_fix(
+            "acme/widgets", 499, ci_verdict=CONFLICT_FIX_PUSH_CI_GREEN,
+        )
+
+        assert result["requeued"] is False
+        assert "nothing to requeue" in result["detail"]
+
+    def test_green_checks_requeue_at_the_original_position_with_edges_preserved(
+        self,
+    ) -> None:
+        state.enqueue_drive_queue(
+            "acme/widgets", 403, after=["acme/widgets#1"],
+            machine="laptop", max_fix_rounds=5,
+        )
+        state.enqueue_drive_queue("acme/widgets", 404, after=["acme/widgets#403"])
+        state.update_drive_queue_entry(
+            "acme/widgets", 403,
+            state="blocked",
+            last_reason="giving up after 2 fix rounds (#2972)",
+        )
+        rows_by_issue = {r["issue_number"]: r for r in state.list_drive_queue("acme/widgets")}
+        original_position = rows_by_issue[403]["position"]
+
+        # Stale verdicts from the PRE-fix head -- must be reset, not
+        # carried forward onto the new head the conflict-fix just pushed.
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="acme/widgets", issue_number=403,
+                issue_title="x", assignment_id="work-403", status="done", type="work",
+                review_state="approve", review_verdict="approve",
+                test_state="passed", test_reason="ok",
+            ),
+            repo_github="acme/widgets",
+        )
+
+        result = requeue_after_conflict_fix(
+            "acme/widgets", 403, ci_verdict=CONFLICT_FIX_PUSH_CI_GREEN,
+        )
+
+        assert result["requeued"] is True
+
+        rows_by_issue = {r["issue_number"]: r for r in state.list_drive_queue("acme/widgets")}
+        row = rows_by_issue[403]
+        assert row["state"] == STATE_WAITING  # no longer `blocked`
+        assert row["position"] == original_position
+        assert row["after_json"] == ["acme/widgets#1"]
+        assert row["machine"] == "laptop"
+        assert row["max_fix_rounds"] == 5
+        # The dependent's own `after=` still points at #403 -- the row was
+        # put back under the SAME key, never a new issue number.
+        assert rows_by_issue[404]["after_json"] == ["acme/widgets#403"]
+
+        board = state.build_board()
+        [work] = [
+            a for a in board.active + board.completed if a.assignment_id == "work-403"
+        ]
+        assert work.review_state != "approve"
+        assert work.test_state is None
+
+
+class TestCeilingBlockedCiPendingCandidates:
+    """#4036: coord.board_doctor._ceiling_blocked_ci_pending_candidates --
+    the narrow filter that picks out exactly the rows
+    run_conflict_fix_ceiling_pending_sweep should act on."""
+
+    def test_ceiling_blocked_fresh_ci_pending_row_is_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 501)
+        row = _row("acme/widgets#501", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        assert _ceiling_blocked_ci_pending_candidates([row]) == [("acme/widgets", 501)]
+
+    def test_stale_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 502)
+        row = _row("acme/widgets#502", queue_diagnose.CAUSE_CI_PENDING, fresh=False)
+
+        assert _ceiling_blocked_ci_pending_candidates([row]) == []
+
+    def test_not_ceiling_blocked_row_is_not_a_candidate(self) -> None:
+        row = _row("acme/widgets#503", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        assert _ceiling_blocked_ci_pending_candidates([row]) == []
+
+    def test_unrelated_cause_on_a_ceiling_blocked_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 504)
+        row = _row("acme/widgets#504", queue_diagnose.CAUSE_MERGE_CONFLICT, fresh=True)
+
+        assert _ceiling_blocked_ci_pending_candidates([row]) == []
+
+    def test_merge_queue_row_is_not_a_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 505)
+        row = _row(
+            "acme/widgets#505", queue_diagnose.CAUSE_CI_PENDING,
+            queue="merge-queue", fresh=True,
+        )
+
+        assert _ceiling_blocked_ci_pending_candidates([row]) == []
+
+    def test_duplicate_rows_for_the_same_issue_dedupe_to_one_candidate(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 506)
+        row = _row("acme/widgets#506", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        assert _ceiling_blocked_ci_pending_candidates([row, row]) == [
+            ("acme/widgets", 506),
+        ]
+
+
+class TestRunConflictFixCeilingPendingSweep:
+    """#4036: coord.board_doctor.run_conflict_fix_ceiling_pending_sweep --
+    wires each candidate's live checks to coord.drive_queue.
+    requeue_after_conflict_fix via injected check_fetcher/requeuer
+    doubles, so this needs no live `gh` call."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(repos=[], machines=[])
+
+    def test_reports_one_result_per_candidate_using_the_injected_doubles(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 601)
+        row = _row("acme/widgets#601", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        fetched: list[tuple[str, int]] = []
+        requeued: list[tuple[str, int, str]] = []
+
+        def _fetcher(repo_name, issue_number):
+            fetched.append((repo_name, issue_number))
+            return ("success", "pending")
+
+        def _requeuer(repo_name, issue_number, *, ci_verdict):
+            requeued.append((repo_name, issue_number, ci_verdict))
+            return {"requeued": False, "detail": "waiting"}
+
+        results = run_conflict_fix_ceiling_pending_sweep(
+            [row], config=self._config(),
+            check_fetcher=_fetcher, requeuer=_requeuer,
+        )
+
+        assert fetched == [("acme/widgets", 601)]
+        assert requeued == [("acme/widgets", 601, CONFLICT_FIX_PUSH_CI_PENDING)]
+        assert results == [
+            {"repo": "acme/widgets", "issue": 601, "requeued": False, "detail": "waiting"},
+        ]
+
+    def test_no_candidates_calls_neither_double(self) -> None:
+        row = _row("acme/widgets#602", queue_diagnose.CAUSE_GATE_BLOCKED, fresh=True)
+        called = []
+
+        results = run_conflict_fix_ceiling_pending_sweep(
+            [row], config=self._config(),
+            check_fetcher=lambda *a: called.append(a) or (),
+            requeuer=lambda *a, **k: called.append((a, k)) or {"requeued": False, "detail": ""},
+        )
+
+        assert results == []
+        assert called == []
+
+
+class TestRunSweepConflictFixCeilingPending:
+    """#4036: coord.board_doctor.run_sweep pulls a ceiling-blocked
+    CAUSE_CI_PENDING row out of the generic tier/auto_dispatchers path
+    entirely -- the acceptance's own test: a requeue attempted while CI is
+    pending is retried LATER (next sweep), never dropped."""
+
+    def test_pending_row_skips_the_generic_dispatcher_and_is_retried_later(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 701)
+        pending_row = _row("acme/widgets#701", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+        other_row = _row("acme/widgets#702", queue_diagnose.CAUSE_GATE_BLOCKED, fresh=True)
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([pending_row, other_row], Board()),
+        )
+
+        captured_other_rows: list = []
+
+        def _fake_sweep(rows, **kwargs):
+            captured_other_rows.extend(rows)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        def _fake_ceiling_sweep(rows, *, config):
+            assert pending_row in rows
+            return [{
+                "repo": "acme/widgets", "issue": 701, "requeued": False,
+                "detail": "still pending -- retried on a later sweep",
+            }]
+
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            conflict_fix_ceiling_sweep=_fake_ceiling_sweep,
+        )
+
+        # Never handed to the generic dispatcher -- there is no dispatcher
+        # for "wait for CI", and nothing here must burn a fix-it-leg budget
+        # trying to act on a row that isn't actually broken.
+        assert pending_row not in captured_other_rows
+        assert other_row in captured_other_rows
+
+        # Not dropped: reported with a confirmed outcome that says it will
+        # be retried, and the row itself was never touched (still queued,
+        # still `blocked`) for the NEXT sweep to pick back up.
+        assert report.conflict_fix_ceiling_pending == [{
+            "repo": "acme/widgets", "issue": 701, "requeued": False,
+            "detail": "still pending -- retried on a later sweep",
+        }]
+        row = state.get_drive_queue_entry("acme/widgets", 701)
+        assert row["state"] == "blocked"
+
+    def test_dry_run_never_invokes_the_ceiling_sweep(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 703)
+        pending_row = _row("acme/widgets#703", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([pending_row], Board()),
+        )
+        monkeypatch.setattr(
+            board_doctor_mod, "sweep",
+            lambda rows, **kwargs: board_doctor_mod.SweepReport(sweep_id="s1"),
+        )
+
+        called = []
+        report = board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            dry_run=True,
+            conflict_fix_ceiling_sweep=lambda rows, **kw: called.append(rows) or [],
+        )
+
+        assert called == []
+        assert report.conflict_fix_ceiling_pending == []
+
+    def test_opt_out_flag_leaves_the_row_on_the_generic_path(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 704)
+        pending_row = _row("acme/widgets#704", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([pending_row], Board()),
+        )
+
+        captured_other_rows: list = []
+
+        def _fake_sweep(rows, **kwargs):
+            captured_other_rows.extend(rows)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        called = []
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            conflict_fix_ceiling_requeue=False,
+            conflict_fix_ceiling_sweep=lambda rows, **kw: called.append(rows) or [],
+        )
+
+        assert called == []
+        assert pending_row in captured_other_rows

@@ -89,7 +89,7 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, TypedDict
 
 from coord.decomposition_chat import is_size_triage_pending_reason
 from coord.dispatch_liveness import is_credential_probe_refusal_reason
@@ -448,6 +448,233 @@ def fix_round_ceiling_blocked_for_issue(repo_name: str, issue_number: int) -> bo
         return False
     entry = QueueEntry.from_row(row)
     return is_fix_round_ceiling_blocked(entry.state, entry.last_reason)
+
+
+#: #4036: the three verdicts :func:`conflict_fix_push_ci_verdict` can reach
+#: for a PR's live checks right after a conflict-fix leg pushed a rebase —
+#: see that function's own docstring for what distinguishes them.
+CONFLICT_FIX_PUSH_CI_RED = "red"
+CONFLICT_FIX_PUSH_CI_PENDING = "pending"
+CONFLICT_FIX_PUSH_CI_GREEN = "green"
+
+
+def conflict_fix_push_ci_verdict(check_conclusions: Sequence[str]) -> str:
+    """Classify a just-pushed conflict-fix branch's live checks for
+    :func:`requeue_after_conflict_fix`'s own gate (#4036): is it SAFE to
+    remove-then-re-add the drive-queue row right now, or must the whole
+    requeue wait for CI to settle first?
+
+    *check_conclusions* is each check's bare ``conclusion`` string — the
+    same vocabulary :class:`coord.queue_diagnose.CheckReading.conclusion`
+    already uses (``"success"`` | ``"failure"`` | ``"pending"`` |
+    ``"unknown"``), passed as plain strings rather than that dataclass so
+    this module needs no import from :mod:`coord.queue_diagnose` — which
+    already imports FROM this module (:func:`is_fix_round_ceiling_blocked`),
+    and a cycle neither side needs. Empty (no checks reported yet, right
+    after a push) reads the same as any check still ``"pending"`` — safe to
+    wait on, never upgraded to green on an absent reading.
+
+    Three verdicts:
+
+    * :data:`CONFLICT_FIX_PUSH_CI_RED` — at least one check has FAILED.
+      Requeuing a pushed "fix" whose own CI is red would just restart the
+      row on a commit that has not actually fixed anything; the caller
+      must leave it for the alert tier instead of requeuing a broken head.
+    * :data:`CONFLICT_FIX_PUSH_CI_PENDING` — nothing failed, but at least
+      one check is still running, none have reported in yet, or an
+      ``"unknown"`` reading leaves the picture incomplete (never upgraded
+      to green on an unconfirmed reading — the same fail-closed rule every
+      other live-evidence read in this fleet follows). The caller must
+      defer the whole remove-then-re-add to a LATER sweep rather than
+      drop the row now and risk the #2377/#3539 refusal a mid-flight
+      ``coord drive-queue add`` would otherwise hit.
+    * :data:`CONFLICT_FIX_PUSH_CI_GREEN` — every check completed and none
+      failed: safe to requeue right now.
+    """
+    conclusions = list(check_conclusions)
+    if any(c == "failure" for c in conclusions):
+        return CONFLICT_FIX_PUSH_CI_RED
+    if not conclusions or any(c != "success" for c in conclusions):
+        return CONFLICT_FIX_PUSH_CI_PENDING
+    return CONFLICT_FIX_PUSH_CI_GREEN
+
+
+class ConflictFixRequeueResult(TypedDict):
+    """:func:`requeue_after_conflict_fix`'s return shape."""
+
+    requeued: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class _ConflictFixRequeueDeclaration:
+    """Snapshot of a drive-queue row's full declared policy — the fields
+    ``coord drive-queue add`` lets an operator set, and a remove-then-
+    re-add must restore byte-for-byte so the row lands back at the same
+    slot with the same edges (#4036). Mirrors the snapshot
+    `coord.board_doctor_permissions.sweep_drive_queue_requeue` already
+    takes for the same reason (#3760 Action 1's ceiling-blocked-mergeable
+    requeue); re-derived here rather than imported so this module needs no
+    dependency on that one."""
+
+    position: int
+    after: tuple[str, ...]
+    machine: str
+    hold_after: bool
+    hold_reason: str
+    resume_when: str
+    hold_scope: str
+    max_fix_rounds: int | None
+    no_acceptance: bool
+    plan_destructive: bool
+
+
+def _declare_conflict_fix_requeue(entry: QueueEntry) -> _ConflictFixRequeueDeclaration:
+    return _ConflictFixRequeueDeclaration(
+        position=entry.position,
+        after=tuple(entry.after),
+        machine=entry.machine or "",
+        hold_after=entry.hold_after,
+        hold_reason=entry.hold_reason,
+        resume_when=entry.resume_when,
+        hold_scope=entry.hold_scope,
+        max_fix_rounds=entry.max_fix_rounds,
+        no_acceptance=entry.no_acceptance,
+        plan_destructive=entry.plan_destructive,
+    )
+
+
+def requeue_after_conflict_fix(
+    repo_name: str,
+    issue_number: int,
+    *,
+    ci_verdict: str,
+) -> ConflictFixRequeueResult:
+    """#4036: put a ceiling-blocked drive-queue row that a conflict-fix
+    leg just pushed a resolution for BACK at its original position, with
+    its original ``after=``/machine/hold/fix-round-override edges intact,
+    once (and only once) its new head's checks have actually settled.
+
+    *ci_verdict* is the caller's ALREADY-COMPUTED
+    :func:`conflict_fix_push_ci_verdict` reading for this row's live PR —
+    this function never probes GitHub itself (that stays the caller's
+    job, same impure/pure split :mod:`coord.board_doctor` uses throughout):
+
+    * :data:`CONFLICT_FIX_PUSH_CI_PENDING` — refuses outright, with NO
+      board mutation at all: the row is left exactly where it was (still
+      ``blocked``, still queued, nothing removed), so the caller's next
+      sweep simply tries again — "retried later", never "dropped". This
+      is the one case the #2377/#3539 ``coord drive-queue add`` CLI
+      refusal (``"its checks are not all green"``) could otherwise strand
+      an operator's manual remove+re-add on; going through this function
+      instead of that CLI path means pending checks are never confused
+      with a genuinely dead PR in the first place.
+    * :data:`CONFLICT_FIX_PUSH_CI_RED` — also refuses with no mutation:
+      the conflict-fix's own push did not actually produce a green head,
+      so requeuing it would just restart Test/Review on a commit that is
+      already known broken. Left for the alert tier instead.
+    * :data:`CONFLICT_FIX_PUSH_CI_GREEN` — proceeds: snapshots the row's
+      full declaration, removes it (`coord.state.dequeue_drive_queue`,
+      ``operator=False`` — this is the sweep's own self-heal, never an
+      operator veto), resets the issue's smoke AND review stage
+      (`coord.state.reset_work_test_state`/`reset_work_review_state` —
+      the verdict either one recorded was for the PRE-fix head, which no
+      longer exists), then re-adds it (`coord.state.enqueue_drive_queue`)
+      with the snapshot restored.
+
+    Returns ``requeued=False`` (never raises) for every refusal shape
+    above, for "not in the drive queue" (nothing to requeue — a row an
+    operator already removed by hand), and for a re-add that could not be
+    confirmed afterward — the caller's convergence counter is the thing
+    that escalates a row stuck in any of these states, not an exception
+    from here.
+    """
+    if ci_verdict == CONFLICT_FIX_PUSH_CI_PENDING:
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number}: checks on the conflict-fix's "
+                "push are still running — waiting for them to settle "
+                "before requeuing; this will be retried on a later sweep"
+            ),
+        )
+    if ci_verdict == CONFLICT_FIX_PUSH_CI_RED:
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number}: checks on the conflict-fix's "
+                "push came back red — leaving the row for the alert tier "
+                "instead of requeuing a still-broken head"
+            ),
+        )
+
+    from coord.state import (  # noqa: PLC0415
+        dequeue_drive_queue,
+        enqueue_drive_queue,
+        get_drive_queue_entry,
+        reset_work_review_state,
+        reset_work_test_state,
+    )
+
+    row = get_drive_queue_entry(repo_name, issue_number)
+    if row is None:
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number} is not in the drive queue — "
+                "nothing to requeue"
+            ),
+        )
+    entry = QueueEntry.from_row(row)
+    declaration = _declare_conflict_fix_requeue(entry)
+
+    removal = dequeue_drive_queue(repo_name, issue_number, operator=False)
+    if not removal.get("removed"):
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number} was not removed, so it was "
+                "not re-added — the queue is unchanged"
+            ),
+        )
+
+    # #4036: the conflict-fix's push moved the branch's head — any
+    # smoke/review verdict recorded against the PRE-fix head no longer
+    # covers the code actually sitting on the branch now.
+    reset_work_test_state(repo_name, issue_number)
+    reset_work_review_state(repo_name, issue_number)
+
+    entry_id = enqueue_drive_queue(
+        repo_name,
+        issue_number,
+        machine=declaration.machine or None,
+        after=list(declaration.after),
+        position=declaration.position,
+        hold_after=declaration.hold_after,
+        hold_reason=declaration.hold_reason,
+        resume_when=declaration.resume_when,
+        hold_scope=declaration.hold_scope,
+        max_fix_rounds=declaration.max_fix_rounds,
+        no_acceptance=declaration.no_acceptance,
+        plan_destructive=declaration.plan_destructive,
+    )
+    if entry_id is None:
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number}: removed but could NOT be put "
+                "back — the queue is short a row and needs `coord "
+                "drive-queue add` by hand"
+            ),
+        )
+    return ConflictFixRequeueResult(
+        requeued=True,
+        detail=(
+            f"{repo_name}#{issue_number} requeued at position "
+            f"{declaration.position} with its declaration preserved, "
+            "smoke/review stage reset for the new head"
+        ),
+    )
 
 
 def is_checks_stale_race_giveup_reason(reason: str | None) -> bool:

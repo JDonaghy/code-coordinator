@@ -411,7 +411,11 @@ def build_sealed_manifest_conflict_briefing(
         "blocks (additive — see the system prompt's rules). If a conflict "
         "marker appears ANYWHERE ELSE, stop — see \"When NOT to guess\" "
         "below.",
-        f"4. Run tests: `{test_cmd}`",
+        f"4. Run the project's FULL configured test command — never just a "
+        f"build/compile check — and confirm it passes: `{test_cmd}`. "
+        "Merging the target branch can break a guard test (a README "
+        "test-count check, a doc-vs-code consistency test, ...) even when "
+        "the conflict hunk itself is additive and trivial.",
         f"5. `git push --force-with-lease origin {entry.branch}`",
         "6. Exit 0 if push succeeds; non-zero otherwise.",
         "",
@@ -713,7 +717,11 @@ def build_stale_rebase_briefing(
         f"`git diff origin/{entry.target_branch}...HEAD | git patch-id --stable`. "
         "It must EXACTLY match step 3's. If it doesn't, stop — see \"When "
         "NOT to guess\" below.",
-        f"8. Run tests: `{test_cmd}`",
+        f"8. Run the project's FULL configured test command — never just a "
+        f"build/compile check — and confirm it passes: `{test_cmd}`. "
+        "Merging the target branch can break a guard test (a README "
+        "test-count check, a doc-vs-code consistency test, ...) even when "
+        "the rebase itself is purely mechanical.",
         f"9. `git push --force-with-lease origin {entry.branch}`",
         "10. Exit 0 if push succeeds; non-zero otherwise.",
         "",
@@ -1055,7 +1063,11 @@ def build_conflict_fix_briefing(
         "3. Resolve any conflict markers.  Prefer additive merges; preserve",
         "   both sides when the conflict is in non-overlapping struct fields,",
         "   list entries, imports, or separate functions.",
-        f"4. Run tests: `{test_cmd}`",
+        f"4. Run the project's FULL configured test command — never just a "
+        f"build/compile check — and confirm it passes: `{test_cmd}`. "
+        "Merging the target branch can break a guard test (a README "
+        "test-count check, a doc-vs-code consistency test, ...) even when "
+        "the conflict hunk itself is additive and trivial.",
         f"5. `git push --force-with-lease origin {entry.branch}`",
         "6. Exit 0 if push succeeds; non-zero otherwise.",
         "",

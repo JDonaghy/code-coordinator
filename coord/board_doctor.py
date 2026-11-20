@@ -1802,6 +1802,13 @@ class SweepReport:
     #: :func:`run_pending_refile_close_sweep` closed as superseded this
     #: round, because its own replacement issue was observed closed.
     refile_closed: list[dict] = field(default_factory=list)
+    #: #4036: one dict per ceiling-blocked, ``CAUSE_CI_PENDING``
+    #: drive-queue row :func:`run_conflict_fix_ceiling_pending_sweep`
+    #: evaluated this round — ``{"repo", "issue", "requeued", "detail"}``.
+    #: Same "not a tier/auto_dispatchers/convergence decision" shape as
+    #: *followthrough*/*refile* above: waiting for (or acting on) live CI
+    #: is not a cause this sweep converges or alerts on.
+    conflict_fix_ceiling_pending: list[dict] = field(default_factory=list)
 
 
 def merge_queue_rows(
@@ -4972,6 +4979,149 @@ def _branch_merged_guard_row_opted_in(row: StuckRow, config: Any) -> bool:
     return board_doctor_followthrough.auto_refile_enabled(repo_name, config)
 
 
+def _ceiling_blocked_ci_pending_candidates(
+    rows: Sequence[StuckRow],
+) -> list[tuple[str, int]]:
+    """``(repo_name, issue_number)`` for every FRESH drive-queue row in
+    *rows* that is both ceiling-blocked (#2972) and currently diagnosed
+    :data:`queue_diagnose.CAUSE_CI_PENDING` — the one shape neither
+    :func:`_reclassify_ceiling_blocked` (which only promotes
+    :data:`CAUSE_NOTHING_BLOCKING`) nor the ordinary mechanical
+    ``CAUSE_MERGE_CONFLICT`` dispatch covers (#4036): a conflict-fix leg
+    already pushed a resolution, GitHub is still running checks on the
+    new head, and nothing else in this sweep is watching for them to
+    settle.
+
+    ``fresh`` is required for the same reason :func:`_reclassify_ceiling_
+    blocked` requires it: a :class:`StuckRow` :func:`_episode_stuck_row`
+    rebuilt from a settled ``block_log`` episode can be arbitrarily old,
+    and this must act only on a live probe THIS sweep just took.
+
+    Deduped — a (repo, issue) can legitimately appear more than once if
+    an earlier pass in :func:`_collect_rows_with_board` also produced a
+    row for it, but this candidate list feeds exactly one requeue attempt
+    per issue per sweep.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        fix_round_ceiling_blocked_for_issue,
+        parse_key as _parse_row_key,
+    )
+
+    seen: set[tuple[str, int]] = set()
+    candidates: list[tuple[str, int]] = []
+    for row in rows:
+        if (
+            row.queue != "drive-queue"
+            or not row.fresh
+            or row.cause != queue_diagnose.CAUSE_CI_PENDING
+        ):
+            continue
+        parsed = _parse_row_key(row.key)
+        if parsed is None or parsed in seen:
+            continue
+        if not fix_round_ceiling_blocked_for_issue(*parsed):
+            continue
+        seen.add(parsed)
+        candidates.append(parsed)
+    return candidates
+
+
+def _live_check_conclusions(
+    repo_name: str, issue_number: int, *, config: Any,
+) -> tuple[str, ...] | None:
+    """A fresh, single-entry live check read for *repo_name*#*issue_number*,
+    via the SAME :class:`coord.queue_diagnose.GhLiveProbe` the main sweep
+    walk uses (#2096: one question, one answer — never a second,
+    independently-shaped `gh` call). ``None`` on any read failure, an
+    unqueued entry, or a probe that could not confirm the checks at all —
+    the fail-closed "we could not tell" reading :func:`coord.drive_queue.
+    conflict_fix_push_ci_verdict` already treats as "still pending", never
+    as green.
+    """
+    from coord.commands.drive_queue import _local_host_id  # noqa: PLC0415
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.drive_queue import QueueEntry  # noqa: PLC0415
+    from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
+    from coord.state import build_board, get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(repo_name, issue_number)
+    if row is None:
+        return None
+    entry = QueueEntry.from_row(row)
+
+    try:
+        board = build_board()
+        local_host = _local_host_id()
+        live_sessions = frozenset(
+            str(r["session_name"]) for r in list_drive_sessions() if r.get("session_name")
+        )
+        fleet_health = local_fleet_health_block([m.name for m in config.machines])
+        probe = queue_diagnose.GhLiveProbe(
+            config=config, board=board, fleet_health=fleet_health,
+            live_sessions=live_sessions, local_host=local_host,
+        )
+        live = probe.probe(entry)
+    except Exception:  # noqa: BLE001 — a failed re-probe reads as "still pending"
+        _log.debug(
+            "board-doctor: live-check re-probe failed for %s#%s",
+            repo_name, issue_number, exc_info=True,
+        )
+        return None
+    if live.checks is None:
+        return None
+    return tuple(c.conclusion for c in live.checks)
+
+
+def run_conflict_fix_ceiling_pending_sweep(
+    rows: Sequence[StuckRow],
+    *,
+    config: Any,
+    check_fetcher: Callable[[str, int], tuple[str, ...] | None] | None = None,
+    requeuer: Callable[..., Any] | None = None,
+) -> list[dict]:
+    """#4036: for every ceiling-blocked drive-queue row this sweep just
+    diagnosed :data:`queue_diagnose.CAUSE_CI_PENDING` (see
+    :func:`_ceiling_blocked_ci_pending_candidates`), re-probe its live
+    checks and hand the verdict to :func:`coord.drive_queue.
+    requeue_after_conflict_fix` — the one place that decides whether to
+    wait, alert, or actually requeue the row.
+
+    *check_fetcher* defaults to :func:`_live_check_conclusions`;
+    *requeuer* defaults to :func:`coord.drive_queue.requeue_after_conflict_fix`
+    — both injectable so a test never needs a live `gh` call or a real
+    drive-queue/board DB.
+
+    Returns one dict per candidate — ``{"repo", "issue", "requeued",
+    "detail"}`` — mirroring :func:`coord.drive_queue.
+    ConflictFixRequeueResult`'s own shape, reported onto :attr:`SweepReport.
+    conflict_fix_ceiling_pending` rather than :attr:`SweepReport.decisions`:
+    like *followthrough*/*refile*, this is not a tier/auto_dispatchers/
+    convergence decision over the row at all.
+    """
+    from coord.drive_queue import conflict_fix_push_ci_verdict  # noqa: PLC0415
+    from coord.drive_queue import requeue_after_conflict_fix as _default_requeuer  # noqa: PLC0415
+
+    fetch_checks = check_fetcher or (
+        lambda repo_name, issue_number: _live_check_conclusions(
+            repo_name, issue_number, config=config,
+        )
+    )
+    requeue = requeuer or _default_requeuer
+
+    results: list[dict] = []
+    for repo_name, issue_number in _ceiling_blocked_ci_pending_candidates(rows):
+        checks = fetch_checks(repo_name, issue_number)
+        ci_verdict = conflict_fix_push_ci_verdict(checks or ())
+        outcome = requeue(repo_name, issue_number, ci_verdict=ci_verdict)
+        results.append({
+            "repo": repo_name,
+            "issue": issue_number,
+            "requeued": bool(outcome.get("requeued")),
+            "detail": outcome.get("detail", ""),
+        })
+    return results
+
+
 def run_sweep(
     *,
     config,
@@ -4996,6 +5146,10 @@ def run_sweep(
         run_refile_sweep
     ),
     refile_close_sweep: Callable[..., list[dict]] = run_pending_refile_close_sweep,
+    conflict_fix_ceiling_requeue: bool = True,
+    conflict_fix_ceiling_sweep: Callable[..., list[dict]] = (
+        run_conflict_fix_ceiling_pending_sweep
+    ),
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -5114,6 +5268,18 @@ def run_sweep(
     # and dismiss its live escalation.
     refile_rows: list[StuckRow] = []
     other_rows: list[StuckRow] = []
+    # #4036: a ceiling-blocked drive-queue row diagnosed `CAUSE_CI_PENDING`
+    # is pulled out the same way `merged-partial`/`branch-merged-guard` rows
+    # are — resolved by *conflict_fix_ceiling_sweep* onto its own report
+    # field below, never by the generic tier/auto_dispatchers path (which
+    # has no dispatcher for "wait for CI" and would otherwise burn the
+    # investigate tier's fix-it-leg budget trying to "fix" a row that is
+    # not broken, just not finished yet).
+    ceiling_pending_keys = (
+        frozenset(_ceiling_blocked_ci_pending_candidates(rows))
+        if conflict_fix_ceiling_requeue and mechanical_causes is None
+        else frozenset()
+    )
     for r in rows:
         if r.cause == CAUSE_MERGED_PARTIAL:
             continue
@@ -5123,8 +5289,14 @@ def run_sweep(
             and _branch_merged_guard_row_opted_in(r, config)
         ):
             refile_rows.append(r)
-        else:
-            other_rows.append(r)
+            continue
+        if r.cause == queue_diagnose.CAUSE_CI_PENDING and r.queue == "drive-queue":
+            from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+
+            parsed = _parse_row_key(r.key)
+            if parsed is not None and parsed in ceiling_pending_keys:
+                continue
+        other_rows.append(r)
     if mechanical_causes is not None:
         other_rows = [r for r in other_rows if r.cause in mechanical_causes]
         followthrough_rows = []
@@ -5167,6 +5339,27 @@ def run_sweep(
         report.refile = refile_sweep(
             refile_rows, config=config, board=board, dry_run=dry_run,
         )
+    if conflict_fix_ceiling_requeue and ceiling_pending_keys and not dry_run:
+        # #4036: `dry_run` is a hard skip (never `conflict_fix_ceiling_
+        # sweep(..., dry_run=...)`) because, unlike *followthrough_sweep*/
+        # *refile_sweep*, this pass has no dry-run mode of its own — it
+        # always probes live and, on a confirmed-green verdict, always
+        # mutates the drive queue. A dry-run caller (`coord board-doctor
+        # sweep --dry-run`) must see zero mutation, not a best-effort one.
+        try:
+            report.conflict_fix_ceiling_pending = conflict_fix_ceiling_sweep(
+                rows, config=config,
+            )
+        except Exception:  # noqa: BLE001 — advisory, same posture as the
+            # refile-close/predicted-after-edges passes just below: a
+            # failed requeue attempt this round never takes the rest of
+            # this report down, and the row stays ceiling-blocked
+            # (unchanged) for the next sweep to retry.
+            _log.warning(
+                "board-doctor: conflict-fix ceiling-pending requeue sweep "
+                "failed this round",
+                exc_info=True,
+            )
     if auto_refile and mechanical_causes is None:
         try:
             report.refile_closed = refile_close_sweep(config=config, dry_run=dry_run)
