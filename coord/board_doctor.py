@@ -1708,7 +1708,7 @@ _CAPACITY_CHECK_UNSET = _CapacityCheckUnset()
 class StuckRow:
     """One drive-queue or merge-queue row this sweep looked at."""
 
-    queue: str  # "drive-queue", "merge-queue", "baseline-red", or "smoke-no-verdict"
+    queue: str  # "drive-queue", "merge-queue", "baseline-red", "smoke-no-verdict", or "idle-fleet-root"
     key: str
     state: str
     cause: str
@@ -2017,96 +2017,154 @@ def baseline_red_rows(blocked_streaks: Mapping[str, int]) -> list[StuckRow]:
     ]
 
 
-#: #4039: synthetic queue for the one-row-per-root alert a repo idling
-#: entirely behind one or more unreachable-wait roots gets — distinct from
-#: the root's own ordinary ``queue="drive-queue"`` row so the two keep
-#: separate convergence/backoff counters (`sweep`'s ``touched`` set is
-#: keyed on ``(queue, key)``, never ``key`` alone) and so `run_sweep` can
-#: route it to its own delivery path
-#: (:func:`coord.notify.post_idle_fleet_root_alert`) instead of the
-#: ordinary per-row escalation.
+#: Synthetic queue for the one-row-per-root alert a repo idling entirely
+#: behind one or more blocked/parked roots gets — distinct from the root's
+#: own ordinary ``queue="drive-queue"`` row so the two keep separate
+#: convergence/backoff counters (`sweep`'s ``touched`` set is keyed on
+#: ``(queue, key)``, never ``key`` alone) and so `run_sweep` can route it to
+#: its own delivery path (:func:`coord.notify.post_idle_fleet_root_alert`)
+#: instead of the ordinary per-row escalation.
 IDLE_FLEET_ROOT_QUEUE = "idle-fleet-root"
 
 
-def idle_fleet_root_rows(entries: Sequence[Any]) -> list[StuckRow]:
-    """One :class:`StuckRow` per root a whole repo sits idle behind (#4039).
+def _transitive_dependent_count(key: str, dependents_of: Mapping[str, Sequence[str]]) -> int:
+    """How many entries, at any chain depth, have *key* somewhere in their
+    ``after=`` ancestry — walks *dependents_of* (``dep -> [keys naming it]``)
+    rather than counting only direct edges, so a root's evidence line names
+    the full chain behind it, not just its immediate dependents.
+    """
+    seen: set[str] = set()
+    stack = list(dependents_of.get(key, ()))
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(dependents_of.get(current, ()))
+    return len(seen)
 
-    2026-11-19's quadraui incident: from ~08:45 to ~14:30 the queue had 0
-    `running`/`waiting` rows and 26 `blocked` rows that all traced back,
-    through their own ``after=`` chains, to two root rows (#2695, #2531).
-    Each root's OWN per-row cause is alert-eligible and does eventually
-    escalate through the ordinary walk — but only on that cause's own
-    convergence/backoff clock, which can legitimately stay quiet for
-    hours even while the WHOLE repo's dispatch capacity sits idle behind
-    it, and the 24 non-root rows never get a row of their own at all (they
-    are correctly waiting on an unsatisfied ``after=``, not independently
-    stuck). The only signal visible that whole window was the queue
-    tick's own ``nothing eligible to launch`` line — true, but silent
-    about *why*, and not a page.
 
-    Deliberately reuses :func:`coord.drive_queue.detect_unreachable_waits`
-    — the SAME predicate that already backs `coord drive-queue status`'s
-    own ``alert:`` line and :mod:`coord.health.checks.wedged_drive_queue`'s
-    ``coord doctor`` WARN — rather than re-walking ``after=`` chains here:
-    that function already excludes a row blocked SOLELY on an
-    unsatisfiable ``after=`` pre-req unconditionally, "leaving only the
-    root that actually needs a human" (its own docstring), and already
-    carries a `.cause` derived from the identical ``last_reason`` markers
-    `coord.queue_diagnose`'s own terminal-park rule trusts. Re-deriving
-    either of those here, independently, is exactly the split-brain #2096
-    warns against — one question (which row is the root, and why), one
-    answer, asked the same way everywhere.
+def idle_fleet_root_rows(
+    entries: Sequence[Any],
+    rows: Sequence[StuckRow] = (),
+    *,
+    blocked_streaks: Mapping[str, int] | None = None,
+) -> list[StuckRow]:
+    """One :class:`StuckRow` per root a whole repo sits idle behind.
 
-    *entries* is the live, this-sweep drive-queue read (never a stored
-    diagnosis) — "a repo has no running/waiting rows" must be observed
-    fresh every call, the same posture :func:`_collect_rows_with_board`
-    already takes for everything else it classifies live.
+    A repo is idle when none of its drive-queue entries is ``running`` —
+    a ``waiting`` entry counts for nothing here: once its own ``after=``
+    chain bottoms out on a terminal park, `_resolve_prereqs` leaves it
+    `waiting` forever rather than ever reaching `blocked` (see
+    :func:`coord.notifier.collect.halted_drives`'s own docstring for the
+    identical shape), so treating `waiting` as "still making progress"
+    is exactly how a repo can sit idle behind a parked root with nothing
+    ever firing.
 
-    Only emits a row for a root whose cause :func:`default_tier_of` says
-    is alert-tier — a cause this epic already auto-fixes (e.g.
-    :data:`queue_diagnose.CAUSE_NEVER_DISPATCHED`'s own ``requeue``
-    handler) needs no second, redundant page; its own handler already acts
-    on the root directly, which is exactly "no handler in this epic will
-    fix automatically" read the other way round. ``UnreachableWait.cause``
-    is always one of :mod:`coord.drive_queue`'s
-    ``UNREACHABLE_WAIT_CAUSE_*`` strings, kept byte-for-byte identical to
-    the matching :mod:`coord.queue_diagnose` ``CAUSE_*`` constant by that
-    module's own design (see its docstring) — so handing it to
-    :func:`default_tier_of` directly, with no translation step, is safe.
+    A root is a `blocked`/`parked` entry whose own ``last_reason`` is NOT
+    one of `_resolve_prereqs`'s after-chain cascade verdicts
+    (:func:`coord.drive_queue.is_unsatisfiable_prereq_reason`) — i.e. it
+    is stuck for its OWN reason, not because a pre-req of its own is.
+    Every other entry chained behind it inherits that cascade verdict as
+    its own ``last_reason`` and is excluded, leaving exactly the root(s) —
+    regardless of ``attempts`` or which specific marker its reason
+    carries, so a confirmed-shut-gate/exhausted-budget block and a
+    #1844/#2019/#2972/#3522 permanent block both qualify as roots just
+    like a terminal park does.
+
+    *rows* is this same sweep's already-classified rows
+    (:func:`_collect_rows_with_board`'s own accumulator at the point this
+    is called) — reused for a root's cause/confidence/evidence rather than
+    re-deriving a second, narrower classification here: a root's cause is
+    whatever `coord.queue_diagnose.run_pass` (or the stored episode it
+    settled from) already concluded for that exact key, which covers the
+    full cause vocabulary, not just a handful of labels invented for this
+    check. A root with no matching row (no episode ever opened for it, or
+    one suppressed by a baseline-red streak) falls back to
+    :func:`coord.drive_queue.classify_unreachable_wait_cause`.
+
+    *blocked_streaks* (repos already past the baseline-red merge-block
+    threshold) are skipped outright — :func:`baseline_red_rows` already
+    files the one repo-wide alert those need; a root's own drive-queue row
+    is `suppressed` for exactly this reason and must not also page here
+    under a fallback classification.
+
+    Only emits a root whose cause :func:`default_tier_of` says is
+    alert-tier — a cause this epic already auto-fixes needs no second,
+    redundant page; its own handler already acts on the root directly.
+    EXCEPT a root whose own ``last_reason`` carries a
+    #1844/#2019/#2972/#3522 permanent-block marker
+    (:func:`coord.drive_queue.is_permanent_block_reason`): that marker is
+    written only once a handler has already tried and given up (e.g. the
+    #2972 fix-round ceiling text an exhausted CI-red/gate-blocked
+    investigate-tier retry stream stamps into ``last_reason`` once its own
+    budget is spent — `coord.drive_queue.is_fix_round_ceiling_reason`),
+    so the cause's normally-auto tier no longer describes this instance;
+    this always alerts for it, unconditionally.
     """
     from coord.drive_queue import (  # noqa: PLC0415
+        STATE_BLOCKED,
+        STATE_PARKED,
         STATE_RUNNING,
-        STATE_WAITING,
-        detect_unreachable_waits,
+        classify_unreachable_wait_cause,
+        is_permanent_block_reason,
+        is_unsatisfiable_prereq_reason,
     )
+
+    rows_by_key: dict[str, StuckRow] = {}
+    for row in rows:
+        if row.queue == "drive-queue" and not row.suppressed:
+            rows_by_key.setdefault(row.key, row)
 
     by_repo: dict[str, list[Any]] = {}
     for entry in entries:
         by_repo.setdefault(entry.repo, []).append(entry)
 
-    rows: list[StuckRow] = []
+    out: list[StuckRow] = []
     for repo_name, repo_entries in by_repo.items():
-        if any(e.state in (STATE_RUNNING, STATE_WAITING) for e in repo_entries):
+        if blocked_streaks and repo_name in blocked_streaks:
             continue
-        for wait in detect_unreachable_waits(repo_entries):
-            if default_tier_of(wait.cause) != TIER_ALERT:
+        if any(e.state == STATE_RUNNING for e in repo_entries):
+            continue
+        dependents_of: dict[str, list[str]] = {}
+        for e in repo_entries:
+            for dep in e.after:
+                dependents_of.setdefault(dep, []).append(e.key)
+        for entry in repo_entries:
+            if entry.state not in (STATE_BLOCKED, STATE_PARKED):
                 continue
-            rows.append(
+            if is_unsatisfiable_prereq_reason(entry.last_reason):
+                continue
+            root_row = rows_by_key.get(entry.key)
+            cause = root_row.cause if root_row is not None else classify_unreachable_wait_cause(entry)
+            if (
+                default_tier_of(cause) != TIER_ALERT
+                and not is_permanent_block_reason(entry.last_reason)
+            ):
+                continue
+            confidence = (
+                root_row.confidence if root_row is not None else queue_diagnose.CONFIDENCE_HIGH
+            )
+            own_evidence = (
+                root_row.evidence if root_row is not None else (f"last_reason: {entry.last_reason}",)
+            )
+            out.append(
                 StuckRow(
                     queue=IDLE_FLEET_ROOT_QUEUE,
-                    key=wait.key,
-                    state=wait.state,
-                    cause=wait.cause,
-                    confidence=queue_diagnose.CONFIDENCE_HIGH,
+                    key=entry.key,
+                    state=entry.state,
+                    cause=cause,
+                    confidence=confidence,
                     evidence=(
-                        f"{repo_name}: 0 running/waiting drive-queue rows",
-                        f"{wait.dependents} row(s) queued directly behind this root",
-                        f"last_reason: {wait.last_reason}",
+                        f"{repo_name}: 0 running drive-queue rows",
+                        f"{_transitive_dependent_count(entry.key, dependents_of)} "
+                        "row(s) queued behind this root",
+                        *own_evidence,
                     ),
-                    fresh=False,
+                    fresh=root_row.fresh if root_row is not None else True,
                 )
             )
-    return rows
+    return out
 
 
 #: Assignment types `coord.state.reset_work_test_state`/`test_reset_candidates`
@@ -4293,10 +4351,10 @@ def _collect_rows_with_board(
         rows = [_suppress_if_blocked(row) for row in rows]
         rows.extend(baseline_red_rows(blocked_streaks))
 
-    # #4039: a live, ledger-only read over *entries* — independent of
-    # every reclassifier above, so it runs regardless of where in this
-    # walk it lands.
-    rows.extend(idle_fleet_root_rows(entries))
+    # A live read over *entries*, cross-referenced against every row this
+    # walk has classified so far — independent of where in the walk it
+    # lands, since it only reads *rows*, never mutates an existing one.
+    rows.extend(idle_fleet_root_rows(entries, rows, blocked_streaks=blocked_streaks))
     return rows, board
 
 

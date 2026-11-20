@@ -1023,40 +1023,47 @@ def post_stalled_pipeline(detection: StalledDetection, config: Config) -> None:
     mark_notified(_stalled_notified_key(detection.assignment_id), EVENT_STALLED)
 
 
-# ── #4039: idle-fleet-root phone alert ──────────────────────────────────────
+# ── idle-fleet-root phone alert ─────────────────────────────────────────────
 
 
 def post_idle_fleet_root_alert(row: "StuckRow") -> bool:
     """One phone alert for a whole repo sitting idle behind *row* — a
     drive-queue root `coord.board_doctor.idle_fleet_root_rows` already
-    confirmed is (a) the bottom of every blocked row's own ``after=``
-    chain in a repo with 0 ``running``/``waiting`` rows, and (b) stuck on
-    a cause no handler in this epic auto-fixes.
+    confirmed is (a) the bottom of every blocked/parked row's own
+    ``after=`` chain in a repo with 0 ``running`` rows, and (b) stuck on a
+    cause no handler in this epic auto-fixes.
 
-    Posts directly to the root issue (`github_ops.post_issue_comment`)
-    rather than through `coord.board_doctor_policy.write_drive_escalation`
-    — that writer keys `drive_escalations` on ``(repo, issue)`` alone, and
-    the SAME root issue already owns that exact slot for its own ordinary
-    per-row board-doctor alert (same cause, `queue="drive-queue"`), so a
-    second writer there would almost always find itself "covered" by that
-    row and skip silently — precisely the multi-hour quiet window between
-    backoff-gated re-alerts that left the 2026-11-19 incident unpaged.
-    `coord.board_doctor.run_sweep` decides WHEN this runs (its own
-    `coord.state.board_doctor_alert_due`/`mark_board_doctor_escalated`
-    backoff, keyed on ``(queue="idle-fleet-root", key)`` — independent of
-    the root's own ``queue="drive-queue"`` counter); this function only
-    delivers once called.
+    Routes through `coord.board_doctor_policy.write_drive_escalation` —
+    the ONE `drive_escalations` write path every other board-doctor alert
+    shares, which is also the ONLY thing that reaches the operator's
+    phone: `coord.notifier.collect.halted_drives` reads that table and
+    hands every open row to `coord.notifier.transport` (ntfy), the one
+    module in this repo that speaks to a push endpoint at all. A GitHub
+    issue comment, by contrast, pages nobody — nothing under
+    `coord/notifier/` or the phone PWA reads issue comments.
+
+    Keyed under a synthetic repo name, ``(idle-fleet-root:<repo>)``, with
+    *row*'s own issue number — not the root's real ``(repo, issue)`` —
+    the same pattern `coord.notifier.collect.drain_overdue` already uses
+    for a release cordon's escalation key. The root's real issue already
+    owns that exact ``(repo, issue)`` slot for its own ordinary
+    ``board-doctor:drive-queue`` escalation (same cause); writing a
+    second record under the identical key would collide with — and
+    silently supersede — that row instead of adding a second,
+    independently backed-off alert. The synthetic key gives this alert
+    its own `drive_escalations` row, so `coord.state.board_doctor_
+    alert_due`/`mark_board_doctor_escalated`'s backoff applies to it
+    exactly like every other `sweep` alert.
 
     Reuses `coord.board_doctor_policy._alert_resolution` for *row*'s own
     cause rather than a second, independently-maintained cause -> command
     table (#2096: one question, one answer) — the exact text/command
     every ordinary board-doctor alert already shows for this cause.
 
-    Returns ``True`` only once `gh` confirms the comment posted (the
-    SAME confirmed-truthy contract every other `sweep` alert_dispatcher
-    honours) — an unresolvable repo slug, an unparseable key or a `gh`
-    failure returns ``False`` so the next due sweep gets another chance;
-    never raises.
+    Returns ``True`` only once the escalation write is confirmed read
+    back (`write_drive_escalation`'s own contract) — an unparseable key
+    or an unconfirmed write returns ``False`` so the next due sweep gets
+    another chance; never raises.
     """
     from coord.drive_queue import parse_key  # noqa: PLC0415
 
@@ -1065,34 +1072,31 @@ def post_idle_fleet_root_alert(row: "StuckRow") -> bool:
         return False
     repo_name, issue_number = parsed
 
-    try:
-        from coord.commands._common import resolve_and_load_config  # noqa: PLC0415
-
-        config = resolve_and_load_config(None)
-    except Exception:  # noqa: BLE001 — best-effort repo-slug resolution only
-        config = None
-    repo = config.repo(repo_name) if config is not None else None
-    repo_github = repo.github if repo is not None else None
-    if not repo_github:
-        return False
-
-    from coord.board_doctor_policy import _alert_resolution  # noqa: PLC0415
+    from coord.board_doctor_policy import (  # noqa: PLC0415
+        _alert_resolution,
+        _board_doctor_stage,
+        write_drive_escalation,
+    )
 
     resolution_suffix, command = _alert_resolution(row, repo_name, issue_number)
     evidence_text = " | ".join(row.evidence) if row.evidence else "(no evidence recorded)"
-    body = (
-        f"## \N{WARNING SIGN} board-doctor: {repo_name} is idle behind this issue (#4039)\n\n"
-        f"{repo_name}'s drive queue has nothing `running` or `waiting` right "
-        f"now, and every `blocked`/`parked` row traces back to this one — "
-        f"cause=`{row.cause}` (confidence={row.confidence}){resolution_suffix}.\n\n"
-        f"Evidence: {evidence_text}\n\n"
-        f"Run: `{command}`"
+    reason = (
+        f"{repo_name} has no running drive-queue row, and every "
+        f"blocked/parked row traces back to {row.key} — cause={row.cause} "
+        f"(confidence={row.confidence}){resolution_suffix}. "
+        f"Evidence: {evidence_text}"
     )
-    try:
-        github_ops.post_issue_comment(repo_github, issue_number, body)
-    except Exception:  # noqa: BLE001 — unconfirmed delivery, not a crash
-        return False
-    return True
+    gate_readings = f"queue={row.queue} | cause={row.cause} | evidence={evidence_text}"
+    result = write_drive_escalation(
+        f"(idle-fleet-root:{repo_name})",
+        issue_number,
+        stage=_board_doctor_stage(row.queue),
+        reason=reason,
+        gate_readings=gate_readings,
+        proposed_command=command,
+        row=row,
+    )
+    return result is True
 
 
 # ── #1478: dispatch arm ──────────────────────────────────────────────────────
