@@ -52,6 +52,7 @@ from coord.board_doctor import (
     baseline_red_rows,
     branch_merged_guard_rows,
     build_refile_candidate,
+    config_drift_candidates,
     config_drift_rows,
     default_tier_of,
     dispatch_plan_leg,
@@ -9345,6 +9346,61 @@ class TestConfigDriftRows:
 
         assert rows == []
 
+    def test_rounds_consumed_counts_only_the_matching_drift_signature(
+        self,
+    ) -> None:
+        # quadraui#2695's own board shape: every failing round names the
+        # SAME dangling target. `rounds_consumed` must come out of
+        # `config_drift_candidates` itself — never a value a caller
+        # supplies — and must NOT fold in a leg that failed on some
+        # OTHER target for the same issue.
+        config = self._config_with_ci_command(
+            "cargo clippy --workspace --example win_panel"
+        )
+        matching = [
+            Assignment(
+                machine_name="m1",
+                repo_name="widgets",
+                issue_number=2695,
+                issue_title="issue-2695-remove-panel",
+                assignment_id=f"aid-2695-{i}",
+                status="done",
+                branch="issue-2695-remove-panel",
+                type="work",
+                test_state="failed",
+                test_reason=(
+                    "error: no example target named `win_panel` in "
+                    "`quadraui` package"
+                ),
+            )
+            for i in range(3)
+        ]
+        other_signature = Assignment(
+            machine_name="m1",
+            repo_name="widgets",
+            issue_number=2695,
+            issue_title="issue-2695-remove-panel",
+            assignment_id="aid-2695-other",
+            status="done",
+            branch="issue-2695-remove-panel",
+            type="work",
+            test_state="failed",
+            test_reason=(
+                "error: no example target named `other_panel` in "
+                "`quadraui` package"
+            ),
+        )
+        board = Board(completed=[*matching, other_signature])
+
+        [candidate] = config_drift_candidates(
+            board, config,
+            diff_lookup=lambda repo_github, branch: ["examples/win_panel.rs"],
+        )
+
+        assert candidate.kind == "example"
+        assert candidate.name == "win_panel"
+        assert candidate.rounds_consumed == 3
+
 
 class TestPlanConfigDriftFix:
     """`coord.board_doctor_policy.plan_config_drift_fix` — acceptance #3:
@@ -9451,8 +9507,6 @@ class TestApplyConfigDriftFixToCoordSettings:
         return result.stdout
 
     def _make_coord_settings_repo(self, tmp_path, *, body: str):
-        import coord.board_doctor as board_doctor_mod  # noqa: F401
-
         settings_dir = tmp_path / "coord-settings"
         settings_dir.mkdir()
         self._git(settings_dir, "init", "-q")
@@ -9561,6 +9615,101 @@ class TestApplyConfigDriftFixToCoordSettings:
         assert result.applied is False
         assert "2 time(s)" in result.detail
         assert real_config.read_text() == body
+        after_log = self._git(settings_dir, "log", "--oneline")
+        assert after_log == before_log
+
+    def test_refuses_onto_an_already_dirty_checkout(self, tmp_path) -> None:
+        # An operator mid-edit of the live symlink already has an
+        # uncommitted change sitting in exactly this file (#4048 review).
+        # The doctor must refuse rather than overwrite it.
+        from coord.board_doctor import apply_config_drift_fix_to_coord_settings
+
+        settings_dir, real_config, symlink_path = self._make_coord_settings_repo(
+            tmp_path,
+            body=(
+                "repos:\n"
+                "  - name: widgets\n"
+                f"    ci_command: {self._COMMAND}\n"
+            ),
+        )
+        in_progress_edit = (
+            "repos:\n"
+            "  - name: widgets\n"
+            f"    ci_command: {self._COMMAND}\n"
+            "  - name: new-repo-a-human-is-adding\n"
+        )
+        real_config.write_text(in_progress_edit)
+        before_log = self._git(settings_dir, "log", "--oneline")
+
+        result = apply_config_drift_fix_to_coord_settings(
+            config_path=symlink_path,
+            command=self._COMMAND,
+            token=self._TOKEN,
+            patched_command=self._PATCHED,
+            repo_name="widgets",
+            issue_number=2695,
+        )
+
+        assert result.applied is False
+        assert "dirty" in result.detail or "uncommitted" in result.detail
+        # The human's in-progress edit is untouched, not clobbered or
+        # committed.
+        assert real_config.read_text() == in_progress_edit
+        after_log = self._git(settings_dir, "log", "--oneline")
+        assert after_log == before_log
+        status = self._git(settings_dir, "status", "--porcelain")
+        assert status.strip() != ""
+
+    def test_refuses_onto_a_checkout_behind_its_upstream(self, tmp_path) -> None:
+        # Nothing may commit onto a stale base: the later `git push`
+        # would fail non-fast-forward while this function still reported
+        # `applied=True`, refunding a fix round while the fleet's
+        # canonical config has already diverged (#4048 review).
+        from coord.board_doctor import apply_config_drift_fix_to_coord_settings
+
+        origin_dir = tmp_path / "origin.git"
+        self._git(tmp_path, "init", "-q", "--bare", str(origin_dir))
+
+        settings_dir = tmp_path / "coord-settings"
+        self._git(tmp_path, "clone", "-q", str(origin_dir), str(settings_dir))
+        self._git(settings_dir, "config", "user.email", "doctor@example.com")
+        self._git(settings_dir, "config", "user.name", "Board Doctor")
+        real_config = settings_dir / "coordinator.yml"
+        real_config.write_text(
+            "repos:\n  - name: widgets\n    ci_command: " + self._COMMAND + "\n"
+        )
+        self._git(settings_dir, "add", "coordinator.yml")
+        self._git(settings_dir, "commit", "-q", "-m", "initial")
+        self._git(settings_dir, "push", "-q", "-u", "origin", "HEAD")
+
+        # Someone else pushes a config change this checkout never pulled.
+        other_clone = tmp_path / "other-clone"
+        self._git(tmp_path, "clone", "-q", str(origin_dir), str(other_clone))
+        self._git(other_clone, "config", "user.email", "other@example.com")
+        self._git(other_clone, "config", "user.name", "Other")
+        (other_clone / "unrelated.txt").write_text("x\n")
+        self._git(other_clone, "add", "unrelated.txt")
+        self._git(other_clone, "commit", "-q", "-m", "unrelated upstream change")
+        self._git(other_clone, "push", "-q")
+
+        symlink_path = tmp_path / "coordinator.yml"
+        symlink_path.symlink_to(real_config)
+        before_log = self._git(settings_dir, "log", "--oneline")
+
+        result = apply_config_drift_fix_to_coord_settings(
+            config_path=symlink_path,
+            command=self._COMMAND,
+            token=self._TOKEN,
+            patched_command=self._PATCHED,
+            repo_name="widgets",
+            issue_number=2695,
+        )
+
+        assert result.applied is False
+        assert "behind" in result.detail
+        assert real_config.read_text() == (
+            "repos:\n  - name: widgets\n    ci_command: " + self._COMMAND + "\n"
+        )
         after_log = self._git(settings_dir, "log", "--oneline")
         assert after_log == before_log
 
