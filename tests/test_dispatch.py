@@ -28,6 +28,7 @@ from coord.dispatch import (
     CapabilityRouting,
     CredentialRouting,
     DispatchRefused,
+    backend_capability_from_title,
     dispatch,
     enforce_epic_dispatch_guard,
     enforce_model_provider_compatibility,
@@ -4239,6 +4240,42 @@ class TestProviderNamePersistence:
         assert row["provider_name"] is None
 
 
+class TestBackendCapabilityFromTitle:
+    """#4056: `[win]`/`[macos]`/`[gtk]` is a leading issue-title tag that
+    names a backend capability — distinct from bookkeeping tags like
+    `[retry]`/`[fix-1]` that must never be mistaken for one.
+    """
+
+    def test_win_tag_maps_to_windows(self) -> None:
+        assert backend_capability_from_title(
+            "[win] Service the control channel in the Windows runners"
+        ) == "windows"
+
+    def test_macos_tag_maps_to_macos(self) -> None:
+        assert backend_capability_from_title("[macos] Fix the dock icon") == "macos"
+
+    def test_gtk_tag_maps_to_gtk(self) -> None:
+        assert backend_capability_from_title("[gtk] Fix the scrollbar") == "gtk"
+
+    def test_retry_bookkeeping_tag_ahead_of_backend_tag_still_matches(self) -> None:
+        """A retry's own title carries `[retry]` ahead of the original
+        `[win]` tag — every leading tag is checked, not just the first."""
+        assert backend_capability_from_title(
+            "[retry] [win] Service the control channel"
+        ) == "windows"
+
+    def test_bookkeeping_only_tag_returns_none(self) -> None:
+        assert backend_capability_from_title("[retry] [fix-1] Tidy up logging") is None
+
+    def test_non_leading_bracket_is_not_a_backend_tag(self) -> None:
+        """A bracket mentioned later in free text must not count — only
+        the LEADING run of tags is backend routing."""
+        assert backend_capability_from_title("Tidy up the [gtk] widget code") is None
+
+    def test_no_tag_at_all_returns_none(self) -> None:
+        assert backend_capability_from_title("Fix auth") is None
+
+
 class TestRouteWorkByCapability:
     """#3241: a `type="work"` dispatch whose declared `## Files` match
     `smoke_tests.capability_rules` must route to a machine that can
@@ -4260,6 +4297,36 @@ class TestRouteWorkByCapability:
             capability_rules=[SmokeRule(files=["src/macos/"], requires=["macos"])],
         )
         assert result is None
+
+    def test_win_tagged_issue_routes_even_when_no_file_rule_matches(self) -> None:
+        """#4056: quadraui#2719's shape — a `[win]`-tagged issue whose
+        declared `## Files` don't match any `capability_rules` entry must
+        still route to the windows host, instead of reading as "nothing
+        required" and leaving the proposed (non-Windows) machine in place."""
+        machines = [
+            Machine(
+                name="precision", host="precision.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["windows"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="precision",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/control_channel.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"])],
+            issue_title="[win] Service the control channel in the Windows runners",
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.rerouted is True
+        assert result.unmet_capabilities == ()
 
     def test_repo_requires_routes_even_when_no_file_rule_matches(self) -> None:
         """#3351: vimcode's shape — the repo unconditionally `requires` a

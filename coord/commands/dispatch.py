@@ -2219,6 +2219,7 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         describe_no_candidate_machines,
         describe_retry_provider_mismatch,
         describe_unsupported_retry_type,
+        drive_queue_pinned_machine,
     )
 
     cfg = _load_config(config_path)
@@ -2438,6 +2439,11 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         result = _reassign(
             assignment, board, cfg, model=retry_model, issue_labels=issue_labels,
             branch_exists_fetcher=github_ops.branch_exists_on_remote,
+            # #4056: a manual `coord retry` must honor the same placement
+            # as the passive reconcile tick — the drive-queue row's pin,
+            # else capability routing — rather than landing on whatever
+            # machine merely has spare capacity.
+            pinned_machine_fetcher=drive_queue_pinned_machine,
         )
     except UnsupportedRetryType as exc:
         # Defense in depth — the precheck above already covers this, but
@@ -2458,7 +2464,7 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         # of a bare "no available machine" — the usual cause is a phantom
         # `running` row from a dead interactive session nothing reaped.
         click.echo(
-            f"error: {describe_no_candidate_machines(assignment, board, cfg, issue_labels)}",
+            f"error: {describe_no_candidate_machines(assignment, board, cfg, issue_labels, drive_queue_pinned_machine)}",
             err=True,
         )
         sys.exit(1)
