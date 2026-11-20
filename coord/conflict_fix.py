@@ -411,7 +411,7 @@ def build_sealed_manifest_conflict_briefing(
         "blocks (additive — see the system prompt's rules). If a conflict "
         "marker appears ANYWHERE ELSE, stop — see \"When NOT to guess\" "
         "below.",
-        f"4. Run the project's FULL configured test command — never just a "
+        "4. Run the project's FULL configured test command — never just a "
         f"build/compile check — and confirm it passes: `{test_cmd}`. "
         "Merging the target branch can break a guard test (a README "
         "test-count check, a doc-vs-code consistency test, ...) even when "
@@ -717,7 +717,7 @@ def build_stale_rebase_briefing(
         f"`git diff origin/{entry.target_branch}...HEAD | git patch-id --stable`. "
         "It must EXACTLY match step 3's. If it doesn't, stop — see \"When "
         "NOT to guess\" below.",
-        f"8. Run the project's FULL configured test command — never just a "
+        "8. Run the project's FULL configured test command — never just a "
         f"build/compile check — and confirm it passes: `{test_cmd}`. "
         "Merging the target branch can break a guard test (a README "
         "test-count check, a doc-vs-code consistency test, ...) even when "
@@ -1063,7 +1063,7 @@ def build_conflict_fix_briefing(
         "3. Resolve any conflict markers.  Prefer additive merges; preserve",
         "   both sides when the conflict is in non-overlapping struct fields,",
         "   list entries, imports, or separate functions.",
-        f"4. Run the project's FULL configured test command — never just a "
+        "4. Run the project's FULL configured test command — never just a "
         f"build/compile check — and confirm it passes: `{test_cmd}`. "
         "Merging the target branch can break a guard test (a README "
         "test-count check, a doc-vs-code consistency test, ...) even when "

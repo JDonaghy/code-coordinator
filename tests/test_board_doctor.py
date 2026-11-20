@@ -39,6 +39,7 @@ from coord.board_doctor import (
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
+    _ceiling_blocked_ci_pending_candidates,
     _reclassify_branch_merged_guard,
     _reclassify_ceiling_blocked,
     _reclassify_checks_stale_race,
@@ -65,7 +66,6 @@ from coord.board_doctor import (
     stranded_prereq_rows,
     sweep,
     sweep_predicted_after_edges,
-    _ceiling_blocked_ci_pending_candidates,
 )
 from coord.config import (
     BoardDoctorConfig,
@@ -8801,6 +8801,31 @@ class TestRequeueAfterConflictFix:
         assert work.review_state != "approve"
         assert work.test_state is None
 
+    def test_green_checks_on_a_mid_flight_deploy_gate_is_refused_without_mutation(
+        self,
+    ) -> None:
+        """#4036 review (blocking finding #2): a green CI verdict must not
+        bypass the #1757 deploy-gate guard that
+        `coord.board_doctor_permissions.sweep_drive_queue_requeue` already
+        enforces -- a row sitting at `hold_state="fired"` or "released"
+        would come back `armed`/`hold_probes=0` from any re-write, which is
+        a run-state change the sweep has no permission to make in either
+        direction."""
+        _seed_ceiling_blocked_entry("acme/widgets", 407)
+        state.update_drive_queue_entry(
+            "acme/widgets", 407, hold_state="fired", hold_probes=3,
+        )
+        before = state.get_drive_queue_entry("acme/widgets", 407)
+
+        result = requeue_after_conflict_fix(
+            "acme/widgets", 407, ci_verdict=CONFLICT_FIX_PUSH_CI_GREEN,
+        )
+
+        assert result["requeued"] is False
+        assert "deploy gate" in result["detail"]
+        after = state.get_drive_queue_entry("acme/widgets", 407)
+        assert after == before  # untouched -- nothing removed, nothing re-added
+
 
 class TestCeilingBlockedCiPendingCandidates:
     """#4036: coord.board_doctor._ceiling_blocked_ci_pending_candidates --
@@ -8847,6 +8872,19 @@ class TestCeilingBlockedCiPendingCandidates:
             ("acme/widgets", 506),
         ]
 
+    def test_low_confidence_row_is_not_a_candidate(self) -> None:
+        """A `CAUSE_CI_PENDING` verdict the live probe itself only half-
+        trusted (`probe_errors` downgraded it to CONFIDENCE_LOW) has not
+        actually established this row is CI-pending at all -- same guard
+        `_reclassify_ceiling_blocked` applies to its own reclassification."""
+        _seed_ceiling_blocked_entry("acme/widgets", 507)
+        row = replace(
+            _row("acme/widgets#507", queue_diagnose.CAUSE_CI_PENDING, fresh=True),
+            confidence=queue_diagnose.CONFIDENCE_LOW,
+        )
+
+        assert _ceiling_blocked_ci_pending_candidates([row]) == []
+
 
 class TestRunConflictFixCeilingPendingSweep:
     """#4036: coord.board_doctor.run_conflict_fix_ceiling_pending_sweep --
@@ -8867,7 +8905,7 @@ class TestRunConflictFixCeilingPendingSweep:
 
         def _fetcher(repo_name, issue_number):
             fetched.append((repo_name, issue_number))
-            return ("success", "pending")
+            return ("success", "pending"), True
 
         def _requeuer(repo_name, issue_number, *, ci_verdict):
             requeued.append((repo_name, issue_number, ci_verdict))
@@ -8875,7 +8913,7 @@ class TestRunConflictFixCeilingPendingSweep:
 
         results = run_conflict_fix_ceiling_pending_sweep(
             [row], config=self._config(),
-            check_fetcher=_fetcher, requeuer=_requeuer,
+            evidence_fetcher=_fetcher, requeuer=_requeuer,
         )
 
         assert fetched == [("acme/widgets", 601)]
@@ -8890,12 +8928,45 @@ class TestRunConflictFixCeilingPendingSweep:
 
         results = run_conflict_fix_ceiling_pending_sweep(
             [row], config=self._config(),
-            check_fetcher=lambda *a: called.append(a) or (),
+            evidence_fetcher=lambda *a: called.append(a) or (None, False),
             requeuer=lambda *a, **k: called.append((a, k)) or {"requeued": False, "detail": ""},
         )
 
         assert results == []
         assert called == []
+
+    def test_a_candidate_with_no_branch_moved_evidence_is_deferred_without_calling_the_requeuer(
+        self,
+    ) -> None:
+        """#4036 review (blocking finding #5): a ceiling-blocked row whose
+        checks happen to be pending for some unrelated reason -- nothing
+        has actually been pushed since its recorded verdict -- must never
+        reach the requeuer: that would reset a verdict that still covers
+        the current head and hand the row a fresh #2972 fix-round budget
+        it was never owed."""
+        _seed_ceiling_blocked_entry("acme/widgets", 603)
+        row = _row("acme/widgets#603", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+        requeuer_calls = []
+
+        results = run_conflict_fix_ceiling_pending_sweep(
+            [row], config=self._config(),
+            evidence_fetcher=lambda *a: (("pending",), False),
+            requeuer=lambda *a, **k: requeuer_calls.append((a, k)) or {
+                "requeued": True, "detail": "should never be reached",
+            },
+        )
+
+        assert requeuer_calls == []
+        assert results == [{
+            "repo": "acme/widgets", "issue": 603, "requeued": False,
+            "detail": (
+                "acme/widgets#603: no live evidence yet that a "
+                "conflict-fix push moved this branch past its recorded "
+                "review/test verdict — waiting for that confirmation "
+                "before resetting the stage or spending a fresh "
+                "fix-round budget"
+            ),
+        }]
 
 
 class TestRunSweepConflictFixCeilingPending:
@@ -8938,9 +9009,11 @@ class TestRunSweepConflictFixCeilingPending:
             conflict_fix_ceiling_sweep=_fake_ceiling_sweep,
         )
 
-        # Never handed to the generic dispatcher -- there is no dispatcher
-        # for "wait for CI", and nothing here must burn a fix-it-leg budget
-        # trying to act on a row that isn't actually broken.
+        # Never handed to the generic dispatcher -- a registered
+        # `CAUSE_CI_PENDING` investigate-tier dispatcher exists, but this
+        # row is already known not to need one (a conflict-fix leg already
+        # pushed a resolution), so nothing here must burn that fix-it-leg
+        # budget trying to act on a row that isn't actually broken.
         assert pending_row not in captured_other_rows
         assert other_row in captured_other_rows
 
@@ -8953,6 +9026,50 @@ class TestRunSweepConflictFixCeilingPending:
         }]
         row = state.get_drive_queue_entry("acme/widgets", 701)
         assert row["state"] == "blocked"
+
+    def test_a_prior_escalations_convergence_counter_is_preserved_while_ceiling_pending(
+        self, monkeypatch,
+    ) -> None:
+        """#4036 review (blocking finding #4): excluding a ceiling-pending
+        row from the generic tier/dispatch path must mark it
+        ``suppressed=True`` (present) rather than drop it outright --
+        dropping it would make `sweep`'s own `clear_absent_rows` (on by
+        default for a plain, non-mechanical call) read the vanish as
+        "resolved" and both wipe its convergence counter and tell
+        *escalation_resolver* to dismiss a live escalation the row may have
+        earned under a DIFFERENT, earlier cause, even though nothing about
+        this row has actually been confirmed fixed yet."""
+        import coord.board_doctor as board_doctor_mod
+
+        _seed_ceiling_blocked_entry("acme/widgets", 706)
+        key = "acme/widgets#706"
+
+        # Build up a real escalation under the ordinary alert tier first,
+        # as if this row alerted on some earlier cause before a
+        # conflict-fix leg ever pushed anything.
+        sweep([_row(key, "merge-conflict")], tier_of=_always(TIER_ALERT), alert_dispatcher=lambda row: True)
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is True
+
+        pending_row = _row("acme/widgets#706", queue_diagnose.CAUSE_CI_PENDING, fresh=True)
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([pending_row], Board()),
+        )
+
+        resolved: list[tuple[str, str]] = []
+        board_doctor_mod.run_sweep(
+            config=Config(repos=[], machines=[]),
+            escalation_resolver=lambda queue, k: resolved.append((queue, k)),
+            conflict_fix_ceiling_sweep=lambda rows, **kw: [{
+                "repo": "acme/widgets", "issue": 706, "requeued": False,
+                "detail": "still pending",
+            }],
+        )
+
+        assert resolved == []
+        row_state = state.board_doctor_row_state("drive-queue", key)
+        assert row_state["escalated"] is True
+        assert row_state["count"] >= 1
 
     def test_dry_run_never_invokes_the_ceiling_sweep(self, monkeypatch) -> None:
         import coord.board_doctor as board_doctor_mod

@@ -506,44 +506,6 @@ class ConflictFixRequeueResult(TypedDict):
     detail: str
 
 
-@dataclass(frozen=True)
-class _ConflictFixRequeueDeclaration:
-    """Snapshot of a drive-queue row's full declared policy — the fields
-    ``coord drive-queue add`` lets an operator set, and a remove-then-
-    re-add must restore byte-for-byte so the row lands back at the same
-    slot with the same edges (#4036). Mirrors the snapshot
-    `coord.board_doctor_permissions.sweep_drive_queue_requeue` already
-    takes for the same reason (#3760 Action 1's ceiling-blocked-mergeable
-    requeue); re-derived here rather than imported so this module needs no
-    dependency on that one."""
-
-    position: int
-    after: tuple[str, ...]
-    machine: str
-    hold_after: bool
-    hold_reason: str
-    resume_when: str
-    hold_scope: str
-    max_fix_rounds: int | None
-    no_acceptance: bool
-    plan_destructive: bool
-
-
-def _declare_conflict_fix_requeue(entry: QueueEntry) -> _ConflictFixRequeueDeclaration:
-    return _ConflictFixRequeueDeclaration(
-        position=entry.position,
-        after=tuple(entry.after),
-        machine=entry.machine or "",
-        hold_after=entry.hold_after,
-        hold_reason=entry.hold_reason,
-        resume_when=entry.resume_when,
-        hold_scope=entry.hold_scope,
-        max_fix_rounds=entry.max_fix_rounds,
-        no_acceptance=entry.no_acceptance,
-        plan_destructive=entry.plan_destructive,
-    )
-
-
 def requeue_after_conflict_fix(
     repo_name: str,
     issue_number: int,
@@ -573,21 +535,27 @@ def requeue_after_conflict_fix(
       the conflict-fix's own push did not actually produce a green head,
       so requeuing it would just restart Test/Review on a commit that is
       already known broken. Left for the alert tier instead.
-    * :data:`CONFLICT_FIX_PUSH_CI_GREEN` — proceeds: snapshots the row's
-      full declaration, removes it (`coord.state.dequeue_drive_queue`,
-      ``operator=False`` — this is the sweep's own self-heal, never an
-      operator veto), resets the issue's smoke AND review stage
-      (`coord.state.reset_work_test_state`/`reset_work_review_state` —
-      the verdict either one recorded was for the PRE-fix head, which no
-      longer exists), then re-adds it (`coord.state.enqueue_drive_queue`)
-      with the snapshot restored.
+    * :data:`CONFLICT_FIX_PUSH_CI_GREEN` — resets the issue's smoke AND
+      review stage (`coord.state.reset_work_test_state`/
+      `reset_work_review_state` — the verdict either one recorded was for
+      the PRE-fix head, which no longer exists), confirms that reset
+      against a fresh board read, then delegates the actual remove+re-add
+      to `coord.board_doctor_permissions.sweep_drive_queue_requeue` — the
+      ONE sweep-authorized way to express "take this row down and put it
+      back exactly as declared" (#2096: this function used to hand-roll a
+      second, field-for-field copy of that same declaration snapshot;
+      going through the shared primitive instead means every #1757
+      deploy-gate / `authorize_sweep_action` / post-write-confirmation
+      guard that primitive already enforces applies here too, with no
+      second implementation to drift out of sync with it).
 
     Returns ``requeued=False`` (never raises) for every refusal shape
     above, for "not in the drive queue" (nothing to requeue — a row an
-    operator already removed by hand), and for a re-add that could not be
-    confirmed afterward — the caller's convergence counter is the thing
-    that escalates a row stuck in any of these states, not an exception
-    from here.
+    operator already removed by hand), for a reset that could not be
+    confirmed, and for any `SweepPermissionError`/`SweepWriteNotConfirmedError`
+    the delegated requeue raises (a gate mid-flight, a validation refusal, an
+    unconfirmed write) — the caller's convergence counter is the thing that
+    escalates a row stuck in any of these states, not an exception from here.
     """
     if ci_verdict == CONFLICT_FIX_PUSH_CI_PENDING:
         return ConflictFixRequeueResult(
@@ -608,16 +576,19 @@ def requeue_after_conflict_fix(
             ),
         )
 
+    from coord.board_doctor_permissions import (  # noqa: PLC0415
+        SweepPermissionError,
+        SweepWriteNotConfirmedError,
+        sweep_drive_queue_requeue,
+    )
     from coord.state import (  # noqa: PLC0415
-        dequeue_drive_queue,
-        enqueue_drive_queue,
+        build_board,
         get_drive_queue_entry,
         reset_work_review_state,
         reset_work_test_state,
     )
 
-    row = get_drive_queue_entry(repo_name, issue_number)
-    if row is None:
+    if get_drive_queue_entry(repo_name, issue_number) is None:
         return ConflictFixRequeueResult(
             requeued=False,
             detail=(
@@ -625,54 +596,63 @@ def requeue_after_conflict_fix(
                 "nothing to requeue"
             ),
         )
-    entry = QueueEntry.from_row(row)
-    declaration = _declare_conflict_fix_requeue(entry)
-
-    removal = dequeue_drive_queue(repo_name, issue_number, operator=False)
-    if not removal.get("removed"):
-        return ConflictFixRequeueResult(
-            requeued=False,
-            detail=(
-                f"{repo_name}#{issue_number} was not removed, so it was "
-                "not re-added — the queue is unchanged"
-            ),
-        )
 
     # #4036: the conflict-fix's push moved the branch's head — any
     # smoke/review verdict recorded against the PRE-fix head no longer
-    # covers the code actually sitting on the branch now.
+    # covers the code actually sitting on the branch now. Reset BEFORE
+    # the requeue, and CONFIRM it against a fresh board read (#2096: a
+    # reported outcome must come from an observation taken after the
+    # write, never from `reset_work_test_state`/`reset_work_review_state`'s
+    # own row-matched rowcount, which proves only that the WHERE clause
+    # matched something, not that the value actually changed) — a row
+    # re-added with a stale verdict still attached would requeue it
+    # straight into the merge gate's own approval.
     reset_work_test_state(repo_name, issue_number)
     reset_work_review_state(repo_name, issue_number)
-
-    entry_id = enqueue_drive_queue(
-        repo_name,
-        issue_number,
-        machine=declaration.machine or None,
-        after=list(declaration.after),
-        position=declaration.position,
-        hold_after=declaration.hold_after,
-        hold_reason=declaration.hold_reason,
-        resume_when=declaration.resume_when,
-        hold_scope=declaration.hold_scope,
-        max_fix_rounds=declaration.max_fix_rounds,
-        no_acceptance=declaration.no_acceptance,
-        plan_destructive=declaration.plan_destructive,
+    board = build_board()
+    still_stale = sorted(
+        a.assignment_id or ""
+        for a in list(board.active) + list(board.completed)
+        if a.repo_name == repo_name
+        and a.issue_number == issue_number
+        and a.type in ("work", "plan")
+        and (
+            a.review_state not in (None, "pending")
+            or a.review_verdict is not None
+            or a.test_state is not None
+        )
     )
-    if entry_id is None:
+    if still_stale:
         return ConflictFixRequeueResult(
             requeued=False,
             detail=(
-                f"{repo_name}#{issue_number}: removed but could NOT be put "
-                "back — the queue is short a row and needs `coord "
-                "drive-queue add` by hand"
+                f"{repo_name}#{issue_number}: the pre-fix smoke/review "
+                "verdict could not be confirmed cleared on re-read for "
+                f"{', '.join(still_stale)} — leaving the row queued for a "
+                "later sweep rather than requeue it with a stale verdict "
+                "still attached"
+            ),
+        )
+
+    try:
+        outcome = sweep_drive_queue_requeue(repo_name, issue_number)
+    except (SweepPermissionError, SweepWriteNotConfirmedError) as exc:
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=f"{repo_name}#{issue_number}: {exc}",
+        )
+    if not outcome.get("requeued"):
+        return ConflictFixRequeueResult(
+            requeued=False,
+            detail=outcome.get(
+                "detail", f"{repo_name}#{issue_number}: requeue did not land",
             ),
         )
     return ConflictFixRequeueResult(
         requeued=True,
         detail=(
-            f"{repo_name}#{issue_number} requeued at position "
-            f"{declaration.position} with its declaration preserved, "
-            "smoke/review stage reset for the new head"
+            f"{outcome.get('detail', '')}, smoke/review stage reset for "
+            "the new head"
         ),
     )
 

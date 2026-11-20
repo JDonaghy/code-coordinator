@@ -3595,6 +3595,9 @@ def drive_queue_sweep(
                     "dropped_predicted_after_edges": list(
                         report.dropped_predicted_after_edges
                     ),
+                    "conflict_fix_ceiling_pending": list(
+                        report.conflict_fix_ceiling_pending
+                    ),
                 }
             )
         )
@@ -3606,6 +3609,7 @@ def drive_queue_sweep(
         and not report.refile
         and not report.refile_closed
         and not report.dropped_predicted_after_edges
+        and not report.conflict_fix_ceiling_pending
     ):
         if mechanical_only:
             # #4027 review: this invocation deliberately dropped every
@@ -3691,6 +3695,17 @@ def drive_queue_sweep(
         click.echo("\ndropped predicted after= edge(s):")
         for note in report.dropped_predicted_after_edges:
             click.echo(f"  {note}")
+    # #4036: a ceiling-blocked drive-queue row diagnosed `CAUSE_CI_PENDING`
+    # is resolved by its own requeue-after-conflict-fix pass rather than
+    # the tier/`Decision` loop above — its own section, same "may be the
+    # ONLY thing this round touched" shape as *dropped_predicted_after_edges*.
+    if report.conflict_fix_ceiling_pending:
+        click.echo("\nconflict-fix ceiling-pending row(s):")
+        for outcome in report.conflict_fix_ceiling_pending:
+            click.echo(
+                f"  {outcome.get('repo')}#{outcome.get('issue')} "
+                f"requeued={outcome.get('requeued')}: {outcome.get('detail')}"
+            )
     if dry_run:
         if report.followthrough or report.refile:
             click.echo(
@@ -3701,7 +3716,13 @@ def drive_queue_sweep(
             )
         else:
             click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
-    elif report.decisions or report.followthrough or report.refile or report.refile_closed:
+    elif (
+        report.decisions
+        or report.followthrough
+        or report.refile
+        or report.refile_closed
+        or report.conflict_fix_ceiling_pending
+    ):
         click.echo(
             f"{report.rows_observed} row(s) observed and decided — read the log later with "
             "`coord drive-queue doctor-log`"
