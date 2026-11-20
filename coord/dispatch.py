@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
@@ -1132,6 +1133,7 @@ def dispatch(
             machines=config.machines,
             capability_rules=config.smoke_tests.capability_rules,
             repo_requires=repo_cfg_for_routing.requires if repo_cfg_for_routing else (),
+            issue_title=proposal.issue_title,
         )
         if capability_routing is not None and capability_routing.rerouted:
             proposal.machine_name = capability_routing.machine_name
@@ -2023,6 +2025,45 @@ class CapabilityRouting:
         )
 
 
+#: #4056: the only bracket tags a `type="work"` issue title leads with that
+#: name a BACKEND, as opposed to a bookkeeping tag (`[retry]`, `[fix-1]`,
+#: `[conflict-fix]`, ...) this function must ignore. Mirrors the capability
+#: names `smoke_tests.capability_rules`/`machines[].capabilities` already
+#: use for the same three quadraui backends.
+_KNOWN_BACKEND_CAPABILITIES = frozenset({"windows", "macos", "gtk"})
+
+#: Only the LEADING run of bracket tags counts as backend routing — a title
+#: that happens to mention `[gtk]` later, in free text, must not be read as
+#: a backend pin.
+_LEADING_TAGS_RE = re.compile(r"^(?:\[[^\]]+\]\s*)+")
+
+
+def backend_capability_from_title(issue_title: str) -> str | None:
+    """The backend capability an issue's leading title tag names, or `None`.
+
+    `[win]`/`[macos]`/`[gtk]` are quadraui's per-backend issue-title prefix
+    convention (see this module's own #4056 note on `route_work_by_capability`
+    below). A retry's title carries extra bookkeeping tags ahead of it
+    (`"[retry] [win] Service the control channel..."`), so every leading
+    bracket tag is checked, not just the first — reusing
+    `coord.board_doctor_followthrough.normalize_capability`'s own
+    `"win"->"windows"` alias table rather than a second copy of it (#2096,
+    "one question, one answer"). Returns the first leading tag that
+    normalizes onto a KNOWN backend capability; a bookkeeping tag
+    (`[retry]`, `[fix-1]`) normalizes to itself and is simply skipped.
+    """
+    from coord.board_doctor_followthrough import normalize_capability  # noqa: PLC0415
+
+    match = _LEADING_TAGS_RE.match((issue_title or "").lstrip())
+    if not match:
+        return None
+    for raw in re.findall(r"\[([^\]]+)\]", match.group(0)):
+        capability = normalize_capability(raw)
+        if capability in _KNOWN_BACKEND_CAPABILITIES:
+            return capability
+    return None
+
+
 def route_work_by_capability(
     *,
     proposed_machine_name: str,
@@ -2031,11 +2072,14 @@ def route_work_by_capability(
     machines: list[Machine],
     capability_rules: list[SmokeRule],
     repo_requires: Iterable[str] = (),
+    issue_title: str = "",
     now: "datetime | None" = None,
 ) -> CapabilityRouting | None:
     """Pick the machine for a `type="work"` dispatch whose declared `##
-    Files` (`files_likely`) match `smoke_tests.capability_rules`, OR whose
-    repo unconditionally `requires` a capability (#3241, #3351).
+    Files` (`files_likely`) match `smoke_tests.capability_rules`, whose
+    title carries a `[win]`/`[macos]`/`[gtk]` backend tag (#4056,
+    `backend_capability_from_title`), OR whose repo unconditionally
+    `requires` a capability (#3241, #3351).
 
     Reuses `coord.smoke.required_capabilities` — the SAME function the Test
     stage's own routing uses to union `repo_requires` (`Repo.requires`,
@@ -2096,11 +2140,21 @@ def route_work_by_capability(
     machine configured always resolves to `unmet_capabilities=()`; see
     `CapabilityRouting`'s docstring for the multi-capability case where no
     one machine fully covers it.
+
+    #4056: *issue_title*'s backend tag is unioned into the required set
+    exactly like a matched `capability_rules` entry — so a `[win]`-tagged
+    issue whose `## Files` happen not to match any file-keyed rule (a repo
+    that hasn't declared one yet, or a diff touching a backend-neutral
+    shim) still routes to the windows host, instead of reading as
+    "nothing required" and falling through to plain availability routing.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
     from coord.smoke import required_capabilities  # noqa: PLC0415
 
-    required = required_capabilities(repo_requires, files_likely, capability_rules)
+    required = list(required_capabilities(repo_requires, files_likely, capability_rules))
+    backend_capability = backend_capability_from_title(issue_title)
+    if backend_capability and backend_capability not in required:
+        required.append(backend_capability)
     if not required:
         return None
 

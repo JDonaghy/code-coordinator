@@ -58,6 +58,8 @@ from coord.config import (
     ModelsConfig,
     ProviderDef,
     ProvidersConfig,
+    SmokeRule,
+    SmokeTestsConfig,
 )
 from coord.models import Assignment, Board, Machine, Repo
 from coord.reconcile import (
@@ -66,6 +68,7 @@ from coord.reconcile import (
     _record_usage_limit_reason,
     _resolve_retry_provider,
     describe_retry_provider_mismatch,
+    drive_queue_pinned_machine,
     reconcile,
     reconcile_completed_assignments,
 )
@@ -710,6 +713,187 @@ class TestReassignCapabilityGate:
 
         assert result is not None
         assert result.machine_name == "server"
+
+
+class TestReassignPlacementGate:
+    """#4056: a retry/relaunch must honor the same placement a first
+    dispatch would — the drive-queue row's `machine=` pin first, else
+    `coord.dispatch.route_work_by_capability` over `## Files` and the
+    issue's backend tag — rather than landing on whatever machine merely
+    has spare capacity. Either way, an unusable target means WAIT, never
+    an arbitrary fallback."""
+
+    def _cfg(self) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="precision", host="precision.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["gtk"],
+                ),
+                Machine(
+                    name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["windows"],
+                ),
+            ],
+            models=ModelsConfig(default="sonnet"),
+            smoke_tests=SmokeTestsConfig(
+                capability_rules=[SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"])],
+            ),
+        )
+
+    @patch("coord.reconcile.httpx.post")
+    def test_pin_wins_and_reuses_the_failed_machine(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """The pinned machine is the SAME one that just failed — a plain
+        availability retry would normally exclude it (#1396's "avoid the
+        machine that just failed" default), but operator intent (the pin)
+        must win: this is exactly the quadraui#2719 shape (dell64 pinned,
+        infra failure on dell64, the next leg must still land on dell64)."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = self._cfg()
+        failed = _failed(
+            machine_name="dell64", repo_name="quadraui",
+            issue_title="[win] Service the control channel",
+        )
+
+        result = _reassign(
+            failed, Board(), cfg,
+            pinned_machine_fetcher=lambda repo, num: "dell64",
+        )
+
+        assert result is not None
+        assert result.machine_name == "dell64"
+
+    @patch("coord.reconcile.httpx.post")
+    def test_win_tagged_issue_with_no_file_match_routes_to_windows_host(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """No pin, no `## Files` match against `capability_rules` — the
+        issue's own `[win]` title tag must still route the retry to the
+        windows-capable host rather than falling through to plain
+        availability routing (which would land it back on precision, a
+        gtk-only box that can never run the Windows suite)."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = self._cfg()
+        failed = _failed(
+            machine_name="precision", repo_name="quadraui",
+            issue_title="[win] Service the control channel",
+            files_allowed=["quadraui/src/win/control_channel.rs"],
+        )
+
+        result = _reassign(failed, Board(), cfg)
+
+        assert result is not None
+        assert result.machine_name == "dell64"
+
+    @patch("coord.reconcile.httpx.post")
+    def test_pinned_host_offline_waits_instead_of_falling_back(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """The pin names a host this config doesn't even have room/paused
+        for — the retry must wait for it (return None), never silently
+        move the work onto the other, otherwise-free machine."""
+        cfg = self._cfg()
+        failed = _failed(machine_name="dell64", repo_name="quadraui")
+
+        from coord.machine_pause import local_pause  # noqa: PLC0415
+
+        local_pause("dell64")
+        result = _reassign(
+            failed, Board(), cfg,
+            pinned_machine_fetcher=lambda repo, num: "dell64",
+        )
+
+        assert result is None
+        mock_post.assert_not_called()
+
+    @patch("coord.reconcile.httpx.post")
+    def test_capability_routed_host_offline_waits_instead_of_falling_back(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Same as the pin case, but for a capability-routed (no explicit
+        pin) target: the windows host is paused, so the retry must wait
+        for it rather than falling back to precision (gtk-only)."""
+        cfg = self._cfg()
+        failed = _failed(
+            machine_name="precision", repo_name="quadraui",
+            issue_title="[win] Service the control channel",
+        )
+
+        from coord.machine_pause import local_pause  # noqa: PLC0415
+
+        local_pause("dell64")
+        result = _reassign(failed, Board(), cfg)
+
+        assert result is None
+        mock_post.assert_not_called()
+
+    def test_drive_queue_pinned_machine_reads_the_enqueued_pin(self) -> None:
+        """`drive_queue_pinned_machine` — the fetcher both `coord retry`
+        and the passive `reconcile()` tick wire in — reads the SAME row
+        `coord drive-queue show` renders, not a second notion of "the
+        pin"."""
+        from coord.state import enqueue_drive_queue
+
+        enqueue_drive_queue("quadraui", 2719, machine="dell64")
+
+        assert drive_queue_pinned_machine("quadraui", 2719) == "dell64"
+        assert drive_queue_pinned_machine("quadraui", 999999) == ""
+
+    def test_diagnostic_names_the_paused_pinned_host_not_the_fleet(self) -> None:
+        """`describe_no_candidate_machines` must mirror `_reassign`'s own
+        pin-first placement — naming the ONE pinned-but-paused host, not a
+        fleet-wide table that would wrongly suggest another machine is a
+        real fallback."""
+        from coord.reconcile import describe_no_candidate_machines
+
+        cfg = self._cfg()
+        failed = _failed(machine_name="dell64", repo_name="quadraui")
+
+        from coord.machine_pause import local_pause  # noqa: PLC0415
+
+        local_pause("dell64")
+        msg = describe_no_candidate_machines(
+            failed, Board(), cfg,
+            pinned_machine_fetcher=lambda repo, num: "dell64",
+        )
+
+        assert "pinned machine 'dell64' is paused" in msg
+        assert "waiting for it" in msg
+
+    def test_diagnostic_names_the_missing_backend_capability(self) -> None:
+        """No pin, and no configured machine declares the tagged backend at
+        all — name the missing capability, not a specific (misleadingly
+        "free") machine."""
+        from coord.reconcile import describe_no_candidate_machines
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="precision", host="precision.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["gtk"],
+                ),
+            ],
+        )
+        failed = _failed(
+            machine_name="precision", repo_name="quadraui",
+            issue_title="[win] Service the control channel",
+        )
+
+        msg = describe_no_candidate_machines(failed, Board(), cfg)
+
+        assert "no machine declares the capability" in msg
+        assert "windows" in msg
 
 
 # ── CLI: `coord retry` ───────────────────────────────────────────────────

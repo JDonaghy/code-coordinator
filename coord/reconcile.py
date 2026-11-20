@@ -1921,6 +1921,22 @@ def _issue_liveness_from_cache(
     return issue_closed, branch_merged
 
 
+def drive_queue_pinned_machine(repo_name: str, issue_number: int) -> str:
+    """The drive-queue row's `machine=` pin for *(repo_name, issue_number)*,
+    or `""` when unpinned or no row exists (#4056).
+
+    The ONE place both `_reassign` call sites — `coord retry`'s CLI and
+    `reconcile()`'s own passive auto-reassign tick — ask "is this retry
+    pinned to a machine": reads `coord.state.get_drive_queue_entry`, the
+    same row `coord drive-queue show` renders, rather than keeping a second
+    notion of "the pin" beside it (#2096, "one question, one answer").
+    """
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    entry = get_drive_queue_entry(repo_name, issue_number)
+    return (entry or {}).get("machine") or ""
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
@@ -1929,6 +1945,7 @@ def _reassign(
     credential_fetcher=None,
     issue_liveness_fetcher=None,
     branch_exists_fetcher=None,
+    pinned_machine_fetcher=None,
 ) -> Assignment | None:
     """Re-dispatch a failed assignment to a machine with spare capacity.
 
@@ -1989,6 +2006,25 @@ def _reassign(
     retry. When the fetcher confirms the branch is absent, this also sets
     ``payload["fresh_branch"] = True`` so the agent starts a fresh branch
     under the SAME name instead of refusing.
+
+    *pinned_machine_fetcher* (#4056) is an optional ``(repo_name: str,
+    issue_number: int) -> str`` callable — a non-empty return is the
+    drive-queue row's explicit ``machine=`` pin, same opt-in shape as the
+    other fetchers above. ``None`` (the default here) performs no lookup
+    and pins nothing, preserving this function's old behavior for every
+    direct caller/test that doesn't pass it. The real wiring
+    (:func:`drive_queue_pinned_machine`) happens at `reconcile()`'s and
+    `coord retry`'s own call sites. When set, the pin wins outright: the
+    retry lands on that machine or not at all (`None`, same as "no
+    candidate machines") — it never falls back to a different host, even
+    the one `route_work_by_capability` below would otherwise pick. With no
+    pin, a `type="work"` retry is routed the SAME way a first dispatch is
+    (`coord.dispatch.dispatch`'s own STRUCTURAL CAPABILITY-ROUTING GATE) —
+    reusing `coord.dispatch.route_work_by_capability` rather than a second
+    copy of "what capability does this diff need" (#2096). A capability
+    match is equally unconditional: the matched machine or nothing, never
+    an arbitrary fallback that can't actually run the backend this issue
+    is about.
 
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
@@ -2081,33 +2117,94 @@ def _reassign(
     def credential_ok(m: Machine) -> bool:
         return credential_fetcher is None or credential_fetcher(m)
 
-    candidates = [
-        m for m in config.machines
-        if m.can_work_on(failed.repo_name)
-        and m.repo_path(failed.repo_name) is not None
-        and has_room(m)
-        and can_run_provider(m)
-        and m.name != failed.machine_name
-        and m.name not in paused
-        and credential_ok(m)
-    ]
-    if not candidates:
-        # Fall back to including the same machine that failed last time —
-        # paused machines (and #1711 capability-lacking, #3371 credential-
-        # dead machines) stay excluded even from the fallback.
-        candidates = [
-            m for m in config.machines
-            if m.can_work_on(failed.repo_name)
+    # Every candidate must clear this regardless of pin/capability routing —
+    # it is the base "can this machine even take the dispatch at all"
+    # question (repo checked out, provider capability, not paused,
+    # credential-reachable). `has_room` is checked separately below so the
+    # pin/capability branches can distinguish "the right host, but it's
+    # full right now" (wait) from "not even eligible" (also wait — #4056,
+    # neither case falls back to an arbitrary host).
+    def eligible(m: Machine) -> bool:
+        return (
+            m.can_work_on(failed.repo_name)
             and m.repo_path(failed.repo_name) is not None
-            and has_room(m)
             and can_run_provider(m)
             and m.name not in paused
             and credential_ok(m)
-        ]
-    if not candidates:
-        return None
+        )
 
-    machine = candidates[0]
+    # #4056: STRUCTURAL RETRY-PLACEMENT GATE — a retry/relaunch must honor
+    # the same placement a first dispatch would: the drive-queue row's
+    # explicit `machine=` pin (operator intent, wins over everything else),
+    # else `coord.dispatch.route_work_by_capability` over the issue's `##
+    # Files` and backend tag (the SAME function/question a first dispatch
+    # uses — #2096). Either way, when the pinned/capable host isn't
+    # actually usable right now (full, paused, unreachable), this returns
+    # `None` — the caller's existing "no candidate machines" signal — so
+    # the retry WAITS for that host instead of silently moving the work
+    # onto one that may not be able to run it at all (`route_work_by_
+    # capability`'s own candidate filter already excludes paused machines,
+    # but not a full one — `has_room` below covers that).
+    pinned_machine_name = (
+        pinned_machine_fetcher(failed.repo_name, failed.issue_number)
+        if pinned_machine_fetcher is not None
+        else ""
+    )
+    if pinned_machine_name:
+        pinned = next((m for m in config.machines if m.name == pinned_machine_name), None)
+        if pinned is None or not eligible(pinned) or not has_room(pinned):
+            return None
+        machine = pinned
+    else:
+        from coord.dispatch import route_work_by_capability  # noqa: PLC0415
+
+        repo_cfg_for_routing = config.repo(failed.repo_name)
+        capability_routing = route_work_by_capability(
+            proposed_machine_name=failed.machine_name,
+            repo_name=failed.repo_name,
+            files_likely=failed.files_allowed,
+            machines=config.machines,
+            capability_rules=config.smoke_tests.capability_rules,
+            repo_requires=(
+                repo_cfg_for_routing.requires if repo_cfg_for_routing is not None else ()
+            ),
+            issue_title=failed.issue_title,
+        )
+        if capability_routing is not None:
+            if capability_routing.unmet_capabilities:
+                # `route_work_by_capability`'s own "never zero machines"
+                # fallback (#3241/#1678) picks the best-covering machine
+                # even when NONE fully satisfies the requirement — correct
+                # for a first dispatch (the worker gets an explicit
+                # briefing warning and a human reviews it) but wrong for
+                # an unattended retry: dispatching it anyway would just
+                # reproduce an UNCONFIRMED verdict on a host that can't
+                # actually run this backend. Wait for the real target
+                # instead.
+                return None
+            capable = next(
+                (m for m in config.machines if m.name == capability_routing.machine_name),
+                None,
+            )
+            if capable is None or not eligible(capable) or not has_room(capable):
+                return None
+            machine = capable
+        else:
+            # Backend-neutral issue, no pin — today's plain availability
+            # routing: prefer a DIFFERENT machine than the one that just
+            # failed, falling back to including it when nothing else is
+            # eligible (paused and capability-lacking machines stay
+            # excluded even from the fallback).
+            candidates = [
+                m for m in config.machines
+                if eligible(m) and has_room(m) and m.name != failed.machine_name
+            ]
+            if not candidates:
+                candidates = [m for m in config.machines if eligible(m) and has_room(m)]
+            if not candidates:
+                return None
+            machine = candidates[0]
+
     repo_path = machine.repo_path(failed.repo_name)
 
     retry_model = model if model is not None else failed.model
@@ -2275,6 +2372,7 @@ def _reassign(
 def describe_no_candidate_machines(
     failed: Assignment, board: Board, config: Config,
     issue_labels: list[str] | None = None,
+    pinned_machine_fetcher=None,
 ) -> str:
     """Explain why :func:`_reassign` found no candidate machine (#1396).
 
@@ -2300,6 +2398,15 @@ def describe_no_candidate_machines(
     *issue_labels* (#2323) threads the same label list the caller handed
     ``_reassign``, so the provider this diagnostic resolves (for the #1711
     capability lines) matches the one the retry actually resolved.
+
+    *pinned_machine_fetcher* (#4056) is the same optional
+    ``(repo_name, issue_number) -> str`` callable as ``_reassign``'s own
+    parameter of that name. When it names a pin, or when no pin exists but
+    ``route_work_by_capability`` names a capability-routed target, this
+    names THAT one host's specific blocking reason instead of the
+    fleet-wide table below — the retry is waiting on exactly one machine,
+    not choosing among many, so listing every machine as if any of them
+    were a fallback would mislead.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
     from coord.providers import (  # noqa: PLC0415
@@ -2333,6 +2440,79 @@ def describe_no_candidate_machines(
     ]
     if not relevant_machines:
         return f"no machine in coordinator.yml can work on repo {failed.repo_name!r}"
+
+    # #4056: a pin or capability-routing narrows the retry to exactly ONE
+    # eligible host — mirrors `_reassign`'s own pin-first/capability-second
+    # placement (same `route_work_by_capability` call) so this diagnostic
+    # names THAT host's specific blocking reason, not a fleet-wide table
+    # that would wrongly read as "any of these is a fallback".
+    pinned_machine_name = (
+        pinned_machine_fetcher(failed.repo_name, failed.issue_number)
+        if pinned_machine_fetcher is not None
+        else ""
+    )
+    target_name = pinned_machine_name
+    target_label = "pinned"
+    if not target_name:
+        from coord.dispatch import route_work_by_capability  # noqa: PLC0415
+
+        repo_cfg_for_routing = config.repo(failed.repo_name)
+        capability_routing = route_work_by_capability(
+            proposed_machine_name=failed.machine_name,
+            repo_name=failed.repo_name,
+            files_likely=failed.files_allowed,
+            machines=config.machines,
+            capability_rules=config.smoke_tests.capability_rules,
+            repo_requires=(
+                repo_cfg_for_routing.requires if repo_cfg_for_routing is not None else ()
+            ),
+            issue_title=failed.issue_title,
+        )
+        if capability_routing is not None:
+            if capability_routing.unmet_capabilities:
+                # Mirrors `_reassign`'s own refusal: no configured machine
+                # fully declares the capability this diff needs, so
+                # `route_work_by_capability`'s "never zero machines"
+                # fallback named one anyway (fine for a first dispatch's
+                # explicit warning, not for an unattended retry) — name
+                # the real blocker instead of a specific machine.
+                return (
+                    "no machine declares the capability this issue needs "
+                    f"({', '.join(capability_routing.unmet_capabilities)}) — "
+                    "the retry is waiting for one, not falling back to a "
+                    "host that cannot verify it"
+                )
+            target_name = capability_routing.machine_name
+            target_label = "capability-routed"
+
+    if target_name:
+        target = next((m for m in config.machines if m.name == target_name), None)
+        waiting = "the retry is waiting for it, not falling back to another host"
+        if target is None:
+            return f"{target_label} machine {target_name!r} is not configured in coordinator.yml — {waiting}"
+        if target.name in paused:
+            return f"{target_label} machine {target.name!r} is paused — {waiting}"
+        if provider_for_capability is not None and not machine_supports_provider(
+            target, provider_for_capability, config.providers,
+        ):
+            return (
+                f"{target_label} machine {target.name!r} cannot run provider "
+                f"{provider_for_capability!r} (no matching capability in "
+                f"coordinator.yml machines[].capabilities) — {waiting}"
+            )
+        target_running = running_by_machine.get(target.name, [])
+        target_cap = _machine_capacity(target, config)
+        if len(target_running) >= target_cap:
+            return (
+                f"{target_label} machine {target.name!r} is at capacity "
+                f"({len(target_running)}/{target_cap} running) — {waiting}"
+            )
+        return (
+            f"{target_label} machine {target.name!r} looks free — "
+            "_reassign must have refused for a different reason (a TOS-"
+            "gate refusal, a dispatch-liveness refusal, or a dispatch POST "
+            "failure); re-run `coord retry` to try again"
+        )
 
     # #1417: the fleet-wide cap blocks every machine regardless of
     # individual headroom — computed once so a machine that's personally
@@ -3012,6 +3192,11 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         _issue_liveness_from_cache(board, repo, num, branch)
                     ),
                     branch_exists_fetcher=github_ops.branch_exists_on_remote,
+                    # #4056: the passive tick must honor the SAME placement
+                    # a manual `coord retry` does — the drive-queue row's
+                    # pin, else capability routing — rather than falling
+                    # back to whatever machine merely had spare capacity.
+                    pinned_machine_fetcher=drive_queue_pinned_machine,
                 )
             except RetryProviderMismatch:
                 # Refuse rather than substitute (#2323) — leave the failed
