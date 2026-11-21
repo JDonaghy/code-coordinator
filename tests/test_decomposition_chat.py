@@ -2226,6 +2226,8 @@ class TestFileAndQueueSplitProposal:
             )),
         )
 
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
     @patch("coord.state.get_drive_queue_entry")
     @patch("coord.state.enqueue_drive_queue")
     @patch("coord.github_ops.get_issue_state")
@@ -2235,6 +2237,7 @@ class TestFileAndQueueSplitProposal:
     def test_files_epic_children_queues_and_supersedes(
         self, mock_create_issue, mock_update_body, mock_close_issue,
         mock_get_issue_state, mock_enqueue, mock_get_entry,
+        mock_get_issue, mock_get_open_issues,
     ) -> None:
         from coord.models import Repo
 
@@ -2245,6 +2248,8 @@ class TestFileAndQueueSplitProposal:
         ]
         mock_get_entry.return_value = {"after_json": []}
         mock_get_issue_state.return_value = "closed"
+        mock_get_issue.return_value = {"milestone": None}
+        mock_get_open_issues.return_value = []
         repo = Repo(name="api", github="acme/api")
 
         epic_number = decomposition_chat.file_and_queue_split_proposal(
@@ -2288,6 +2293,8 @@ class TestFileAndQueueSplitProposal:
         assert "500" in close_kwargs["comment"]
         mock_get_issue_state.assert_called_once_with("acme/api", 99)
 
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
     @patch("coord.state.get_drive_queue_entry")
     @patch("coord.state.enqueue_drive_queue")
     @patch("coord.github_ops.get_issue_state")
@@ -2297,6 +2304,7 @@ class TestFileAndQueueSplitProposal:
     def test_raises_when_close_does_not_read_back_closed(
         self, mock_create_issue, mock_update_body, mock_close_issue,
         mock_get_issue_state, mock_enqueue, mock_get_entry,
+        mock_get_issue, mock_get_open_issues,
     ) -> None:
         """`close_issue()` returning without raising only proves the close
         REQUEST was issued — if GitHub still reports the original issue as
@@ -2311,6 +2319,8 @@ class TestFileAndQueueSplitProposal:
         ]
         mock_get_entry.return_value = {"after_json": []}
         mock_get_issue_state.return_value = "open"
+        mock_get_issue.return_value = {"milestone": None}
+        mock_get_open_issues.return_value = []
         repo = Repo(name="api", github="acme/api")
 
         with pytest.raises(RuntimeError, match="did not read back closed"):
@@ -2319,6 +2329,8 @@ class TestFileAndQueueSplitProposal:
             )
         mock_close_issue.assert_called_once()
 
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
     @patch("coord.state.get_drive_queue_entry")
     @patch("coord.state.enqueue_drive_queue")
     @patch("coord.github_ops.close_issue")
@@ -2326,7 +2338,7 @@ class TestFileAndQueueSplitProposal:
     @patch("coord.github_ops.create_issue")
     def test_raises_when_queued_child_does_not_read_back(
         self, mock_create_issue, mock_update_body, mock_close_issue,
-        mock_enqueue, mock_get_entry,
+        mock_enqueue, mock_get_entry, mock_get_issue, mock_get_open_issues,
     ) -> None:
         """An unconfirmed queue insert is not a queued child — the original
         must not be closed if a child never read back from the drive
@@ -2339,6 +2351,8 @@ class TestFileAndQueueSplitProposal:
             {"number": 502, "url": "https://x/502"},
         ]
         mock_get_entry.return_value = None
+        mock_get_issue.return_value = {"milestone": None}
+        mock_get_open_issues.return_value = []
         repo = Repo(name="api", github="acme/api")
 
         with pytest.raises(RuntimeError, match="did not read back"):
@@ -2346,6 +2360,189 @@ class TestFileAndQueueSplitProposal:
                 proposal=self._proposal(), verification=self._verification(), repo=repo,
             )
         mock_close_issue.assert_not_called()
+
+
+class TestFileAndQueueSplitProposalMilestoneAndParentEpic:
+    """#4064: every filed child (and a brand-new tracker, when one is
+    filed) inherits the original's own milestone, and a split of an issue
+    already parented by an open epic splices its children into THAT epic
+    instead of filing a second tracker."""
+
+    def _proposal(self) -> "decomposition_chat.SplitProposal":
+        from coord.models import SplitChunk, SplitProposal
+
+        return SplitProposal(
+            id=0, repo_name="api", issue_number=99, issue_title="A giant issue",
+            rationale="too big for one worker", chunks=[
+                SplitChunk(title="Part 1", scope="do part 1", files_likely=["a.py"]),
+                SplitChunk(title="Part 2", scope="do part 2", files_likely=["b.py"]),
+            ],
+        )
+
+    def _verification(self) -> "decomposition_chat.SplitVerification":
+        from coord.milestone_order import WorkOrder, WorkOrderNode
+        from coord.preflight_size import SplitVerification
+
+        return SplitVerification(
+            ok=True, reason=None, epic_body="rationale text",
+            work_order=WorkOrder(nodes=(
+                WorkOrderNode(issue_number=1, after=()),
+                WorkOrderNode(issue_number=2, after=(1,)),
+            )),
+        )
+
+    @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    @patch("coord.github_ops.get_open_issues", return_value=[])
+    @patch("coord.github_ops.get_issue")
+    def test_children_and_tracker_inherit_original_milestone(
+        self, mock_get_issue, mock_get_open_issues, mock_create_issue,
+        mock_update_body, mock_close_issue, mock_get_issue_state,
+        mock_enqueue, mock_get_entry,
+    ) -> None:
+        from coord.models import Repo
+
+        mock_get_issue.return_value = {
+            "milestone": {"number": 7, "title": "v2.0"}
+        }
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},  # tracker epic
+            {"number": 501, "url": "https://x/501"},  # Part 1
+            {"number": 502, "url": "https://x/502"},  # Part 2
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+
+        for call in mock_create_issue.call_args_list:
+            assert call.kwargs["milestone"] == "v2.0"
+
+    @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.create_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
+    def test_splices_into_parent_epic_instead_of_filing_a_second_tracker(
+        self, mock_get_issue, mock_get_open_issues, mock_update_body,
+        mock_create_issue, mock_close_issue, mock_get_issue_state,
+        mock_enqueue, mock_get_entry,
+    ) -> None:
+        from coord.milestone_order import parse_sub_issues
+        from coord.models import Repo
+
+        epic_body = (
+            "Epic description.\n\n"
+            "## Sub-issues\n"
+            "- [ ] #5\n"
+            "- [ ] #99  {after: #5}\n"
+            "- [ ] #20  {after: #99}\n"
+        )
+        epics = {10: {"number": 10, "body": epic_body}}
+
+        def _get_issue(repo_github, number):
+            if number == 99:
+                return {"milestone": None}
+            return dict(epics[number])
+
+        def _update_body(repo_github, number, body):
+            epics[number] = {**epics[number], "body": body}
+
+        mock_get_issue.side_effect = _get_issue
+        mock_update_body.side_effect = _update_body
+        mock_get_open_issues.return_value = [
+            {"number": 10, "labels": [{"name": "epic"}], "body": epic_body},
+        ]
+        mock_create_issue.side_effect = [
+            {"number": 501, "url": "https://x/501"},  # Part 1
+            {"number": 502, "url": "https://x/502"},  # Part 2
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        epic_number = decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+
+        # No second tracker epic — only the two children are filed, and
+        # the function reports the REAL parent, not a new issue number.
+        assert epic_number == 10
+        assert mock_create_issue.call_count == 2
+        for call in mock_create_issue.call_args_list:
+            assert "labels" not in call.kwargs or call.kwargs["labels"] is None
+
+        final_body = epics[10]["body"]
+        work_order = parse_sub_issues(final_body)
+        numbers = set(work_order.issue_numbers)
+        # #99's own node is gone — replaced by its children.
+        assert 99 not in numbers
+        assert {5, 20, 501, 502} <= numbers
+        # The split's root (501) inherits #99's own predecessor (#5); its
+        # internal dependent (502) is unchanged.
+        assert work_order.node(501).after == (5,)
+        assert work_order.node(502).after == (501,)
+        # #20 depended on #99 — it's re-pointed at the split's SINK (502),
+        # not its root, so it can't launch before the whole chain lands.
+        assert work_order.node(20).after == (502,)
+        # #5 is untouched — it never named #99 in its own `after`.
+        assert work_order.node(5).after == ()
+
+    @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.create_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
+    def test_in_progress_marker_survives_the_splice_write(
+        self, mock_get_issue, mock_get_open_issues, mock_update_body,
+        mock_create_issue, mock_close_issue, mock_get_issue_state,
+        mock_enqueue, mock_get_entry,
+    ) -> None:
+        """The #4064 in-progress marker `find_filed_split_epic` scans for
+        must still be present on the parent epic AFTER the final splice
+        write — it is prepended, not appended, specifically so the
+        splice's own section-replace (which spans to EOF when the
+        checklist is the body's last section) can never silently discard
+        it; a crash right after this point must still read as "already
+        filed" on retry, never trigger a second, duplicate attempt."""
+        from coord.models import Repo
+
+        epic_body = "## Sub-issues\n- [ ] #99\n"
+        epics = {10: {"number": 10, "body": epic_body}}
+
+        def _get_issue(repo_github, number):
+            if number == 99:
+                return {"milestone": None}
+            return dict(epics[number])
+
+        def _update_body(repo_github, number, body):
+            epics[number] = {**epics[number], "body": body}
+
+        mock_get_issue.side_effect = _get_issue
+        mock_update_body.side_effect = _update_body
+        mock_get_open_issues.return_value = [
+            {"number": 10, "labels": [{"name": "epic"}], "body": epic_body},
+        ]
+        mock_create_issue.side_effect = [
+            {"number": 501, "url": "https://x/501"},
+            {"number": 502, "url": "https://x/502"},
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+
+        assert "Split from #99 by " in epics[10]["body"]
 
 
 class TestRepointQueuedDependentsAtSplit:
@@ -2385,17 +2582,22 @@ class TestRepointQueuedDependentsAtSplit:
             )),
         )
 
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
     @patch("coord.github_ops.get_issue_state")
     @patch("coord.github_ops.close_issue")
     @patch("coord.github_ops.update_issue_body")
     @patch("coord.github_ops.create_issue")
     def test_dependents_repointed_at_sink_children_and_original_closed(
         self, mock_create_issue, mock_update_body, mock_close_issue, mock_get_issue_state,
+        mock_get_issue, mock_get_open_issues,
     ) -> None:
         from coord.drive_queue import entry_key
         from coord.models import Repo
         from coord.state import enqueue_drive_queue, list_drive_queue
 
+        mock_get_issue.return_value = {"milestone": None}
+        mock_get_open_issues.return_value = []
         mock_create_issue.side_effect = [
             {"number": 500, "url": "https://x/500"},  # epic
             {"number": 501, "url": "https://x/501"},  # C1
@@ -2431,12 +2633,15 @@ class TestRepointQueuedDependentsAtSplit:
         # The original is still force-closed, after the re-point.
         mock_close_issue.assert_called_once()
 
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
     @patch("coord.github_ops.get_issue_state")
     @patch("coord.github_ops.close_issue")
     @patch("coord.github_ops.update_issue_body")
     @patch("coord.github_ops.create_issue")
     def test_repoint_failure_aborts_before_close_and_leaves_row_untouched(
         self, mock_create_issue, mock_update_body, mock_close_issue, mock_get_issue_state,
+        mock_get_issue, mock_get_open_issues,
         monkeypatch,
     ) -> None:
         """A failed re-point write must abort BEFORE the original closes,
@@ -2447,6 +2652,8 @@ class TestRepointQueuedDependentsAtSplit:
         from coord.models import Repo
         from coord.state import enqueue_drive_queue, list_drive_queue
 
+        mock_get_issue.return_value = {"milestone": None}
+        mock_get_open_issues.return_value = []
         mock_create_issue.side_effect = [
             {"number": 500, "url": "https://x/500"},
             {"number": 501, "url": "https://x/501"},
@@ -2622,6 +2829,8 @@ class TestAutoSplitNeedsDecomposition:
         assert epic is None
         mock_file.assert_not_called()
 
+    @patch("coord.github_ops.get_open_issues", return_value=[])
+    @patch("coord.github_ops.get_issue", return_value={"milestone": None})
     @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
     @patch("coord.state.enqueue_drive_queue")
     @patch("coord.github_ops.get_issue_state", return_value="closed")
@@ -2631,6 +2840,7 @@ class TestAutoSplitNeedsDecomposition:
     def test_filer_origin_is_quoted_in_epic_and_close_comment(
         self, mock_create_issue, mock_update_body, mock_close_issue,
         mock_get_issue_state, mock_enqueue, mock_get_entry,
+        mock_get_issue, mock_get_open_issues,
     ) -> None:
         from coord.milestone_order import WorkOrder, WorkOrderNode
         from coord.models import Repo, SplitChunk, SplitProposal
