@@ -2502,6 +2502,136 @@ class TestFileAndQueueSplitProposalMilestoneAndParentEpic:
     @patch("coord.github_ops.update_issue_body")
     @patch("coord.github_ops.get_open_issues")
     @patch("coord.github_ops.get_issue")
+    def test_splices_into_epic_whose_only_block_is_work_order(
+        self, mock_get_issue, mock_get_open_issues, mock_update_body,
+        mock_create_issue, mock_close_issue, mock_get_issue_state,
+        mock_enqueue, mock_get_entry,
+    ) -> None:
+        """`coord milestone write-order` only ever writes `## Work order`
+        (never `## Sub-issues`), and `coord milestone sync` removes `##
+        Sub-issues` once it has folded it in — a work-order-only epic is
+        the dominant shape, not an edge case. `_find_parent_epic` must
+        still find it, and the splice must still land in that section."""
+        from coord.milestone_order import parse_work_order
+        from coord.models import Repo
+
+        epic_body = (
+            "Epic description.\n\n"
+            "## Work order\n"
+            "- #5\n"
+            "- #99  {after: #5}\n"
+            "- #20  {after: #99}\n"
+        )
+        epics = {10: {"number": 10, "body": epic_body}}
+
+        def _get_issue(repo_github, number):
+            if number == 99:
+                return {"milestone": None}
+            return dict(epics[number])
+
+        def _update_body(repo_github, number, body):
+            epics[number] = {**epics[number], "body": body}
+
+        mock_get_issue.side_effect = _get_issue
+        mock_update_body.side_effect = _update_body
+        mock_get_open_issues.return_value = [
+            {"number": 10, "labels": [{"name": "epic"}], "body": epic_body},
+        ]
+        mock_create_issue.side_effect = [
+            {"number": 501, "url": "https://x/501"},  # Part 1
+            {"number": 502, "url": "https://x/502"},  # Part 2
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        epic_number = decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+
+        # No second tracker epic — the work-order-only epic is found and
+        # spliced into directly.
+        assert epic_number == 10
+        assert mock_create_issue.call_count == 2
+
+        final_body = epics[10]["body"]
+        work_order = parse_work_order(final_body)
+        numbers = set(work_order.issue_numbers)
+        assert 99 not in numbers
+        assert {5, 20, 501, 502} <= numbers
+        assert work_order.node(501).after == (5,)
+        assert work_order.node(502).after == (501,)
+        assert work_order.node(20).after == (502,)
+        # Checkbox-free grammar preserved — no `- [ ] #N` row introduced.
+        assert "[ ]" not in final_body
+        assert "[x]" not in final_body
+
+    @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.create_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
+    def test_splice_preserves_hand_written_prose_on_other_rows(
+        self, mock_get_issue, mock_get_open_issues, mock_update_body,
+        mock_create_issue, mock_close_issue, mock_get_issue_state,
+        mock_enqueue, mock_get_entry,
+    ) -> None:
+        """A hand-written row's free-text suffix (e.g. `— tranche 2 of
+        #101`) on a sibling the splice never touches must survive
+        byte-for-byte — only #99's own row is replaced, and only #20's
+        `after:` annotation is rewritten in place."""
+        from coord.models import Repo
+
+        epic_body = (
+            "Epic description.\n\n"
+            "## Sub-issues\n"
+            "- [ ] #5 — tranche 1 of #101\n"
+            "- [ ] #99  {after: #5} — tranche 2 of #101\n"
+            "- [ ] #20  {after: #99} — tranche 3 of #101\n"
+        )
+        epics = {10: {"number": 10, "body": epic_body}}
+
+        def _get_issue(repo_github, number):
+            if number == 99:
+                return {"milestone": None}
+            return dict(epics[number])
+
+        def _update_body(repo_github, number, body):
+            epics[number] = {**epics[number], "body": body}
+
+        mock_get_issue.side_effect = _get_issue
+        mock_update_body.side_effect = _update_body
+        mock_get_open_issues.return_value = [
+            {"number": 10, "labels": [{"name": "epic"}], "body": epic_body},
+        ]
+        mock_create_issue.side_effect = [
+            {"number": 501, "url": "https://x/501"},  # Part 1
+            {"number": 502, "url": "https://x/502"},  # Part 2
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+
+        final_body = epics[10]["body"]
+        # Untouched sibling row's prose survives verbatim.
+        assert "- [ ] #5 — tranche 1 of #101" in final_body
+        # #20's row keeps its own prose suffix — only the `after:` target
+        # inside its annotation changed, from #99 to the split's sink.
+        assert "— tranche 3 of #101" in final_body
+        section = final_body.split("## Sub-issues")[1]
+        assert "#99" not in section
+
+    @patch("coord.state.get_drive_queue_entry", return_value={"after_json": []})
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.create_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
     def test_in_progress_marker_survives_the_splice_write(
         self, mock_get_issue, mock_get_open_issues, mock_update_body,
         mock_create_issue, mock_close_issue, mock_get_issue_state,

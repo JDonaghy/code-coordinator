@@ -124,6 +124,9 @@ class MarkdownParentage:
     candidate tracking issue as ``{"number": int, "state": str, "body":
     str}``. The first whose ``## Sub-issues`` checklist names *issue_number*
     is the parent; ``None`` when no candidate does (or none were supplied).
+    Accepts the same ``fallback_to_work_order`` kwarg as ``children()``, for
+    the identical reason: plenty of epics carry only a ``## Work order``
+    block and were never additionally seeded with ``## Sub-issues``.
 
     The checklist's ``- [x]`` / ``- [ ]`` box is the only completion signal
     this convention carries, so it doubles as the child's reported ``state``
@@ -155,10 +158,14 @@ class MarkdownParentage:
         issue_number: int,
         *,
         epics: list[dict] | None = None,
+        fallback_to_work_order: bool = False,
     ) -> ParentRef | None:
         for epic in epics or []:
             try:
-                work_order = parse_sub_issues(epic.get("body") or "")
+                body = epic.get("body") or ""
+                work_order = parse_sub_issues(body)
+                if not work_order.nodes and fallback_to_work_order:
+                    work_order = parse_work_order(body)
             except Exception:  # noqa: BLE001 — a malformed epic body: skip it
                 continue
             if work_order.node(issue_number) is not None:

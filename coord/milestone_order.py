@@ -109,6 +109,8 @@ __all__ = [
     "render_sub_issues",
     "replace_sub_issues_section",
     "remove_sub_issues_section",
+    "splice_replace_work_order_node",
+    "splice_replace_sub_issues_node",
     "milestone_work_order_membership",
     "validate_milestone_membership",
     "validate_no_shared_oracle_group",
@@ -469,6 +471,187 @@ def replace_sub_issues_section(body: str, new_block: str) -> str:
     return _splice_checklist_section(
         body, new_block, _SUB_ISSUES_HEADING_RE, "## Sub-issues"
     )
+
+
+def splice_replace_work_order_node(
+    body: str,
+    *,
+    original_issue: int,
+    replacement_nodes: tuple[WorkOrderNode, ...],
+    repoint_after_to: tuple[int, ...] = (),
+) -> str | None:
+    """Replace the `## Work order` row declaring *original_issue* with one
+    row per *replacement_nodes*, editing only that one line.
+
+    Returns ``None`` when *body* has no `## Work order` heading, or that
+    section doesn't declare *original_issue* at all — the caller's cue to
+    try the other checklist convention instead.
+
+    Unlike :func:`replace_work_order_section` (which re-renders the WHOLE
+    section from a parsed :class:`WorkOrder`, and so loses a hand-written
+    row's free-text suffix — :class:`WorkOrderNode` has no field for it),
+    this touches only the single row naming *original_issue* and, for every
+    OTHER row whose own ``after:`` names *original_issue*, rewrites just
+    that reference to *repoint_after_to* in place. Every other byte of
+    every other line — a hand-written row's prose suffix, blank lines, the
+    rest of the body — is preserved verbatim.
+
+    Each new row's checkbox style (`- [ ] #N` vs `- #N`) matches whatever
+    *original_issue*'s own row used, so a splice can't flip a section
+    between the two conventions. A *replacement_nodes* entry that declares
+    its own ``after`` keeps it; one that doesn't inherits *original_issue*'s
+    own ``after``.
+
+    Re-validates the computed body with :func:`parse_work_order` before
+    returning it — raises :class:`WorkOrderError` rather than ever handing
+    back a corrupted splice.
+    """
+    return _splice_replace_node(
+        body, _HEADING_RE, parse_work_order,
+        original_issue=original_issue,
+        replacement_nodes=replacement_nodes,
+        repoint_after_to=repoint_after_to,
+    )
+
+
+def splice_replace_sub_issues_node(
+    body: str,
+    *,
+    original_issue: int,
+    replacement_nodes: tuple[WorkOrderNode, ...],
+    repoint_after_to: tuple[int, ...] = (),
+) -> str | None:
+    """Mirrors :func:`splice_replace_work_order_node` exactly, for the
+    `## Sub-issues` checklist instead of `## Work order` — see that
+    function's docstring for the full contract.
+    """
+    return _splice_replace_node(
+        body, _SUB_ISSUES_HEADING_RE, parse_sub_issues,
+        original_issue=original_issue,
+        replacement_nodes=replacement_nodes,
+        repoint_after_to=repoint_after_to,
+    )
+
+
+def _splice_replace_node(
+    body: str,
+    heading_re: re.Pattern[str],
+    parser: Callable[[str], WorkOrder],
+    *,
+    original_issue: int,
+    replacement_nodes: tuple[WorkOrderNode, ...],
+    repoint_after_to: tuple[int, ...],
+) -> str | None:
+    """Shared implementation behind :func:`splice_replace_work_order_node` /
+    :func:`splice_replace_sub_issues_node`."""
+    existing = parser(body)
+    original_node = existing.node(original_issue)
+    if original_node is None:
+        return None
+
+    lines = body.splitlines()
+    trailing_newline = body.endswith("\n")
+    start = None
+    for i, line in enumerate(lines):
+        if heading_re.match(line.strip()):
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].strip().startswith("#"):
+            end = i
+            break
+
+    new_section: list[str] = []
+    for line in lines[start:end]:
+        content = line.lstrip()
+        indent = line[: len(line) - len(content)]
+        stripped = content.rstrip()
+        if not stripped:
+            new_section.append(line)
+            continue
+        m = _ITEM_RE.match(stripped)
+        if not m:
+            new_section.append(line)
+            continue
+        if int(m.group(2)) == original_issue:
+            uses_checkbox = m.group(1) is not None
+            split_nodes = tuple(
+                WorkOrderNode(
+                    issue_number=n.issue_number,
+                    group=n.group,
+                    after=n.after if n.after else original_node.after,
+                    checked=n.checked,
+                )
+                for n in replacement_nodes
+            )
+            rendered = render_work_order(
+                WorkOrder(nodes=split_nodes), checkbox=uses_checkbox,
+            ).splitlines()
+            new_section.extend(f"{indent}{r}" for r in rendered)
+            continue
+        if repoint_after_to and m.group(3):
+            new_section.append(
+                _repoint_after_in_line(indent, stripped, m, original_issue, repoint_after_to)
+            )
+        else:
+            new_section.append(line)
+
+    new_lines = lines[:start] + new_section + lines[end:]
+    result = "\n".join(new_lines)
+    result = f"{result}\n" if trailing_newline else result
+    parser(result)  # raises WorkOrderError on a corrupted splice
+    return result
+
+
+def _repoint_after_in_line(
+    indent: str,
+    stripped: str,
+    item_match: re.Match[str],
+    old: int,
+    new_targets: tuple[int, ...],
+) -> str:
+    """Rewrite *old*'s occurrence inside *stripped*'s own ``{after: ...}``
+    annotation to *new_targets*, leaving every other byte of the line
+    (including any prose after the closing ``}``) untouched. Returns
+    *stripped* (re-indented) unchanged when its ``after`` list doesn't
+    actually name *old*. De-duplicates against whatever else the ``after``
+    list already names, preserving first-seen order — mirrors
+    :func:`coord.drive_queue.rewrite_after_for_split`'s own posture.
+    """
+    brace_start, brace_end = item_match.start(3), item_match.end(3)
+    inner = item_match.group(4) or ""
+    pieces: list[str] = []
+    changed = False
+    for pair in _PAIR_RE.finditer(inner):
+        key = pair.group(1).strip()
+        value = pair.group(2).strip().rstrip(",").strip()
+        if key.lower() != "after":
+            pieces.append(f"{key}: {value}")
+            continue
+        seen: set[int] = set()
+        new_list: list[str] = []
+        for chunk in value.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            num = int(chunk.lstrip("#"))
+            if num == old:
+                changed = True
+                for target in new_targets:
+                    if target not in seen:
+                        seen.add(target)
+                        new_list.append(f"#{target}")
+            elif num not in seen:
+                seen.add(num)
+                new_list.append(f"#{num}")
+        pieces.append("after: " + ",".join(new_list))
+    if not changed:
+        return f"{indent}{stripped}"
+    new_brace = "{" + ", ".join(pieces) + "}"
+    return f"{indent}{stripped[:brace_start]}{new_brace}{stripped[brace_end:]}"
 
 
 def remove_sub_issues_section(body: str) -> str:
