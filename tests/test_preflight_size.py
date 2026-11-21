@@ -426,6 +426,96 @@ class TestVerifySplitProposalRejectsPlaceholderFiles:
         assert "child 2" in verification.reason
 
 
+class TestVerifySplitProposalRejectsProseOnlyDependency:
+    """#4064: a child whose own scope names a dependency on an earlier
+    child in PROSE, with no matching `After:` line, is rejected — the
+    quadraui#2804/#2847 incidents, where the edge was known (written in the
+    child's own body) but never landed in the parsed `chunk.after` field."""
+
+    def test_depends_on_child_n_with_no_after_line_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="Depends on Child 1 — reuses the type it adds.",
+                    files_likely=["coord/unrelated.py"],
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+        assert "1" in verification.reason
+        assert "verification failure" in verification.reason
+
+    def test_once_children_n_merge_with_no_after_line_is_rejected(self) -> None:
+        # quadraui#2797's own observed shape: "once Children 1-2 merge".
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+                SplitChunk(
+                    title="c",
+                    scope="Wires both up, once Children 1-2 merge.",
+                    files_likely=["coord/unrelated.py"],
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 3" in verification.reason
+
+    def test_after_child_n_prose_with_no_after_line_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="Ship this after Child 1 lands.",
+                    files_likely=["coord/unrelated.py"],
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+
+    def test_prose_dependency_with_matching_after_line_is_accepted(self) -> None:
+        # The declared `After:` line is already stripped out of `scope` by
+        # `_split_after_declaration` before it ever reaches here — so a
+        # chunk that correctly used BOTH the real line and a prose
+        # restatement of the same dependency (e.g. "Depends on Child 1" in
+        # its own prose, with the position also present in `chunk.after`)
+        # is accepted, exactly like any other declared-after chunk.
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="Depends on Child 1 — reuses the type it adds.",
+                    files_likely=["coord/unrelated.py"],
+                    after=(1,),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_no_prose_dependency_mention_behaves_exactly_as_before(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+
 class TestVerifySplitProposalRejectsNoChunks:
     def test_no_chunks_is_rejected_with_a_reason(self) -> None:
         verification = verify_split_proposal(_proposal([]))

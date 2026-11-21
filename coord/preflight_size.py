@@ -358,6 +358,44 @@ def score_issue_size(
 # yet to validate.
 
 
+# #4064: a child's dependency on an earlier one can be stated in PROSE —
+# "Depends on Child 1", "once Children 1-2 merge", "after Child 1 lands" —
+# with no matching `After:` line (the quadraui#2804/#2847 incidents: the
+# agent wrote the dependency in the child's own scope text and never
+# emitted the machine-readable line #4031 added). The dependency is known
+# either way; it just isn't in the parsed field `verify_split_proposal`
+# actually chains on. This regex is a heuristic text scan, not a grammar —
+# deliberately permissive about punctuation/wording between the cue word
+# and the digits — and is matched only against a chunk's own scope prose
+# (never its `## Files` list), the same corpus `_split_after_declaration`
+# already scans for the real `After:` line.
+_PROSE_DEPENDENCY_RE = re.compile(
+    r"\b(?:depends?\s+on|once|after)\s+child(?:ren)?\s+"
+    r"([0-9][0-9,\s\-]*(?:\s+and\s+\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _prose_dependency_positions(scope_text: str) -> tuple[int, ...]:
+    """Child positions *scope_text* names as a dependency in prose, deduped
+    and in first-seen order — see :data:`_PROSE_DEPENDENCY_RE`.
+
+    ``()`` when nothing matches — the common case, and the only case for a
+    scope that correctly used the `After:` line instead (that line is
+    stripped out of ``scope`` before it ever reaches here —
+    :func:`coord.decomposition_chat._split_after_declaration`).
+    """
+    positions: list[int] = []
+    seen: set[int] = set()
+    for match in _PROSE_DEPENDENCY_RE.finditer(scope_text or ""):
+        for raw in re.findall(r"\d+", match.group(1)):
+            n = int(raw)
+            if n not in seen:
+                seen.add(n)
+                positions.append(n)
+    return tuple(positions)
+
+
 @dataclass(frozen=True)
 class SplitVerification:
     """The gate's verdict on one :class:`~coord.models.SplitProposal`.
@@ -393,12 +431,21 @@ def verify_split_proposal(
        meaningless to :func:`coord.overlap_predict.predict_overlap` and not
        safe to file onto a real issue's ``## Files`` section (#4031, the
        quadraui#2664 incident).
-    3. *epic_body* — the `## Sub-issues` block that would actually be
+    3. No chunk's own scope prose names a dependency on an earlier chunk —
+       "Depends on Child N", "once Child(ren) N... merge(s)", "after Child
+       N" (:func:`_prose_dependency_positions`) — that isn't ALSO present
+       in its declared ``chunk.after`` (#4064, the quadraui#2804/#2847
+       incidents: a child's body said "Depends on Child 1" in prose but
+       declared no `After:` line, so the edge was silently dropped and the
+       sibling could launch beside it). A prose-only dependency is rejected
+       here, before any epic body is even built — same posture as check 4
+       below rejecting a declared edge to a nonexistent/later child.
+    4. *epic_body* — the `## Sub-issues` block that would actually be
        written to the real epic issue — parses under the create-epic
        grammar (:func:`coord.milestone_order.parse_sub_issues`) and
        produces exactly one node per proposed chunk (so every child will
        actually be visible once filed).
-    4. When the caller has no real epic body yet (the common case: the
+    5. When the caller has no real epic body yet (the common case: the
        real issue numbers don't exist until the epic and its children are
        filed), one is COMPUTED here — sequential placeholder numbers in
        proposal order, with each child's ``after`` edges the UNION (#4031)
@@ -417,7 +464,7 @@ def verify_split_proposal(
 
        This construction is a DAG by built-in (every edge, declared or
        predicted, only ever points strictly backward), so it can never
-       itself trip check 3's cycle/undeclared-target failure; those
+       itself trip check 4's cycle/undeclared-target failure; those
        failure modes are reachable through the *epic_body* override
        instead — see the test suite.
 
@@ -449,6 +496,24 @@ def verify_split_proposal(
                 reason=(
                     f"child {i} ({chunk.title!r}) declares unfilled template "
                     f"placeholder(s) in '## Files': {placeholders!r}"
+                ),
+            )
+        declared_after = {int(p) for p in (chunk.after or ())}
+        prose_only = sorted(
+            p for p in _prose_dependency_positions(chunk.scope) if p not in declared_after
+        )
+        if prose_only:
+            return SplitVerification(
+                ok=False,
+                reason=(
+                    f"child {i} ({chunk.title!r}) names a dependency on "
+                    f"{'child' if len(prose_only) == 1 else 'children'} "
+                    f"{', '.join(str(p) for p in prose_only)} in its own "
+                    "scope prose, but declares no matching 'After: Child "
+                    f"{prose_only[0]}' line — a prose-only dependency is a "
+                    "verification failure; declare the 'After:' line (or "
+                    "drop the prose reference if there is in fact no such "
+                    "dependency)"
                 ),
             )
 
