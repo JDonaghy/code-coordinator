@@ -515,6 +515,43 @@ class TestVerifySplitProposalRejectsProseOnlyDependency:
         verification = verify_split_proposal(proposal)
         assert verification.ok is True
 
+    def test_self_reference_in_own_scope_is_not_a_false_positive(self) -> None:
+        """A chunk's own scope naming ITSELF (e.g. "Children 2-7 depend on
+        Child 1" written inside child 1's own scope) must never be read as
+        child 1 depending on child 1 — there is no earlier sibling to
+        declare an `After:` line against, so flagging it would make the
+        split unsatisfiable."""
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="Adds PaintState. Children 2-7 depend on Child 1.",
+                    files_likely=["coord/a.py"],
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_forward_reference_in_own_scope_is_not_a_false_positive(self) -> None:
+        """A chunk's own scope naming a LATER sibling ("Depends on Child
+        3" written in child 2) is not an earlier-sibling dependency this
+        gate can act on — it must not be rejected as if it were."""
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="Depends on Child 3 for its schema.",
+                    files_likely=["coord/b.py"],
+                ),
+                SplitChunk(title="c", scope="scope c", files_likely=["coord/c.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
 
 class TestVerifySplitProposalRejectsNoChunks:
     def test_no_chunks_is_rejected_with_a_reason(self) -> None:

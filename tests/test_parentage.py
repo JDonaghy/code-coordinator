@@ -174,6 +174,33 @@ class TestMarkdownParentageParent:
         assert store.parent("acme/api", 101, epics=epics) == ParentRef(number=500, state="open")
 
 
+class TestMarkdownParentageParentWorkOrderFallback:
+    """``parent()`` must accept the identical ``fallback_to_work_order``
+    opt-in ``children()`` already does — an epic seeded only with `##
+    Work order` is the dominant shape (``coord milestone write-order``
+    only ever writes that section; ``coord milestone sync`` removes `##
+    Sub-issues` once it has folded it in), not an edge case."""
+
+    def test_falls_back_to_work_order_when_opted_in(self) -> None:
+        store = MarkdownParentage()
+        epics = [{"number": 500, "state": "open", "body": _WORK_ORDER_ONLY_BODY}]
+        assert store.parent(
+            "acme/api", 101, epics=epics, fallback_to_work_order=True,
+        ) == ParentRef(number=500, state="open")
+
+    def test_no_fallback_by_default(self) -> None:
+        store = MarkdownParentage()
+        epics = [{"number": 500, "state": "open", "body": _WORK_ORDER_ONLY_BODY}]
+        assert store.parent("acme/api", 101, epics=epics) is None
+
+    def test_sub_issues_block_wins_over_work_order_even_with_fallback(self) -> None:
+        store = MarkdownParentage()
+        epics = [{"number": 500, "state": "open", "body": _EPIC_BODY}]
+        assert store.parent(
+            "acme/api", 101, epics=epics, fallback_to_work_order=True,
+        ) == ParentRef(number=500, state="open")
+
+
 class TestMarkdownParentageWrites:
     def test_add_child_raises_not_implemented(self) -> None:
         store = MarkdownParentage()

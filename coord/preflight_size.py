@@ -500,7 +500,9 @@ def verify_split_proposal(
             )
         declared_after = {int(p) for p in (chunk.after or ())}
         prose_only = sorted(
-            p for p in _prose_dependency_positions(chunk.scope) if p not in declared_after
+            p
+            for p in _prose_dependency_positions(chunk.scope)
+            if p not in declared_after and 1 <= p < i
         )
         if prose_only:
             return SplitVerification(
