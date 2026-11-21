@@ -3,7 +3,7 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-07-04_ — near-term direction is the two-tier **Pipeline v2**
+> _Last updated: 2026-09-10_ — near-term direction is the two-tier **Pipeline v2**
 > ([`docs/PIPELINE_V2.md`](docs/PIPELINE_V2.md)) and the **oracle loop**
 > ([`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md)): tighten the Work↔Test cycle into a warm in-session
 > loop against an independent, sealed acceptance oracle, to drive user-acceptance pass-rate toward
@@ -29,6 +29,18 @@
 > machinery; what the bug lane lacks is intake, the red-test authoring gate, and a standing
 > re-run cadence. vimcode is the testbed for it (and the forcing function for quadraui's gaps),
 > **not** a product being maintained.
+>
+> _The third lane (2026-09-10):_ **work targets that are not code.** The lanes above all
+> assume the deliverable is a diff against a repo someone already runs. Three epics now say
+> otherwise: **#3230** (terraform — coord gates an `apply`), **#3262** (job applications —
+> coord gates an outbound document about a real person), and **#3278** (an app from a
+> paragraph). They share one enabler and one blocker. The enabler is **#3261** — a pipeline
+> gate becomes a data object instead of a hardcoded membership test, because today a
+> non-code lane's gates either no-op silently or block forever. The blocker is **#3277** —
+> a queue row that comes back, for work whose value is in repetition rather than completion.
+> This is a **widening of what coord drives**, not a replacement for the lanes above: the
+> code lanes remain the proving ground, and none of this is credible until the machinery is
+> trustworthy on them.
 
 ## 🎯 North star
 
@@ -108,12 +120,17 @@ instrumentation teaches nothing.
 
 **Authored, gated, not dispatched:**
 
-- **M-W0 — web acceptance oracle** (milestone #51, epic #1537). The blocking discovery:
-  `coord/acceptance_drivers.py` supports only `tui-tuidriver` and `cli-pytest` —
-  **`web-playwright` does not exist**, despite `CLAUDE.md` describing it as shipped. The
-  oracle cannot currently gate a line of React. Keystone story #1538: a deterministic
-  seeded-board fixture server (the web twin of `make_test_app(BoardData)`), because
-  acceptance tests that read live fleet state are a flake generator, not an oracle.
+- **M-W0 — web acceptance oracle** (milestone #51, epic #1537). The original blocking
+  discovery was that `coord/acceptance_drivers.py` supported only `tui-tuidriver` and
+  `cli-pytest`. **Superseded 2026-09-10:** `SUPPORTED_KINDS` is now
+  `("tui-tuidriver", "cli-pytest", "web-playwright", "terraform")` — the Playwright driver
+  landed in #1539. The remaining gap is narrower but unchanged in kind: keystone story
+  **#1538**, a deterministic seeded-board fixture server (the web twin of
+  `make_test_app(BoardData)`), has *not* shipped, so `web-playwright` runs against whatever
+  the live fleet happens to be doing. `coord/acceptance_drivers.py:80-92` tracks it
+  explicitly as a driver that produces a real verdict but not yet a deterministic one —
+  "a smoke net, not a deterministic oracle". Acceptance tests that read live fleet state
+  are a flake generator, not an oracle.
 - **M-W1 — responsive shell + design system** (milestone #52, epic #1545).
 - Then: Pipeline read → Pipeline actions → desktop sessions → the remaining panels.
 
@@ -126,6 +143,48 @@ steps.
 it, fix it **with a test**, then resume. Shipping around a known process bug forfeits the
 evidence, which is half the point. The scorecard (first-pass acceptance rate, human
 interventions per issue, cost + wall-clock, escaped defects by stage) is in the RFC.
+
+## Near-term priority — widen what coord drives (2026-09-10)
+
+Everything above assumes the deliverable is **a diff against a repo someone already runs**.
+That assumption is now load-bearing in places it was never meant to be, and three filed
+epics push against it from different sides:
+
+| Epic | Work target | What it proves coord can gate |
+|---|---|---|
+| **#3230** | terraform | an `apply` |
+| **#3262** | job applications | an outbound document about a real person |
+| **#3278** | an app from a paragraph | provisioning a thing that did not exist |
+
+**The enabler is #3261, and it is not optional.** A pipeline gate is currently a hardcoded
+membership test — `pipeline.default_gates` accepts any list of strings, and every consumer
+is a literal `"review" in gates`. An unknown gate name parses clean, writes to the DB,
+renders in `coord gates`, and does nothing. So a non-code lane today gets a `test` gate
+that silently no-ops without a `test_command` (the grocery-list precedent), a `review` gate
+reading the code checklist against a research note, and a `merge` gate that blocks forever
+in a CI-less repo. #3261 makes the gate list real; its five slices are **#3269-#3273**,
+queued as a serial chain.
+
+**The blocker is #3277** — a queue row that comes back. Every entry is one-shot today, and
+work whose value is in *repetition rather than completion* has nowhere to live. #3262's
+`match` leg is blocked on exactly this.
+
+**Ordering, and why it is not the obvious one.** Scheduling is the most visible of the
+three ideas and the most tempting to build first. Doing so produces a daily row whose gates
+are decorative — an automated no-op, billed daily. The order is **#3261 → #3277 → the work
+targets**, and #3278 additionally waits on **#3275** because it reuses the `epic-decompose`
+path.
+
+**The commercial case, measured not assumed.** A cheap first pass is the point of #3278:
+a description in, something running out, at a price that makes it worth showing someone
+rather than quoting them. In the 2026-09-10 usage window the fleet's simplest lane
+(format-converter) ran at **~$1.23/issue** against quadraui's **~$14.11** — an 11x spread,
+where the cheap end is what a small greenfield app looks like. Re-measure with
+`coord usage --by repo` before repeating that number anywhere it matters.
+
+**This widens the north star; it does not replace it.** The code lanes stay the proving
+ground. A work target that is not code is only as trustworthy as the gate machinery
+underneath it, and that machinery is still being proven on diffs.
 
 ## Near-term priority — Tech Debt sweep (2026-06-25, 17/18 done)
 
