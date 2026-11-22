@@ -111,6 +111,7 @@ from coord.merge_queue import (
     is_ci_absent_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
+    is_ci_pending_reason,
     is_ci_stuck_reason,
     is_ci_terminal_reason,
     is_ci_unreadable_reason,
@@ -4675,6 +4676,15 @@ def is_unreachable_wait_shape(entry: QueueEntry) -> bool:
     `remove`+`add` (or #2920's equivalent auto-reset): re-queuing it would
     only run straight back into the same refusal.
 
+    A row parked on a `CI running:`/`CI stuck:` reason
+    (:func:`~coord.merge_queue.is_ci_pending_reason`) is excluded too —
+    that text is written only by `_reconcile_running`'s CI-pending park,
+    which by construction never fires without a real branch/PR/merge-queue
+    row to park ON. That is direct, current proof a dispatch happened, so
+    the row fails this predicate's own stated invariant ("both provably
+    have no branch/PR/merge-queue row for any sweep to ever form an
+    opinion about") rather than merely being slow to satisfy it.
+
     Pure and cheap (a predicate over one already-loaded row, no clock, no
     I/O) so callers in both tick-time reconcile and read-only status/doctor
     paths can share it without either paying for or needing live evidence.
@@ -4684,6 +4694,8 @@ def is_unreachable_wait_shape(entry: QueueEntry) -> bool:
     if _is_unsatisfiable_prereq_reason(entry.last_reason):
         return False
     if is_permanent_block_reason(entry.last_reason):
+        return False
+    if is_ci_pending_reason(entry.last_reason):
         return False
     if entry.attempts == 0:
         return True
@@ -6789,8 +6801,10 @@ def _reconcile_running(
                 "spending an attempt; a checks/jobs desync does not clear on "
                 "its own the way a pending check does, so this may still need "
                 "an operator — see the reason above, and once the "
-                "merge-queue sweep's own bounded auto-heal is exhausted, run "
-                "`coord ci rerun <repo> <pr> --run ID --job ID --stuck` (#4072)"
+                "merge-queue sweep's own bounded auto-heal "
+                "(`coord.merge_queue.MAX_CI_STUCK_RERUNS`) is exhausted it "
+                "names the exact `coord ci rerun` command for this PR's "
+                "actual run/job IDs — run that, not a guessed one"
             )
         else:
             reason = (

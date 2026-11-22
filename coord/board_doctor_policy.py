@@ -1069,12 +1069,17 @@ def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
 
 
 def _never_dispatched_still_true(repo_name: str, issue_number: int) -> bool:
-    """Does the board, read right now, still show ZERO assignments for
-    *repo_name*#*issue_number*?
+    """Does *repo_name*#*issue_number* still look never-dispatched right
+    now — zero board assignments AND no live CI-pending park?
 
-    `queue_diagnose.CAUSE_NEVER_DISPATCHED` is minted from exactly this
-    observation (`coord.queue_diagnose.LiveState.no_assignment_ever`, read
-    off `coord.gates.build_gate_report`'s own `rows`), but a
+    Echoes its own `warning:` line (via `click`) for every ``False`` it
+    returns, so :func:`_requeue_never_dispatched` never has to guess, or
+    reprint, which of the several refusal shapes below actually fired.
+
+    `queue_diagnose.CAUSE_NEVER_DISPATCHED` is minted from exactly the
+    board-assignments half of this observation
+    (`coord.queue_diagnose.LiveState.no_assignment_ever`, read off
+    `coord.gates.build_gate_report`'s own `rows`), but a
     :class:`~coord.board_doctor.StuckRow` reaching an auto action does not
     have to carry a verdict THIS sweep computed: `coord.board_doctor.
     _episode_stuck_row` reconstructs a row from an episode's *stored*
@@ -1123,6 +1128,14 @@ def _never_dispatched_still_true(repo_name: str, issue_number: int) -> bool:
     if live_entry is not None and is_ci_pending_reason(
         str(live_entry.get("last_reason") or "")
     ):
+        click.echo(
+            f"warning: board-doctor NOT requeuing {repo_name}#{issue_number} "
+            "— its live drive-queue entry already shows a \"CI running:\"/"
+            "\"CI stuck:\" park, so a dispatch happened even though the "
+            "board scan below would read as empty; leaving it for the "
+            "alert tier rather than removing a row with a live PR behind it",
+            err=True,
+        )
         return False
 
     try:
@@ -1135,7 +1148,17 @@ def _never_dispatched_still_true(repo_name: str, issue_number: int) -> bool:
             err=True,
         )
         return False
-    return not assignments_for_issue(board, repo_name, issue_number)
+    if assignments_for_issue(board, repo_name, issue_number):
+        click.echo(
+            f"warning: board-doctor NOT requeuing {repo_name}#{issue_number} "
+            "— the board now shows at least one assignment for it, so it is "
+            "no longer the never-dispatched row this cause was diagnosed "
+            "from; leaving it for the alert tier rather than removing a row "
+            "with live work behind it",
+            err=True,
+        )
+        return False
+    return True
 
 
 def _requeue_never_dispatched(row: StuckRow) -> bool:
@@ -1175,14 +1198,9 @@ def _requeue_never_dispatched(row: StuckRow) -> bool:
     import click  # noqa: PLC0415
 
     if not _never_dispatched_still_true(repo_name, issue_number):
-        click.echo(
-            f"warning: board-doctor NOT requeuing {repo_name}#{issue_number} "
-            "— the board now shows at least one assignment for it, so it is "
-            "no longer the never-dispatched row this cause was diagnosed "
-            "from; leaving it for the alert tier rather than removing a row "
-            "with live work behind it",
-            err=True,
-        )
+        # `_never_dispatched_still_true` already echoed the specific reason
+        # (board now shows an assignment, a live CI-pending park, or an
+        # unreadable re-check) — nothing more to say here.
         return False
 
     try:

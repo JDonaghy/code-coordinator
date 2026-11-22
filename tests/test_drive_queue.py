@@ -58,6 +58,7 @@ from coord.drive_queue import (
     describe_unreachable_wait,
     detect_unreachable_waits,
     is_benign_queue_alert_command,
+    is_unreachable_wait_shape,
     compute_leg_counts,
     dispatch_type_for_labels,
     effective_max_fix_rounds,
@@ -9577,6 +9578,27 @@ def test_detect_unreachable_waits_flags_a_never_dispatched_parked_entry():
     assert [w.key for w in waits] == [entry_key(REPO, 2907)]
 
 
+@pytest.mark.parametrize(
+    "last_reason",
+    ["CI running: build, lint", "CI stuck: build — auto-rerun 1/1 triggered"],
+)
+def test_detect_unreachable_waits_excludes_a_live_ci_pending_park(last_reason):
+    """#4072: a row parked on `CI running:`/`CI stuck:` has, by
+    construction, a real branch/PR/merge-queue row behind it
+    (`coord.drive_queue._reconcile_running`'s #1891/#4070 park never fires
+    without one) — so it fails `is_unreachable_wait_shape`'s own invariant
+    even though `attempts == 0` still reads True (the park never spends an
+    attempt). Must not surface on `coord drive-queue status`'s alert, `coord
+    doctor`'s WARN or the notifier's `HaltedDrive`, all of which key off
+    `detect_unreachable_waits`/`describe_unreachable_wait` with no
+    pre-filter of their own."""
+    stuck = entry(
+        2908, state=STATE_PARKED, attempts=0, deferrals=186,
+        last_reason=last_reason,
+    )
+    assert detect_unreachable_waits([stuck]) == []
+
+
 def test_detect_unreachable_waits_does_not_trip_below_the_grace_threshold():
     """A genuinely transient block — freshly blocked, few deferrals — must
     not trip: that would false-positive on the very first tick a `waiting`
@@ -9790,6 +9812,20 @@ def test_detect_unreachable_waits_does_not_claim_a_chain_with_no_dependents():
 # generic (never-dispatched / exhausted-dispatch-layer) shapes keep the
 # original remedy — only a row whose OWN `last_reason` already asserts no
 # relaunch can resolve it gets routed to the read-only fallback.
+
+
+@pytest.mark.parametrize(
+    "last_reason",
+    ["CI running: build, lint", "CI stuck: build — auto-rerun 1/1 triggered"],
+)
+def test_is_unreachable_wait_shape_excludes_a_live_ci_pending_park(last_reason):
+    """#4072: direct unit coverage of the predicate the review asked for —
+    `attempts == 0` alone would otherwise still read True for this row (the
+    CI-pending park never spends an attempt), so the explicit
+    `is_ci_pending_reason` exclusion is load-bearing, not redundant with
+    the attempts check above it."""
+    stuck = entry(2909, state=STATE_PARKED, attempts=0, last_reason=last_reason)
+    assert is_unreachable_wait_shape(stuck) is False
 
 
 def test_classify_unreachable_wait_cause_recognises_all_three_terminal_parks():
