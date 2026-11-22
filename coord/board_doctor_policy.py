@@ -1089,11 +1089,41 @@ def _never_dispatched_still_true(repo_name: str, issue_number: int) -> bool:
     (#2096: one question, one answer). It answers only from a board read
     that SUCCEEDED: a read that raises is reported and treated as "cannot
     confirm", which refuses the requeue — never as "nothing is there".
+
+    `assignments_for_issue` only ever scans `board.active` +
+    `board.completed` (see that function's own docstring) — a dispatch
+    whose assignment has since aged into the drive-queue's own archive
+    table reads identically to "never happened" there, even though the
+    row's LIVE drive-queue entry still carries a "CI running:"/"CI stuck:"
+    `last_reason` naming the real PR CI is still (or again) working
+    through. That text is written only by `coord.drive_queue.
+    _reconcile_running`'s CI-pending park, which by construction never
+    fires without a branch/PR to park on — stronger, more current evidence
+    than the board scan above, so it is checked FIRST and wins outright:
+    `drive_queue_requeue` is a remove-plus-re-add, and tearing down a row
+    that is merely waiting on CI (not missing a dispatch) would orphan the
+    live PR it already opened.
     """
     import click  # noqa: PLC0415
 
     from coord.gates import assignments_for_issue  # noqa: PLC0415
-    from coord.state import build_board  # noqa: PLC0415
+    from coord.merge_queue import is_ci_pending_reason  # noqa: PLC0415
+    from coord.state import build_board, get_drive_queue_entry  # noqa: PLC0415
+
+    try:
+        live_entry = get_drive_queue_entry(repo_name, issue_number)
+    except Exception as exc:  # noqa: BLE001 — a re-check, never a decision
+        click.echo(
+            f"warning: board-doctor could not read the drive-queue entry to "
+            f"confirm {repo_name}#{issue_number} was never dispatched: "
+            f"{type(exc).__name__}: {exc}",
+            err=True,
+        )
+        return False
+    if live_entry is not None and is_ci_pending_reason(
+        str(live_entry.get("last_reason") or "")
+    ):
+        return False
 
     try:
         board = build_board()

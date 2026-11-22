@@ -475,6 +475,63 @@ def test_a_genuine_no_pr_stall_with_no_marker_still_classifies_no_pr():
     assert got.cause == qd.CAUSE_NO_PR
 
 
+# ── #4072: a live CI running/stuck park must never mint never-dispatched ────
+
+
+def _never_dispatched_shape(**kw) -> qd.LiveState:
+    """A picture matching the never-dispatched upgrade's OWN preconditions
+    (`is_unreachable_wait_shape` + a confirmed `no_assignment_ever`) except
+    for whatever *kw* overrides — isolates the #4072 guard from everything
+    else `diagnose` checks."""
+    base: dict = {
+        "pr_number": None, "pr_state": "", "mergeable": None, "checks": None,
+        "gate_ready": None, "agent_reachable": None, "no_assignment_ever": True,
+    }
+    base.update(kw)
+    return qd.LiveState(**base)
+
+
+def test_a_ci_running_park_never_mints_never_dispatched():
+    """`coord.drive_queue._reconcile_running`'s #1891 park writes
+    `last_reason` starting with "CI running: " only when a real branch/PR
+    exists to park on — so a row carrying that text was dispatched, even
+    though `is_unreachable_wait_shape`'s own `attempts == 0` branch can
+    still read True for it (the park's `Reconcile.updates` never touches
+    `attempts`) and the live probe's own `no_assignment_ever` can still
+    read `True` (the dispatch's board row aged out of `coord.gates.
+    assignments_for_issue`'s active+completed scan). The upgrade must stay
+    refused regardless."""
+    got = qd.diagnose(
+        entry(21, attempts=0, last_reason="CI running: build, lint"),
+        _never_dispatched_shape(),
+    )
+    assert got.cause != qd.CAUSE_NEVER_DISPATCHED
+    assert got.cause == qd.CAUSE_UNKNOWN
+
+
+def test_a_ci_stuck_park_never_mints_never_dispatched():
+    """Same #4072 guard, for #4070's checks/jobs-desync `last_reason`
+    prefix."""
+    got = qd.diagnose(
+        entry(22, attempts=0, last_reason="CI stuck: build — auto-rerun 1/1 triggered"),
+        _never_dispatched_shape(),
+    )
+    assert got.cause != qd.CAUSE_NEVER_DISPATCHED
+    assert got.cause == qd.CAUSE_UNKNOWN
+
+
+def test_a_genuine_never_dispatched_row_still_classifies_without_a_ci_park():
+    """Regression: the new #4072 guard must not swallow the ordinary
+    never-dispatched reading for a row whose `last_reason` names nothing
+    CI-shaped at all."""
+    got = qd.diagnose(
+        entry(23, attempts=0, last_reason="waiting on acme#1"),
+        _never_dispatched_shape(),
+    )
+    assert got.cause == qd.CAUSE_NEVER_DISPATCHED
+    assert got.confidence == qd.CONFIDENCE_HIGH
+
+
 def test_needs_decomposition_is_not_auto_or_investigate_eligible():
     """#3979's whole point: the new cause must never land on the #3760
     mechanical allowlist or the #3769 investigate tier — those answer to

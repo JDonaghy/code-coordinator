@@ -64,6 +64,7 @@ from coord.drive_queue import (
     is_fix_round_ceiling_blocked,
     is_unreachable_wait_shape,
 )
+from coord.merge_queue import is_ci_pending_reason
 from coord.models import (
     is_needs_decomposition_reason,
     is_premise_refusal_reason,
@@ -1075,10 +1076,26 @@ def diagnose(
     # already excluded there — a permanent block, or `_resolve_prereqs`'s
     # own unsatisfiable `after=` verdict, which `_reconcile_blocked_after`
     # alone resolves — is excluded here too.
+    #
+    # ALSO refused whenever `entry.last_reason` itself already names a
+    # "CI running:"/"CI stuck:" park (`coord.merge_queue.
+    # is_ci_pending_reason`, which matches both prefixes). That text is
+    # written only by `coord.drive_queue._reconcile_running`'s CI-pending
+    # park, which by construction never fires without a real branch/PR to
+    # park ON — so it is direct, current proof a dispatch happened, and it
+    # must outrank `_probe_confirms_never_dispatched`'s `no_assignment_ever`
+    # reading: that board scan (`coord.gates.assignments_for_issue`) only
+    # covers `board.active`/`board.completed`, so a dispatch whose
+    # assignment has since aged into the drive-queue's own archive reads
+    # identically to "never happened" there even though the PR it opened is
+    # still live and CI is still (or again) working through it. Trusting
+    # the stale board read over the entry's own fresher text would be
+    # exactly the confidently-wrong verdict this module exists to avoid.
     if (
         cause == CAUSE_UNKNOWN
         and is_unreachable_wait_shape(entry)
         and _probe_confirms_never_dispatched(live)
+        and not is_ci_pending_reason(entry.last_reason)
     ):
         cause, confidence = CAUSE_NEVER_DISPATCHED, CONFIDENCE_HIGH
 

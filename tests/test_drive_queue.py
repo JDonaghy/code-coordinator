@@ -4338,6 +4338,52 @@ def test_a_parked_entry_never_reaches_blocked_even_deep_into_the_attempt_budget(
     assert plan.alert is None
 
 
+def test_an_honest_ci_pending_park_still_says_no_operator_needed():
+    """Regression for #4072: an ordinary, self-refreshing "still running"
+    park must keep its original #1891 wording — only the #4070 stuck
+    shape below gets the sharper copy."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(ci_pending=(1650,)), capacity=1)
+    reason = plan.reconciles[0].reason
+    assert "no operator needed" in reason
+    assert "coord ci rerun" not in reason
+
+
+def test_a_checks_jobs_desync_park_names_the_manual_rerun_command_not_no_operator_needed():
+    """#4072: a #4070 checks/jobs-desync park (`CI stuck:` in the board's
+    own `merge_ci_pending_reason`) is NOT a self-refreshing "still running"
+    read — GitHub's checks surface being wedged does not clear on its own
+    the way an honest pending check does, and the merge-queue sweep's own
+    bounded auto-heal (`coord.merge_queue.MAX_CI_STUCK_RERUNS`) hands a
+    human the exact `coord ci rerun ... --stuck` command once its budget is
+    exhausted. The #1891 park's "no operator needed" claim must not survive
+    next to that — it must name the manual command instead."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    stuck_board = BoardView(
+        issues={
+            entry_key(REPO, 1650): IssueFacts(
+                known=True,
+                merge_ci_pending=True,
+                merge_ci_pending_reason=(
+                    "CI stuck: build — auto-rerun budget exhausted (1/1); "
+                    "needs a human — `coord ci rerun claude-coordinator 99 "
+                    "--run 1 --job 2 --stuck`"
+                ),
+            )
+        }
+    )
+    plan = plan_tick(entries, stuck_board, capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == "parked"
+    assert "attempts" not in reconcile.updates
+    reason = reconcile.reason
+    assert "no operator needed" not in reason
+    assert "coord ci rerun" in reason
+    assert "--stuck" in reason
+    assert reason.startswith("CI stuck:")
+
+
 # ── #3254: `checks_absent` blocks (not parks), and never spends an attempt ─
 
 
