@@ -66,7 +66,7 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
 from coord import board_doctor_followthrough, queue_diagnose
 from coord.dao import TERMINAL_STATUSES as _ASSIGNMENT_TERMINAL_STATUSES
-from coord.models import Board
+from coord.models import Board, coordinator_owned_docs
 
 if TYPE_CHECKING:
     from coord.entry_truth import EntryTruth
@@ -1437,6 +1437,25 @@ def _covering_prs_by_issue(github_repo: str) -> dict[int, int]:
     return index
 
 
+def _process_upstream_gaps_for_followthrough(
+    final_message: str, *, config: Any, repo_name: str, issue_number: int,
+) -> list[Any]:
+    """`process_upstream_gaps` seam for :func:`run_followthrough_sweep`
+    (#4079c): the same filer `coord.notify._capture_upstream_gaps` already
+    calls at transition time (:func:`coord.upstream_gaps.process_upstream_gaps`
+    — one question, one answer), just reusing the *config* this sweep
+    already has in hand rather than reloading it. Safe to call even when
+    the transition-time capture already filed the same gap — filing is
+    idempotent (see that function's own docstring).
+    """
+    from coord.upstream_gaps import process_upstream_gaps  # noqa: PLC0415
+
+    return process_upstream_gaps(
+        final_message, config=config, repo_name=repo_name,
+        issue_number=issue_number,
+    )
+
+
 def _covering_open_pr(github_repo: str, issue_number: int) -> int | None:
     """An open PR in *github_repo* whose body already carries a GitHub
     closing keyword for *issue_number* — remediation for the parent is
@@ -1927,6 +1946,14 @@ def run_followthrough_sweep(
     A row resolved as :data:`~coord.board_doctor_followthrough.
     ACTION_ALREADY_COVERED` does not consume one of *max_rows*' slots —
     see the loop's own comment for why.
+
+    *coordinator_owned_docs* (#4079a, :func:`coord.models.coordinator_owned_docs`)
+    and *process_upstream_gaps* (#4079c,
+    :func:`_process_upstream_gaps_for_followthrough`) are forwarded to
+    :func:`~coord.board_doctor_followthrough.run_followthrough` so a plan
+    naming a coordinator-owned doc, or a parent whose resolution text
+    itself carries a `BLOCKED_ON_UPSTREAM` marker, is handled there rather
+    than closing the parent on either.
     """
     from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
 
@@ -2015,6 +2042,15 @@ def run_followthrough_sweep(
             epic_exists=lambda epic_number, _r=github_repo: _issue_exists(_r, epic_number),
             milestone_exists=lambda title, _r=github_repo: _milestone_exists(_r, title),
             covering_issue_open=lambda number, _r=github_repo: _issue_open(_r, number),
+            coordinator_owned_docs=coordinator_owned_docs(config.repo(repo_name)),
+            process_upstream_gaps=(
+                lambda final_message, *, repo_name=repo_name, issue_number=issue_number: (
+                    _process_upstream_gaps_for_followthrough(
+                        final_message, config=config, repo_name=repo_name,
+                        issue_number=issue_number,
+                    )
+                )
+            ),
             dry_run=dry_run,
             auto_queue=auto_queue,
             coverage=coverage,
