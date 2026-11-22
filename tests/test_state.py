@@ -6258,6 +6258,137 @@ class TestReviewPostClaimRacesLiveAndOrphanPaths:
         assert state.claim_review_post(aid) is True
 
 
+class TestNeedsDecompositionSplitClaim:
+    """`claim_needs_decomposition_split` / `record_needs_decomposition_split_epic`
+    / `release_needs_decomposition_split_claim`: closes #4077 (quadraui#2905) —
+    the same `needs_decomposition` event comment posted twice, 7 seconds
+    apart, by two overlapping coordinator passes, each of which read the
+    original issue as still open and both filed a full split. Mirrors
+    `claim_review_post`'s conditional-insert shape, but also carries the
+    recorded epic number so a losing call can learn which epic already
+    exists instead of just "someone else has this"."""
+
+    def test_second_claim_for_the_same_assignment_loses(self, coord_db) -> None:
+        claimed, epic = state.claim_needs_decomposition_split("ndc1")
+        assert claimed is True
+        assert epic is None
+        # Same DB, same key — simulates the two overlapping deliveries of
+        # one assignment's transition: the second caller must lose
+        # deterministically, never also file a split.
+        claimed, epic = state.claim_needs_decomposition_split("ndc1")
+        assert claimed is False
+
+    def test_loser_sees_no_epic_while_winner_still_in_flight(self, coord_db) -> None:
+        """The production race: the second delivery's claim attempt arrives
+        before the first attempt has filed anything at all — the exact gap
+        a read-before-write check on GitHub cannot close. The loser must
+        still lose, and see no epic number yet rather than blocking on the
+        winner."""
+        assert state.claim_needs_decomposition_split("ndc1") == (True, None)
+        assert state.claim_needs_decomposition_split("ndc1") == (False, None)
+
+    def test_loser_sees_winners_recorded_epic(self, coord_db) -> None:
+        assert state.claim_needs_decomposition_split("ndc1") == (True, None)
+        state.record_needs_decomposition_split_epic("ndc1", 999)
+        assert state.claim_needs_decomposition_split("ndc1") == (False, 999)
+
+    def test_claims_for_different_assignments_both_win(self, coord_db) -> None:
+        assert state.claim_needs_decomposition_split("ndc1") == (True, None)
+        assert state.claim_needs_decomposition_split("ndc2") == (True, None)
+
+    def test_release_then_reclaim_succeeds(self, coord_db) -> None:
+        """A claimed attempt that filed nothing (no split block, an
+        unverifiable proposal, or the filer itself raising) must not
+        permanently strand the assignment — releasing the claim lets a
+        later legitimate retry win it again."""
+        assert state.claim_needs_decomposition_split("ndc1") == (True, None)
+        state.release_needs_decomposition_split_claim("ndc1")
+        assert state.claim_needs_decomposition_split("ndc1") == (True, None)
+
+    def test_release_is_idempotent(self, coord_db) -> None:
+        state.release_needs_decomposition_split_claim("never-claimed")  # no raise
+        assert state.claim_needs_decomposition_split("never-claimed") == (True, None)
+
+    def test_empty_assignment_id_always_wins(self, coord_db) -> None:
+        assert state.claim_needs_decomposition_split("") == (True, None)
+        assert state.claim_needs_decomposition_split("") == (True, None)
+
+    def test_successful_filing_never_releases_the_claim(self, coord_db) -> None:
+        """Once an epic is recorded there is nothing left to retry — a
+        slow concurrent second caller that only checks the claim table
+        still loses, and now also learns the epic number."""
+        assert state.claim_needs_decomposition_split("ndc1") == (True, None)
+        state.record_needs_decomposition_split_epic("ndc1", 500)
+        assert state.claim_needs_decomposition_split("ndc1") == (False, 500)
+
+    def test_claim_routes_to_daemon_when_service_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A thin client with `board_service` configured must POST the
+        claim to the daemon rather than writing its own empty local DB —
+        the whole point of routing through the canonical board for
+        cross-process/cross-host atomicity."""
+        from coord import client as cc
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc, "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            ) or {"ok": True, "claimed": True, "epic_number": None},
+        )
+
+        claimed, epic = state.claim_needs_decomposition_split("ndc-remote")
+
+        assert claimed is True
+        assert epic is None
+        assert captured["path"] == "/needs-decomposition-split-claim"
+        assert captured["payload"]["assignment_id"] == "ndc-remote"
+        # Local DB must NOT have been written (empty local DB, thin-client).
+        row = coord_db.execute(
+            "SELECT 1 FROM needs_decomposition_split_claims WHERE assignment_id=?",
+            ("ndc-remote",),
+        ).fetchone()
+        assert row is None
+
+    def test_record_and_release_route_to_daemon_when_service_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord import client as cc
+
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc, "post_record",
+            lambda svc, path, payload, **kw: captured.append(
+                {"path": path, "payload": payload}
+            ) or {"ok": True},
+        )
+
+        state.record_needs_decomposition_split_epic("ndc-remote", 777)
+        state.release_needs_decomposition_split_claim("ndc-remote")
+
+        assert captured[0]["path"] == "/needs-decomposition-split-epic"
+        assert captured[0]["payload"] == {
+            "assignment_id": "ndc-remote", "epic_number": 777,
+        }
+        assert captured[1]["path"] == "/needs-decomposition-split-claim-release"
+        assert captured[1]["payload"] == {"assignment_id": "ndc-remote"}
+        # Neither write touched the local DB.
+        row = coord_db.execute(
+            "SELECT 1 FROM needs_decomposition_split_claims WHERE assignment_id=?",
+            ("ndc-remote",),
+        ).fetchone()
+        assert row is None
+
+
 # ── #3333: atomic smoke fan-out dispatch claim ───────────────────────────────
 
 

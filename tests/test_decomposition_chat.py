@@ -2457,6 +2457,10 @@ class TestFileAndQueueSplitProposalRefusesAlreadySuperseded:
         mock_get_issue_comments.return_value = [
             {"body": "unrelated comment"},
             {"body": "Superseded by #900 on a totally different issue"},
+            # Adversarial: contains both words independently, but not the
+            # exact "Superseded by #<N> — split into " phrase — must not
+            # match (#4077 review).
+            {"body": "Superseded by #900 — I'd rather this were split into three"},
         ]
         mock_create_issue.side_effect = [{"number": 500}, {"number": 501}]
         repo = Repo(name="api", github="acme/api")

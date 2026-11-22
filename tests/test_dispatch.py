@@ -1978,6 +1978,52 @@ class TestPreflightGuard:
         mock_dispatch_triage.assert_not_called()
         mock_file_and_queue.assert_not_called()
 
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.preflight_size.verify_split_proposal")
+    @patch("coord.decomposition_chat.parse_size_triage_response")
+    @patch("coord.notify._fetch_raw_log_text_by_id")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_filer_refusing_as_already_superseded_is_not_reported_as_a_split(
+        self, mock_get_issue, mock_dispatch_triage, mock_fetch_log, mock_parse,
+        mock_verify, mock_file_and_queue,
+    ) -> None:
+        """#4077 review: `file_and_queue_split_proposal` returning ``None``
+        (its own belt-and-braces re-read found the original already
+        superseded by an earlier split) must never be reported to the
+        operator as "split into epic #None" with a claim that work
+        continues on children that were never filed — it must refuse with
+        a truthful reason instead."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(self._completed_triage_assignment())
+        mock_get_issue.return_value = {
+            "title": "A giant issue", "labels": [{"name": "epic"}],
+        }
+        mock_fetch_log.return_value = "SPLIT — too big for one worker."
+        proposal = SplitProposal(
+            id=0, repo_name="api", issue_number=99, issue_title="A giant issue",
+            rationale="too big for one worker", chunks=[
+                SplitChunk(title="Part 1", scope="do part 1", files_likely=["a.py"]),
+            ],
+        )
+        mock_parse.return_value = proposal
+        mock_verify.return_value = SplitVerification(
+            ok=True, reason=None, epic_body="epic body",
+            work_order=WorkOrder(nodes=(WorkOrderNode(issue_number=1, after=()),)),
+        )
+        mock_file_and_queue.return_value = None
+
+        with pytest.raises(DispatchRefused, match="already superseded") as exc:
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=99,
+                machine=machine, board=board,
+            )
+        assert "None" not in str(exc.value)
+        assert "epic #" not in str(exc.value)
+
     @patch(
         "coord.decomposition_chat.dispatch_size_triage_review",
     )
@@ -2198,6 +2244,33 @@ class TestPreflightGuardCrossBackendSplit:
         proposal = mock_file_and_queue.call_args.kwargs["proposal"]
         assert len(proposal.chunks) == 4  # seam + 3 backends
         assert mock_file_and_queue.call_args.kwargs["repo"] is repo
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_filer_refusing_as_already_superseded_is_not_reported_as_a_split(
+        self, mock_get_issue, mock_dispatch_triage, mock_file_and_queue,
+    ) -> None:
+        """#4077 review: `file_and_queue_split_proposal` returning ``None``
+        here must never be reported as "split into epic #None" claiming
+        work continues on children that were never filed."""
+        cfg = self._cfg(["gtk", "cocoa", "windows"])
+        repo = cfg.repo("quadraui")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "Fix render path", "body": self._MULTI_BACKEND_BODY,
+            "labels": [],
+        }
+        mock_file_and_queue.return_value = None
+
+        with pytest.raises(DispatchRefused, match="already superseded") as exc:
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=321,
+                machine=machine, board=board,
+            )
+        assert "None" not in str(exc.value)
+        assert "epic #" not in str(exc.value)
 
     @patch("coord.decomposition_chat.file_and_queue_split_proposal")
     @patch("coord.decomposition_chat.dispatch_size_triage_review")

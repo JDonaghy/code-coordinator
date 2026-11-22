@@ -1030,11 +1030,13 @@ class TestNeedsDecompositionNotify:
     ) -> None:
         """#4077: a duplicate transition for the SAME assignment — the
         observed shape was the same `needs_decomposition` event comment
-        posted twice a few seconds apart — must not double the split.
-        Calling `_capture_needs_decomposition_split` twice for one
-        assignment files exactly one tracker + one set of children; the
-        second call is a logged no-op that returns the first call's own
-        epic number straight from `find_filed_split_epic`."""
+        posted twice a few seconds apart, by two overlapping coordinator
+        passes — must not double the split. The second call never even
+        reaches `auto_split_needs_decomposition`/`create_issue`: it loses
+        `coord.state.claim_needs_decomposition_split`'s atomic claim and
+        returns straight away. `create_issue`'s side effect is unbounded
+        (never raises) so this proves the gate by `call_count`, not by an
+        `IndexError` a real double-split would also trigger."""
         reason = (
             "WORK_OUTCOME: needs-decomposition — two independent halves\n\n"
             "SIZE_TRIAGE_VERDICT: split\n"
@@ -1051,15 +1053,12 @@ class TestNeedsDecompositionNotify:
         entry = {"needs_decomposition_reason": reason}
         record = {"type": "work", "repo_github": "acme/api"}
 
-        created: list[dict] = [
-            {"number": 500, "url": "https://x/500"},  # tracker epic
-            {"number": 501, "url": "https://x/501"},  # Parser half
-            {"number": 502, "url": "https://x/502"},  # Wiring half
-        ]
+        created: list[dict] = []
         open_issues: list[dict] = []
 
         def _create_issue(repo, **kwargs):
-            issue = created.pop(0)
+            issue = {"number": 500 + len(created), "url": f"https://x/{500 + len(created)}"}
+            created.append(issue)
             open_issues.append({"number": issue["number"], "body": kwargs.get("body") or ""})
             return issue
 
@@ -1069,7 +1068,7 @@ class TestNeedsDecompositionNotify:
              patch("coord.github_ops.get_open_issues",
                    side_effect=lambda repo: list(open_issues)), \
              patch("coord.github_ops.get_issue_comments", return_value=[]), \
-             patch("coord.github_ops.create_issue", side_effect=_create_issue), \
+             patch("coord.github_ops.create_issue", side_effect=_create_issue) as mock_create, \
              patch("coord.github_ops.update_issue_body"), \
              patch("coord.github_ops.close_issue"), \
              patch("coord.github_ops.get_issue_state", return_value="closed"), \
@@ -1079,8 +1078,10 @@ class TestNeedsDecompositionNotify:
             notify_mod._capture_needs_decomposition_split(transition, entry, record)
             notify_mod._capture_needs_decomposition_split(transition, entry, record)
 
-        # Exactly one tracker + one set of children were ever created.
-        assert created == []
+        # Exactly one tracker + one set of children were ever created —
+        # an unbounded side effect means a regression would show up as
+        # `call_count == 6`, not a swallowed `IndexError`.
+        assert mock_create.call_count == 3
         mock_dequeue.assert_called_once_with("api", 42, operator=False)
 
 
