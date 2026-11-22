@@ -20,6 +20,16 @@ a genuine test failure (a statement about the *code*) — used exclusively by
 itself (:func:`failed_checks` and ``_PASSING_CONCLUSIONS`` are unchanged: a
 verdictless check still blocks the merge, it just doesn't cost a retry).
 
+Phase 4 (#4070) adds a PENDING check's own analogue of Phase 3's question:
+is this check's own in-flight reading even true? :func:`is_checks_jobs_desync`
+recognizes a check still reporting ``in_progress``/``queued`` well past a
+threshold while its own job already reports ``completed`` in the jobs API —
+GitHub's checks surface wedged, not an honest "still running". Surfaced only
+by :mod:`coord.merge_queue`'s live merge path (never the board-render path,
+for the same extra-I/O reason Phase 3's classification isn't either) as a
+NAME-level refinement of the existing ``CI_PENDING_PREFIX`` wording, never a
+change to which checks the merge gate blocks on.
+
 The split between :class:`CiStore` (Protocol) and the concrete backends
 (:class:`coord.ci_github.GitHubCi`, :class:`NoOpCi`) means tests can pass a
 stub through ``ci_store=`` without touching subprocess at all.
@@ -83,6 +93,18 @@ class JobRun:
     :func:`coord.github_ops.get_job_log`). Defaults to ``""`` so every
     pre-#3114 ``JobRun(...)`` construction (all keyword-based; see
     :meth:`coord.ci_github.GitHubCi._fetch_jobs`) keeps working unchanged.
+
+    ``status`` (#4070) is the jobs API's own lifecycle phase (queued /
+    in_progress / completed) — distinct from ``conclusion``, which GitHub
+    only ever populates once ``status == "completed"``. Needed because
+    :func:`is_checks_jobs_desync` asks "has the job itself finished",
+    which ``conclusion is not None`` would answer too, but less directly
+    (and not at all for a completed job with no recognized conclusion).
+    Defaults to ``""`` so every pre-#4070 ``JobRun(...)`` construction
+    keeps working unchanged; a backend that never populates this reads as
+    "unknown", which :func:`is_checks_jobs_desync` treats as "not
+    completed" — the same false-negative bias :func:`is_verdictless_job`
+    already takes toward missing job data.
     """
 
     name: str
@@ -90,6 +112,7 @@ class JobRun:
     runner_name: str
     steps: list[JobStep] = field(default_factory=list)
     job_id: str = ""
+    status: str = ""
 
 
 @dataclass
@@ -215,6 +238,17 @@ class CheckRun:
     conclusion this module has never seen — blocks the merge gate. ``status
     != "completed"`` is in-flight, handled separately by
     :func:`in_flight_checks`.
+
+    ``job_id`` (#4070) is the numeric Actions job id parsed from ``url``
+    when the check's own details link already points at a specific job
+    (``.../actions/runs/{run_id}/job/{job_id}``, the shape GitHub gives an
+    in-flight check once it has a job to point at) — ``""`` when the link is
+    still a bare run URL or isn't an Actions link at all. Lets a caller
+    match a *pending* check straight to its job by id (see
+    :func:`is_checks_jobs_desync`) rather than by name, the way
+    :func:`is_verdictless_job`'s callers already do for a *completed*
+    check's own link (which has collapsed back to the bare run URL by the
+    time a check finishes).
     """
 
     name: str
@@ -224,6 +258,7 @@ class CheckRun:
     run_id: str
     started_at: float | None
     completed_at: float | None
+    job_id: str = ""
 
 
 @runtime_checkable
@@ -820,6 +855,67 @@ def is_verdictless_job(check: CheckRun, job: JobRun | None) -> bool:
         s for s in job.steps if s.conclusion not in (None, "success", "skipped")
     ]
     return len(failed_steps) == 1 and failed_steps[0].name == _SET_UP_JOB_STEP_NAME
+
+
+# ── Check/job desync — "CI stuck" (#4070) ───────────────────────────────────
+#
+# A check's own lifecycle (queued/in_progress/completed, read via `gh pr
+# checks`) and its job's lifecycle (read separately via the jobs API) are two
+# independent GitHub reads that are *supposed* to agree — but GitHub's checks
+# surface has been observed to wedge: a check keeps reporting in_progress (or
+# queued) indefinitely while the Actions job it names has already finished,
+# with a real conclusion, in the jobs API. That isn't "still running" (the
+# ordinary, honest `in_flight_checks` case `CI_PENDING_PREFIX` already
+# covers) — it's the checks surface itself failing to reflect ground truth,
+# and no amount of further waiting resolves it; only a rerun (or GitHub's own
+# eventual reconciliation) does.
+#
+# `CI_STUCK_THRESHOLD_SECONDS` is a deliberately long floor: a check briefly
+# ahead of its job's completion (the job finished a few seconds before the
+# checks API caught up) is normal eventual-consistency lag, not a desync —
+# only a gap this wide across BOTH reads is confident evidence of the stuck
+# state rather than ordinary polling skew.
+CI_STUCK_THRESHOLD_SECONDS = 1800.0  # 30 minutes
+
+
+def is_checks_jobs_desync(
+    check: CheckRun,
+    job: JobRun | None,
+    *,
+    now: float,
+    threshold_seconds: float = CI_STUCK_THRESHOLD_SECONDS,
+) -> bool:
+    """True when *check* has been in_progress/queued for longer than
+    *threshold_seconds* while its own *job* already reports ``completed`` in
+    the jobs API (#4070) — a checks/jobs desync, not an honest "still
+    running".
+
+    A completed check is never asked about here (``in_flight_checks``'s own
+    filter already excludes it from the caller's *pending* set; this
+    function doesn't re-check `check.status == "completed"` explicitly
+    against that case, but reads it as `False` the same way #1892's sibling
+    does for a mismatched expectation — see below). ``check.started_at``
+    missing, or *now* not yet past the threshold, both read as "not stuck
+    yet" — this predicate has no stale-leaning bias of its own the way
+    :func:`checks_are_stale` does, because getting this wrong the other way
+    (calling a genuinely-running check "stuck") invites a pointless rerun of
+    a check that was always going to finish on its own.
+
+    A missing *job* (no match for this check's `job_id` in the run's job
+    list — see :meth:`CiStore.list_jobs_for_run`) reads as "not stuck" —
+    the same false-negative bias :func:`is_verdictless_job` takes toward
+    absent job data: a confirmed desync needs positive evidence from BOTH
+    reads, not the absence of one.
+    """
+    if check.status == "completed":
+        return False
+    if check.started_at is None:
+        return False
+    if (now - check.started_at) < threshold_seconds:
+        return False
+    if job is None:
+        return False
+    return job.status == "completed"
 
 
 def checks_are_stale(checks: list[CheckRun], base_commit_time: float | None) -> bool:

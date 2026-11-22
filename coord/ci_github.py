@@ -67,6 +67,14 @@ _BUCKET_CONCLUSIONS: dict[str, str] = {
 # concern.
 _RUN_ID_RE = re.compile(r"/runs/(\d+)")
 
+# #4070: the job-URL shape the comment above already names
+# (".../actions/runs/{run_id}/job/{job_id}") — distinct from `_RUN_ID_RE`,
+# which matches the run id present in EITHER URL shape. Only a check whose
+# link already points at a specific job (typically one that's in flight, or
+# has a single job behind it) matches; a bare run URL leaves `CheckRun.
+# job_id` at its `""` default, same as any other non-Actions check link.
+_JOB_ID_RE = re.compile(r"/runs/\d+/job/(\d+)")
+
 
 # #3114: bound on the log excerpt threaded into a ci-fix briefing — "last
 # ~200 lines or ~8KB, whichever is smaller" per the issue's fix shape. A
@@ -439,6 +447,18 @@ def _run_id_from_link(link: str) -> str:
     return match.group(1) if match else ""
 
 
+def _job_id_from_link(link: str) -> str:
+    """Extract the numeric Actions *job* id from a `gh pr checks` `link` URL
+    (#4070), or ``""`` when *link* is a bare run URL (no job breakdown yet)
+    or isn't an Actions link at all.
+
+    Mirrors :func:`_run_id_from_link` one level down — see this module's
+    ``_RUN_ID_RE`` comment for the two URL shapes `gh pr checks` emits.
+    """
+    match = _JOB_ID_RE.search(link or "")
+    return match.group(1) if match else ""
+
+
 def _normalize_bucket(bucket: str) -> str:
     """Lowercase/None-safe normalisation of gh's ``bucket`` field, shared by
     :func:`_status_from_bucket` and :func:`_conclusion_from_bucket` so the two
@@ -799,6 +819,7 @@ class GitHubCi:
                     runner_name=str(entry.get("runner_name") or ""),
                     steps=steps,
                     job_id=str(entry.get("id", "") or ""),
+                    status=str(entry.get("status") or ""),
                 )
             )
         return jobs
@@ -911,6 +932,7 @@ class GitHubCi:
                 run_id=_run_id_from_link(str(entry.get("link", ""))),
                 started_at=_parse_ts(entry.get("startedAt")),
                 completed_at=_parse_ts(entry.get("completedAt")),
+                job_id=_job_id_from_link(str(entry.get("link", ""))),
             )
             for entry in raw
             if isinstance(entry, dict)

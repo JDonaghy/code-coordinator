@@ -80,6 +80,7 @@ def _check(
     conclusion: str | None = "failure",
     run_id: str = "1",
     started_at: float | None = None,
+    job_id: str = "",
 ) -> CheckRun:
     """#1892 test helper: a `CheckRun` with a settable `run_id`, needed to
     exercise `_ci_infra_reason`'s per-run job lookup — mirrors
@@ -88,11 +89,15 @@ def _check(
     `started_at` (#1986) lets a caller position the run before/after a
     fake base timestamp, to exercise the `checks_failed` staleness wording
     — defaults to `None` (unreadable anchor) exactly like every pre-#1986
-    caller of this helper, so none of them need updating."""
+    caller of this helper, so none of them need updating.
+
+    `job_id` (#4070) lets a caller exercise `_ci_stuck_names`'s by-id
+    matching — defaults to `""` (no job breakdown yet) exactly like every
+    pre-#4070 caller of this helper, so none of them need updating."""
     return CheckRun(
         name=name, status=status, conclusion=conclusion,
         url=f"https://gh/runs/{run_id}", run_id=run_id,
-        started_at=started_at, completed_at=None,
+        started_at=started_at, completed_at=None, job_id=job_id,
     )
 
 
@@ -12100,6 +12105,146 @@ class TestCiInfraReason:
         assert ci.calls == [("acme/api", "999")]
 
 
+class TestCiStuckNames:
+    """#4070: `_ci_stuck_names` — the classification helper, isolated from
+    `process()`'s I/O. Mirrors `TestCiInfraReason`'s shape, but matches
+    check to job by ID (not name — an in-flight check's link already points
+    at a specific job) and asks a different question ("has the job itself
+    already completed", not "did it fail verdictlessly")."""
+
+    _fn = staticmethod(mq._ci_stuck_names)
+
+    class _Ci:
+        def __init__(self, jobs_by_run):
+            self._jobs_by_run = jobs_by_run
+            self.calls: list[tuple[str, str]] = []
+
+        def list_jobs_for_run(self, repo, run_id):
+            self.calls.append((repo, run_id))
+            return self._jobs_by_run.get(run_id, [])
+
+    def test_empty_pending_list_is_empty_and_makes_no_calls(self) -> None:
+        ci = self._Ci({})
+        assert self._fn(ci, "acme/api", 1, []) == frozenset()
+        assert ci.calls == []
+
+    def test_desynced_check_is_named(self) -> None:
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="456",
+        )
+        ci = self._Ci({"999": [
+            JobRun(name="e2e", conclusion="success", runner_name="r1",
+                   job_id="456", status="completed"),
+        ]})
+        with _patched_time(now):
+            result = self._fn(ci, "acme/api", 1, [check])
+        assert result == frozenset({"e2e"})
+
+    def test_honest_still_running_check_is_not_named(self) -> None:
+        """Both reads agree it's genuinely still running — no desync,
+        however long it's been."""
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="456",
+        )
+        ci = self._Ci({"999": [
+            JobRun(name="e2e", conclusion=None, runner_name="r1",
+                   job_id="456", status="in_progress"),
+        ]})
+        with _patched_time(now):
+            result = self._fn(ci, "acme/api", 1, [check])
+        assert result == frozenset()
+
+    def test_not_yet_past_threshold_is_not_named(self) -> None:
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - 60.0, job_id="456",
+        )
+        ci = self._Ci({"999": [
+            JobRun(name="e2e", conclusion="success", runner_name="r1",
+                   job_id="456", status="completed"),
+        ]})
+        with _patched_time(now):
+            result = self._fn(ci, "acme/api", 1, [check])
+        assert result == frozenset()
+
+    def test_matches_by_job_id_not_name(self) -> None:
+        """Two checks sharing a run but distinct jobs must each match their
+        OWN job — a name-based match (the `_ci_infra_reason` convention)
+        would be wrong here."""
+        now = 10_000.0
+        stuck = _check(
+            "stuck-job", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="1",
+        )
+        running = _check(
+            "running-job", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="2",
+        )
+        ci = self._Ci({"999": [
+            JobRun(name="stuck-job", conclusion="success", runner_name="r1",
+                   job_id="1", status="completed"),
+            JobRun(name="running-job", conclusion=None, runner_name="r2",
+                   job_id="2", status="in_progress"),
+        ]})
+        with _patched_time(now):
+            result = self._fn(ci, "acme/api", 1, [stuck, running])
+        assert result == frozenset({"stuck-job"})
+
+    def test_check_with_no_job_id_is_not_named(self) -> None:
+        """A check whose link never resolved to a job (still a bare run
+        URL) has nothing to match against — reads as not stuck, the safe
+        false-negative direction — and costs no jobs-lookup call."""
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="",
+        )
+        ci = self._Ci({"999": [
+            JobRun(name="e2e", conclusion="success", runner_name="r1",
+                   job_id="456", status="completed"),
+        ]})
+        with _patched_time(now):
+            result = self._fn(ci, "acme/api", 1, [check])
+        assert result == frozenset()
+        assert ci.calls == []
+
+    def test_stub_without_list_jobs_for_run_degrades_to_empty(self) -> None:
+        """Mirrors `_ci_infra_reason`'s own backward-compat posture: a
+        `CiStore` stand-in that predates #4070 (`coord.gate_snapshot.
+        GateSnapshot` included) must not raise."""
+        class _OldCi:
+            pass
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999", job_id="456",
+        )
+        assert self._fn(_OldCi(), "acme/api", 1, [check]) == frozenset()
+
+    def test_only_one_call_per_distinct_run_id(self) -> None:
+        now = 10_000.0
+        a = _check(
+            "a", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="1",
+        )
+        b = _check(
+            "b", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="2",
+        )
+        ci = self._Ci({"999": [
+            JobRun(name="a", conclusion="success", runner_name="r1",
+                   job_id="1", status="completed"),
+            JobRun(name="b", conclusion="success", runner_name="r2",
+                   job_id="2", status="completed"),
+        ]})
+        with _patched_time(now):
+            self._fn(ci, "acme/api", 1, [a, b])
+        assert ci.calls == [("acme/api", "999")]
+
+
 class TestProcessCiCheckShrinkage:
     """#3263: coord-tui#83 merged 1.3s into a PARTIAL GitHub Actions re-run
     ("Re-run failed jobs") of its one failing required check
@@ -12631,6 +12776,125 @@ class TestProcessCiInfraAutoRerun:
         process(items, gh, ci_store=ci)
 
         assert items[0].ci_infra_reruns == 0
+
+
+class TestProcessCiStuckCheck:
+    """#4070: `process()`'s live merge path (and its `--dry-run` preview)
+    labels a desynced pending check `CI stuck: <name>` instead of the
+    ordinary `CI running: <name>` — read-only: the gate still blocks the
+    exact same way either way (`checks_pending`, never `merged`)."""
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, *, checks, jobs_by_run):
+            self._checks = checks
+            self._jobs_by_run = jobs_by_run
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+        def list_jobs_for_run(self, repo, run_id):
+            return self._jobs_by_run.get(run_id, [])
+
+    def test_all_stuck_reports_ci_stuck_prefix(self) -> None:
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="456",
+        )
+        ci = self._Ci(
+            checks=[check],
+            jobs_by_run={"999": [
+                JobRun(name="e2e", conclusion="success", runner_name="r1",
+                       job_id="456", status="completed"),
+            ]},
+        )
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci)
+        assert items[0].state == PENDING
+        kinds = [e.kind for e in events]
+        assert "checks_pending" in kinds
+        assert "merged" not in kinds
+        assert items[0].error == "CI stuck: e2e"
+        assert mq.is_ci_stuck_reason(items[0].error) is True
+        # #4070: still recognized as pending — nothing downstream
+        # (`coord.drive`'s "wait, don't retry" contract) changes behavior.
+        assert mq.is_ci_pending_reason(items[0].error) is True
+
+    def test_honest_pending_check_still_reports_ci_running(self) -> None:
+        """Regression: an honest still-running check (job not yet
+        completed) keeps the UNCHANGED `CI running:` wording — this issue
+        adds a label, it never relabels an honest pending check."""
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="456",
+        )
+        ci = self._Ci(
+            checks=[check],
+            jobs_by_run={"999": [
+                JobRun(name="e2e", conclusion=None, runner_name="r1",
+                       job_id="456", status="in_progress"),
+            ]},
+        )
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci)
+        assert items[0].error == "CI running: e2e"
+        assert mq.is_ci_stuck_reason(items[0].error) is False
+        assert mq.is_ci_pending_reason(items[0].error) is True
+
+    def test_mixed_stuck_and_running_names_both_named(self) -> None:
+        now = 10_000.0
+        stuck = _check(
+            "stuck-job", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="1",
+        )
+        running = _check(
+            "running-job", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - 60.0, job_id="2",
+        )
+        ci = self._Ci(
+            checks=[stuck, running],
+            jobs_by_run={"999": [
+                JobRun(name="stuck-job", conclusion="success", runner_name="r1",
+                       job_id="1", status="completed"),
+                JobRun(name="running-job", conclusion=None, runner_name="r2",
+                       job_id="2", status="in_progress"),
+            ]},
+        )
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci)
+        assert "CI running: running-job" in items[0].error
+        assert "CI stuck: stuck-job" in items[0].error
+
+    def test_dry_run_preview_shows_the_same_stuck_label(self) -> None:
+        now = 10_000.0
+        check = _check(
+            "e2e", status="in_progress", conclusion=None, run_id="999",
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id="456",
+        )
+        ci = self._Ci(
+            checks=[check],
+            jobs_by_run={"999": [
+                JobRun(name="e2e", conclusion="success", runner_name="r1",
+                       job_id="456", status="completed"),
+            ]},
+        )
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci, dry_run=True)
+        pending_event = _event(events, "checks_pending")
+        assert "CI stuck: e2e" in pending_event.message
+        # Preview-only: never mutates the persisted entry.
+        assert items[0].error is None
 
 
 class TestProcessCiUnreadableAutoRetry:

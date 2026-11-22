@@ -33,11 +33,13 @@ from coord.ci_store import (
     CheckRun,
     CiCheckSummary,
     CiStore,
+    CI_STUCK_THRESHOLD_SECONDS,
     JobRun,
     NoOpCi,
     checks_are_stale,
     failed_checks,
     in_flight_checks,
+    is_checks_jobs_desync,
     is_unreadable_check,
     is_unreadable_check_name,
     is_verdictless_job,
@@ -3082,6 +3084,18 @@ CI_STALE_PREFIX = "CI stale:"
 # never drift apart the way #1141 warns about.
 CI_PENDING_PREFIX = "CI running:"
 
+# #4070: a NAME-level refinement of the same "has not reported a conclusion
+# yet" fact — a pending check whose own job already completed in the jobs
+# API well past :data:`coord.ci_store.CI_STUCK_THRESHOLD_SECONDS` is GitHub's
+# checks surface wedged, not an honest "still running", but it is STILL,
+# from the gate's point of view, a check that has not reported a conclusion
+# — the exact condition :func:`is_ci_pending_reason` names. See
+# :func:`_ci_stuck_names` for the classification (live-merge-path only, same
+# scoping :data:`CI_INFRA_PREFIX` already uses, for the same reason: it
+# needs an extra `CiStore.list_jobs_for_run` call `_entry_gate_status`'s
+# board-render path must never pay for).
+CI_STUCK_PREFIX = "CI stuck:"
+
 
 def is_ci_pending_reason(reason: str | None) -> bool:
     """True when *reason* names checks that exist but have not reported a
@@ -3091,8 +3105,26 @@ def is_ci_pending_reason(reason: str | None) -> bool:
     prose, the same posture :func:`is_stale_smoke_reason` takes for the smoke
     gate: callers whose input is a persisted ``merge_reason``/``entry.error``
     string (not a live ``CheckRun`` list) use this instead of re-deriving it.
+
+    #4070: also matches :data:`CI_STUCK_PREFIX` — a checks/jobs desync is
+    still, by definition, a check that hasn't reported a conclusion; callers
+    of THIS function (`coord.drive`'s "wait, don't retry" contract,
+    `coord.drive_queue`'s `parked` outcome) keep treating it exactly as they
+    always treated an ordinary pending check, so distinguishing the two in
+    the reason TEXT (see :func:`is_ci_stuck_reason` for a caller that wants
+    that distinction) changes nothing about how either consumer behaves.
     """
-    return (reason or "").startswith(CI_PENDING_PREFIX)
+    return (reason or "").startswith((CI_PENDING_PREFIX, CI_STUCK_PREFIX))
+
+
+def is_ci_stuck_reason(reason: str | None) -> bool:
+    """True when *reason* names a checks/jobs desync specifically (#4070) —
+    a NARROWER question than :func:`is_ci_pending_reason` (every stuck
+    reason is also a pending one, never the reverse). For a caller that
+    wants to tell "GitHub's checks surface is wedged" apart from an honest
+    "still running", e.g. to recommend a rerun instead of more waiting.
+    """
+    return (reason or "").startswith(CI_STUCK_PREFIX)
 
 
 # #3536: floor/cap for `ci_pending_poll_interval_s`'s exponential growth.
@@ -3668,6 +3700,54 @@ def _ci_infra_reason(
     return (
         f"{CI_INFRA_PREFIX} {summary} — no verdict about the code (never "
         "assigned a runner, or died before checkout)"
+    )
+
+
+def _ci_stuck_names(
+    ci: "CiStore", repo: str, number: int, pending: "list[CheckRun]"
+) -> frozenset[str]:
+    """Names within *pending* (already filtered via :func:`in_flight_checks`)
+    whose own job has already completed in the jobs API — a checks/jobs
+    desync (#4070), not an honest "still running".
+
+    Mirrors :func:`_ci_infra_reason`'s shape — at most one
+    :meth:`CiStore.list_jobs_for_run` call per distinct ``run_id`` among
+    *pending*, never when *pending* is empty — but matches check to job by
+    JOB ID (``CheckRun.job_id``, parsed from the check's own details URL by
+    the backend) rather than by name: an in-flight check's link already
+    points at the specific job, unlike a completed check's link (which has
+    collapsed back to the bare run URL by the time :func:`_ci_infra_reason`
+    looks at it, which is why THAT matcher keys on name instead).
+
+    ``getattr(ci, "list_jobs_for_run", None)`` mirrors ``_ci_infra_reason``'s
+    own fail-closed-toward-"no answer" posture: a ``CiStore`` stand-in that
+    predates this capability (a duck-typed test stub, or
+    :class:`coord.gate_snapshot.GateSnapshot`) simply never produces this
+    classification — every pending check keeps reading as ordinary
+    :data:`CI_PENDING_PREFIX`, exactly as it did before #4070. Deliberately
+    never called from :func:`_entry_gate_status` (the board-render path) for
+    the same reason :func:`_ci_infra_reason` isn't either — see that
+    function's call sites' comments.
+    """
+    if not pending:
+        return frozenset()
+    list_jobs = getattr(ci, "list_jobs_for_run", None)
+    if list_jobs is None:
+        return frozenset()
+    run_ids = sorted({c.run_id for c in pending if c.run_id and c.job_id})
+    jobs_by_run: dict[str, dict[str, JobRun]] = {}
+    for run_id in run_ids:
+        try:
+            jobs = list_jobs(repo, run_id)
+        except Exception:  # noqa: BLE001 — classification-only, never raises upward
+            jobs = []
+        jobs_by_run[run_id] = {j.job_id: j for j in (jobs or []) if j.job_id}
+    now = time.time()
+    return frozenset(
+        c.name
+        for c in pending
+        if c.job_id
+        and is_checks_jobs_desync(c, jobs_by_run.get(c.run_id, {}).get(c.job_id), now=now)
     )
 
 
@@ -7372,6 +7452,16 @@ def _entry_gate_status(
         else:
             pending = in_flight_checks(checks)
             if pending:
+                # #4070: deliberately NOT classified via `_ci_stuck_names`
+                # here — same reason `_ci_infra_reason` isn't either (see
+                # that function's own call sites): it needs an extra
+                # `CiStore.list_jobs_for_run` call this board-render path
+                # must never pay for (Invariant 1, `coord.gate_snapshot`).
+                # Only the LIVE merge path (`process()`) computes it; a
+                # stuck entry still reads as ordinary `CI_PENDING_PREFIX`
+                # here until a live attempt refines the wording and
+                # persists it onto `QueuedMerge.error`, same recovery path
+                # `CI_INFRA_PREFIX` already relies on.
                 summary = ", ".join(c.name for c in pending)
                 return PLAN_BLOCKED, f"{CI_PENDING_PREFIX} {summary}"
             if checks and _ci_checks_are_stale(
@@ -9843,10 +9933,28 @@ def process(
                             continue
                         pending = in_flight_checks(checks)
                         if pending:
-                            summary = ", ".join(c.name for c in pending)
+                            # #4070: preview the same checks/jobs desync
+                            # classification a live attempt would compute —
+                            # same posture as the `failed`/`unreadable_
+                            # reason`/`infra_reason` preview just above.
+                            stuck_names = _ci_stuck_names(
+                                ci, entry.repo_github, entry.pr_number, pending
+                            )
+                            running_names = [
+                                c.name for c in pending if c.name not in stuck_names
+                            ]
+                            parts = []
+                            if running_names:
+                                parts.append(
+                                    f"checks still running: {', '.join(running_names)}"
+                                )
+                            if stuck_names:
+                                parts.append(
+                                    f"{CI_STUCK_PREFIX} {', '.join(sorted(stuck_names))}"
+                                )
                             events.append(MergeEvent(
                                 entry, "checks_pending",
-                                f"(dry run) would be blocked: checks still running: {summary}",
+                                f"(dry run) would be blocked: {', '.join(parts)}",
                             ))
                             continue
                         # #1851: a green CI result can itself be stale —
@@ -10593,14 +10701,31 @@ def process(
                     continue  # #292: skip, don't halt the group
                 pending = in_flight_checks(checks)
                 if pending:
-                    summary = ", ".join(c.name for c in pending)
                     # #1891: same `CI_PENDING_PREFIX` wording `_entry_gate_status`
                     # returns for the board render — this is what lets
                     # `IssueState.merge_reason`'s raw-row fallback (see that
                     # constant's docstring) carry the SAME, recognisable marker
                     # even when it falls back to this persisted `entry.error`
-                    # instead of a fresh live re-evaluation.
-                    msg = f"{CI_PENDING_PREFIX} {summary}"
+                    # instead of a fresh live re-evaluation. #4070: a name
+                    # whose own job already completed in the jobs API gets
+                    # `CI_STUCK_PREFIX` instead — `is_ci_pending_reason` (and
+                    # therefore every consumer of the fallback above) still
+                    # recognizes this reason as pending, so nothing about
+                    # that recovery path changes.
+                    stuck_names = _ci_stuck_names(
+                        ci, entry.repo_github, entry.pr_number, pending
+                    )
+                    running_names = [
+                        c.name for c in pending if c.name not in stuck_names
+                    ]
+                    parts = []
+                    if running_names:
+                        parts.append(f"{CI_PENDING_PREFIX} {', '.join(running_names)}")
+                    if stuck_names:
+                        parts.append(
+                            f"{CI_STUCK_PREFIX} {', '.join(sorted(stuck_names))}"
+                        )
+                    msg = ", ".join(parts)
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
                     continue  # #292: skip, don't halt the group
