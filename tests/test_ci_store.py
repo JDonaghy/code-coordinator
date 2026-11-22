@@ -22,6 +22,7 @@ from coord.ci_store import (
     CheckRun,
     CiStore,
     CIFailureDetail,
+    CI_STUCK_THRESHOLD_SECONDS,
     JobRun,
     JobStep,
     NoOpCi,
@@ -31,6 +32,7 @@ from coord.ci_store import (
     ci_failure_detail_to_json,
     failed_checks,
     in_flight_checks,
+    is_checks_jobs_desync,
     is_verdictless_job,
     shifted_failed_check_names,
     shrunk_check_names,
@@ -612,6 +614,76 @@ class TestIsVerdictlessJob:
         assert is_verdictless_job(check, _never_assigned_a_runner()) is False
 
 
+# ── is_checks_jobs_desync (#4070) ─────────────────────────────────────────────
+
+def _pending_job(status: str = "in_progress") -> JobRun:
+    return JobRun(name="e2e", conclusion=None, runner_name="GitHub Actions 1", status=status)
+
+
+class TestIsChecksJobsDesync:
+    def test_stuck_check_with_completed_job_is_desynced(self) -> None:
+        """The exact shape the issue names: a check still in_progress well
+        past the threshold whose own job already completed."""
+        check = _check("e2e", status="in_progress", conclusion=None, started_at=1000.0)
+        job = _pending_job(status="completed")
+        now = 1000.0 + CI_STUCK_THRESHOLD_SECONDS + 1
+        assert is_checks_jobs_desync(check, job, now=now) is True
+
+    def test_queued_check_with_completed_job_is_desynced(self) -> None:
+        """'queued', not just 'in_progress', is also an in-flight status
+        this predicate must recognize."""
+        check = _check("e2e", status="queued", conclusion=None, started_at=1000.0)
+        job = _pending_job(status="completed")
+        now = 1000.0 + CI_STUCK_THRESHOLD_SECONDS + 1
+        assert is_checks_jobs_desync(check, job, now=now) is True
+
+    def test_not_yet_past_threshold_is_not_desynced(self) -> None:
+        """A check that only just started is an honest 'still running', not
+        stuck — the whole point of the threshold floor."""
+        check = _check("e2e", status="in_progress", conclusion=None, started_at=1000.0)
+        job = _pending_job(status="completed")
+        now = 1000.0 + CI_STUCK_THRESHOLD_SECONDS - 1
+        assert is_checks_jobs_desync(check, job, now=now) is False
+
+    def test_job_still_in_progress_is_not_desynced(self) -> None:
+        """Both reads agree the work is genuinely still running — no
+        desync, however long it's been."""
+        check = _check("e2e", status="in_progress", conclusion=None, started_at=1000.0)
+        job = _pending_job(status="in_progress")
+        now = 1000.0 + CI_STUCK_THRESHOLD_SECONDS + 1
+        assert is_checks_jobs_desync(check, job, now=now) is False
+
+    def test_completed_check_is_never_desynced(self) -> None:
+        """Only an in-flight check is ever asked about — a completed one
+        (whatever its conclusion) must never read as stuck."""
+        check = _check("e2e", status="completed", conclusion="success", started_at=1000.0)
+        job = _pending_job(status="completed")
+        now = 1000.0 + CI_STUCK_THRESHOLD_SECONDS + 1
+        assert is_checks_jobs_desync(check, job, now=now) is False
+
+    def test_missing_started_at_is_not_desynced(self) -> None:
+        """No anchor to measure elapsed time from — false-negative bias,
+        same posture as `is_verdictless_job`'s missing-job-data default."""
+        check = _check("e2e", status="in_progress", conclusion=None, started_at=None)
+        job = _pending_job(status="completed")
+        assert is_checks_jobs_desync(check, job, now=1_000_000.0) is False
+
+    def test_no_matching_job_is_not_desynced(self) -> None:
+        """No job data at all (unmatched id, or `list_jobs_for_run`
+        failed/returned nothing) must default to "not stuck" — the safe
+        false-negative direction, never the reverse."""
+        check = _check("e2e", status="in_progress", conclusion=None, started_at=1000.0)
+        now = 1000.0 + CI_STUCK_THRESHOLD_SECONDS + 1
+        assert is_checks_jobs_desync(check, None, now=now) is False
+
+    def test_custom_threshold_is_honored(self) -> None:
+        """A caller-supplied threshold overrides the module default."""
+        check = _check("e2e", status="in_progress", conclusion=None, started_at=1000.0)
+        job = _pending_job(status="completed")
+        assert is_checks_jobs_desync(check, job, now=1100.0, threshold_seconds=50.0) is True
+        assert is_checks_jobs_desync(check, job, now=1010.0, threshold_seconds=50.0) is False
+
+
 class TestSummarize:
     def test_empty(self) -> None:
         assert summarize([]) == "no checks"
@@ -906,6 +978,33 @@ class TestGitHubCi:
         by_name = {c.name: c for c in checks}
         assert by_name["lint"].run_id == ""
 
+    def test_job_id_extracted_from_job_link(self) -> None:
+        """#4070: the same job-shaped link `test_run_id_extracted_from_job_
+        link` reads the run id out of also carries the job id — needed to
+        match a pending check straight to its job by id (see
+        `coord.ci_store.is_checks_jobs_desync`)."""
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        by_name = {c.name: c for c in checks}
+        assert by_name["test (3.12)"].job_id == "456"
+
+    def test_job_id_empty_for_bare_run_link(self) -> None:
+        """A link with no job breakdown yet (still a bare run URL) leaves
+        `job_id` at its `""` default."""
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        by_name = {c.name: c for c in checks}
+        assert by_name["deploy-preview"].job_id == ""
+
+    def test_job_id_empty_when_link_empty(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        by_name = {c.name: c for c in checks}
+        assert by_name["lint"].job_id == ""
+
 
 class TestGitHubCiForgeAvailabilityRecording:
     """#1896 Phase 0: `GitHubCi._fetch` records one forge-availability
@@ -1154,6 +1253,59 @@ class TestGitHubCiListRunsForBranch:
             runs = store.list_runs_for_branch("acme/api", "main")
         assert len(runs) == 1
         assert runs[0].run_id == "1"
+
+
+class TestGitHubCiListJobsForRunStatus:
+    """#4070: `list_jobs_for_run` now also carries the jobs API's own
+    `status` lifecycle field (queued/in_progress/completed), distinct from
+    `conclusion` — needed for `is_checks_jobs_desync` to ask "has the job
+    itself finished" directly rather than inferring it from `conclusion`."""
+
+    def _jobs_payload(self, status: str) -> str:
+        return json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 456, "run_id": 123, "name": "test (3.12)",
+                "status": status, "conclusion": None if status != "completed" else "success",
+                "runner_name": "GitHub Actions 1", "steps": [],
+            }],
+        })
+
+    def test_completed_status_is_mapped(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self._jobs_payload("completed")),
+        ):
+            jobs = store.list_jobs_for_run("acme/api", "123")
+        assert jobs[0].status == "completed"
+        assert jobs[0].job_id == "456"
+
+    def test_in_progress_status_is_mapped(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self._jobs_payload("in_progress")),
+        ):
+            jobs = store.list_jobs_for_run("acme/api", "123")
+        assert jobs[0].status == "in_progress"
+
+    def test_missing_status_defaults_to_empty_string(self) -> None:
+        """A backend/payload shape that omits `status` entirely must not
+        raise — defaults to `""`, which `is_checks_jobs_desync` reads as
+        "not completed", the safe false-negative direction."""
+        payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 456, "run_id": 123, "name": "test (3.12)",
+                "conclusion": "success", "runner_name": "GitHub Actions 1",
+                "steps": [],
+            }],
+        })
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            jobs = store.list_jobs_for_run("acme/api", "123")
+        assert jobs[0].status == ""
 
 
 class TestGitHubCiListAllChecksForPr:
