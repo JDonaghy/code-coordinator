@@ -5058,6 +5058,192 @@ def _release_review_post_claim_local(assignment_id: str) -> None:
     retry_on_locked(_write)
 
 
+# ── Atomic needs-decomposition split claim (#4077) ───────────────────────────
+
+
+def claim_needs_decomposition_split(assignment_id: str) -> tuple[bool, int | None]:
+    """Atomically claim the right to file the split a ``needs_decomposition``
+    work leg proposed for *assignment_id* (#4077).
+
+    Returns ``(claimed, epic_number)``. ``claimed`` is ``True`` when THIS
+    call wins the claim — ``epic_number`` is then always ``None``, since
+    nothing has been filed yet. ``claimed`` is ``False`` when another call
+    already claimed this assignment; ``epic_number`` is that earlier call's
+    already-recorded epic (set by :func:`record_needs_decomposition_split_epic`
+    once it finishes filing), or ``None`` if that earlier attempt is still
+    in flight or filed nothing.
+
+    ``coord.notify._capture_needs_decomposition_split`` is reachable twice
+    for the SAME work assignment — the observed #4077 incident was the same
+    ``needs_decomposition`` event comment posted twice, 7 seconds apart, by
+    two overlapping coordinator passes. Both calls read the original issue
+    as still open (neither attempt had closed it yet), so a read-before-
+    write check alone cannot tell them apart — exactly the gap
+    :func:`claim_review_post` / :func:`claim_smoke_dispatch` close for their
+    own duplicate-delivery races via a single ``INSERT ... OR IGNORE``,
+    atomic even across two separate processes/machines. This is the same
+    shape, keyed on the work assignment id per the original fix request,
+    taken BEFORE either attempt ever calls
+    :func:`coord.decomposition_chat.auto_split_needs_decomposition` — the
+    loser skips filing entirely rather than relying on a later, best-effort
+    re-read of GitHub to catch it.
+
+    Routes to the daemon when ``board_service`` is configured (the claim
+    table lives on the shared canonical DB, same as ``assignments``), else
+    writes the local DB directly.
+
+    Released by :func:`release_needs_decomposition_split_claim` — called by
+    the caller only when the claimed attempt filed nothing (no split block,
+    an unverifiable proposal, or the filer itself raised), so a legitimate
+    retry for the same assignment id is never permanently stranded. A
+    successful filing never releases the claim: once
+    :func:`record_needs_decomposition_split_epic` has set ``epic_number``,
+    the row answers "already split, into #N" forever, which is correct —
+    there is nothing left to retry.
+    """
+    if not assignment_id:
+        return True, None
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/needs-decomposition-split-claim", {"assignment_id": assignment_id}
+    )
+    if resp is not None:
+        return bool(resp.get("claimed", False)), resp.get("epic_number")
+    return _claim_needs_decomposition_split_local(assignment_id)
+
+
+def _claim_needs_decomposition_split_local(assignment_id: str) -> tuple[bool, int | None]:
+    """Local-DB write for :func:`claim_needs_decomposition_split`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP — same ``retry_on_locked`` + row-scoped
+    :func:`coord.db.undo_pending_write` treatment as
+    :func:`_claim_review_post_local`: a `database is locked` collision is
+    absorbed rather than raised straight out, and if the `INSERT OR IGNORE`
+    applied but the following `conn.commit()` raised, the closure undoes
+    its own just-inserted row before re-raising so a commit failure never
+    leaves a claim nobody actually won sitting on the shared connection.
+    """
+
+    def _write() -> tuple[bool, int | None]:
+        conn = get_connection()
+        claimed_at = time.time()
+        inserted = 0
+        try:
+            cur = sql.insert_ignore(
+                conn, "needs_decomposition_split_claims",
+                ["assignment_id", "claimed_at"],
+                (assignment_id, claimed_at),
+            )
+            inserted = cur.rowcount or 0
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            if inserted:
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.execute(
+                        conn,
+                        "DELETE FROM needs_decomposition_split_claims "
+                        "WHERE assignment_id=? AND claimed_at=?",
+                        (assignment_id, claimed_at),
+                    ),
+                )
+            raise
+        if inserted:
+            return True, None
+        row = sql.execute(
+            conn,
+            "SELECT epic_number FROM needs_decomposition_split_claims "
+            "WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        epic_number = row["epic_number"] if row is not None else None
+        return False, epic_number
+
+    return retry_on_locked(_write)
+
+
+def record_needs_decomposition_split_epic(assignment_id: str, epic_number: int) -> None:
+    """Record *epic_number* as the epic :func:`claim_needs_decomposition_split`'s
+    winning caller filed for *assignment_id* (#4077), so a later loser call
+    can report which epic already exists instead of just "someone else has
+    this".
+
+    Routes to the daemon exactly like :func:`claim_needs_decomposition_split`
+    does. Only ever called by the claim's own winner, after a successful
+    filing — never on a refusal/failure, which releases the claim instead
+    (:func:`release_needs_decomposition_split_claim`).
+    """
+    if not assignment_id:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/needs-decomposition-split-epic",
+        {"assignment_id": assignment_id, "epic_number": epic_number},
+    )
+    if resp is not None:
+        return
+    _record_needs_decomposition_split_epic_local(assignment_id, epic_number)
+
+
+def _record_needs_decomposition_split_epic_local(
+    assignment_id: str, epic_number: int
+) -> None:
+    """Local-DB write for :func:`record_needs_decomposition_split_epic`."""
+
+    def _write() -> None:
+        conn = get_connection()
+        sql.execute(
+            conn,
+            "UPDATE needs_decomposition_split_claims SET epic_number=? "
+            "WHERE assignment_id=?",
+            (epic_number, assignment_id),
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
+def release_needs_decomposition_split_claim(assignment_id: str) -> None:
+    """Release a claim taken by :func:`claim_needs_decomposition_split`, when
+    the claimed attempt filed nothing (#4077).
+
+    Idempotent — deleting an absent row is a no-op. Routes to the daemon
+    exactly like :func:`claim_needs_decomposition_split` does: a thin
+    client that claimed via the ``/needs-decomposition-split-claim`` POST
+    above must release through the same seam, or the claim it took on the
+    daemon's canonical DB would never actually clear.
+
+    Deliberately NOT called after :func:`record_needs_decomposition_split_epic`
+    has run — see that function's own docstring for why a lingering claim
+    after a successful filing is correct, not just harmless.
+    """
+    if not assignment_id:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/needs-decomposition-split-claim-release", {"assignment_id": assignment_id}
+    )
+    if resp is not None:
+        return
+    _release_needs_decomposition_split_claim_local(assignment_id)
+
+
+def _release_needs_decomposition_split_claim_local(assignment_id: str) -> None:
+    """Local-DB write for :func:`release_needs_decomposition_split_claim`."""
+
+    def _write() -> None:
+        conn = get_connection()
+        sql.execute(
+            conn,
+            "DELETE FROM needs_decomposition_split_claims WHERE assignment_id=?",
+            (assignment_id,),
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
 # ── Atomic smoke fan-out dispatch claim (#3333) ──────────────────────────────
 
 

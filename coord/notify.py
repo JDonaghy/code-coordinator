@@ -2456,19 +2456,33 @@ def _capture_needs_decomposition_split(
     in the worker log. Best-effort: any failure is logged and the issue
     stays parked for the coordinator, the same as a prose-only proposal.
 
-    **Idempotent per assignment (#4077):** a duplicate transition for the
-    SAME assignment — observed as the same ``needs_decomposition`` event
-    comment posted twice a few seconds apart — calls this twice with an
-    identical *text*.
-    :func:`coord.decomposition_chat.auto_split_needs_decomposition` itself
-    is what makes the second call a no-op (it returns the already-filed
-    epic's number rather than filing a second tracker + child set — see
-    its own docstring); this function only has to log that number either
-    way, which it already does below.
+    **Atomically claimed per assignment (#4077):** a duplicate transition
+    for the SAME assignment — observed as the same ``needs_decomposition``
+    event comment posted twice a few seconds apart, by two overlapping
+    coordinator passes — calls this twice with an identical *text*. Both
+    calls can read the original issue as still open (neither attempt has
+    closed it yet), so a read-before-write check inside the filer alone
+    cannot tell them apart. Before ever calling
+    :func:`coord.decomposition_chat.auto_split_needs_decomposition`, this
+    takes :func:`coord.state.claim_needs_decomposition_split` — a DB-level
+    conditional insert, atomic even across two separate processes/
+    machines, exactly like :func:`coord.state.claim_review_post` closes the
+    identical shape for posting a review's findings. The loser skips
+    filing entirely; the winner records the epic it files
+    (:func:`coord.state.record_needs_decomposition_split_epic`) so a later
+    loser call can log which epic already exists, or releases the claim
+    (:func:`coord.state.release_needs_decomposition_split_claim`) when it
+    filed nothing, so a legitimate retry (a transient failure, or a
+    message with no split block) is never permanently stranded.
     """
     from coord.decomposition_chat import (  # noqa: PLC0415
         SIZE_TRIAGE_END_MARKER,
         auto_split_needs_decomposition,
+    )
+    from coord.state import (  # noqa: PLC0415
+        claim_needs_decomposition_split,
+        record_needs_decomposition_split_epic,
+        release_needs_decomposition_split_claim,
     )
 
     if (record.get("type") or "work") != "work" or not transition.issue_number:
@@ -2483,19 +2497,41 @@ def _capture_needs_decomposition_split(
             text = final_message_from_log_text(_worker_log_text(transition, entry))
         if SIZE_TRIAGE_END_MARKER not in text:
             return
+
+        claimed, existing_epic = claim_needs_decomposition_split(
+            transition.assignment_id
+        )
+        if not claimed:
+            log.info(
+                "_capture_needs_decomposition_split: %s already claimed by "
+                "another delivery of this same transition (epic #%s) — "
+                "not filing a second split",
+                transition.assignment_id, existing_epic,
+            )
+            return
+
         from coord.config import load as _load_config  # noqa: PLC0415
 
-        epic_number = auto_split_needs_decomposition(
-            text,
-            config=_load_config(),
-            repo_name=transition.repo_name,
-            issue_number=transition.issue_number,
-        )
+        try:
+            epic_number = auto_split_needs_decomposition(
+                text,
+                config=_load_config(),
+                repo_name=transition.repo_name,
+                issue_number=transition.issue_number,
+            )
+        except Exception:
+            release_needs_decomposition_split_claim(transition.assignment_id)
+            raise
         if epic_number is not None:
+            record_needs_decomposition_split_epic(
+                transition.assignment_id, epic_number
+            )
             log.info(
                 "_capture_needs_decomposition_split: %s#%s split into epic #%s",
                 transition.repo_name, transition.issue_number, epic_number,
             )
+        else:
+            release_needs_decomposition_split_claim(transition.assignment_id)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "_capture_needs_decomposition_split: failed for %s: %s",

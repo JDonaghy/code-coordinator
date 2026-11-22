@@ -4271,6 +4271,102 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/needs-decomposition-split-claim": {
+            "post": {
+                "summary": (
+                    "Atomically claim the right to file a needs-decomposition "
+                    "work leg's proposed split (#4077) — a conditional insert "
+                    "so two overlapping deliveries of the same transition can "
+                    "never both file the epic + children for one assignment"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — `claimed` is true iff this call won; "
+                            "`epic_number` is the earlier winner's already-"
+                            "recorded epic, or null if still in flight"
+                        ),
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
+        "/needs-decomposition-split-epic": {
+            "post": {
+                "summary": (
+                    "Record the epic a /needs-decomposition-split-claim "
+                    "winner filed (#4077), so a later loser call can report "
+                    "which epic already exists"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "epic_number": {"type": "integer"},
+                                },
+                                "required": ["assignment_id", "epic_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/needs-decomposition-split-claim-release": {
+            "post": {
+                "summary": (
+                    "Release a claim taken via /needs-decomposition-split-claim "
+                    "(#4077), ONLY when the claimed attempt filed nothing, so a "
+                    "legitimate retry isn't permanently stranded"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — idempotent, absent claim is a no-op",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
         "/smoke-claim": {
             "post": {
                 "summary": (
@@ -8630,6 +8726,74 @@ def build_app(
             )
         return JSONResponse({"ok": True})
 
+    async def post_needs_decomposition_split_claim(request: Request) -> Response:
+        # #4077: atomic needs-decomposition split-FILING claim on the
+        # daemon's canonical DB — see
+        # coord.state.claim_needs_decomposition_split's docstring for the
+        # duplicate-split race this closes.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            claimed, epic_number = state._claim_needs_decomposition_split_local(
+                body["assignment_id"]
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "needs-decomposition-split-claim write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {"ok": True, "claimed": claimed, "epic_number": epic_number}
+        )
+
+    async def post_needs_decomposition_split_epic(request: Request) -> Response:
+        # #4077: record the epic a claim's winner filed — see
+        # coord.state.record_needs_decomposition_split_epic's docstring.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._record_needs_decomposition_split_epic_local(
+                body["assignment_id"], body["epic_number"]
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "needs-decomposition-split-epic write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_needs_decomposition_split_claim_release(request: Request) -> Response:
+        # #4077: release a claim taken via post_needs_decomposition_split_claim
+        # above.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._release_needs_decomposition_split_claim_local(body["assignment_id"])
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {
+                    "error": "needs-decomposition-split-claim-release write failed",
+                    "detail": str(e),
+                },
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_smoke_claim(request: Request) -> Response:
         # #3333: atomic smoke fan-out dispatch claim on the daemon's
         # canonical DB — see coord.state.claim_smoke_dispatch's docstring
@@ -12273,6 +12437,18 @@ def build_app(
         Route(
             "/review-post-claim-release", post_review_post_claim_release,
             methods=["POST"],
+        ),
+        Route(
+            "/needs-decomposition-split-claim",
+            post_needs_decomposition_split_claim, methods=["POST"],
+        ),
+        Route(
+            "/needs-decomposition-split-epic",
+            post_needs_decomposition_split_epic, methods=["POST"],
+        ),
+        Route(
+            "/needs-decomposition-split-claim-release",
+            post_needs_decomposition_split_claim_release, methods=["POST"],
         ),
         Route("/smoke-claim", post_smoke_claim, methods=["POST"]),
         Route("/smoke-claim-release", post_smoke_claim_release, methods=["POST"]),

@@ -2648,7 +2648,15 @@ class TestUatStateAndReasonColumns:
 # bounded auto-heal budget for a parked row whose only non-green checks are
 # a checks/jobs desync (#4070), capped at `coord.merge_queue.
 # MAX_CI_STUCK_RERUNS`.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (29, 103)
+# #4077 bumped this to (30, 103): a new `needs_decomposition_split_claims`
+# TABLE (not a column — `_MIGRATE_ADD_COLUMNS`'s length is unchanged at
+# 103, so only the version moved, to force `_ensure_schema`'s `CREATE
+# TABLE IF NOT EXISTS` to run once more on an existing database) — same
+# shape as #3113's `review_claims` / #3333's `smoke_claims` / #2468's
+# `review_post_claims` bumps above. Closes the race where two overlapping
+# deliveries of the same `needs_decomposition` transition for one work
+# assignment both file a split for the same original issue.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (30, 103)
 
 
 class TestMigrateAddColumnsVersionGuard:

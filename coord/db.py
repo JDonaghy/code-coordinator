@@ -1194,7 +1194,15 @@ def retry_on_locked(
 # each other: a stuck reading answers a different question ("is GitHub's
 # checks surface itself wedged?") than any of the other three. 0 for every
 # row predating this migration.
-_DB_SCHEMA_VERSION = 29
+# #4077: bumped 29 -> 30 for the new `needs_decomposition_split_claims`
+# TABLE below (not a column — same table-only shape as #3113/#3333/#2468/
+# #3889/#3992 above). `coord.state.claim_needs_decomposition_split` does
+# the same conditional `INSERT ... OR IGNORE` + `rowcount` check
+# `claim_review_post` already does for posting a review; the loser of THIS
+# claim skips filing a second split entirely instead of also spending a
+# duplicate tracker + child-issue set on GitHub. See that table's own
+# comment below for the incident this closes.
+_DB_SCHEMA_VERSION = 30
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -2188,6 +2196,39 @@ _SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS review_post_claims (
             assignment_id TEXT    PRIMARY KEY,
             claimed_at    REAL    NOT NULL
+        );
+
+        -- #4077: atomic needs-decomposition split-FILING claim — a sibling
+        -- to `review_post_claims` above, keyed on the work assignment id a
+        -- `needs_decomposition` work leg ended under, for the act of
+        -- filing that leg's proposed split (an epic + child issues) rather
+        -- than posting a review. `coord.notify._capture_needs_decomposition_
+        -- split` is reachable twice for the SAME assignment — the observed
+        -- incident (quadraui#2905) was the identical `needs_decomposition`
+        -- event comment posted twice, 7 seconds apart, by two overlapping
+        -- coordinator passes, each of which read the original issue as
+        -- still open and both filed a full split (two trackers, two full
+        -- sets of children, all queued) before either attempt had closed
+        -- it. `coord.state.claim_needs_decomposition_split` does the same
+        -- conditional `INSERT ... OR IGNORE` + `rowcount` check
+        -- `claim_review_post` already does; the loser of THIS claim skips
+        -- calling the filer at all instead of also spending a duplicate
+        -- tracker + child-issue set. `epic_number` is set by
+        -- `coord.state.record_needs_decomposition_split_epic` once the
+        -- winner's filing succeeds, so a loser that queries the row (via
+        -- the same claim call) learns which epic already exists rather
+        -- than just "someone else has this". Released
+        -- (`coord.state.release_needs_decomposition_split_claim`) only
+        -- when the claimed attempt filed nothing (no split block, an
+        -- unverifiable proposal, or the filer itself raised), so a
+        -- legitimate retry for the same assignment id is never
+        -- permanently stranded — a successful filing never releases the
+        -- claim, which is correct (not just harmless): there is nothing
+        -- left to retry once `epic_number` is set.
+        CREATE TABLE IF NOT EXISTS needs_decomposition_split_claims (
+            assignment_id TEXT    PRIMARY KEY,
+            claimed_at    REAL    NOT NULL,
+            epic_number   INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);

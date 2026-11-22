@@ -433,6 +433,22 @@ def enforce_preflight_guard(
                         verification=cross_backend_verification,
                         repo=repo,
                     )
+                    if epic_number is None:
+                        # #4077: `file_and_queue_split_proposal` itself
+                        # refused — its own re-read found issue #{issue_number}
+                        # already superseded by an earlier split (closed, or
+                        # already carrying the "Superseded by #N — split
+                        # into" comment). Nothing was filed on THIS call, so
+                        # refusing with that truthful reason, not claiming a
+                        # split that never happened.
+                        raise DispatchRefused(
+                            f"issue #{issue_number} named {len(named)} "
+                            f"backends ({', '.join(named)}) in a repo with "
+                            "a one-backend-per-issue rule, but an earlier "
+                            "split attempt already superseded it — refusing "
+                            "to dispatch the original rather than re-filing "
+                            "a split for it."
+                        )
                     raise DispatchRefused(
                         f"issue #{issue_number} named {len(named)} backends "
                         f"({', '.join(named)}) in a repo with a "
@@ -523,6 +539,20 @@ def enforce_preflight_guard(
                             verification=verification,
                             repo=repo,
                         )
+                        if epic_number is None:
+                            # #4077: same refusal shape as the preflight
+                            # decomposition-rule call site above — nothing
+                            # was filed on THIS call, so refuse with that
+                            # truthful reason instead of claiming a split
+                            # that never happened.
+                            raise DispatchRefused(
+                                f"issue #{issue_number} was proposed for a "
+                                "split by the preflight size-triage review, "
+                                "but an earlier split attempt already "
+                                "superseded it — refusing to dispatch the "
+                                "original rather than re-filing a split "
+                                "for it."
+                            )
                         raise DispatchRefused(
                             f"issue #{issue_number} was split by the preflight "
                             f"size-triage review into epic #{epic_number} — the "

@@ -1550,22 +1550,23 @@ def _repoint_queued_dependents_at_split(
             )
 
 
-def _original_milestone_title(repo: "Repo", issue_number: int) -> str | None:
-    """The milestone title *issue_number* already carries, or ``None``.
+def _original_milestone_title(issue_data: dict) -> str | None:
+    """The milestone title *issue_data* already carries, or ``None``.
 
     #4064: a split's children (and its tracker epic, when one is filed)
     must land on the SAME milestone as the issue being split — otherwise
     they're invisible in the Plans panel and ``coord milestone
     write-order`` refuses them outright (it requires every node to share
-    one milestone). :func:`coord.github_ops.get_issue`'s own ``milestone``
-    field is already ``None``/``{"number": ..., "title": ...}`` — the exact
-    shape ``coord milestone order`` resolves a tracking issue's milestone
-    from — so this re-fetches through that one answer rather than deriving
-    a second notion of "this issue's milestone" (#2096).
+    one milestone). *issue_data* is :func:`coord.github_ops.get_issue`'s
+    own response — its ``milestone`` field is already
+    ``None``/``{"number": ..., "title": ...}``, the exact shape ``coord
+    milestone order`` resolves a tracking issue's milestone from, so this
+    reads through that one answer rather than deriving a second notion of
+    "this issue's milestone" (#2096). Takes the caller's own already-
+    fetched issue dict rather than re-fetching by number (#4077 review) —
+    every call site already has one on hand by the time it needs this.
     """
-    from coord import github_ops  # noqa: PLC0415
-
-    milestone = github_ops.get_issue(repo.github, issue_number).get("milestone")
+    milestone = issue_data.get("milestone")
     if isinstance(milestone, dict):
         title = milestone.get("title")
         if title:
@@ -1768,13 +1769,15 @@ def _splice_split_into_parent_epic(
         )
 
 
-#: The literal substring :func:`file_and_queue_split_proposal`'s own close
-#: comment always contains — `f"Superseded by #{epic_number} — split into
-#: {len(proposal.chunks)} child issue(s) per the {origin}."` — so a later
-#: call scanning for "did an earlier attempt already finish this split"
-#: can match on it directly rather than deriving a second notion of the
-#: same marker (#2096, #4077).
-_SUPERSEDED_COMMENT_MARKERS = ("Superseded by #", "split into")
+#: Matches the one fixed phrase :func:`file_and_queue_split_proposal`'s own
+#: close comment always contains — `f"Superseded by #{epic_number} — split
+#: into {len(proposal.chunks)} child issue(s) per the {origin}."` — as a
+#: single anchored sequence rather than two substrings matched
+#: independently anywhere in the body, so an unrelated comment that merely
+#: happens to contain both words (e.g. "Superseded by #900 — I'd rather
+#: this were split into three") can never false-positive this guard
+#: (#2096, #4077).
+_SUPERSEDED_COMMENT_RE = re.compile(r"Superseded by #\d+ — split into ")
 
 
 def _already_has_superseded_comment(repo: "Repo", issue_number: int) -> bool:
@@ -1796,7 +1799,7 @@ def _already_has_superseded_comment(repo: "Repo", issue_number: int) -> bool:
     except Exception:  # noqa: BLE001 — best-effort guard, not a precondition
         return False
     return any(
-        all(marker in (comment.get("body") or "") for marker in _SUPERSEDED_COMMENT_MARKERS)
+        _SUPERSEDED_COMMENT_RE.search(comment.get("body") or "")
         for comment in comments
     )
 
@@ -1866,15 +1869,22 @@ def file_and_queue_split_proposal(
     own original issue and refuses — logging and returning ``None``,
     filing nothing — when it is already closed, or already carries the
     literal ``"Superseded by #N — split into"`` comment the close below
-    writes. This is a SEPARATE, later read than whatever check a caller
-    made first (:func:`find_filed_split_epic` in
+    writes. This is a best-effort, SEPARATE, later read than whatever
+    check a caller made first (:func:`find_filed_split_epic` in
     :func:`auto_split_needs_decomposition` / `coord.board_doctor_policy`'s
-    decomposition act tier) — two concurrent attempts for the same
-    original can both pass an earlier check before either one has filed
-    anything, so the earlier check alone cannot close the race. This one
-    protects every caller uniformly, including `coord.dispatch`'s two
-    inline call sites that invoke this function directly with no upstream
-    check of their own.
+    decomposition act tier) — two attempts for the same original close
+    enough together that neither has filed anything yet can both pass
+    this re-read too, so it is a backstop for an already-superseded
+    original reopened or otherwise re-triggered later, NOT the primary
+    defense against two overlapping deliveries of the SAME work
+    assignment's transition. That primary defense is
+    :func:`coord.state.claim_needs_decomposition_split` — an atomic DB-
+    level claim taken in `coord.notify._capture_needs_decomposition_split`
+    BEFORE either delivery ever reaches this function at all, so the
+    loser never calls it. `coord.dispatch`'s two inline call sites have no
+    such upstream claim (they are not keyed on a work assignment id, so
+    there is nothing to claim against) — this re-read is their only
+    protection, and it is what they get: best-effort, not atomic.
     """
     from coord import github_ops
     from coord.milestone_order import (
@@ -1905,7 +1915,7 @@ def file_and_queue_split_proposal(
 
     assert verification.work_order is not None  # guaranteed by ok=True
 
-    milestone_title = _original_milestone_title(repo, proposal.issue_number)
+    milestone_title = _original_milestone_title(original)
     parent = _find_parent_epic(repo, proposal.issue_number)
 
     split_marker_prefix = f"Split from #{proposal.issue_number} by the {origin}."
