@@ -2455,6 +2455,16 @@ def _capture_needs_decomposition_split(
     ``needs_decomposition_reason`` first, falling back to the final message
     in the worker log. Best-effort: any failure is logged and the issue
     stays parked for the coordinator, the same as a prose-only proposal.
+
+    **Idempotent per assignment (#4077):** a duplicate transition for the
+    SAME assignment — observed as the same ``needs_decomposition`` event
+    comment posted twice a few seconds apart — calls this twice with an
+    identical *text*.
+    :func:`coord.decomposition_chat.auto_split_needs_decomposition` itself
+    is what makes the second call a no-op (it returns the already-filed
+    epic's number rather than filing a second tracker + child set — see
+    its own docstring); this function only has to log that number either
+    way, which it already does below.
     """
     from coord.decomposition_chat import (  # noqa: PLC0415
         SIZE_TRIAGE_END_MARKER,

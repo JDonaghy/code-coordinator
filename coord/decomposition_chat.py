@@ -1768,18 +1768,56 @@ def _splice_split_into_parent_epic(
         )
 
 
+#: The literal substring :func:`file_and_queue_split_proposal`'s own close
+#: comment always contains — `f"Superseded by #{epic_number} — split into
+#: {len(proposal.chunks)} child issue(s) per the {origin}."` — so a later
+#: call scanning for "did an earlier attempt already finish this split"
+#: can match on it directly rather than deriving a second notion of the
+#: same marker (#2096, #4077).
+_SUPERSEDED_COMMENT_MARKERS = ("Superseded by #", "split into")
+
+
+def _already_has_superseded_comment(repo: "Repo", issue_number: int) -> bool:
+    """True when *issue_number* already carries the "Superseded by #N —
+    split into" comment :func:`file_and_queue_split_proposal` posts on the
+    original it closes (#4077).
+
+    Best-effort, mirroring :func:`find_filed_split_epic`'s own "the issue
+    list itself cannot be fetched" fallback: a transient failure fetching
+    comments must never block a legitimate split, so this reports ``False``
+    (same as "no such comment found") rather than letting the fetch
+    failure propagate out of a guard that is only ever a belt-and-braces
+    extra check, never the sole gate.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        comments = github_ops.get_issue_comments(repo.github, issue_number)
+    except Exception:  # noqa: BLE001 — best-effort guard, not a precondition
+        return False
+    return any(
+        all(marker in (comment.get("body") or "") for marker in _SUPERSEDED_COMMENT_MARKERS)
+        for comment in comments
+    )
+
+
 def file_and_queue_split_proposal(
     *,
     proposal: "SplitProposal",
     verification: "SplitVerification",
     repo: "Repo",
     origin: str = "preflight size-triage review",
-) -> int:
+) -> int | None:
     """File *proposal*'s chunks as real child issues and queue them (#4064).
 
     *origin* names what proposed the split; it is quoted in the epic body
     (when a new tracker is filed) and in the comment closing the
     superseded original.
+
+    Returns ``None``, filing nothing, when a belt-and-braces re-read of the
+    original right here finds it already superseded — see the "Idempotency"
+    paragraph below. Every other documented outcome below still returns the
+    real epic number.
 
     Called only after :func:`coord.preflight_size.verify_split_proposal` has
     returned ``ok=True`` for *verification* — this function trusts
@@ -1823,6 +1861,20 @@ def file_and_queue_split_proposal(
     the original" left to fall back to; the caller's own abort-on-rejection
     path is for *before* this function is ever called, when
     ``verification.ok`` is still ``False``.
+
+    **Idempotency (#4077):** before touching anything, re-reads *proposal*'s
+    own original issue and refuses — logging and returning ``None``,
+    filing nothing — when it is already closed, or already carries the
+    literal ``"Superseded by #N — split into"`` comment the close below
+    writes. This is a SEPARATE, later read than whatever check a caller
+    made first (:func:`find_filed_split_epic` in
+    :func:`auto_split_needs_decomposition` / `coord.board_doctor_policy`'s
+    decomposition act tier) — two concurrent attempts for the same
+    original can both pass an earlier check before either one has filed
+    anything, so the earlier check alone cannot close the race. This one
+    protects every caller uniformly, including `coord.dispatch`'s two
+    inline call sites that invoke this function directly with no upstream
+    check of their own.
     """
     from coord import github_ops
     from coord.milestone_order import (
@@ -1833,6 +1885,23 @@ def file_and_queue_split_proposal(
         replace_sub_issues_section,
     )
     from coord.state import enqueue_drive_queue, get_drive_queue_entry
+
+    original = github_ops.get_issue(repo.github, proposal.issue_number)
+    if str(original.get("state") or "").upper() == "CLOSED":
+        _log.warning(
+            "file_and_queue_split_proposal: %s#%s is already closed — "
+            "refusing to file a second split for it",
+            repo.name, proposal.issue_number,
+        )
+        return None
+    if _already_has_superseded_comment(repo, proposal.issue_number):
+        _log.warning(
+            "file_and_queue_split_proposal: %s#%s already carries a "
+            "superseded-by-split comment — refusing to file a second "
+            "split for it",
+            repo.name, proposal.issue_number,
+        )
+        return None
 
     assert verification.work_order is not None  # guaranteed by ok=True
 
@@ -2126,6 +2195,14 @@ def auto_split_needs_decomposition(
     proposal fails the verification gate — a broken epic is never filed.
     A failure *inside* the filer propagates: by then real issues exist on
     GitHub.
+
+    **Idempotent across repeated calls for the same work leg (#4077):**
+    when an epic for *issue_number*'s split already exists
+    (:func:`find_filed_split_epic`), this returns ITS number straight away
+    and files nothing new — a duplicate transition delivery for the same
+    terminal assignment (the observed cause of a #4077-style double split)
+    costs one extra read, not a second tracker and a second set of
+    children.
     """
     text = final_message or ""
     if not _SIZE_TRIAGE_VERDICT_RE.search(text):
@@ -2140,6 +2217,29 @@ def auto_split_needs_decomposition(
     if str(issue_data.get("state") or "").upper() == "CLOSED":
         return None
     issue_title = issue_data.get("title") or f"issue #{issue_number}"
+
+    # #4077: claim before filing. A replayed/duplicate transition for the
+    # SAME terminal work leg can call this function a second time before
+    # the first attempt's own close of the original has even started —
+    # the closed-check above alone cannot catch that, since both calls
+    # still read the original as open. `find_filed_split_epic` is the
+    # existing answer to "did an attempt already get far enough to start
+    # this split" (`coord.board_doctor_policy`'s decomposition act tier
+    # already relies on it for the identical race before ever calling
+    # `consume_split_verdict` — this was the one caller that didn't).
+    # `file_and_queue_split_proposal`'s own belt-and-braces re-read is the
+    # backstop for the window this check cannot close either (two calls
+    # landing close enough together that neither epic exists yet when
+    # both check); this one just avoids spending that second attempt at
+    # all in the common case where the first has already filed something.
+    existing_epic = find_filed_split_epic(repo, issue_number)
+    if existing_epic is not None:
+        _log.info(
+            "auto_split_needs_decomposition: %s#%s already has a filed "
+            "split epic #%s — not filing a second one",
+            repo_name, issue_number, existing_epic,
+        )
+        return existing_epic
 
     try:
         epic_number = consume_split_verdict(
