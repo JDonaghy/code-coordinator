@@ -83,6 +83,10 @@ class TestNoOpCi:
         """Same opt-out for the explicit-id single-job rerun."""
         assert NoOpCi().rerun_job("acme/api", "123", "99") is False
 
+    def test_rerun_run_is_a_noop(self) -> None:
+        """Same opt-out for the explicit-id whole-run rerun."""
+        assert NoOpCi().rerun_run("acme/api", "123") is False
+
     def test_expects_checks_is_false(self) -> None:
         """#1904: `ci_store: { type: none }` is the supported "this repo has
         no CI" opt-out — an empty check list from `NoOpCi` must never read
@@ -1514,6 +1518,83 @@ class TestGitHubCiRerunJob:
             ]
             store.list_jobs_for_run("acme/api", "123")
             ok = store.rerun_job("acme/api", "123", "99")
+            assert ok is False
+            store.list_jobs_for_run("acme/api", "123")
+        assert run.call_count == 2
+
+
+class TestGitHubCiRerunRun:
+    """`GitHubCi.rerun_run` — the explicit run-id primitive that skips
+    `rerun_for_pr`'s PR-check discovery entirely, bypassing it the way
+    `rerun_job` bypasses it at the job level."""
+
+    def test_success_issues_the_right_gh_invocation(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result("")) as run:
+            ok = store.rerun_run("acme/api", "123")
+        assert ok is True
+        run.assert_called_once_with(
+            ["gh", "run", "rerun", "123", "--repo", "acme/api"],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def test_nonzero_gh_exit_returns_false_without_raising(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result("", returncode=1, stderr="run not found"),
+        ):
+            assert store.rerun_run("acme/api", "123") is False
+
+    def test_gh_missing_returns_false_without_raising(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", side_effect=FileNotFoundError):
+            assert store.rerun_run("acme/api", "123") is False
+
+    def test_success_invalidates_the_jobs_cache_for_that_run_id(self) -> None:
+        """Same #1892 reasoning as `rerun_job`'s own cache invalidation: a
+        successful rerun of a run id must not leave a stale pre-rerun
+        `list_jobs_for_run` snapshot cached for that same run id."""
+        jobs_payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 1, "run_id": 123, "name": "test",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            }],
+        })
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(jobs_payload),  # list_jobs_for_run, pre-rerun
+                _gh_result(""),  # gh run rerun 123
+                _gh_result(jobs_payload),  # list_jobs_for_run, post-rerun — must NOT be cached
+            ]
+            store.list_jobs_for_run("acme/api", "123")
+            ok = store.rerun_run("acme/api", "123")
+            assert ok is True
+            store.list_jobs_for_run("acme/api", "123")
+        assert run.call_count == 3
+
+    def test_failed_rerun_leaves_the_jobs_cache_alone(self) -> None:
+        jobs_payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 1, "run_id": 123, "name": "test",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            }],
+        })
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(jobs_payload),  # list_jobs_for_run, pre-rerun
+                _gh_result("", returncode=1, stderr="boom"),  # gh run rerun fails
+                # list_jobs_for_run below must be served from cache — no
+                # further subprocess call queued.
+            ]
+            store.list_jobs_for_run("acme/api", "123")
+            ok = store.rerun_run("acme/api", "123")
             assert ok is False
             store.list_jobs_for_run("acme/api", "123")
         assert run.call_count == 2

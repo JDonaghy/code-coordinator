@@ -10,14 +10,17 @@ belongs to no PR. :meth:`coord.ci_store.CiStore.list_runs_for_branch` closes
 that; this module is the CLI surface over it plus the two capabilities that
 already existed but had no verb: per-run job detail and per-PR checks.
 
-Read-only throughout — mirrors ``coord issue view``/``coord issue list``'s
-posture (see ``coord/commands/issues.py``): every subcommand here talks to
-the configured :class:`~coord.ci_store.CiStore` directly, the same way those
-two call ``github_ops`` directly, rather than routing through the daemon —
-there is no write here for the daemon seam to arbitrate. This is also what
-lets a worker (``gh`` deny-listed by policy, not by host capability) inspect
-CI state without asking the coordinator to relay it by hand: ``coord ci
-...`` is the sanctioned command, not a raw ``gh`` invocation.
+Every subcommand here talks to the configured
+:class:`~coord.ci_store.CiStore` directly — the same way ``coord issue
+view``/``coord issue list`` call ``github_ops`` directly (see
+``coord/commands/issues.py``) — rather than routing through the daemon.
+``rerun`` is this module's one write, and it needs no board arbitration:
+unlike an issue/milestone edit, a CI rerun touches no board state the
+daemon seam exists to serialize, only a third-party CI backend's own run
+state. This is also what lets a worker (``gh`` deny-listed by policy, not
+by host capability) inspect and re-trigger CI without asking the
+coordinator to relay it by hand: ``coord ci ...`` is the sanctioned
+command, not a raw ``gh`` invocation.
 """
 
 from __future__ import annotations
@@ -274,12 +277,20 @@ def ci_rerun_cmd(
                 sys.exit(1)
             ok = rerun_job(slug, run_id, job_id)
         elif run_id is not None:
-            # No CiStore-level primitive reruns an arbitrary explicit run id
-            # outside of PR-check discovery, so this goes straight to the
-            # same `gh` sink GitHubCi itself reruns through.
-            from coord import github_ops  # noqa: PLC0415
-
-            ok = github_ops.rerun_workflow_run(slug, run_id)
+            # Explicit-run-id rerun, bypassing PR-check discovery — duck-typed
+            # exactly like the --job branch above, so a non-GitHub backend
+            # (or the `type: none` opt-out) declines rather than this command
+            # silently talking to GitHub regardless of `ci_store.type`.
+            ci_store = _build_ci_store(cfg)
+            rerun_run = getattr(ci_store, "rerun_run", None)
+            if rerun_run is None:
+                click.echo(
+                    f"error: {type(ci_store).__name__} does not support "
+                    "explicit run-id reruns",
+                    err=True,
+                )
+                sys.exit(1)
+            ok = rerun_run(slug, run_id)
         elif failed:
             ci_store = _build_ci_store(cfg)
             ok = ci_store.rerun_failed_for_pr(slug, pr)
