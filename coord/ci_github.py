@@ -692,6 +692,33 @@ class GitHubCi:
                 self._jobs_cache.pop((repo, str(run_id)), None)
         return all_ok and any_ok
 
+    def rerun_job(self, repo: str, run_id: str, job_id: str) -> bool:
+        """Re-run a single job *job_id* within Actions run *run_id* on
+        *repo* via ``gh run rerun <run_id> --job <job_id>``.
+
+        The explicit-id counterpart to `rerun_for_pr`/`rerun_failed_for_pr`
+        above: those two discover run ids by reading a PR's checks and
+        rerun whole runs (or whole failed-job sets per run); this skips
+        discovery entirely and reruns exactly the one job the caller
+        already knows about — `coord ci rerun REPO PR --run ID --job ID`,
+        or any other caller holding a job id from :meth:`list_jobs_for_run`.
+
+        Thin wrapper over :func:`github_ops.rerun_workflow_run_job` — same
+        best-effort contract: ``True`` only on a clean (exit 0) rerun,
+        ``False`` on any failure rather than raising.
+
+        Invalidates this run's cached :meth:`list_jobs_for_run` entry on
+        success, same reasoning as `rerun_for_pr`'s own cache invalidation
+        — a stale pre-rerun job/step snapshot read within ``cache_ttl``
+        right after a successful rerun would misreport the job as still in
+        its old state. Does not touch the PR checks cache: this method is
+        never told which PR (if any) the run belongs to.
+        """
+        ok = github_ops.rerun_workflow_run_job(repo, run_id, job_id)
+        if ok:
+            self._jobs_cache.pop((repo, str(run_id)), None)
+        return ok
+
     def list_jobs_for_run(self, repo: str, run_id: str) -> list["JobRun"]:
         """Job/step detail for Actions run *run_id* on *repo* via ``gh api``
         (#1892) — backs :func:`coord.ci_store.is_verdictless_job`.
