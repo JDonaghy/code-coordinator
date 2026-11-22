@@ -2644,7 +2644,11 @@ class TestUatStateAndReasonColumns:
 # work-like assignment a SCOPED re-review actually reviewed, captured
 # deterministically at dispatch time instead of reconstructed later from a
 # cross-machine clock comparison.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (28, 102)
+# #4071 bumped this to (29, 103): `merge_queue.ci_stuck_reruns` — the
+# bounded auto-heal budget for a parked row whose only non-green checks are
+# a checks/jobs desync (#4070), capped at `coord.merge_queue.
+# MAX_CI_STUCK_RERUNS`.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (29, 103)
 
 
 class TestMigrateAddColumnsVersionGuard:

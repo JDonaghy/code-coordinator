@@ -223,7 +223,10 @@ def ci_checks_cmd(repo: str, pr: int, as_json: bool, config_path: Path) -> None:
         "current checks. --failed narrows to only the currently-failing "
         "run ids. --run ID reruns exactly that run id, bypassing PR-check "
         "discovery entirely; add --job ID to narrow further to a single "
-        "job within that run.\n\n"
+        "job within that run. --stuck (requires --run and --job) marks "
+        "this as a manual auto-heal escalation for a checks/jobs desync — "
+        "the exact command the merge-queue sweep recommends once its own "
+        "bounded auto-rerun budget is exhausted.\n\n"
         "This is the sanctioned seam for triggering a CI rerun — call this "
         "instead of a raw `gh run rerun` invocation."
     ),
@@ -239,6 +242,13 @@ def ci_checks_cmd(repo: str, pr: int, as_json: bool, config_path: Path) -> None:
     "--job", "job_id", default=None,
     help="With --run, narrow to a single job id within that run.",
 )
+@click.option(
+    "--stuck", "stuck", is_flag=True,
+    help=(
+        "Mark this as the manual escalation for a checks/jobs desync "
+        "(#4070/#4071) — requires --run and --job."
+    ),
+)
 @_CONFIG_OPTION
 def ci_rerun_cmd(
     repo: str,
@@ -246,6 +256,7 @@ def ci_rerun_cmd(
     failed: bool,
     run_id: str | None,
     job_id: str | None,
+    stuck: bool,
     config_path: Path,
 ) -> None:
     if failed and run_id is not None:
@@ -253,6 +264,9 @@ def ci_rerun_cmd(
         sys.exit(1)
     if job_id is not None and run_id is None:
         click.echo("error: --job requires --run", err=True)
+        sys.exit(1)
+    if stuck and (run_id is None or job_id is None):
+        click.echo("error: --stuck requires --run and --job", err=True)
         sys.exit(1)
 
     cfg = _load_config(config_path)
@@ -304,7 +318,8 @@ def ci_rerun_cmd(
     target = f"{slug}#{pr}"
     if run_id is not None:
         target = f"{slug} run {run_id}" + (f" job {job_id}" if job_id is not None else "")
+    label = "stuck-check rerun" if stuck else "rerun"
     if not ok:
-        click.echo(f"rerun failed for {target}", err=True)
+        click.echo(f"{label} failed for {target}", err=True)
         sys.exit(1)
-    click.echo(f"rerun triggered for {target}")
+    click.echo(f"{label} triggered for {target}")

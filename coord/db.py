@@ -1185,7 +1185,16 @@ def retry_on_locked(
 # `_dedupe_merge_queue_assignment_ids` runs immediately before this index is
 # created so an upgrading database that already carries duplicate
 # `assignment_id` rows doesn't fail the `CREATE UNIQUE INDEX` outright.
-_DB_SCHEMA_VERSION = 28
+# #4071: bumped 28 -> 29 for the new `merge_queue.ci_stuck_reruns` column
+# appended to `_MIGRATE_ADD_COLUMNS` below — the bounded auto-heal budget
+# for a parked row whose only non-green checks are a checks/jobs desync
+# (#4070, `CI_STUCK_PREFIX`), capped at `coord.merge_queue.
+# MAX_CI_STUCK_RERUNS`. Independent of `ci_infra_reruns`/`ci_flaky_reruns`/
+# `ci_unreadable_reruns` for the same reason those three are kept apart from
+# each other: a stuck reading answers a different question ("is GitHub's
+# checks surface itself wedged?") than any of the other three. 0 for every
+# row predating this migration.
+_DB_SCHEMA_VERSION = 29
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1459,7 +1468,8 @@ _SCHEMA_SQL = """
             ci_fix_detail_json TEXT,
             ci_seen_checks_sha TEXT NOT NULL DEFAULT '',
             ci_seen_check_names_json TEXT,
-            ci_rerun_budget_sha TEXT NOT NULL DEFAULT ''
+            ci_rerun_budget_sha TEXT NOT NULL DEFAULT '',
+            ci_stuck_reruns INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -2816,6 +2826,12 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # reconstructed later from cross-machine clock comparisons. NULL for
     # every row predating this column and for every non-scoped review.
     "ALTER TABLE assignments ADD COLUMN review_scoped_work_id TEXT",
+    # #4071: the bounded auto-heal budget for a parked row whose only
+    # non-green checks are a checks/jobs desync — see the CREATE TABLE
+    # comment above and `coord.merge_queue.QueuedMerge.ci_stuck_reruns`'s
+    # docstring. 0 for every row predating this migration, which reads
+    # identically to "no auto-heal rerun spent yet" for a fresh entry.
+    "ALTER TABLE merge_queue ADD COLUMN ci_stuck_reruns INTEGER NOT NULL DEFAULT 0",
 ]
 
 

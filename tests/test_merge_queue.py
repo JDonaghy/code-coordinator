@@ -12816,9 +12816,16 @@ class TestProcessCiStuckCheck:
             events = process(items, gh, ci_store=ci)
         assert items[0].state == PENDING
         kinds = [e.kind for e in events]
-        assert "checks_pending" in kinds
         assert "merged" not in kinds
-        assert items[0].error == "CI stuck: e2e"
+        # #4071: an all-stuck reading is no longer a bare `checks_pending`
+        # label — the live path auto-heals (one bounded `rerun_job`
+        # attempt; this fixture predates that capability, so it reports
+        # "failed to trigger" rather than raising). See
+        # `TestProcessCiStuckAutoHeal` for the full auto-heal coverage.
+        assert "ci_stuck_rerun" in kinds
+        assert items[0].error == (
+            "CI stuck: e2e — auto-rerun 1/1 failed to trigger (#4071)"
+        )
         assert mq.is_ci_stuck_reason(items[0].error) is True
         # #4070: still recognized as pending — nothing downstream
         # (`coord.drive`'s "wait, don't retry" contract) changes behavior.
@@ -12895,6 +12902,202 @@ class TestProcessCiStuckCheck:
         assert "CI stuck: e2e" in pending_event.message
         # Preview-only: never mutates the persisted entry.
         assert items[0].error is None
+
+
+class TestProcessCiStuckAutoHeal:
+    """#4071: when EVERY non-green check on a parked row is stuck (#4070 —
+    a checks/jobs desync, never an honest "still running"), `process()`'s
+    live merge path issues exactly one automatic rerun via `CiStore.
+    rerun_job` (#4069's single-job primitive), bounded by `ci_stuck_reruns`/
+    `MAX_CI_STUCK_RERUNS`, writes one `ci_stuck_rerun` audit row, and
+    escalates with the literal manual `coord ci rerun ... --stuck` command
+    on a second consecutive all-stuck reading instead of rerunning again."""
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, *, checks, jobs_by_run, rerun_ok=True):
+            self._checks = checks
+            self._jobs_by_run = jobs_by_run
+            self.rerun_ok = rerun_ok
+            self.rerun_job_calls: list[tuple[str, str, str]] = []
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+        def list_jobs_for_run(self, repo, run_id):
+            return self._jobs_by_run.get(run_id, [])
+
+        def rerun_job(self, repo, run_id, job_id):
+            self.rerun_job_calls.append((repo, run_id, job_id))
+            return self.rerun_ok
+
+    class _CiPredatingTheFeature:
+        """A `CiStore` stand-in with no `rerun_job` at all — duck-typed
+        call site must degrade to "failed to trigger", never raise."""
+
+        is_available = True
+
+        def __init__(self, *, checks, jobs_by_run):
+            self._checks = checks
+            self._jobs_by_run = jobs_by_run
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+        def list_jobs_for_run(self, repo, run_id):
+            return self._jobs_by_run.get(run_id, [])
+
+    @staticmethod
+    def _stuck_check(now, *, name="e2e", run_id="999", job_id="456"):
+        check = _check(
+            name, status="in_progress", conclusion=None, run_id=run_id,
+            started_at=now - mq.CI_STUCK_THRESHOLD_SECONDS - 1, job_id=job_id,
+        )
+        jobs = {run_id: [
+            JobRun(name=name, conclusion="success", runner_name="r1",
+                   job_id=job_id, status="completed"),
+        ]}
+        return check, jobs
+
+    @staticmethod
+    def _audit_rows(coord_db, event_type: str = "ci_stuck_rerun") -> list:
+        return coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type = ?", (event_type,)
+        ).fetchall()
+
+    def test_first_all_stuck_reading_triggers_exactly_one_rerun_job_call(
+        self, coord_db,
+    ) -> None:
+        now = 10_000.0
+        check, jobs = self._stuck_check(now)
+        ci = self._Ci(checks=[check], jobs_by_run=jobs)
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci)
+
+        assert items[0].state == PENDING
+        assert items[0].ci_stuck_reruns == 1
+        assert ci.rerun_job_calls == [("acme/api", "999", "456")]
+        kinds = [e.kind for e in events]
+        assert "ci_stuck_rerun" in kinds
+        assert "checks_pending" not in kinds
+        assert "ci_stuck_escalated" not in kinds
+        assert items[0].error == (
+            "CI stuck: e2e — auto-rerun 1/1 triggered (#4071)"
+        )
+
+        rows = self._audit_rows(coord_db)
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "operational"
+        assert rows[0]["category"] == "ci"
+        assert rows[0]["repo"] == "api"
+        details = json.loads(rows[0]["details_json"])
+        assert details["pr_number"] == 99
+        assert details["stuck_names"] == ["e2e"]
+        assert details["triggered"] is True
+
+    def test_second_consecutive_all_stuck_reading_escalates_with_literal_command(
+        self, coord_db,
+    ) -> None:
+        now = 10_000.0
+        check, jobs = self._stuck_check(now)
+        ci = self._Ci(checks=[check], jobs_by_run=jobs)
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+
+        with _patched_time(now):
+            process(items, gh, ci_store=ci)  # tick 1: rerun spent
+            events = process(items, gh, ci_store=ci)  # tick 2: still stuck
+
+        assert items[0].ci_stuck_reruns == 1  # unchanged — no 2nd rerun
+        assert ci.rerun_job_calls == [("acme/api", "999", "456")]  # unchanged
+        kinds = [e.kind for e in events]
+        assert "ci_stuck_escalated" in kinds
+        assert "ci_stuck_rerun" not in kinds
+        assert items[0].error == (
+            "CI stuck: e2e — auto-rerun budget exhausted (1/1); needs a "
+            "human — `coord ci rerun api 99 --run 999 --job 456 --stuck`"
+        )
+        # Only the first tick's rerun wrote an audit row — the escalation
+        # itself issues no further automatic remedy to record.
+        assert len(self._audit_rows(coord_db)) == 1
+
+    def test_mixed_stuck_and_running_never_triggers_a_rerun(self) -> None:
+        """A genuinely-running sibling check means there is still something
+        honest to wait out — #4071's auto-heal only fires when EVERY
+        non-green check is stuck."""
+        now = 10_000.0
+        stuck, jobs = self._stuck_check(now, name="stuck-job", job_id="1")
+        running = _check(
+            "running-job", status="in_progress", conclusion=None,
+            run_id="999", started_at=now - 60.0, job_id="2",
+        )
+        jobs["999"].append(
+            JobRun(name="running-job", conclusion=None, runner_name="r2",
+                   job_id="2", status="in_progress")
+        )
+        ci = self._Ci(checks=[stuck, running], jobs_by_run=jobs)
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci)
+
+        assert ci.rerun_job_calls == []
+        assert items[0].ci_stuck_reruns == 0
+        kinds = [e.kind for e in events]
+        assert "checks_pending" in kinds
+        assert "ci_stuck_rerun" not in kinds
+
+    def test_recovering_resets_the_budget_for_a_later_unrelated_streak(
+        self,
+    ) -> None:
+        now = 10_000.0
+        check, jobs = self._stuck_check(now)
+        ci = self._Ci(checks=[check], jobs_by_run=jobs)
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+
+        with _patched_time(now):
+            process(items, gh, ci_store=ci)
+        assert items[0].ci_stuck_reruns == 1
+
+        # Recovers: still pending, but no longer stuck (an honest
+        # still-running check this time).
+        ci._checks = [
+            _check("e2e", status="in_progress", conclusion=None,
+                   run_id="999", started_at=now - 5.0, job_id="456"),
+        ]
+        ci._jobs_by_run = {"999": [
+            JobRun(name="e2e", conclusion=None, runner_name="r1",
+                   job_id="456", status="in_progress"),
+        ]}
+        with _patched_time(now + 5.0):
+            process(items, gh, ci_store=ci)
+        assert items[0].ci_stuck_reruns == 0
+
+    def test_no_rerun_job_capability_degrades_to_failed_to_trigger(self) -> None:
+        """Duck-typed like #2252's `rerun_failed_for_pr` — a `CiStore` stand-in
+        predating #4069's single-job primitive must never raise, just report
+        the rerun as not triggered while still spending the budget."""
+        now = 10_000.0
+        check, jobs = self._stuck_check(now)
+        ci = self._CiPredatingTheFeature(checks=[check], jobs_by_run=jobs)
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+
+        with _patched_time(now):
+            events = process(items, gh, ci_store=ci)
+
+        assert items[0].ci_stuck_reruns == 1
+        kinds = [e.kind for e in events]
+        assert "ci_stuck_rerun" in kinds
+        assert items[0].error == (
+            "CI stuck: e2e — auto-rerun 1/1 failed to trigger (#4071)"
+        )
 
 
 class TestProcessCiUnreadableAutoRetry:
