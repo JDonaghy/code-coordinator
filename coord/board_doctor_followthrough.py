@@ -55,6 +55,7 @@ from coord.milestone_order import (
     render_work_order,
     replace_work_order_section,
 )
+from coord.models import coordinator_doc_overlap
 from coord.preflight_size import detect_cross_backend_scope
 from coord.upstream_gaps import UPSTREAM_GAP_MARKER, parse_upstream_markers
 
@@ -80,10 +81,31 @@ ACTION_PLAN_FAILED = "followthrough-plan-failed"
 #: keyword for the parent — remediation is already in flight.
 ACTION_ALREADY_COVERED = "followthrough-already-covered"
 #: The parent's own resolution text carries a `BLOCKED_ON_UPSTREAM` marker
-#: (#4079c): no plan leg is dispatched at all — the upstream gap is
-#: filed/linked (idempotently — see `coord.upstream_gaps.process_upstream_gaps`)
-#: and the parent is left open as the tracker, parked behind it.
+#: (#4079c): no plan leg is dispatched at all — every gap named was
+#: confirmed filed/linked (idempotently — see
+#: `coord.upstream_gaps.process_upstream_gaps`) and the parent is left open
+#: as the tracker.
 ACTION_UPSTREAM_PARKED = "followthrough-upstream-parked"
+#: Minted when `run_followthrough`'s own *already_upstream_parked* argument
+#: is ``True`` (seeded by the caller, `coord.board_doctor.
+#: run_followthrough_sweep`, from :func:`upstream_parked_keys`'s durable
+#: decision-log read-back): this row's key already reports parked, so it is
+#: not re-commented or re-filed — same "already filed → reuse, don't
+#: rewrite" shape as :data:`ACTION_REFILE_ALREADY_FILED` (see its own
+#: docstring). Never recorded to the durable decision log — doing so would
+#: overwrite the :data:`ACTION_UPSTREAM_PARKED` entry
+#: :func:`upstream_parked_keys` itself reads back, making this key
+#: invisible to it on the next sweep.
+ACTION_UPSTREAM_ALREADY_PARKED = "followthrough-upstream-already-parked"
+#: At least one `BLOCKED_ON_UPSTREAM` marker in the resolution text was NOT
+#: confirmed filed/linked by `process_upstream_gaps` — a per-gap failure
+#: (`status in {"error", "unknown-repo"}`, or any status that did not come
+#: back with either a real upstream issue number or a direct park) means
+#: there is nothing durable backing a "parked behind it" claim. Alerted, not
+#: recorded as :data:`ACTION_UPSTREAM_PARKED` — leaving the row eligible for
+#: a fresh attempt on the next sweep rather than silently stuck "already
+#: parked" behind a gap that was never actually filed.
+ACTION_UPSTREAM_PARK_FAILED = "followthrough-upstream-park-failed"
 
 _ISSUE_REF_RE = re.compile(r"^#?(\d+)$")
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
@@ -788,7 +810,7 @@ def validate_plan(
         ):
             reasons.append(
                 f"item {item.item!r}: evidence {item.evidence!r} is just a "
-                "symbol/test/file name, not a quoted line showing the "
+                "symbol or test name, not a quoted line showing the "
                 "behaviour — a name existing is not evidence it runs"
             )
     # Only when the resolution text names 2+ DISTINCT leftovers: a single
@@ -852,7 +874,16 @@ def validate_plan(
             reasons.append(f"{label}: duplicate key")
         for target in fu.after:
             ref = _ISSUE_REF_RE.match(target)
-            if target.startswith("#") and ref:
+            if target.startswith("#") and ref and int(ref.group(1)) == partial.issue_number:
+                # #4079a: same self-pointing hazard as `already_covered_by`
+                # below — an `after` edge naming the parent would splice a
+                # dependency on the very issue this plan leg is meant to
+                # replace.
+                reasons.append(
+                    f"{label}: `after` target {target} points at the parent "
+                    f"issue #{partial.issue_number} itself"
+                )
+            elif target.startswith("#") and ref:
                 if int(ref.group(1)) not in declared:
                     reasons.append(
                         f"{label}: `after` target {target} is not declared in the "
@@ -904,8 +935,7 @@ def validate_plan(
                     f"{label}: `already_covered_by` {fu.already_covered_by!r} does "
                     "not reference a currently open issue"
                 )
-        coordinator_owned = {p.strip().lstrip("./") for p in coordinator_owned_docs}
-        touched = sorted(coordinator_owned & {f.lstrip("./") for f in fu.files})
+        touched = coordinator_doc_overlap(fu.files, coordinator_owned_docs)
         if touched:
             reasons.append(
                 f"{label}: names {', '.join(touched)} in `files` — a "
@@ -1175,7 +1205,7 @@ def _upstream_parked_comment(outcomes: Sequence[Any]) -> str:
     lines = [
         "Board-doctor follow-through: this merged-partial issue's "
         "remainder is blocked on an upstream gap. Staying open as the "
-        "tracker, parked behind it rather than closed.",
+        "tracker for the upstream issue(s) below.",
     ]
     for outcome in outcomes:
         gap = outcome.gap
@@ -1185,6 +1215,50 @@ def _upstream_parked_comment(outcomes: Sequence[Any]) -> str:
             detail = f" — {outcome.detail}" if outcome.detail else ""
             lines.append(f"- {gap.repo}: {gap.title} ({outcome.status}{detail})")
     return "\n".join(lines)
+
+
+def _upstream_gap_resolved(outcome: Any) -> bool:
+    """Did :func:`~coord.upstream_gaps.process_upstream_gaps` actually
+    confirm *outcome*'s gap filed/linked, rather than merely not raising
+    (#4079c)?
+
+    ``process_upstream_gaps`` catches per-gap failures internally and
+    RETURNS them rather than raising, so ``status`` can come back
+    ``"error"`` or ``"unknown-repo"`` (the gap's named repo is not in
+    `coordinator.yml`) with no exception ever thrown. A resolved outcome is
+    either a real, linked upstream issue (``"filed"``/``"already-filed"``/
+    ``"deduped"`` with ``number`` set) or a direct park that needed no
+    upstream issue at all (``"not-a-gap"`` with ``outcome.parked`` true,
+    #3930/#3977) — anything else did not actually land.
+    """
+    if outcome.status in ("filed", "already-filed", "deduped"):
+        return outcome.number is not None
+    if outcome.status == "not-a-gap":
+        return bool(outcome.parked)
+    return False
+
+
+def upstream_parked_keys(decisions: Sequence[Mapping[str, Any]]) -> set[str]:
+    """``key`` for every row whose LATEST decision-log entry recorded
+    :data:`ACTION_UPSTREAM_PARKED` (#4079c).
+
+    *decisions* is the FULL decision log (oldest first, same order
+    :func:`coord.state.board_doctor_decisions` returns), not pre-filtered
+    by action — mirrors :func:`pending_refiles`'s own "latest entry
+    overall, not latest filtered by action" rule: the only way to tell a
+    key's park is no longer current is to see that a LATER entry for the
+    same key recorded something else instead (an operator reopening it
+    with a fresh resolution, for instance).
+    """
+    latest: dict[str, Mapping[str, Any]] = {}
+    for entry in decisions:
+        key = entry.get("key")
+        if key:
+            latest[str(key)] = entry
+    return {
+        key for key, entry in latest.items()
+        if entry.get("action") == ACTION_UPSTREAM_PARKED
+    }
 
 
 def run_followthrough(
@@ -1202,6 +1276,7 @@ def run_followthrough(
     covering_issue_open: Callable[[int], bool] = lambda _n: True,
     coordinator_owned_docs: Sequence[str] = (),
     process_upstream_gaps: Callable[..., Sequence[Any]] = _default_process_upstream_gaps,
+    already_upstream_parked: bool = False,
     dry_run: bool = False,
     auto_queue: AutoQueueContext | None = None,
     coverage: FollowThroughCoverage | None = None,
@@ -1238,9 +1313,19 @@ def run_followthrough(
     files a follow-up at all — it files/links the upstream gap (the same
     way a work leg's own transition does, idempotently), comments the link
     on the parent, and leaves the parent OPEN as the tracker
-    (:data:`ACTION_UPSTREAM_PARKED`). This is the safety net for the gap
-    where the transition-time capture never ran (or the parent otherwise
-    sat merged-partial with its blocker never acted on).
+    (:data:`ACTION_UPSTREAM_PARKED`) ONLY once every named gap comes back
+    confirmed filed/linked — `process_upstream_gaps` catches per-gap
+    failures and returns them rather than raising, so the absence of an
+    exception is not proof of success (see :data:`ACTION_UPSTREAM_PARK_
+    FAILED`). This is the safety net for the gap where the transition-time
+    capture never ran (or the parent otherwise sat merged-partial with its
+    blocker never acted on).
+
+    *already_upstream_parked* (seeded by the caller from
+    :func:`upstream_parked_keys`, the durable decision-log read-back) is
+    checked before any of that: once a key has been successfully parked,
+    a repeat sweep must not re-comment or re-file for it, forever — see
+    :data:`ACTION_UPSTREAM_ALREADY_PARKED`.
     """
     key = f"{partial.repo_name}#{partial.issue_number}"
     disposition = Disposition(
@@ -1273,6 +1358,15 @@ def run_followthrough(
         else []
     )
     if upstream_gaps:
+        if already_upstream_parked:
+            # Already resolved by a previous sweep — do not re-comment or
+            # re-record. See `ACTION_UPSTREAM_ALREADY_PARKED`'s own docstring.
+            disposition.reasons.append(
+                f"{len(upstream_gaps)} BLOCKED_ON_UPSTREAM marker(s) already "
+                "parked by a previous sweep; not re-commenting"
+            )
+            disposition.action = ACTION_UPSTREAM_ALREADY_PARKED
+            return disposition
         if dry_run:
             disposition.reasons.append(
                 f"{len(upstream_gaps)} BLOCKED_ON_UPSTREAM marker(s) in the "
@@ -1285,12 +1379,39 @@ def run_followthrough(
                 partial.resolution_text, repo_name=partial.repo_name,
                 issue_number=partial.issue_number,
             )
+        except Exception as exc:  # noqa: BLE001 — every write failure must alert
+            disposition.reasons.append(f"upstream gap filing failed: {exc}")
+            alert(f"{key}: follow-through upstream filing failed", str(exc))
+            return _finish(ACTION_WRITE_FAILED)
+        unresolved = [o for o in outcomes if not _upstream_gap_resolved(o)]
+        if unresolved:
+            # `process_upstream_gaps` catches per-gap failures and returns
+            # them rather than raising — the absence of an exception above
+            # is not proof every gap was actually filed/linked. Alert and
+            # leave the row unrecorded as parked, so the next sweep tries
+            # again rather than silently treating a never-filed gap as done.
+            detail = "\n".join(
+                f"- {o.gap.repo}: {o.gap.title} ({o.status}"
+                + (f" — {o.detail}" if o.detail else "") + ")"
+                for o in unresolved
+            )
+            disposition.reasons.append(
+                f"{len(unresolved)} of {len(upstream_gaps)} BLOCKED_ON_UPSTREAM "
+                "marker(s) could not be confirmed filed/linked; not claiming parked"
+            )
+            alert(
+                f"{key}: follow-through upstream filing incomplete",
+                f"process_upstream_gaps did not confirm every gap filed/linked "
+                f"for {key}:\n{detail}",
+            )
+            return _finish(ACTION_UPSTREAM_PARK_FAILED)
+        try:
             writer.comment_issue(
                 partial.github_slug, partial.issue_number,
                 body=_upstream_parked_comment(outcomes),
             )
         except Exception as exc:  # noqa: BLE001 — every write failure must alert
-            disposition.reasons.append(f"upstream gap filing failed: {exc}")
+            disposition.reasons.append(f"upstream gap comment failed: {exc}")
             alert(f"{key}: follow-through upstream filing failed", str(exc))
             return _finish(ACTION_WRITE_FAILED)
         disposition.reasons.append(
