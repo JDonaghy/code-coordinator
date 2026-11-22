@@ -1919,6 +1919,47 @@ def _record_ci_flake_shift_audit(
     )
 
 
+def _record_ci_stuck_rerun_audit(
+    entry: "QueuedMerge", stuck_names: "frozenset[str]", triggered: bool,
+) -> None:
+    """Emit one ``ci_stuck_rerun`` operational audit row (#4071): the live
+    merge path observed every non-green check on this entry as a
+    checks/jobs desync (#4070, :data:`CI_STUCK_PREFIX`) and issued its one
+    bounded auto-heal rerun via :meth:`coord.ci_store.CiStore.rerun_job`
+    (#4069's single-job primitive).
+
+    Durable record of the one automatic rerun :data:`MAX_CI_STUCK_RERUNS`
+    allows per stuck streak — without it, a wedged GitHub checks surface
+    recurring across many PRs would have no queryable trail (``coord
+    audit`` / ``query_audit_log``) distinguishing "auto-healed itself" from
+    a streak that went on to the escalation a human later saw. Best-effort
+    like every other audit call site in this module — ``record_audit``
+    never raises.
+    """
+    record_audit(
+        tier="operational",
+        category="ci",
+        event_type="ci_stuck_rerun",
+        actor="system",
+        summary=(
+            f"CI stuck on {entry.repo_name}#{entry.issue_number} "
+            f"(PR #{entry.pr_number}): {', '.join(sorted(stuck_names))} — "
+            f"auto-rerun {'triggered' if triggered else 'failed to trigger'} "
+            f"({entry.ci_stuck_reruns}/{MAX_CI_STUCK_RERUNS}, #4071)"
+        ),
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={
+            "pr_number": entry.pr_number,
+            "sha": entry.branch_head_sha,
+            "stuck_names": sorted(stuck_names),
+            "triggered": triggered,
+            "ci_stuck_reruns": entry.ci_stuck_reruns,
+        },
+    )
+
+
 @dataclass(frozen=True)
 class MergeGateFailure:
     """One un-satisfied merge gate for a work row / queue entry (#1695).
@@ -3125,6 +3166,18 @@ def is_ci_stuck_reason(reason: str | None) -> bool:
     "still running", e.g. to recommend a rerun instead of more waiting.
     """
     return (reason or "").startswith(CI_STUCK_PREFIX)
+
+
+# #4071: at most one automatic `CiStore.rerun_job` call (#4069's single-job
+# primitive) per entry's CURRENT streak of an all-stuck pending reading
+# (every non-green check is a checks/jobs desync — see `_ci_stuck_names`)
+# before `process()` stops auto-healing and escalates with the exact manual
+# command a human should run instead. Deliberately 1, not 2+ like
+# `MAX_CI_INFRA_RERUNS`: a desync is GitHub's checks surface wedged, not a
+# blip that benefits from repeated retries — the SECOND stuck reading in a
+# row (the rerun this budget already spent did not clear it) is itself the
+# signal that this needs a human, not a third automatic attempt.
+MAX_CI_STUCK_RERUNS = 1
 
 
 # #3536: floor/cap for `ci_pending_poll_interval_s`'s exponential growth.
@@ -5402,6 +5455,21 @@ class QueuedMerge:
     # entry that has never had a live CI-failure read, and for rows
     # predating this column.
     ci_rerun_budget_sha: str = ""
+    # #4071: count of automatic `CiStore.rerun_job` calls (#4069's
+    # single-job primitive) `process()` has issued for this entry's
+    # CURRENT streak of an all-stuck pending reading — every non-green
+    # check a checks/jobs desync (#4070), none merely still running —
+    # capped at `MAX_CI_STUCK_RERUNS`. Kept separate from `ci_infra_reruns`/
+    # `ci_flaky_reruns`/`ci_unreadable_reruns` for the same reason those
+    # three are kept apart from each other: a stuck reading answers a
+    # different question ("is GitHub's checks surface itself wedged?") than
+    # any of the other three, and is independently capped/legible in the
+    # audit trail. Reset to 0 the moment a later read sees no stuck check at
+    # all (recovered on its own, or the streak was never stuck to begin
+    # with) — a later, unrelated desync starts its own budget fresh. 0 for
+    # every entry that has never hit an all-stuck reading, and for rows
+    # predating this column.
+    ci_stuck_reruns: int = 0
 
 
 class GhOps(Protocol):
@@ -5834,6 +5902,9 @@ def load_queue() -> list[QueuedMerge]:
             # #3754: same NULL-to-'' decoding as ci_seen_checks_sha above,
             # for rows predating this migration.
             ci_rerun_budget_sha=row["ci_rerun_budget_sha"] or "",
+            # #4071: same NULL-to-0 decoding as ci_infra_reruns above, for
+            # rows predating this column.
+            ci_stuck_reruns=row["ci_stuck_reruns"] or 0,
         )
         for row in rows
     ]
@@ -5849,7 +5920,7 @@ _MERGE_QUEUE_UPSERT_COLUMNS = (
     "ci_fix_head_sha", "ci_fix_noop_streak",
     "ci_fix_detail_sha", "ci_fix_detail_json",
     "ci_seen_checks_sha", "ci_seen_check_names_json",
-    "ci_rerun_budget_sha",
+    "ci_rerun_budget_sha", "ci_stuck_reruns",
 )
 
 
@@ -5866,7 +5937,7 @@ def _merge_queue_upsert_params(item: QueuedMerge) -> tuple:
         item.ci_fix_head_sha, item.ci_fix_noop_streak,
         item.ci_fix_detail_sha, item.ci_fix_detail_json,
         item.ci_seen_checks_sha, item.ci_seen_check_names_json,
-        item.ci_rerun_budget_sha,
+        item.ci_rerun_budget_sha, item.ci_stuck_reruns,
     )
 
 
@@ -10718,6 +10789,95 @@ def process(
                     running_names = [
                         c.name for c in pending if c.name not in stuck_names
                     ]
+                    if not stuck_names:
+                        # #4071: nothing stuck on this read — recovered on
+                        # its own, or never stuck to begin with. A later,
+                        # unrelated desync starts its own bounded-rerun
+                        # budget fresh rather than inheriting a stale count.
+                        entry.ci_stuck_reruns = 0
+                    elif not running_names:
+                        # #4071: EVERY non-green check is stuck — nothing
+                        # left to honestly wait out, only a checks/jobs
+                        # desync (#4070) an explicit rerun can clear. Pick
+                        # one deterministically (sorted by name) — bounded
+                        # auto-heal issues exactly one rerun per streak via
+                        # #4069's single-job primitive, not one per stuck
+                        # name.
+                        stuck_checks = sorted(
+                            (c for c in pending if c.name in stuck_names),
+                            key=lambda c: c.name,
+                        )
+                        target = stuck_checks[0]
+                        if entry.ci_stuck_reruns < MAX_CI_STUCK_RERUNS:
+                            entry.ci_stuck_reruns += 1
+                            rerun_job = getattr(ci, "rerun_job", None)
+                            triggered = False
+                            if (
+                                rerun_job is not None
+                                and target.run_id
+                                and target.job_id
+                            ):
+                                try:
+                                    triggered = bool(
+                                        rerun_job(
+                                            entry.repo_github,
+                                            target.run_id,
+                                            target.job_id,
+                                        )
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    triggered = False
+                            _log.info(
+                                "#4071 auto-heal rerun %d/%d for %s#%d "
+                                "(PR #%s): %s (rerun_job %s)",
+                                entry.ci_stuck_reruns, MAX_CI_STUCK_RERUNS,
+                                entry.repo_name, entry.issue_number,
+                                entry.pr_number, sorted(stuck_names),
+                                "triggered" if triggered else "FAILED",
+                            )
+                            msg = (
+                                f"{CI_STUCK_PREFIX} {', '.join(sorted(stuck_names))} "
+                                f"— auto-rerun {entry.ci_stuck_reruns}/"
+                                f"{MAX_CI_STUCK_RERUNS} "
+                                f"{'triggered' if triggered else 'failed to trigger'} "
+                                "(#4071)"
+                            )
+                            entry.error = msg
+                            _record_ci_stuck_rerun_audit(
+                                entry, stuck_names, triggered,
+                            )
+                            events.append(
+                                MergeEvent(entry, "ci_stuck_rerun", msg)
+                            )
+                            continue  # #292: skip, don't halt the group
+                        # #4071: budget exhausted — a SECOND consecutive
+                        # all-stuck reading means the one rerun this budget
+                        # already spent did not clear it. Stop auto-healing
+                        # and hand a human the exact, already-scoped manual
+                        # command instead of retrying forever.
+                        cmd = (
+                            f"coord ci rerun {entry.repo_name} "
+                            f"{entry.pr_number} --run {target.run_id} "
+                            f"--job {target.job_id} --stuck"
+                        )
+                        _log.info(
+                            "#4071 auto-heal budget exhausted for %s#%d "
+                            "(PR #%s) after %d/%d tries: %s",
+                            entry.repo_name, entry.issue_number,
+                            entry.pr_number, entry.ci_stuck_reruns,
+                            MAX_CI_STUCK_RERUNS, sorted(stuck_names),
+                        )
+                        msg = (
+                            f"{CI_STUCK_PREFIX} {', '.join(sorted(stuck_names))} "
+                            f"— auto-rerun budget exhausted "
+                            f"({entry.ci_stuck_reruns}/{MAX_CI_STUCK_RERUNS}); "
+                            f"needs a human — `{cmd}`"
+                        )
+                        entry.error = msg
+                        events.append(
+                            MergeEvent(entry, "ci_stuck_escalated", msg)
+                        )
+                        continue  # #292: skip, don't halt the group
                     parts = []
                     if running_names:
                         parts.append(f"{CI_PENDING_PREFIX} {', '.join(running_names)}")
@@ -10771,6 +10931,13 @@ def process(
                 # failures the budget was tracking is over. A LATER,
                 # unrelated fetch failure starts its own count from zero.
                 entry.ci_unreadable_reruns = 0
+                # #4071: same "genuinely resolved" reset — `pending` being
+                # empty here already covers "no stuck check either", but a
+                # row can reach this point without ever passing through the
+                # `if pending:` block's own reset (e.g. a straight
+                # failed -> resolved transition), so reset explicitly here
+                # too rather than rely on that branch alone.
+                entry.ci_stuck_reruns = 0
                 # #3754: keep `ci_rerun_budget_sha` in lockstep with the
                 # three counters above — harmless if it's already current
                 # (the `if failed:` guard above is idempotent), but keeps a

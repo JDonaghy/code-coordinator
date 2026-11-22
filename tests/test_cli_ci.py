@@ -331,6 +331,34 @@ class TestCiRerun:
         assert result.exit_code != 0
         assert "does not support single-job reruns" in result.output
 
+    def test_stuck_reruns_exactly_that_job_with_a_distinct_label(
+        self, config_file: Path,
+    ) -> None:
+        """#4071: `--stuck` is the manual counterpart to the merge-queue
+        sweep's own bounded auto-heal — same underlying `rerun_job` call as
+        a bare `--run`/`--job`, just labeled distinctly so a human (or a
+        log) can tell a deliberate stuck-check escalation apart from an
+        ordinary explicit-id rerun."""
+        store = _FakeCiStore()
+        with patch("coord.ci_store.build_ci_store", return_value=store):
+            result = _invoke(
+                "ci", "rerun", "api", "7", "--run", "123", "--job", "99",
+                "--stuck", config_file=config_file,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert store.rerun_job_calls == [("acme/api", "123", "99")]
+        assert "stuck-check rerun triggered" in result.output
+
+    def test_stuck_without_run_and_job_is_rejected(self, config_file: Path) -> None:
+        with patch("coord.ci_store.build_ci_store", return_value=_FakeCiStore()):
+            result = _invoke(
+                "ci", "rerun", "api", "7", "--stuck", config_file=config_file,
+            )
+
+        assert result.exit_code != 0
+        assert "--stuck requires --run and --job" in result.output
+
     def test_failed_gh_exit_reports_nonzero_without_raising(self, config_file: Path) -> None:
         """A non-zero `gh` exit (surfaced as a `False` return, not a raise —
         see `github_ops.rerun_workflow_run`'s own contract) must still
