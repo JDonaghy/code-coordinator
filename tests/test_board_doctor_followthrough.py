@@ -50,6 +50,7 @@ class FakeWriter:
         self.children: list[tuple[int, int, tuple[int, ...]]] = []
         self.bodies: dict[int, str] = {50: epic_body}
         self.closed: list[tuple[int, str]] = []
+        self.comments: list[tuple[int, str]] = []
 
     def create_issue(self, repo_name, *, title, body, milestone):
         number = self.next_number
@@ -69,9 +70,15 @@ class FakeWriter:
     def close_issue(self, repo_name, number, *, comment):
         self.closed.append((number, comment))
 
+    def comment_issue(self, repo_name, number, *, body):
+        self.comments.append((number, body))
+
     @property
     def wrote_anything(self) -> bool:
-        return bool(self.created or self.children or self.closed) or self.bodies[50] != EPIC_BODY
+        return (
+            bool(self.created or self.children or self.closed or self.comments)
+            or self.bodies[50] != EPIC_BODY
+        )
 
 
 class Sinks:
@@ -1047,3 +1054,225 @@ class TestGitHubFollowThroughWriterReadBack:
         )
         with pytest.raises(RuntimeError, match="not confirmed closed"):
             writer.close_issue("acme/api", 101, comment="done")
+
+
+# ── #4079: self-pointing remainder / coordinator-owned remainder ───────────
+
+
+def test_already_covered_by_pointing_at_parent_rejects_without_closing() -> None:
+    """quadraui#2806's own failure mode: the plan leg named the follow-up
+    `already_covered_by` the PARENT issue itself. `covering_issue_open`
+    alone can't catch this — the parent is still open at validation time —
+    so this must be checked directly."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "Rewrite CLAUDE.md", "body": "...",
+             "already_covered_by": "#101"},
+        ],
+    }
+    disp, writer, sinks = _run(_partial(), plan)  # _partial()'s issue_number is 101
+
+    assert disp.action == ft.ACTION_REJECTED
+    assert any(
+        "already_covered_by" in r and "parent issue #101" in r for r in disp.reasons
+    )
+    assert not writer.wrote_anything
+
+
+def test_follow_up_naming_coordinator_owned_doc_rejects_without_closing() -> None:
+    """A follow-up whose own `files` names a coordinator-owned doc
+    (CLAUDE.md) can never actually be finished by an ordinary worker
+    dispatch — writing it and closing the parent on the strength of it
+    would silently lose the remainder (quadraui#2806)."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "Rewrite CLAUDE.md", "body": "...",
+             "files": ["CLAUDE.md"]},
+        ],
+    }
+    disp, writer, sinks = _run(
+        _partial(), plan, coordinator_owned_docs=("CLAUDE.md",),
+    )
+
+    assert disp.action == ft.ACTION_REJECTED
+    assert any("CLAUDE.md" in r and "coordinator-owned" in r for r in disp.reasons)
+    assert not writer.wrote_anything
+
+
+def test_coordinator_owned_doc_check_inert_without_configured_paths() -> None:
+    """Without any `coordinator_owned_docs` configured (the default), a
+    follow-up naming CLAUDE.md in `files` is not rejected on that basis —
+    mirrors `detect_cross_backend_scope`'s own "inert without configured
+    backends" contract."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "t", "body": "...", "files": ["CLAUDE.md"]},
+        ],
+    }
+    disp, writer, sinks = _run(_partial(), plan)
+    assert disp.action == ft.ACTION_FILED
+
+
+# ── #4079b: every named leftover must be addressed, not just claimed ───────
+
+
+_TWO_LEFTOVER_RESOLUTION = (
+    "ISSUE_RESOLUTION: partial — the menu-bar scenario needs covering; "
+    "and the cut leg of copy/cut/paste is not actually exercised."
+)
+
+
+def test_resolution_leftover_silently_dropped_rejects() -> None:
+    """quadracalc#27's own shape: the resolution text names TWO leftovers
+    but the plan only has an item for one of them — `validate_plan` must
+    not let the other vanish silently."""
+    plan = {
+        "items": [
+            {"item": "menu-bar scenario", "verified_still_missing": False,
+             "evidence": "tests/test_menu.py:42 drives File > Open via the menu bar"},
+        ],
+        "follow_ups": [],
+    }
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_TWO_LEFTOVER_RESOLUTION), plan,
+    )
+    assert disp.action == ft.ACTION_REJECTED
+    assert any(
+        "leftover" in r and "copy/cut/paste" in r for r in disp.reasons
+    )
+    assert not writer.wrote_anything
+
+
+def test_resolution_leftover_verified_by_name_only_rejects() -> None:
+    """Same shape, but BOTH leftovers get a plan item — the second one's
+    "evidence" is just the scenario's name, not a quoted line showing the
+    `Ctrl+X` keypress actually ran. A name existing is not evidence."""
+    plan = {
+        "items": [
+            {"item": "menu-bar scenario", "verified_still_missing": False,
+             "evidence": "tests/test_menu.py:42 drives File > Open via the menu bar"},
+            {"item": "cut leg of copy/cut/paste", "verified_still_missing": False,
+             "evidence": "copy_cut_paste"},
+        ],
+        "follow_ups": [],
+    }
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_TWO_LEFTOVER_RESOLUTION), plan,
+    )
+    assert disp.action == ft.ACTION_REJECTED
+    assert any(
+        "copy_cut_paste" in r and "not a quoted line" in r for r in disp.reasons
+    )
+    assert not writer.wrote_anything
+    # The leftover-coverage check itself is satisfied (there IS an item
+    # naming the cut leg) — only the bare-symbol-evidence check fires.
+    assert not any("leftover" in r for r in disp.reasons)
+
+
+def test_resolution_leftover_with_quoted_behaviour_passes() -> None:
+    """The positive case: both leftovers get an item, and the second's
+    evidence actually quotes the behaviour — nothing to reject."""
+    plan = {
+        "items": [
+            {"item": "menu-bar scenario", "verified_still_missing": False,
+             "evidence": "tests/test_menu.py:42 drives File > Open via the menu bar"},
+            {"item": "cut leg of copy/cut/paste", "verified_still_missing": False,
+             "evidence": "tests/test_clipboard.py:88 presses Ctrl+X and asserts "
+                         "the selection is removed and placed on the clipboard"},
+        ],
+        "follow_ups": [],
+    }
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_TWO_LEFTOVER_RESOLUTION), plan,
+    )
+    assert disp.action == ft.ACTION_ALL_LANDED
+    [(closed, comment)] = writer.closed
+
+
+def test_single_short_resolution_text_leftover_check_inert() -> None:
+    """A single, short resolution ("partial — B remains") has nothing for
+    the leftover-coverage check to usefully compare — it must not reject a
+    plan on the strength of a weak one-phrase match."""
+    disp, writer, sinks = _run(_partial(), HAPPY_PLAN)
+    assert disp.action == ft.ACTION_FILED
+
+
+# ── #4079c: an upstream-blocked partial is filed/linked, not ignored ───────
+
+
+_UPSTREAM_RESOLUTION = """\
+ISSUE_RESOLUTION: partial — blocked on upstream (BLOCKED_ON_UPSTREAM above)
+
+BLOCKED_ON_UPSTREAM: quadraui: Expose per-pane scroll offsets
+quadracalc's minimap needs the f32 scroll offset of a pane; today only the
+integer line index is public.
+"""
+
+
+def _fake_upstream_outcome(repo="quadraui", title="Expose per-pane scroll offsets",
+                            number=9001, status="filed", detail=""):
+    gap = SimpleNamespace(repo=repo, title=title)
+    return SimpleNamespace(gap=gap, status=status, number=number, detail=detail)
+
+
+def test_upstream_blocked_partial_parks_without_closing() -> None:
+    """quadracalc#48's own shape: the worker's final message carries a
+    `BLOCKED_ON_UPSTREAM` marker. Follow-through must not plan or file an
+    ordinary follow-up for this — it files/links the upstream gap and
+    leaves the parent open as the tracker."""
+    calls: list[tuple[str, str, int]] = []
+
+    def fake_process(final_message, *, repo_name, issue_number):
+        calls.append((final_message, repo_name, issue_number))
+        return [_fake_upstream_outcome()]
+
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_UPSTREAM_RESOLUTION),
+        plan={},  # never read: the plan leg is never even dispatched
+        process_upstream_gaps=fake_process,
+    )
+
+    assert disp.action == ft.ACTION_UPSTREAM_PARKED
+    assert writer.closed == []
+    assert writer.created == []
+    assert len(calls) == 1
+    assert calls[0][1:] == ("claude-coordinator", 101)
+    [(number, comment)] = writer.comments
+    assert number == 101
+    assert "quadraui#9001" in comment
+    assert not sinks.prompts  # the plan leg was never dispatched
+
+
+def test_upstream_blocked_partial_dry_run_does_not_write() -> None:
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_UPSTREAM_RESOLUTION),
+        plan={},
+        process_upstream_gaps=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not be called in dry_run")
+        ),
+        dry_run=True,
+    )
+    assert disp.action == ft.ACTION_UPSTREAM_PARKED
+    assert not writer.wrote_anything
+    assert not sinks.records
+
+
+def test_upstream_blocked_partial_write_failure_alerts() -> None:
+    def fake_process(final_message, *, repo_name, issue_number):
+        return [_fake_upstream_outcome()]
+
+    class BrokenCommentWriter(FakeWriter):
+        def comment_issue(self, repo_name, number, *, body):
+            raise RuntimeError("boom")
+
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_UPSTREAM_RESOLUTION),
+        plan={},
+        writer=BrokenCommentWriter(),
+        process_upstream_gaps=fake_process,
+    )
+    assert disp.action == ft.ACTION_WRITE_FAILED
+    assert sinks.alerts
