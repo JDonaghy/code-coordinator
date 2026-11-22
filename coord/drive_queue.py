@@ -111,6 +111,7 @@ from coord.merge_queue import (
     is_ci_absent_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
+    is_ci_stuck_reason,
     is_ci_terminal_reason,
     is_ci_unreadable_reason,
     is_stale_smoke_reason,
@@ -6770,11 +6771,33 @@ def _reconcile_running(
     # `Blocked`, because unlike `refused` this is not a terminal condition —
     # see `plan_tick`'s pre-pass, which is what un-parks it).
     if facts.merge_ci_pending:
-        reason = (
-            f"{facts.merge_ci_pending_reason or 'CI checks have not reported yet'}"
-            f"{launched} — parking without spending an attempt; the queue "
-            "resumes it automatically once they do, no operator needed (#1891)"
-        )
+        # `merge_ci_pending_reason` also matches `CI_STUCK_PREFIX` — a
+        # checks/jobs desync, a DIFFERENT shape from an honest still-running
+        # check, even though `is_ci_pending_reason` folds both into the same
+        # "has not reported a conclusion" park so the self-refreshing
+        # disposition below (no attempt spent) stays correct either way.
+        # The WORDING must not: GitHub's checks surface being wedged is not
+        # something more real time resolves on its own the way a slow CI
+        # run is, and the merge-queue sweep's own bounded auto-heal
+        # (`coord.merge_queue.MAX_CI_STUCK_RERUNS`) hands a human the exact
+        # `coord ci rerun ... --stuck` command the moment its budget is
+        # exhausted — this row genuinely may still need an operator, so the
+        # wording below must never claim otherwise.
+        if is_ci_stuck_reason(facts.merge_ci_pending_reason):
+            reason = (
+                f"{facts.merge_ci_pending_reason}{launched} — parking without "
+                "spending an attempt; a checks/jobs desync does not clear on "
+                "its own the way a pending check does, so this may still need "
+                "an operator — see the reason above, and once the "
+                "merge-queue sweep's own bounded auto-heal is exhausted, run "
+                "`coord ci rerun <repo> <pr> --run ID --job ID --stuck` (#4072)"
+            )
+        else:
+            reason = (
+                f"{facts.merge_ci_pending_reason or 'CI checks have not reported yet'}"
+                f"{launched} — parking without spending an attempt; the queue "
+                "resumes it automatically once they do, no operator needed (#1891)"
+            )
         return (
             Reconcile(
                 entry.key,

@@ -2209,6 +2209,74 @@ class TestRequeueNeverDispatched:
             is False
         )
 
+    @pytest.mark.parametrize("prefix", ["CI running:", "CI stuck:"])
+    def test_a_live_ci_pending_park_refuses_the_requeue_even_with_an_empty_board(
+        self, monkeypatch, coord_db, prefix,
+    ) -> None:
+        """#4072: a `drive_queue` row whose LIVE `last_reason` already names
+        a "CI running:"/"CI stuck:" park was, by construction, dispatched —
+        `coord.drive_queue._reconcile_running`'s #1891/#4070 park never
+        writes that text without a real branch/PR behind it. The board scan
+        `assignments_for_issue` only covers `board.active`/`board.completed`,
+        so an assignment that has since aged into the drive-queue's own
+        archive reads identically to "never happened" there — exactly the
+        false-empty-board shape this guards against. The drive-queue entry's
+        own fresher text must win and refuse the requeue, even though the
+        board read below reports zero assignments."""
+        self._empty_board(monkeypatch)
+        state.enqueue_drive_queue("acme/widgets", 2035)
+        state.update_drive_queue_entry(
+            "acme/widgets", 2035, last_reason=f"{prefix} build, lint",
+        )
+
+        assert (
+            board_doctor_policy._never_dispatched_still_true("acme/widgets", 2035)
+            is False
+        )
+
+    def test_the_requeue_itself_is_refused_for_a_live_ci_pending_park(
+        self, monkeypatch, coord_db,
+    ) -> None:
+        """Same #4072 shape, through the public :func:`_requeue_never_
+        dispatched` entry point — the dispatch must never fire."""
+        calls: list[tuple] = []
+
+        self._empty_board(monkeypatch)
+        state.enqueue_drive_queue("acme/widgets", 2035)
+        state.update_drive_queue_entry(
+            "acme/widgets", 2035, last_reason="CI stuck: build — auto-rerun 1/1 triggered",
+        )
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: calls.append(a) or {"requeued": True},
+        )
+
+        assert _requeue_never_dispatched(self._row()) is False
+        assert calls == []
+
+    def test_an_unreadable_drive_queue_entry_refuses_rather_than_assuming_absent(
+        self, monkeypatch,
+    ) -> None:
+        """A drive-queue read that raises says nothing about whether this
+        row is really a live CI park, so it must fail closed exactly like
+        an unreadable board does."""
+        calls: list[tuple] = []
+
+        def boom(repo_name, issue_number):
+            raise TimeoutError("drive-queue read timed out")
+
+        self._empty_board(monkeypatch)
+        monkeypatch.setattr(state, "get_drive_queue_entry", boom)
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: calls.append(a) or {"requeued": True},
+        )
+
+        assert _requeue_never_dispatched(self._row()) is False
+        assert calls == []
+
 
 class TestFixitRebudgetGlobalCap:
     """#3847's load-bearing safety property: at most one auto-rebudget
