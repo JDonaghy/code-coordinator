@@ -377,6 +377,26 @@ class CiStore(Protocol):
         """
         ...
 
+    def rerun_run(self, repo: str, run_id: str) -> bool:
+        """Re-run explicit run *run_id* on *repo*, bypassing PR-check
+        discovery entirely. Returns whether it worked.
+
+        The explicit-id counterpart to :meth:`rerun_for_pr` the way
+        :meth:`rerun_job` is to it at the job level: ``rerun_for_pr``
+        discovers run ids by reading a PR's checks and reruns every one of
+        them; this skips discovery and reruns exactly the one run id the
+        caller already has — ``coord ci rerun REPO PR --run ID`` with no
+        ``--job``, or any other caller holding a run id from
+        :meth:`list_runs_for_branch`.
+
+        Optional/duck-typed like `rerun_job`: call sites use
+        ``getattr(ci, "rerun_run", None)`` so a `CiStore` backend that
+        does not implement an explicit-run-id rerun (no GitHub Actions
+        run model behind it, or CI gating opted out entirely) declines
+        rather than silently falling back to a different backend.
+        """
+        ...
+
     def list_runs_for_branch(
         self, repo: str, branch: str, *, event: str | None = None, limit: int = 20,
     ) -> list[RunSummary]:
@@ -436,6 +456,11 @@ class NoOpCi:
         return False
 
     def rerun_job(self, repo: str, run_id: str, job_id: str) -> bool:
+        """No-op: CI gating is disabled entirely, so there is nothing to
+        re-run."""
+        return False
+
+    def rerun_run(self, repo: str, run_id: str) -> bool:
         """No-op: CI gating is disabled entirely, so there is nothing to
         re-run."""
         return False

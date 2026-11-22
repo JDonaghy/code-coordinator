@@ -1,4 +1,5 @@
-"""Black-box tests for `coord ci runs`/`coord ci jobs`/`coord ci checks` (#3405).
+"""Black-box tests for `coord ci runs`/`coord ci jobs`/`coord ci checks`/
+`coord ci rerun` (#3405).
 
 Drives the CLI end-to-end against a stubbed `CiStore` (patched at
 `coord.ci_store.build_ci_store`, the exact seam `coord pr merge`'s own tests
@@ -56,7 +57,9 @@ class _FakeCiStore:
         rerun_for_pr_result: bool = True,
         rerun_failed_for_pr_result: bool = True,
         rerun_job_result: bool = True,
+        rerun_run_result: bool = True,
         supports_rerun_job: bool = True,
+        supports_rerun_run: bool = True,
     ) -> None:
         self._runs = runs or []
         self._jobs = jobs or []
@@ -65,13 +68,19 @@ class _FakeCiStore:
         self._rerun_for_pr_result = rerun_for_pr_result
         self._rerun_failed_for_pr_result = rerun_failed_for_pr_result
         self._rerun_job_result = rerun_job_result
+        self._rerun_run_result = rerun_run_result
         self.rerun_for_pr_calls: list[tuple] = []
         self.rerun_failed_for_pr_calls: list[tuple] = []
         self.rerun_job_calls: list[tuple] = []
+        self.rerun_run_calls: list[tuple] = []
         if supports_rerun_job:
             self.rerun_job = self._rerun_job
         # else: no `rerun_job` attribute at all — the duck-typed "this
         # backend predates (or never modeled) single-job reruns" case.
+        if supports_rerun_run:
+            self.rerun_run = self._rerun_run
+        # else: no `rerun_run` attribute at all — the duck-typed "this
+        # backend does not implement explicit-run-id reruns" case.
 
     def list_runs_for_branch(self, repo, branch, *, event=None, limit=20):
         self.runs_calls.append((repo, branch, event, limit))
@@ -96,6 +105,10 @@ class _FakeCiStore:
     def _rerun_job(self, repo, run_id, job_id):
         self.rerun_job_calls.append((repo, run_id, job_id))
         return self._rerun_job_result
+
+    def _rerun_run(self, repo, run_id):
+        self.rerun_run_calls.append((repo, run_id))
+        return self._rerun_run_result
 
 
 def _run(run_id: str, *, event: str, conclusion: str | None, name: str = "test") -> RunSummary:
@@ -263,23 +276,35 @@ class TestCiRerun:
         assert result.exit_code != 0
         assert "--job requires --run" in result.output
 
-    def test_run_without_job_reruns_the_whole_run_via_github_ops(
+    def test_run_without_job_reruns_the_whole_run_via_the_backend(
         self, config_file: Path,
     ) -> None:
         store = _FakeCiStore()
-        with (
-            patch("coord.ci_store.build_ci_store", return_value=store),
-            patch("coord.github_ops.rerun_workflow_run", return_value=True) as rerun,
-        ):
+        with patch("coord.ci_store.build_ci_store", return_value=store):
             result = _invoke(
                 "ci", "rerun", "api", "7", "--run", "123", config_file=config_file,
             )
 
         assert result.exit_code == 0, result.output
-        rerun.assert_called_once_with("acme/api", "123")
+        assert store.rerun_run_calls == [("acme/api", "123")]
         assert store.rerun_for_pr_calls == []
         assert store.rerun_failed_for_pr_calls == []
         assert store.rerun_job_calls == []
+
+    def test_run_without_job_on_a_backend_without_rerun_run_errors_cleanly(
+        self, config_file: Path,
+    ) -> None:
+        """A non-GitHub (or `type: none`) backend must decline an explicit
+        `--run` rerun rather than this command silently falling back to
+        GitHub regardless of the configured `ci_store.type`."""
+        store = _FakeCiStore(supports_rerun_run=False)
+        with patch("coord.ci_store.build_ci_store", return_value=store):
+            result = _invoke(
+                "ci", "rerun", "api", "7", "--run", "123", config_file=config_file,
+            )
+
+        assert result.exit_code != 0
+        assert "does not support explicit run-id reruns" in result.output
 
     def test_run_and_job_reruns_exactly_that_job(self, config_file: Path) -> None:
         store = _FakeCiStore()
