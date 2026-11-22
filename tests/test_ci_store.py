@@ -79,6 +79,10 @@ class TestNoOpCi:
         """#2252: same opt-out for the narrower failed-jobs-only rerun."""
         assert NoOpCi().rerun_failed_for_pr("acme/api", 1) is False
 
+    def test_rerun_job_is_a_noop(self) -> None:
+        """Same opt-out for the explicit-id single-job rerun."""
+        assert NoOpCi().rerun_job("acme/api", "123", "99") is False
+
     def test_expects_checks_is_false(self) -> None:
         """#1904: `ci_store: { type: none }` is the supported "this repo has
         no CI" opt-out — an empty check list from `NoOpCi` must never read
@@ -1436,6 +1440,118 @@ class TestGitHubCiRerunFailedForPr:
             store.rerun_failed_for_pr("acme/api", 42)
             store.list_checks_for_pr("acme/api", 42)
         assert run.call_count == 3
+
+
+class TestGitHubCiRerunJob:
+    """`GitHubCi.rerun_job` — the explicit run-id/job-id primitive that
+    skips `rerun_for_pr`/`rerun_failed_for_pr`'s PR-check discovery
+    entirely."""
+
+    def test_success_issues_the_right_gh_invocation(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result("")) as run:
+            ok = store.rerun_job("acme/api", "123", "99")
+        assert ok is True
+        run.assert_called_once_with(
+            ["gh", "run", "rerun", "123", "--repo", "acme/api", "--job", "99"],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def test_nonzero_gh_exit_returns_false_without_raising(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result("", returncode=1, stderr="job not found"),
+        ):
+            assert store.rerun_job("acme/api", "123", "99") is False
+
+    def test_gh_missing_returns_false_without_raising(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", side_effect=FileNotFoundError):
+            assert store.rerun_job("acme/api", "123", "99") is False
+
+    def test_success_invalidates_the_jobs_cache_for_that_run_id(self) -> None:
+        """Same #1892 reasoning as `rerun_for_pr`'s own cache invalidation:
+        a successful rerun of a run id must not leave a stale pre-rerun
+        `list_jobs_for_run` snapshot cached for that same run id."""
+        jobs_payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 1, "run_id": 123, "name": "test",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            }],
+        })
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(jobs_payload),  # list_jobs_for_run, pre-rerun
+                _gh_result(""),  # gh run rerun 123 --job 99
+                _gh_result(jobs_payload),  # list_jobs_for_run, post-rerun — must NOT be cached
+            ]
+            store.list_jobs_for_run("acme/api", "123")
+            ok = store.rerun_job("acme/api", "123", "99")
+            assert ok is True
+            store.list_jobs_for_run("acme/api", "123")
+        assert run.call_count == 3
+
+    def test_failed_rerun_leaves_the_jobs_cache_alone(self) -> None:
+        jobs_payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 1, "run_id": 123, "name": "test",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            }],
+        })
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(jobs_payload),  # list_jobs_for_run, pre-rerun
+                _gh_result("", returncode=1, stderr="boom"),  # gh run rerun fails
+                # list_jobs_for_run below must be served from cache — no
+                # further subprocess call queued.
+            ]
+            store.list_jobs_for_run("acme/api", "123")
+            ok = store.rerun_job("acme/api", "123", "99")
+            assert ok is False
+            store.list_jobs_for_run("acme/api", "123")
+        assert run.call_count == 2
+
+
+class TestGhOpsRerunWorkflowRunJob:
+    """`github_ops.rerun_workflow_run_job` — the single-`gh`-sink primitive
+    `GitHubCi.rerun_job` wraps, mirroring `rerun_workflow_run`/
+    `rerun_workflow_run_failed`'s own best-effort "never raise" contract."""
+
+    def test_clean_exit_returns_true(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_gh_result(""),
+        ) as run:
+            assert github_ops.rerun_workflow_run_job("acme/api", "123", "99") is True
+        run.assert_called_once_with(
+            ["gh", "run", "rerun", "123", "--repo", "acme/api", "--job", "99"],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def test_nonzero_exit_returns_false(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_gh_result("", returncode=1, stderr="job not found"),
+        ):
+            assert github_ops.rerun_workflow_run_job("acme/api", "123", "99") is False
+
+    def test_gh_missing_returns_false(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.rerun_workflow_run_job("acme/api", "123", "99") is False
+
+    def test_timeout_returns_false(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            assert github_ops.rerun_workflow_run_job("acme/api", "123", "99") is False
 
 
 class TestGitHubCiListJobsForRun:

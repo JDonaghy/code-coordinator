@@ -359,6 +359,24 @@ class CiStore(Protocol):
         """
         ...
 
+    def rerun_job(self, repo: str, run_id: str, job_id: str) -> bool:
+        """Re-run ONLY job *job_id* within run *run_id* on *repo*.
+        Returns whether it worked.
+
+        The explicit-id counterpart to `rerun_for_pr`/`rerun_failed_for_pr`:
+        those two discover run ids by reading a PR's checks; this skips
+        discovery and reruns exactly the one job the caller already
+        identified — the single-job primitive behind ``coord ci rerun
+        --run ID --job ID``, and the seam a scripted caller (e.g. an
+        unattended CI-babysitting agent) should reach for instead of
+        shelling out to ``gh run rerun --job`` directly.
+
+        Optional/duck-typed like `rerun_failed_for_pr`: call sites use
+        ``getattr(ci, "rerun_job", None)`` so a `CiStore` stand-in that
+        predates this capability simply doesn't offer it.
+        """
+        ...
+
     def list_runs_for_branch(
         self, repo: str, branch: str, *, event: str | None = None, limit: int = 20,
     ) -> list[RunSummary]:
@@ -415,6 +433,11 @@ class NoOpCi:
     def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
         """No-op: CI gating is disabled entirely, so there is nothing to
         re-run (#2252)."""
+        return False
+
+    def rerun_job(self, repo: str, run_id: str, job_id: str) -> bool:
+        """No-op: CI gating is disabled entirely, so there is nothing to
+        re-run."""
         return False
 
     def list_runs_for_branch(

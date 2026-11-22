@@ -3092,6 +3092,51 @@ def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
     return True
 
 
+def rerun_workflow_run_job(repo: str, run_id: str, job_id: str) -> bool:
+    """Re-run a single job *job_id* within Actions run *run_id* on *repo*
+    via ``gh run rerun <run_id> --job <job_id>``.
+
+    The narrowest of this module's three rerun primitives:
+    :func:`rerun_workflow_run` restarts the whole run, :func:`
+    rerun_workflow_run_failed` restarts every currently-failing job in it,
+    and this restarts exactly the one job the caller already knows about —
+    the sanctioned seam `coord ci rerun --run ID --job ID` (and anything
+    else that would otherwise shell out to ``gh`` directly for this) calls.
+
+    Returns ``True`` only on a clean (exit 0) rerun; any subprocess failure
+    (missing ``gh``, timeout, non-zero exit — e.g. the job id doesn't belong
+    to that run, or the run is already in progress) returns ``False``
+    rather than raising, matching :func:`rerun_workflow_run`'s own
+    best-effort contract.
+
+    Shells out directly rather than through :func:`_gh` for the same reason
+    as :func:`rerun_workflow_run` — see that docstring — but still records
+    the same forge-availability observation.
+    """
+    args = ["run", "rerun", str(run_id), "--repo", repo, "--job", str(job_id)]
+    _t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc),
+                        caller="github_ops.rerun_workflow_run_job")
+        return False
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr,
+                        caller="github_ops.rerun_workflow_run_job")
+        return False
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration,
+                    caller="github_ops.rerun_workflow_run_job")
+    return True
+
+
 def diff_file_paths(diff_text: str) -> list[str]:
     """Return every file path touched by *diff_text*, deduped, order-preserving.
 
