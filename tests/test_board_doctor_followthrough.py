@@ -212,7 +212,13 @@ def test_after_declared_in_work_order_but_not_sub_issues_rejects_before_any_writ
             {"key": "a", "title": "New piece", "body": "Do it.", "after": ["#101"]},
         ],
     }
-    disp, writer, sinks = _run(_partial(epic_body=body), plan, writer=FakeWriter(body))
+    # `issue_number` overridden away from the default 101 so the `after`
+    # target under test (`#101`, declared in `## Work order` but not
+    # `## Sub-issues`) doesn't also collide with the parent's own self-
+    # pointing check (#4079a) — the two are deliberately different hazards.
+    disp, writer, sinks = _run(
+        _partial(issue_number=902, epic_body=body), plan, writer=FakeWriter(body),
+    )
 
     assert disp.action == ft.ACTION_REJECTED
     assert any(
@@ -1116,6 +1122,48 @@ def test_coordinator_owned_doc_check_inert_without_configured_paths() -> None:
     assert disp.action == ft.ACTION_FILED
 
 
+def test_follow_up_naming_file_under_coordinator_owned_directory_rejects() -> None:
+    """A `coordinator_only_files` entry ending in `/` is a directory prefix
+    (`coord.models.path_is_sealed_entry`) — a follow-up naming a file
+    beneath it must be caught the same way a single named file is, via the
+    shared `coord.models.coordinator_doc_overlap` matcher."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "Rewrite the operator guide", "body": "...",
+             "files": ["docs/OPERATOR_GUIDES.md"]},
+        ],
+    }
+    disp, writer, sinks = _run(
+        _partial(), plan, coordinator_owned_docs=("docs/",),
+    )
+
+    assert disp.action == ft.ACTION_REJECTED
+    assert any("docs/" in r and "coordinator-owned" in r for r in disp.reasons)
+    assert not writer.wrote_anything
+
+
+def test_after_target_pointing_at_parent_rejects() -> None:
+    """Same self-pointing hazard as `already_covered_by` (#4079a review):
+    an `after` edge naming the parent would splice a dependency on the very
+    issue this plan leg is meant to replace. The parent is normally
+    declared in the epic's own `## Work order`, so the ordinary
+    `declared`-membership check alone would pass this silently."""
+    plan = {
+        "items": [{"item": "B", "verified_still_missing": True}],
+        "follow_ups": [
+            {"key": "a", "title": "t", "body": "...", "after": ["#101"]},
+        ],
+    }
+    disp, writer, sinks = _run(_partial(), plan)  # _partial()'s issue_number is 101
+
+    assert disp.action == ft.ACTION_REJECTED
+    assert any(
+        "after" in r and "parent issue #101" in r for r in disp.reasons
+    )
+    assert not writer.wrote_anything
+
+
 # ── #4079b: every named leftover must be addressed, not just claimed ───────
 
 
@@ -1189,7 +1237,7 @@ def test_resolution_leftover_with_quoted_behaviour_passes() -> None:
         _partial(resolution_text=_TWO_LEFTOVER_RESOLUTION), plan,
     )
     assert disp.action == ft.ACTION_ALL_LANDED
-    [(closed, comment)] = writer.closed
+    assert len(writer.closed) == 1
 
 
 def test_single_short_resolution_text_leftover_check_inert() -> None:
@@ -1276,3 +1324,86 @@ def test_upstream_blocked_partial_write_failure_alerts() -> None:
     )
     assert disp.action == ft.ACTION_WRITE_FAILED
     assert sinks.alerts
+
+
+def test_upstream_already_parked_does_not_re_comment() -> None:
+    """Re-entry guard (#4079c review): once a key is already parked, a
+    repeat sweep must write nothing, not even a second comment."""
+    def must_not_be_called(final_message, *, repo_name, issue_number):
+        raise AssertionError("must not file/link again once already parked")
+
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_UPSTREAM_RESOLUTION),
+        plan={},
+        process_upstream_gaps=must_not_be_called,
+        already_upstream_parked=True,
+    )
+    assert disp.action == ft.ACTION_UPSTREAM_ALREADY_PARKED
+    assert not writer.wrote_anything
+    # Never recorded — recording would overwrite the original
+    # `ACTION_UPSTREAM_PARKED` entry `upstream_parked_keys` reads back.
+    assert not sinks.records
+
+
+def test_upstream_gap_unresolved_is_not_claimed_parked() -> None:
+    """A per-gap failure (`status="unknown-repo"`, no exception raised) must
+    not be reported as filed/linked, must alert, and must not be recorded
+    as `ACTION_UPSTREAM_PARKED` — the next sweep needs to retry it."""
+    def fake_process(final_message, *, repo_name, issue_number):
+        return [_fake_upstream_outcome(status="unknown-repo", number=None)]
+
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_UPSTREAM_RESOLUTION),
+        plan={},
+        process_upstream_gaps=fake_process,
+    )
+    assert disp.action == ft.ACTION_UPSTREAM_PARK_FAILED
+    assert writer.comments == []
+    assert writer.closed == []
+    assert sinks.alerts
+    assert sinks.records and sinks.records[0]["action"] == ft.ACTION_UPSTREAM_PARK_FAILED
+
+
+def test_upstream_gap_not_a_gap_parked_counts_as_resolved() -> None:
+    """A `"not-a-gap"` outcome that parked the downstream row directly
+    (#3930/#3977) has no upstream issue number and is still a legitimate
+    resolution — not a failure."""
+    gap = SimpleNamespace(repo="quadraui", title="Expose per-pane scroll offsets")
+    outcome = SimpleNamespace(gap=gap, status="not-a-gap", number=None, detail="", parked=True)
+
+    def fake_process(final_message, *, repo_name, issue_number):
+        return [outcome]
+
+    disp, writer, sinks = _run(
+        _partial(resolution_text=_UPSTREAM_RESOLUTION),
+        plan={},
+        process_upstream_gaps=fake_process,
+    )
+    assert disp.action == ft.ACTION_UPSTREAM_PARKED
+    [(number, comment)] = writer.comments
+    assert number == 101
+    assert "not-a-gap" in comment
+
+
+class TestUpstreamParkedKeys:
+    """:func:`coord.board_doctor_followthrough.upstream_parked_keys`."""
+
+    def test_latest_parked_entry_is_a_key(self) -> None:
+        decisions = [
+            {"key": "quadraui#48", "action": ft.ACTION_UPSTREAM_PARKED},
+        ]
+        assert ft.upstream_parked_keys(decisions) == {"quadraui#48"}
+
+    def test_a_later_non_parked_entry_for_the_same_key_wins(self) -> None:
+        """An operator reopening the row with a fresh resolution records a
+        different action afterward — that key must no longer read as
+        parked."""
+        decisions = [
+            {"key": "quadraui#48", "action": ft.ACTION_UPSTREAM_PARKED},
+            {"key": "quadraui#48", "action": ft.ACTION_FILED},
+        ]
+        assert ft.upstream_parked_keys(decisions) == set()
+
+    def test_unrelated_action_is_not_a_key(self) -> None:
+        decisions = [{"key": "quadraui#48", "action": ft.ACTION_ALREADY_COVERED}]
+        assert ft.upstream_parked_keys(decisions) == set()
