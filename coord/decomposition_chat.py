@@ -1836,27 +1836,40 @@ def file_and_queue_split_proposal(
     them vanish from the Plans panel / ``coord milestone write-order``'s
     one-shared-milestone requirement) and look for an open epic that
     already parents the original (:func:`_find_parent_epic`); file each
-    child in ``proposal.chunks`` order on that milestone; either splice the
-    remapped work order into that parent epic
+    child in ``proposal.chunks`` order on that milestone, its body built by
+    :func:`coord.preflight_size.build_slice_child_body` (a short header
+    naming this slice's own scope and every sibling's, followed by the
+    ORIGINAL's complete body, verbatim — #4081, never a one-line summary)
+    and then re-written once every child exists so the header's sibling
+    placeholders resolve to their real issue numbers
+    (:func:`coord.preflight_size.substitute_slice_tokens`); either splice
+    the remapped work order into that parent epic
     (:func:`_splice_split_into_parent_epic`) or, when the original has no
     parent, file a brand-new tracker epic and splice into THAT instead
     (never both — #4064's whole point is one parent, not two); queue each
-    child (confirming every queue write with a readback — an unconfirmed
-    queue insert is not a queued child); re-point every ALREADY-queued
-    entry whose ``after=`` names the original onto the split's sink
-    children (:func:`_repoint_queued_dependents_at_split`, #3984 —
-    otherwise ``drive_queue._resolve_prereqs``'s ``live_prereq_terminal``
-    recovery reads the original's close as "pre-req satisfied" and
-    launches every dependent before any child has landed); then close the
-    original issue pointing at the new epic — forcing past the "open
-    children" guard (the original's own body is exactly the shape expected
-    to trip it once it already carries a ``## Sub-issues``/``## Work
-    order`` block, e.g. from a prior triage pass) and confirming the close
-    itself with a readback, since `close_issue()` returning without
-    raising only proves the close *request* was issued, not that GitHub
-    actually ended up with the issue closed (#2096). Returns the epic's
-    issue number — the real parent's, when one was spliced into, else the
-    freshly filed tracker's.
+    child, its own ``after=`` the union of its proposal-declared
+    predecessors with whatever the ORIGINAL issue's own drive-queue row
+    already declared (#4081 — a root chunk, e.g. the cross-backend split's
+    seam, inherits the original's own prereqs so nothing in the split can
+    launch before the original itself could have; mirrors
+    `coord.milestone_order._splice_replace_node`'s identical "a node with
+    no declared `after` inherits the node it replaced" rule for the epic
+    body one line below) — confirming every queue write with a readback,
+    since an unconfirmed queue insert is not a queued child; re-point every
+    ALREADY-queued entry whose ``after=`` names the original onto the
+    split's sink children (:func:`_repoint_queued_dependents_at_split`,
+    #3984 — otherwise ``drive_queue._resolve_prereqs``'s
+    ``live_prereq_terminal`` recovery reads the original's close as
+    "pre-req satisfied" and launches every dependent before any child has
+    landed); then close the original issue pointing at the new epic —
+    forcing past the "open children" guard (the original's own body is
+    exactly the shape expected to trip it once it already carries a ``##
+    Sub-issues``/``## Work order`` block, e.g. from a prior triage pass)
+    and confirming the close itself with a readback, since `close_issue()`
+    returning without raising only proves the close *request* was issued,
+    not that GitHub actually ended up with the issue closed (#2096).
+    Returns the epic's issue number — the real parent's, when one was
+    spliced into, else the freshly filed tracker's.
 
     A failure partway through (a `gh` call failing, a queue write or close
     that doesn't read back) is allowed to raise — by that point real
@@ -1894,6 +1907,7 @@ def file_and_queue_split_proposal(
         render_sub_issues,
         replace_sub_issues_section,
     )
+    from coord.preflight_size import build_slice_child_body, substitute_slice_tokens
     from coord.state import enqueue_drive_queue, get_drive_queue_entry
 
     original = github_ops.get_issue(repo.github, proposal.issue_number)
@@ -1949,15 +1963,42 @@ def file_and_queue_split_proposal(
         )
         epic_number = epic["number"]
 
+    # #4081: the parent's own body — every child below carries this
+    # verbatim, never a one-line summary.
+    parent_body = original.get("body")
+
     position_to_real: dict[int, int] = {}
     for position, chunk in enumerate(proposal.chunks, start=1):
-        files_block = "\n".join(f"- {f}" for f in chunk.files_likely)
-        child_body = f"{chunk.scope}\n\n## Files\n{files_block}\n"
+        child_body = build_slice_child_body(
+            parent_issue_number=proposal.issue_number,
+            parent_body=parent_body,
+            position=position,
+            chunks=proposal.chunks,
+        )
         child = github_ops.create_issue(
             repo.github, title=chunk.title, body=child_body,
             milestone=milestone_title,
         )
         position_to_real[position] = child["number"]
+
+    # Every child body just filed above named its siblings with a
+    # placeholder token (no real issue number existed for any of them
+    # until the loop above finished) — now that every one does, patch
+    # each child's body in place so a reader sees real sibling issue
+    # numbers, not placeholder tokens.
+    for position in position_to_real:
+        resolved_body = substitute_slice_tokens(
+            build_slice_child_body(
+                parent_issue_number=proposal.issue_number,
+                parent_body=parent_body,
+                position=position,
+                chunks=proposal.chunks,
+            ),
+            position_to_real,
+        )
+        github_ops.update_issue_body(
+            repo.github, position_to_real[position], resolved_body,
+        )
 
     remapped_nodes = tuple(
         WorkOrderNode(
@@ -1983,9 +2024,29 @@ def file_and_queue_split_proposal(
             replace_sub_issues_section(epic_body, new_block),
         )
 
+    # #4081: whatever the ORIGINAL issue's own drive-queue row already
+    # declared as its own prereq — same "root inherits the node it
+    # replaced" rule `coord.milestone_order._splice_replace_node` applies
+    # to the epic body just above, kept consistent here so the queue rows
+    # never disagree with what the epic body now says (#2096, one
+    # question one answer): a node this split gives NO declared `after`
+    # (a root — e.g. the cross-backend split's seam) inherits the
+    # original's own prereq instead of launching unconditionally; a node
+    # that DOES declare one (e.g. a backend child chained after the seam)
+    # keeps only that — it is already ordered behind the root that
+    # inherited the original's prereq, so nothing here can launch earlier
+    # than the original itself could have.
+    original_queue_entry = get_drive_queue_entry(repo.name, proposal.issue_number)
+    inherited_after: tuple[str, ...] = tuple(
+        str(a) for a in (original_queue_entry.get("after_json") or ())
+    ) if original_queue_entry is not None else ()
+
     for node in remapped_nodes:
-        after_keys = [f"{repo.name}#{a}" for a in node.after] or None
-        enqueue_drive_queue(repo.name, node.issue_number, after=after_keys)
+        if node.after:
+            after_keys = [f"{repo.name}#{a}" for a in node.after]
+        else:
+            after_keys = list(inherited_after)
+        enqueue_drive_queue(repo.name, node.issue_number, after=after_keys or None)
         if get_drive_queue_entry(repo.name, node.issue_number) is None:
             raise RuntimeError(
                 f"queued child #{node.issue_number} in {repo.name!r} but it "

@@ -65,8 +65,12 @@ __all__ = [
     "score_issue_size",
     "SplitVerification",
     "verify_split_proposal",
+    "NO_BACKEND_SPLIT_MARKER",
     "detect_cross_backend_scope",
     "build_cross_backend_split_proposal",
+    "build_slice_header",
+    "build_slice_child_body",
+    "substitute_slice_tokens",
 ]
 
 
@@ -632,6 +636,20 @@ def detect_cross_backend_scope(
     Otherwise, returns the backends actually named — every configured
     backend, in *backends*' own order, for an explicit "every backend" /
     "all backends" phrase; just the ones matched by name otherwise.
+
+    This answers ONLY "does the text name more than one backend" — it is
+    deliberately silent on whether a flagged issue is SAFE to mechanically
+    split (that's :func:`build_cross_backend_split_proposal`'s job, #4081
+    below) because this same answer also feeds a second, unrelated
+    caller: `coord.board_doctor_followthrough`'s auto-filed-follow-up
+    validator, which needs to flag ANY follow-up naming more than one
+    backend (including a deliberate "port X to every backend" follow-up,
+    which is exactly the shape that validator must reject) — changing
+    THIS function's answer for the split caller's benefit would silently
+    break that unrelated caller's own, still-valid, question (#2096: one
+    function, one question — "should this issue be split" is a different
+    question from "does this text name >1 backend", even though the
+    first is built out of the second).
     """
     if len(backends) < 2:
         return ()
@@ -644,6 +662,40 @@ def detect_cross_backend_scope(
     return named if len(named) >= 2 else ()
 
 
+#: #4081: an issue body (or title) can opt out of
+#: :func:`build_cross_backend_split_proposal` entirely by carrying this
+#: literal marker — the same "HTML-comment flag embedded in markdown"
+#: convention this codebase's own `coord:event=` comment markers already
+#: use. Checked as a plain substring, case-sensitively, like every other
+#: such marker.
+NO_BACKEND_SPLIT_MARKER = "<!-- coord:no-backend-split -->"
+
+#: #4081 (the quadraui#2823 incident): an issue that is EXPLICITLY
+#: cross-backend by design — a port, or scoped "end to end" / "every
+#: backend" — names more than one backend on purpose, as ONE unit of
+#: work, not because it forgot the one-backend-per-issue rule.
+#: :func:`build_cross_backend_split_proposal` treats a match as "don't
+#: build a split for this" — a change from the OLD reading, where an
+#: "every backend"/"all backends" phrase reaching
+#: :func:`detect_cross_backend_scope` picked every configured backend and
+#: forced a seam+N-way split; that old reading is exactly what produced
+#: the #2823 incident. `detect_cross_backend_scope` itself still answers
+#: the OLD way (see its own docstring for why) — only the split-building
+#: step treats the phrase as a reason to skip.
+_CROSS_BACKEND_BY_DESIGN_RE = re.compile(
+    r"\bend[- ]to[- ]end\b|\b(?:every|all)\s+backends?\b|\bport(?:s|ed|ing)?\b",
+    re.IGNORECASE,
+)
+
+#: #4081: a parent naming "delete" anywhere in its title/body is doing
+#: replace-and-delete work across every backend it names — splitting it
+#: would let the seam and each backend child half-own the same deletion
+#: (quadraui's Widget Contract port shape: `src/{tui,gtk,macos,win}/
+#: <widget>.rs` deleted together with the matching `Backend` methods, in
+#: one change).
+_DELETE_RE = re.compile(r"\bdelet(?:e|es|ed|ing)\b", re.IGNORECASE)
+
+
 def build_cross_backend_split_proposal(
     *,
     repo_name: str,
@@ -654,7 +706,9 @@ def build_cross_backend_split_proposal(
 ) -> SplitProposal | None:
     """Build the seam-plus-per-backend :class:`SplitProposal` for an issue
     :func:`detect_cross_backend_scope` flagged, or ``None`` when there is
-    not enough real file-scope evidence to pin a clean partition.
+    not enough real file-scope evidence to pin a clean partition, OR the
+    issue is cross-backend ON PURPOSE and must never be mechanically split
+    at all (#4081).
 
     Reuses the issue's OWN `## Files` declaration (via
     :func:`coord.overlap_predict.parse_declared_files`) rather than
@@ -666,18 +720,48 @@ def build_cross_backend_split_proposal(
     mechanical enforcement of "one backend per issue" this whole check
     exists for.
 
-    Returns ``None`` — "nothing to pin, don't fabricate a scope" — when:
+    Returns ``None`` — "don't build a split for this issue" — when:
 
-    * the issue declared no `## Files` at all (nothing to partition), or
+    * the text carries the literal :data:`NO_BACKEND_SPLIT_MARKER` — an
+      explicit, machine-readable opt-out an issue author (or a filed
+      split child, see :func:`build_slice_child_body`) can declare;
+    * the text matches :data:`_CROSS_BACKEND_BY_DESIGN_RE` — "end to
+      end", "every backend"/"all backends", or "port"/"ported"/"porting"
+      — naming every backend ON PURPOSE, as one unit (the quadraui#2823
+      incident: mechanically splitting this shape destroyed the parent's
+      spec), or the text names "delete" (:data:`_DELETE_RE`) — a
+      cross-backend replace-and-delete issue, one unit by construction:
+      splitting it would let the seam and each backend child half-own
+      the same deletion;
+    * the issue declared no `## Files` at all (nothing to partition); or
     * any named backend has zero files pinned to it (the text named it,
       but no declared file actually falls under its directory, so this
       check has no real evidence for how to split that backend out).
 
     A caller seeing ``None`` falls through to whatever triage path would
-    otherwise have run (the free heuristic scorer, or nothing) — this
-    check is a prevention net for the common, file-evidenced case, not a
-    guarantee it catches every cross-backend issue shape.
+    otherwise have run (the free heuristic scorer, or running the issue
+    whole) — this check is a prevention net for the common, file-
+    evidenced, genuinely-splittable case, not a guarantee it catches
+    every cross-backend issue shape, and deliberately never the sole gate
+    against mis-splitting a deliberately-whole issue (the ``None``-return
+    checks above are belt-and-braces alongside them).
+
+    Checked against *title*/*issue_body* only — never against
+    :func:`detect_cross_backend_scope`'s OWN return value, which this
+    module's other caller (`coord.board_doctor_followthrough`'s auto-
+    filed-follow-up validator) still needs to mean "names more than one
+    backend", full stop, with none of this function's extra skip logic
+    (#2096 — see that function's own docstring for why they must answer
+    different questions despite sharing input).
     """
+    text = f"{issue_title or ''}\n{issue_body or ''}"
+    if NO_BACKEND_SPLIT_MARKER in text:
+        return None
+    if _CROSS_BACKEND_BY_DESIGN_RE.search(text):
+        return None
+    if _DELETE_RE.search(text):
+        return None
+
     files = parse_declared_files(issue_body)
     if not files:
         return None
@@ -728,6 +812,14 @@ def build_cross_backend_split_proposal(
                     f"{b} alone; every other backend is out of scope here."
                 ),
                 files_likely=by_backend[b],
+                # #4081: every backend child is explicitly chained after the
+                # seam chunk (always chunk 1 — the loop above appends it
+                # first) — the seam is the shared contract every backend
+                # depends on, and the seam/backend file sets are disjoint by
+                # construction above, so `verify_split_proposal`'s own
+                # file-overlap prediction would never infer this edge on
+                # its own.
+                after=(1,),
             )
         )
 
@@ -745,3 +837,142 @@ def build_cross_backend_split_proposal(
         ),
         chunks=chunks,
     )
+
+
+# ── #4081: child-body construction — the parent's full spec, never lost ────
+#
+# WHAT THIS GUARDS. The quadraui#2823 incident: a rule-based split's
+# filed children carried a one- or two-sentence boilerplate summary
+# instead of the parent's own spec (a 4,590-char design/deletion-
+# list/acceptance body collapsed to 236-389 chars per child). The worker
+# had to guess what its own slice actually was; the reviewer judged the
+# child against the inherited full-pilot title and rejected it for
+# "missing" scope that was never filed on the child issue to begin with.
+#
+# Every child body built here is the SAME shape: a short header naming
+# this slice's own scope and every sibling's (so a worker/reviewer with
+# zero other context can tell at a glance which part is theirs), followed
+# by the parent's COMPLETE original body, verbatim — never a one-line
+# summary.
+
+_SLICE_TOKEN_RE = re.compile(r"\{\{child:(\d+)\}\}")
+
+
+def _slice_token(position: int) -> str:
+    """Placeholder for sibling *position* (1-based) in a header built
+    before any child has actually been filed — no real GitHub issue
+    number exists yet at that point. See :func:`substitute_slice_tokens`.
+    """
+    return f"{{{{child:{position}}}}}"
+
+
+def _slice_label(chunk: SplitChunk) -> str:
+    """A short, human description of what *chunk* owns.
+
+    :func:`build_cross_backend_split_proposal` already gives every chunk a
+    title ending in a parenthesized suffix (``"... (seam)"``, ``"...
+    (gtk)"``) naming exactly what it is — reused here rather than
+    re-deriving a second description of the same scope. A chunk with no
+    such suffix (any other `SplitProposal` producer, e.g. the paid
+    size-triage agent) falls back to its whole title.
+    """
+    title = chunk.title.strip()
+    if title.endswith(")") and "(" in title:
+        return title[title.rindex("(") + 1 : -1]
+    return title
+
+
+def build_slice_header(
+    *,
+    parent_issue_number: int,
+    position: int,
+    chunks: Sequence[SplitChunk],
+) -> str:
+    """Header text for the child at *position* (1-based) of *chunks* —
+    this slice's own scope, then every sibling's, each sibling named by a
+    :func:`_slice_token` placeholder (resolved to the sibling's real
+    issue number once every child has actually been filed — see
+    :func:`substitute_slice_tokens`).
+    """
+    total = len(chunks)
+    this_chunk = chunks[position - 1]
+    siblings = [(i, c) for i, c in enumerate(chunks, start=1) if i != position]
+    siblings_desc = "; ".join(
+        f"{_slice_label(c)} ({_slice_token(i)})" for i, c in siblings
+    )
+    return (
+        f"Slice {position} of {total} slices of #{parent_issue_number}. "
+        f"This slice owns: {_slice_label(this_chunk)}. "
+        f"Sibling slices own: {siblings_desc or 'nothing else'}. "
+        "Out of scope here: everything named above as a sibling slice's "
+        "own scope — the parent's full original scope below is for "
+        "context only."
+    )
+
+
+def build_slice_child_body(
+    *,
+    parent_issue_number: int,
+    parent_body: str | None,
+    position: int,
+    chunks: Sequence[SplitChunk],
+) -> str:
+    """The full body to file for the child at *position* (1-based) of
+    *chunks* (#4081).
+
+    Three parts, always in this order:
+
+    1. :data:`NO_BACKEND_SPLIT_MARKER` — a filed child is already pinned
+       to exactly one backend (or the seam); the parent's own body quoted
+       in part 3 below very likely names every backend (that's WHY it was
+       split), so without this marker a later preflight pass over the
+       CHILD's own body would see those same backend names and try to
+       split it again.
+    2. :func:`build_slice_header` — this slice's own scope and every
+       sibling's, so a worker/reviewer can tell at a glance which part of
+       the parent's scope below is theirs.
+    3. This chunk's own pinned ``## Files`` declaration
+       (``chunks[position - 1].files_likely``) — the one declaration
+       :func:`coord.overlap_predict.parse_declared_files` should treat as
+       authoritative for THIS child — followed by the parent's COMPLETE
+       original body, verbatim, under its own clearly-labeled heading.
+       Never a one-line summary — that's the whole point of #4081.
+    """
+    chunk = chunks[position - 1]
+    header = build_slice_header(
+        parent_issue_number=parent_issue_number,
+        position=position,
+        chunks=chunks,
+    )
+    files_block = "\n".join(f"- {f}" for f in chunk.files_likely)
+    parent_text = str(parent_body or "").rstrip("\n")
+    return (
+        f"{NO_BACKEND_SPLIT_MARKER}\n"
+        f"{header}\n\n"
+        "## Files\n"
+        f"{files_block}\n\n"
+        "---\n\n"
+        f"## Full original scope of #{parent_issue_number}\n\n"
+        f"{parent_text}\n"
+    )
+
+
+def substitute_slice_tokens(body: str, position_to_real: Mapping[int, int]) -> str:
+    """Resolve every :func:`_slice_token` placeholder in *body* to
+    ``#<real issue number>`` using *position_to_real* (1-based proposal
+    position -> real filed GitHub issue number) — called once every
+    sibling in a split has actually been filed
+    (`coord.decomposition_chat.file_and_queue_split_proposal`), since no
+    real number exists for any of them while :func:`build_slice_header`
+    is first building their bodies.
+
+    A token naming a position absent from *position_to_real* is left
+    untouched rather than raising — the same fail-open posture the rest
+    of this module takes toward input it did not itself produce.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        real = position_to_real.get(int(match.group(1)))
+        return f"#{real}" if real is not None else match.group(0)
+
+    return _SLICE_TOKEN_RE.sub(_replace, body)

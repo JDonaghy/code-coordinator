@@ -2367,6 +2367,125 @@ class TestFileAndQueueSplitProposal:
         mock_close_issue.assert_not_called()
 
 
+class TestFileAndQueueSplitProposalCrossBackendOrderingAndBody:
+    """#4081 acceptance: a seam+per-backend split's children are chained
+    after the seam on BOTH the drive-queue rows and the epic's `##
+    Sub-issues`/`## Work order` (parsed), every child carries the parent's
+    full original body verbatim, and a root chunk (the seam) inherits
+    whatever the original issue's own drive-queue row already declared as
+    its own prereq."""
+
+    _PARENT_BODY = (
+        "Approved design: ListView becomes a seam-backed widget.\n\n"
+        "## Deletion list\n\n- src/tui/list_view.rs\n- src/gtk/list_view.rs\n"
+    )
+
+    def _proposal(self) -> "decomposition_chat.SplitProposal":
+        from coord.models import SplitChunk, SplitProposal
+
+        return SplitProposal(
+            id=0, repo_name="api", issue_number=99,
+            issue_title="Pilot 1: ListView end to end",
+            rationale="cross-backend rule split", chunks=[
+                SplitChunk(
+                    title="Pilot 1: ListView end to end (seam)",
+                    scope="seam scope", files_likely=["src/shared/contract.rs"],
+                ),
+                SplitChunk(
+                    title="Pilot 1: ListView end to end (tui)",
+                    scope="tui scope", files_likely=["src/tui/list_view.rs"],
+                    after=(1,),
+                ),
+                SplitChunk(
+                    title="Pilot 1: ListView end to end (gtk)",
+                    scope="gtk scope", files_likely=["src/gtk/list_view.rs"],
+                    after=(1,),
+                ),
+            ],
+        )
+
+    def _verification(self) -> "decomposition_chat.SplitVerification":
+        from coord.milestone_order import WorkOrder, WorkOrderNode, render_sub_issues
+        from coord.preflight_size import SplitVerification
+
+        work_order = WorkOrder(nodes=(
+            WorkOrderNode(issue_number=1, after=()),
+            WorkOrderNode(issue_number=2, after=(1,)),
+            WorkOrderNode(issue_number=3, after=(1,)),
+        ))
+        epic_body = "## Sub-issues\n" + render_sub_issues(work_order)
+        return SplitVerification(
+            ok=True, reason=None, epic_body=epic_body, work_order=work_order,
+        )
+
+    @patch("coord.github_ops.get_issue_comments", return_value=[])
+    @patch("coord.github_ops.get_open_issues", return_value=[])
+    @patch("coord.state.get_drive_queue_entry")
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state", return_value="closed")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    @patch("coord.github_ops.get_issue")
+    def test_ordering_and_body_on_a_fresh_tracker(
+        self, mock_get_issue, mock_create_issue, mock_update_body,
+        mock_close_issue, mock_get_issue_state, mock_enqueue, mock_get_entry,
+        mock_get_open_issues, mock_get_issue_comments,
+    ) -> None:
+        mock_get_issue.return_value = {
+            "milestone": None, "body": self._PARENT_BODY,
+        }
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},  # tracker epic
+            {"number": 501, "url": "https://x/501"},  # seam
+            {"number": 502, "url": "https://x/502"},  # tui
+            {"number": 503, "url": "https://x/503"},  # gtk
+        ]
+        # First read is the ORIGINAL's own queue entry (its own prereq to
+        # inherit); the rest are per-child readback confirmations.
+        mock_get_entry.side_effect = [
+            {"after_json": ["api#10"]},
+            {"issue_number": 501},
+            {"issue_number": 502},
+            {"issue_number": 503},
+        ]
+        repo = Repo(name="api", github="acme/api")
+
+        epic_number = decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+        assert epic_number == 500
+
+        # Every filed child body contains the ORIGINAL's full body,
+        # verbatim — never a one-line summary (#4081).
+        for call in mock_create_issue.call_args_list[1:]:
+            assert self._PARENT_BODY in call.kwargs["body"]
+
+        # The drive-queue rows: the seam (a root — no declared `after`)
+        # inherits the original's own prereq; both backend children are
+        # chained after the seam's REAL number.
+        enqueue_calls = {
+            call.args[:2]: call.kwargs.get("after")
+            for call in mock_enqueue.call_args_list
+        }
+        assert enqueue_calls[("api", 501)] == ["api#10"]
+        assert enqueue_calls[("api", 502)] == ["api#501"]
+        assert enqueue_calls[("api", 503)] == ["api#501"]
+
+        # And the epic's own `## Sub-issues`/`## Work order` (parsed)
+        # agrees — not just the queue rows (#2096, one question one
+        # answer).
+        from coord.milestone_order import parse_sub_issues, parse_work_order
+
+        final_body = mock_update_body.call_args_list[-1].args[2]
+        parsed_sub = parse_sub_issues(final_body)
+        parsed_work = parse_work_order(final_body)
+        all_nodes = list(parsed_sub.nodes) + list(parsed_work.nodes)
+        by_number = {n.issue_number: n for n in all_nodes}
+        assert 501 in by_number[502].after
+        assert 501 in by_number[503].after
+
+
 class TestFileAndQueueSplitProposalRefusesAlreadySuperseded:
     """#4077: a belt-and-braces re-read right before filing anything —
     catches a duplicate/replayed attempt even when the caller's own
@@ -2599,7 +2718,11 @@ class TestFileAndQueueSplitProposalMilestoneAndParentEpic:
             return dict(epics[number])
 
         def _update_body(repo_github, number, body):
-            epics[number] = {**epics[number], "body": body}
+            # #4081: every filed child's body is also patched once, to
+            # resolve its header's sibling placeholders — not just the
+            # epic, so this fixture must tolerate (and record) a write to
+            # any issue number, not only the ones it pre-seeded.
+            epics[number] = {**epics.get(number, {"number": number}), "body": body}
 
         mock_get_issue.side_effect = _get_issue
         mock_update_body.side_effect = _update_body
@@ -2676,7 +2799,11 @@ class TestFileAndQueueSplitProposalMilestoneAndParentEpic:
             return dict(epics[number])
 
         def _update_body(repo_github, number, body):
-            epics[number] = {**epics[number], "body": body}
+            # #4081: every filed child's body is also patched once, to
+            # resolve its header's sibling placeholders — not just the
+            # epic, so this fixture must tolerate (and record) a write to
+            # any issue number, not only the ones it pre-seeded.
+            epics[number] = {**epics.get(number, {"number": number}), "body": body}
 
         mock_get_issue.side_effect = _get_issue
         mock_update_body.side_effect = _update_body
@@ -2745,7 +2872,11 @@ class TestFileAndQueueSplitProposalMilestoneAndParentEpic:
             return dict(epics[number])
 
         def _update_body(repo_github, number, body):
-            epics[number] = {**epics[number], "body": body}
+            # #4081: every filed child's body is also patched once, to
+            # resolve its header's sibling placeholders — not just the
+            # epic, so this fixture must tolerate (and record) a write to
+            # any issue number, not only the ones it pre-seeded.
+            epics[number] = {**epics.get(number, {"number": number}), "body": body}
 
         mock_get_issue.side_effect = _get_issue
         mock_update_body.side_effect = _update_body
@@ -2803,7 +2934,11 @@ class TestFileAndQueueSplitProposalMilestoneAndParentEpic:
             return dict(epics[number])
 
         def _update_body(repo_github, number, body):
-            epics[number] = {**epics[number], "body": body}
+            # #4081: every filed child's body is also patched once, to
+            # resolve its header's sibling placeholders — not just the
+            # epic, so this fixture must tolerate (and record) a write to
+            # any issue number, not only the ones it pre-seeded.
+            epics[number] = {**epics.get(number, {"number": number}), "body": body}
 
         mock_get_issue.side_effect = _get_issue
         mock_update_body.side_effect = _update_body
