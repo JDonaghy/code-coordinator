@@ -10563,3 +10563,92 @@ def test_local_claim_commit_failure_undoes_row_even_when_rowcount_misread(
         "SELECT COUNT(*) FROM review_claims WHERE of_assignment_id='w-commit'"
     ).fetchone()[0]
     assert rows == 1
+
+
+# ── #4089: a scoped re-review covering a leg blocks a second, full review ───
+
+
+def _scoped_review_of(completed, *, aid="scoped-1", status="done", verdict="request-changes"):
+    return Assignment(
+        machine_name="precision",
+        repo_name=completed.repo_name,
+        issue_number=completed.issue_number,
+        issue_title="[scoped-review] t",
+        assignment_id=aid,
+        status=status,
+        type="review",
+        review_of_assignment_id="older-round",
+        review_scoped_work_id=completed.assignment_id,
+        review_verdict=verdict,
+        dispatched_at=(completed.dispatched_at or 0) + 10,
+    )
+
+
+@pytest.mark.parametrize("status", ["running", "done"])
+def test_dispatch_review_skipped_when_scoped_review_covers_the_leg(
+    two_machine_config: Config, status: str,
+) -> None:
+    """quadraui#2985: a scoped re-review finished on fix-1 at 14:16:56, its
+    verdict not yet re-pointed onto the leg, and the stall detector's
+    `dispatch_review(fix-1)` sent a second, full review 59s later."""
+    completed = _completed_assignment()
+    scoped = _scoped_review_of(completed, status=status)
+    board = Board()
+    (board.active if status == "running" else board.completed).append(scoped)
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "unused"}),
+        pr_lookup=lambda repo_github, **kw: {"number": 1, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert result is None
+    assert "scoped-1" in (completed.review_dispatch_reason or "")
+
+
+def test_dispatch_review_not_blocked_by_a_failed_scoped_review(
+    two_machine_config: Config,
+) -> None:
+    completed = _completed_assignment()
+    board = Board()
+    board.completed.append(
+        _scoped_review_of(completed, status="failed", verdict=None)
+    )
+    dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "unused"}),
+        pr_lookup=lambda repo_github, **kw: {"number": 1, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert "scoped review" not in (completed.review_dispatch_reason or "")
+
+
+def test_newest_leg_already_reviewed_survives_the_scoped_repoint() -> None:
+    """quadraui#2985 fix-3: the first scoped review was re-pointed onto the
+    leg it covered, so the sweep's `review_of == prior.review_of` dedupe
+    stopped matching it and a second scoped review went out."""
+    from coord.review import newest_leg_already_reviewed
+
+    fix2 = Assignment(
+        machine_name="m", repo_name="r", issue_number=7, issue_title="[fix-2] t",
+        assignment_id="fix-2", status="done", type="work", dispatched_at=100.0,
+    )
+    prior = Assignment(
+        machine_name="m", repo_name="r", issue_number=7, issue_title="[review] t",
+        assignment_id="rev-fix-2", status="done", type="review",
+        review_of_assignment_id="fix-2", review_verdict="request-changes",
+        dispatched_at=150.0,
+    )
+    fix3 = replace(fix2, assignment_id="fix-3", issue_title="[fix-3] t", dispatched_at=200.0)
+    scoped = replace(
+        prior, assignment_id="scoped-fix-3", issue_title="[scoped-review] t",
+        review_of_assignment_id="fix-3", review_scoped_work_id="fix-3",
+        dispatched_at=300.0,
+    )
+    board = Board(completed=[fix2, prior, fix3])
+    assert not newest_leg_already_reviewed(board, "r", 7, prior)
+    board.completed.append(scoped)
+    assert newest_leg_already_reviewed(board, "r", 7, prior)
+    board.completed[-1] = replace(scoped, status="failed")
+    assert not newest_leg_already_reviewed(board, "r", 7, prior)

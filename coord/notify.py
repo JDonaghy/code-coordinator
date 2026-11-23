@@ -30,6 +30,7 @@ def _agent_host(machine_name: str) -> str | None:
     return _AGENT_HOSTS.get(machine_name)
 
 from coord import github_ops
+from coord.claim import review_covers
 from coord.comments import (
     EVENT_ADVISORY,
     EVENT_COMPLETION,
@@ -867,6 +868,13 @@ def detect_stalled_pipeline(
             and "review" in required_gates
             and work.provider_name != "claude-pty"
             and work.test_state in ("passed", "skipped")
+            # A scoped re-review covering this leg carries it only in
+            # `review_scoped_work_id` until its verdict is propagated; it is
+            # a review of this leg, and dispatching another would repeat it.
+            and not any(
+                review_covers(a, work.assignment_id, include_dead=False)
+                for a in all_assignments
+            )
         ):
             reason = "done_no_review"
             detail = (

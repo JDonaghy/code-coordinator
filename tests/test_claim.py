@@ -1292,3 +1292,45 @@ def test_superseding_work_row_none_for_branchless_row() -> None:
     board = Board(completed=[row])
 
     assert superseding_work_row(board, row) is None
+
+
+# ── #4089: review_covers counts a scoped re-review's covered leg ──────────────
+
+
+def _rev(**kw) -> Assignment:
+    base = dict(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="[review] t",
+        assignment_id="rev", status="running", type="review",
+    )
+    base.update(kw)
+    return Assignment(**base)
+
+
+def test_review_covers_matches_either_field() -> None:
+    from coord.claim import review_covers
+
+    assert review_covers(_rev(review_of_assignment_id="w"), "w")
+    assert review_covers(
+        _rev(review_of_assignment_id="old", review_scoped_work_id="w"), "w",
+    )
+    assert not review_covers(_rev(review_of_assignment_id="old"), "w")
+    assert not review_covers(_rev(review_of_assignment_id="w", type="smoke"), "w")
+    assert not review_covers(_rev(review_of_assignment_id="w"), None)
+
+
+def test_review_covers_dead_reviews_only_when_asked() -> None:
+    from coord.claim import review_covers
+
+    dead = _rev(review_scoped_work_id="w", status="failed")
+    assert review_covers(dead, "w")
+    assert not review_covers(dead, "w", include_dead=False)
+
+
+def test_has_active_followup_sees_an_in_flight_scoped_review() -> None:
+    from coord.claim import has_active_followup
+
+    board = Board(active=[
+        _rev(review_of_assignment_id="old", review_scoped_work_id="w"),
+    ])
+    assert has_active_followup(board, of_assignment_id="w", assignment_type="review")
+    assert not has_active_followup(board, of_assignment_id="w", assignment_type="smoke")
