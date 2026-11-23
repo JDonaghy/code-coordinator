@@ -3185,6 +3185,81 @@ class TestNeedsDecompositionLegDispatcher:
             mock_create.assert_not_called()
             assert len(state.list_drive_escalations()) == 1
 
+    def test_escaped_stream_json_log_still_parses_a_split(self, monkeypatch) -> None:
+        """#4083: `_fetch_raw_log_text_by_id` returns the RAW
+        ``claude -p --output-format stream-json`` log — the agent's final
+        message lives inside it JSON-encoded, so a line break in the
+        verdict is a literal two-character ``\\n`` in the raw text, not an
+        actual newline. `_SIZE_TRIAGE_CHILD_HEADING_RE` is MULTILINE and
+        never matches that, so feeding the raw log straight into
+        `consume_split_verdict` (what every OTHER test in this class does,
+        by constructing `raw_log` as already-decoded text) masked this.
+        Decoding with `coord.upstream_gaps.final_message_from_log_text`
+        first — the same way `coord.notify._capture_needs_decomposition_
+        split` already does for the worker-message path — must recover
+        the real newlines before the heading regex ever sees it."""
+        import json as _json
+
+        import coord.commands._common as common
+
+        config = self._config()
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda *a, **k: config)
+
+        final_message = (
+            "SIZE_TRIAGE_VERDICT: split\n"
+            "## Child 1: API surface\n"
+            "Do the API half.\n\n"
+            "## Files\n"
+            "- coord/api_part.py\n\n"
+            "## Child 2: CLI wiring\n"
+            "Do the CLI half.\n\n"
+            "## Files\n"
+            "- coord/cli_part.py\n\n"
+            "END_SIZE_TRIAGE\n"
+        )
+        # A genuine stream-json log: each line is a JSON event, so the
+        # final message's newlines round-trip as a literal `\n` substring
+        # in `raw_log` itself — exactly the shape #4083 describes.
+        raw_log = "\n".join(
+            _json.dumps(e)
+            for e in [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "thinking..."}]},
+                },
+                {"type": "result", "result": final_message},
+            ]
+        )
+        assert "\\n" in raw_log  # the escaped shape this test guards against
+        self._terminal_board(raw_log=raw_log, monkeypatch=monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda *a, **k: {"state": "OPEN", "title": "A giant issue"},
+        )
+        monkeypatch.setattr("coord.github_ops.get_open_issues", lambda *a, **k: [])
+
+        consumed: list[str] = []
+
+        def fake_consume_split_verdict(raw_response, **kwargs):
+            consumed.append(raw_response)
+            return 900
+
+        monkeypatch.setattr(
+            "coord.decomposition_chat.consume_split_verdict",
+            fake_consume_split_verdict,
+        )
+
+        from coord.board_doctor_policy import AUTO_DISPATCHERS
+
+        result = AUTO_DISPATCHERS[queue_diagnose.CAUSE_NEEDS_DECOMPOSITION](self._row())
+
+        assert result is True
+        assert len(consumed) == 1
+        # The decoded text, not the raw stream-json log, reached the filer.
+        assert consumed[0] == final_message
+        assert "\\n" not in consumed[0]
+        assert state.list_drive_escalations() == []
+
 
 class TestParseNoProgressMinutes:
     """#3888 review: `no_progress_minutes` validates the same way its
