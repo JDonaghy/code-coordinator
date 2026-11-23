@@ -2502,6 +2502,21 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
         raise click.ClickException(f"{entry_key(repo, issue)} is not in the drive queue")
     _record_operator_release(before, resolution="operator_removed")
 
+    # #4085: `remove` IS the "cause went away" signal for this entry's own
+    # `QUEUE_ALERT_STAGE` escalation — the "pre-req X is queued but
+    # blocked — it will never satisfy" record, among others. Without this
+    # the record sits open until the NEXT tick's own reaping pass notices
+    # the row is gone; `coord/commands/drive.py`'s `escalate dismiss`/
+    # `decide` paths already clear their escalation the moment a human
+    # acts on it, and a removal is exactly that kind of act. Best-effort: a
+    # failed dismissal must never block the remove itself.
+    try:
+        from coord.state import dismiss_drive_escalation  # noqa: PLC0415
+
+        dismiss_drive_escalation(repo, issue)
+    except Exception:  # noqa: BLE001 — cosmetic; never fail a remove on it
+        pass
+
     session = removal["driver_session"]
     if session is None:
         # No live driver — behaves exactly as before #3282.
@@ -8359,7 +8374,19 @@ def _escalate(
     gates: str,
     command: str,
     assignment_id: str | None = None,
+    written: set[tuple[str, int]] | None = None,
 ) -> None:
+    """Write (or renew) REPO ISSUE's own `QUEUE_ALERT_STAGE` escalation.
+
+    *written* (#4085) — when given — records the key THIS CALL just wrote,
+    so :func:`_reap_resolved_drive_queue_escalations` (run once, later in
+    the same tick) never dismisses a record this exact tick just raised,
+    however the queue row otherwise reads. Every per-entry call site within
+    :func:`drive_queue_tick` passes its own tick-scoped set; the one
+    `QUEUE_ALERT_REPO`/`QUEUE_ALERT_ISSUE` sentinel call does not, since
+    that record is a different kind of thing the reap pass already
+    excludes by key.
+    """
     from coord.state import record_drive_escalation  # noqa: PLC0415
 
     record_drive_escalation(
@@ -8371,6 +8398,99 @@ def _escalate(
         proposed_command=command,
         assignment_id=assignment_id,
     )
+    if written is not None:
+        written.add((repo, issue))
+
+
+def _reap_resolved_drive_queue_escalations(
+    escalated_this_tick: set[tuple[str, int]],
+) -> None:
+    """Dismiss every open `QUEUE_ALERT_STAGE` per-entry escalation whose own
+    cause this tick just confirmed is gone (#4085).
+
+    `_escalate` writes one of these records exactly once — the tick an
+    entry first reaches `blocked`/`oscillating`/`gate_unreadable`/the
+    #3719 refusal `parked` shapes — and nothing re-checks it afterwards.
+    Unlike `CHECKS_STALE_ALERT_STAGE` (dropped once a row is no longer a
+    live candidate, #3396) and the `board-doctor:<queue>` records
+    (`board_doctor_policy.dismiss_resolved_escalation`), this stage had no
+    equivalent: a row that resumes to `waiting` on a satisfiable edge, is
+    removed and re-added, or leaves the queue entirely used to leave its
+    "pre-req … it will never satisfy" (or any other per-entry) record open
+    forever, burying genuinely live escalations behind stale ones.
+
+    Mirrors the #3396 cleanup pass's posture exactly: "absence from a REAL
+    observation means resolved", never "we didn't look so it must still be
+    fine". The `list_drive_queue()` read here is taken fresh, AFTER this
+    tick's own `_apply_writes(plan)` already landed — the post-action
+    observation epic #2096 requires — never the pre-tick `entries`
+    snapshot `plan_tick` reconciled against. Best-effort end to end: a
+    failed re-read (the board/queue-read-failure case the issue calls out
+    by name), or any other hiccup, dismisses nothing rather than guessing,
+    and none of this may turn an otherwise-successful tick into a reported
+    CLI failure.
+
+    *escalated_this_tick* is the set of (repo, issue) keys `_escalate`
+    itself was just called for, THIS tick, elsewhere in
+    :func:`drive_queue_tick` — never reaped, however stale the queue row
+    this pass reads otherwise looks (#4085's own "never dismiss a record
+    this same tick just (re)wrote" constraint).
+    """
+    try:
+        from coord.state import (  # noqa: PLC0415
+            dismiss_drive_escalation,
+            list_drive_escalations,
+            list_drive_queue,
+        )
+
+        escalations = [
+            esc
+            for esc in list_drive_escalations()
+            if esc.get("stage") == QUEUE_ALERT_STAGE
+            and (esc.get("repo_name"), esc.get("issue_number"))
+            != (QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+        ]
+        if not escalations:
+            return
+        rows_by_key = {
+            (row.get("repo_name"), row.get("issue_number")): row
+            for row in list_drive_queue()
+        }
+    except Exception:  # noqa: BLE001 — best-effort, see docstring: a failed
+        # read must dismiss nothing, never guess.
+        return
+
+    reaped = 0
+    for esc in escalations:
+        key = (esc.get("repo_name"), esc.get("issue_number"))
+        if key in escalated_this_tick:
+            continue
+        row = rows_by_key.get(key)
+        reapable = (
+            # Orphan: no drive-queue row at all — removed, or never added.
+            row is None
+            # Back to a healthy state — a satisfiable `after=` edge, a
+            # merge-gate clear, an operator's own fix.
+            or row.get("state") in (STATE_WAITING, STATE_RUNNING, STATE_DONE)
+            # Still `blocked`/`parked`, but the row's own `last_reason` has
+            # moved on to a cause nothing this tick escalated — the frozen
+            # record describes a shape that no longer holds.
+            or (row.get("last_reason") or "") != (esc.get("reason") or "")
+        )
+        if not reapable:
+            # Still genuinely blocked/parked on the SAME cause this record
+            # describes — nothing resolved, leave it open.
+            continue
+        try:
+            if dismiss_drive_escalation(key[0], key[1]):
+                reaped += 1
+        except Exception:  # noqa: BLE001 — one failed dismissal must not
+            # stop the rest of the pass from reaping what it safely can.
+            continue
+    if reaped:
+        click.echo(
+            f"(reaped {reaped} resolved drive-queue escalation(s) — #4085)"
+        )
 
 
 def _requeue_command(entry: QueueEntry | None, key: str) -> str:
@@ -9412,6 +9532,11 @@ def drive_queue_tick(
             pass
 
         by_key = {e.key: e for e in entries}
+        # #4085: every per-entry `_escalate` call below records its key
+        # here, so `_reap_resolved_drive_queue_escalations` (run once, at
+        # the end of this tick's reconciliation) never dismisses a record
+        # THIS tick just raised — see that function's own docstring.
+        escalated_this_tick: set[tuple[str, int]] = set()
         for item in plan.blocked:
             parsed = parse_key(item.key)
             if parsed is None:
@@ -9429,6 +9554,7 @@ def drive_queue_tick(
                 command=_blocked_escalation_command(
                     entry, item.key, item.reason, config_path=config_path,
                 ),
+                written=escalated_this_tick,
             )
 
         # #2230: an entry #2230's sweep would have resumed, but has already
@@ -9458,6 +9584,7 @@ def drive_queue_tick(
                 command=_blocked_escalation_command(
                     entry, item.key, item.reason, config_path=config_path,
                 ),
+                written=escalated_this_tick,
             )
 
         # #2806: a `blocked` entry #2230's sweep targeted this tick, but whose
@@ -9493,6 +9620,7 @@ def drive_queue_tick(
                     f"position={entry.position if entry else '?'}"
                 ),
                 command=merge_plan_inspect_command(parsed[0]),
+                written=escalated_this_tick,
             )
 
         # #3719: a `parked` entry whose park reason names a policy (#2234)
@@ -9556,6 +9684,7 @@ def drive_queue_tick(
                         config_path=config_path,
                     ),
                     assignment_id=aid or None,
+                    written=escalated_this_tick,
                 )
             except Exception as exc:  # noqa: BLE001 — the stdout line is the floor
                 click.echo(
@@ -9765,6 +9894,15 @@ def drive_queue_tick(
             plan.drift_reason, now=now, config_path=config_path
         )
 
+        # #4085: the reaping half of this tick's per-entry escalations —
+        # see `_reap_resolved_drive_queue_escalations`'s own docstring.
+        # Placed here (after every per-entry `_escalate` call above, and
+        # after `_apply_writes(plan)` already landed this tick's state
+        # changes) so the fresh `list_drive_queue()` read it takes is a
+        # REAL post-write observation, and `escalated_this_tick` already
+        # holds every key this tick itself just (re)wrote.
+        _reap_resolved_drive_queue_escalations(escalated_this_tick)
+
         target = plan.launch
         if target is None:
             return
@@ -9933,6 +10071,7 @@ def drive_queue_tick(
                 command=_blocked_escalation_command(
                     target, target.key, reason, config_path=config_path,
                 ),
+                written=escalated_this_tick,
             )
             # #2235 Phase 0: a launch that never reached tmux is #2235's own
             # `stick-demo#1` row. It blocks OUTSIDE the plan (the subprocess

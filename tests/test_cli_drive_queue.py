@@ -2600,6 +2600,33 @@ def test_remove_of_an_unqueued_issue_exits_non_zero(cli):
     assert "not in the drive queue" in result.output
 
 
+def test_remove_dismisses_the_entrys_own_drive_queue_escalation(cli, seed, launches):
+    """#4085: `remove` IS the "cause went away" signal — a human just acted
+    on the one-key fix the escalation itself proposed — so it must not wait
+    for the NEXT tick's own reaping pass to notice the row is gone."""
+    seed(issues={1650: "open", 1654: "open"})
+    cli("add", REPO, "1650")
+    # (#2972) marks this a PERMANENT block reason — excluded from the
+    # #3983 "unreachable wait" auto-reset a plain made-up reason would
+    # otherwise hit on this very tick, before `1654`'s own unsatisfiable
+    # verdict is ever written. See `_block_1654_on_1650`'s docstring below
+    # for the full explanation (duplicated here rather than shared, since
+    # that helper is declared later in this file, after the `tick` tests).
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked",
+        last_reason="drive exited too many times — giving up (#2972)",
+    )
+    cli("add", REPO, "1654", "--after", "1650")
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert state._get_drive_escalation_local(REPO, 1654) is not None
+
+    result = cli("remove", REPO, "1654")
+    assert result.exit_code == 0, result.output
+    assert state._get_drive_escalation_local(REPO, 1654) is None
+
+
 # ── clear-refusal (#3339) ────────────────────────────────────────────────────
 #
 # `coord retry`/the printed #3164 remedy both used to name `drive-queue
@@ -3050,6 +3077,183 @@ def test_a_merged_prereq_unblocks_the_dependent_entry(cli, seed, launches):
     result = cli("tick")
     assert result.exit_code == 0, result.output
     assert "1654" in " ".join(launches[0])
+
+
+# ── #4085: reaping a tick's own per-entry `drive-queue`-stage escalations ───
+#
+# `_escalate` (stage=`QUEUE_ALERT_STAGE`) writes a per-entry record exactly
+# once — the tick an entry FIRST reaches `blocked`/`parked` — and nothing
+# re-checks it afterwards. Before this, a row that resumed to `waiting` on a
+# satisfiable `after=` edge, was removed and re-added, or left the queue
+# entirely left that record open forever, burying genuinely live
+# escalations behind stale ones (quadraui#2825-#2877's 18 stale "it will
+# never satisfy" records, 2026-11-22).
+
+
+def _block_1654_on_1650(cli, seed) -> str:
+    """Seed `1650` as `blocked` for an unrelated, PERMANENT reason, then
+    add `1654` `--after 1650` so a tick's own `_resolve_prereqs` reads it
+    as unsatisfiable. Returns the exact "it will never satisfy" reason
+    `_escalate` is expected to record for `1654`.
+
+    `1650`'s own reason carries the `(#2972)` fix-round-ceiling marker
+    (`is_permanent_block_reason`) deliberately — a reason WITHOUT one of
+    `_PERMANENT_BLOCK_MARKERS` is itself a #3983 "unreachable wait" this
+    same tick auto-resets to `waiting` on sight (nothing real — no branch,
+    no PR, no live gate reading — stands behind it), which would resolve
+    `1654`'s own unsatisfiable verdict before it is ever even written,
+    leaving nothing here for this module's reap pass to reap.
+    """
+    seed(issues={1650: "open", 1654: "open"})
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked",
+        last_reason="drive exited too many times — giving up (#2972)",
+    )
+    cli("add", REPO, "1654", "--after", "1650")
+    return f"pre-req {REPO}#1650 is queued but blocked — it will never satisfy"
+
+
+def test_tick_reaps_an_unsatisfiable_prereq_escalation_once_the_dependent_resumes(
+    cli, seed, launches,
+):
+    dep_reason = _block_1654_on_1650(cli, seed)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1654)
+    assert entry["state"] == "blocked"
+    assert entry["last_reason"] == dep_reason
+    escalation = state._get_drive_escalation_local(REPO, 1654)
+    assert escalation is not None
+    assert "it will never satisfy" in escalation["reason"]
+
+    # The pre-req's own cause clears (an operator fixes it, or #2230's own
+    # sweep resumes it) — #2756's partial resume reads 1654's unsatisfiable
+    # condition as cleared and puts it back to `waiting`, a satisfiable
+    # edge, even though 1650 has not fully landed yet.
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="waiting", last_reason="", attempts=0,
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(1654)["state"] != "blocked"
+    assert state._get_drive_escalation_local(REPO, 1654) is None
+
+
+def test_tick_reaps_an_orphan_escalation_with_no_queue_row_at_all(cli, seed):
+    """An escalation whose entry has since left the queue entirely (removed
+    out of band, or never added — a dangling record from a prior host/DB
+    state) is reaped on the very next tick, same as a row that resumed."""
+    from coord.drive_queue import QUEUE_ALERT_STAGE
+
+    seed(issues={})
+    state._record_drive_escalation_local(
+        REPO, 2532, stage=QUEUE_ALERT_STAGE,
+        reason=f"pre-req {REPO}#9 is queued but blocked — it will never satisfy",
+        gate_readings="", proposed_command=f"coord drive-queue remove {REPO} 2532",
+    )
+    assert state._get_drive_escalation_local(REPO, 2532) is not None
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert state._get_drive_escalation_local(REPO, 2532) is None
+
+
+def test_a_record_rewritten_this_same_tick_is_never_reaped(cli):
+    """#4085's own "never dismiss a record this same tick just (re)wrote"
+    constraint. Exercised directly against the reap pass (rather than
+    through a `tick` invocation) because the ordinary escalation paths all
+    write the queue row's `last_reason` and the escalation's `reason` from
+    the exact same string in the exact same call — a genuine production
+    tick can never show the generic "last_reason/state looks resolved"
+    check a FALSE positive on a key it just wrote. This proves the
+    `escalated_this_tick` guard holds even against that otherwise-resolved-
+    looking shape, not merely against a shape the generic check would
+    already have preserved on its own."""
+    from coord.commands.drive_queue import _reap_resolved_drive_queue_escalations
+    from coord.drive_queue import QUEUE_ALERT_STAGE
+
+    cli("add", REPO, "1654")
+    # The row itself looks fully resolved — `waiting`, no trace of the old
+    # reason — exactly the shape the reap pass would otherwise dismiss.
+    state._update_drive_queue_entry_local(
+        REPO, 1654, state="waiting", last_reason="",
+    )
+    state._record_drive_escalation_local(
+        REPO, 1654, stage=QUEUE_ALERT_STAGE,
+        reason="pre-req claude-coordinator#1650 is queued but blocked — "
+        "it will never satisfy",
+        gate_readings="", proposed_command=f"coord drive-queue remove {REPO} 1654",
+    )
+
+    _reap_resolved_drive_queue_escalations({(REPO, 1654)})
+
+    assert state._get_drive_escalation_local(REPO, 1654) is not None
+
+
+def test_a_failed_queue_read_dismisses_nothing(cli, seed, launches, monkeypatch):
+    """Only dismiss from a confirmed read — a queue read that fails this
+    tick (a daemon hiccup, a locked DB) must leave every escalation record
+    exactly as it found it, never guess."""
+    dep_reason = _block_1654_on_1650(cli, seed)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert state._get_drive_escalation_local(REPO, 1654) is not None
+
+    # A satisfiable edge, same as the sibling resume test — were the reap
+    # pass's own fresh read to succeed, this record would be reaped.
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="waiting", last_reason="", attempts=0,
+    )
+
+    real_list_drive_queue = state.list_drive_queue
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        # The tick's OWN primary read (step 1) must still succeed — only
+        # the reap pass's later, SECOND read fails.
+        if calls["n"] >= 2:
+            raise RuntimeError("board daemon unreachable")
+        return real_list_drive_queue(*args, **kwargs)
+
+    monkeypatch.setattr(state, "list_drive_queue", _flaky)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    escalation = state._get_drive_escalation_local(REPO, 1654)
+    assert escalation is not None
+    assert escalation["reason"] == dep_reason
+
+
+def test_other_escalation_stages_are_never_touched_by_the_reap_pass():
+    """The reap pass is scoped to `QUEUE_ALERT_STAGE` only. `checks_stale`
+    and `board-doctor:<queue>` records already have their OWN, independent
+    cleanup passes — exercised directly against the reap pass (rather than
+    through a `tick` invocation, which would also run those other sweeps
+    and dismiss an orphan `checks_stale`/`board-doctor` record on its own,
+    making it impossible to tell which pass did the dismissing) so this
+    proves THIS pass's own stage filter, specifically."""
+    from coord.commands.drive_queue import _reap_resolved_drive_queue_escalations
+
+    # Both look, by this pass's OWN criteria, exactly like a reapable
+    # orphan — no matching drive-queue row for either key at all.
+    state._record_drive_escalation_local(
+        REPO, 7777, stage="checks_stale", reason="stale",
+        gate_readings="", proposed_command="coord merge --only x 7777",
+    )
+    state._record_drive_escalation_local(
+        REPO, 8888, stage="board-doctor:some-queue", reason="needs a human",
+        gate_readings="", proposed_command="coord escalate run x 8888",
+    )
+
+    _reap_resolved_drive_queue_escalations(set())
+
+    assert state._get_drive_escalation_local(REPO, 7777) is not None
+    assert state._get_drive_escalation_local(REPO, 8888) is not None
 
 
 # ── tick: capacity ───────────────────────────────────────────────────────────
