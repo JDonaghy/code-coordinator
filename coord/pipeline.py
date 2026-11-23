@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
+from coord.claim import review_covers
 from coord.merge_queue import (
     evaluate_uat_verdict,
     is_uat_gate_reason,
@@ -334,6 +335,9 @@ def compute_pipeline(
             a for a in all_assignments
             if a.review_of_assignment_id == aid and a.type == "review"
         ),
+        None,
+    ) or next(
+        (a for a in all_assignments if review_covers(a, aid)),
         None,
     )
     smoke_assignment: Assignment | None = next(

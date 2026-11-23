@@ -51,6 +51,7 @@ from pathlib import Path
 import httpx
 
 from coord import github_ops
+from coord.claim import review_covers
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.prereview_gate import GateResult, run_prereview_gate
@@ -4433,6 +4434,25 @@ def dispatch_review(
             "(#3670, stale board snapshot)"
         )
 
+    # A scoped re-review that covered this leg carries the leg only in
+    # `review_scoped_work_id` until `propagate_review_verdict` re-points it,
+    # so neither check above sees it yet. Its verdict is about to land on
+    # this leg; a second, full review would only repeat it.
+    _scoped_cover = next(
+        (
+            a for a in list(board.active) + list(board.completed)
+            if a.review_scoped_work_id == completed.assignment_id
+            and review_covers(a, completed.assignment_id, include_dead=False)
+        ),
+        None,
+    )
+    if _scoped_cover is not None:
+        return _deny(
+            f"assignment {completed.assignment_id} is already covered by "
+            f"scoped review {_scoped_cover.assignment_id} "
+            f"({_scoped_cover.status}) — refusing a second review"
+        )
+
     # Dedupe: don't fire a second review if one's already in flight for this
     # completed work assignment. This in-memory check is a fast path only —
     # `board` is a snapshot that can already be stale by the time we reach
@@ -5514,7 +5534,7 @@ def superseded_review_gap(
     ]
     if not reviews:
         return None
-    if any(r.review_of_assignment_id == newest.assignment_id for r in reviews):
+    if any(review_covers(r, newest.assignment_id) for r in reviews):
         return None
     latest = max(reviews, key=lambda a: (a.dispatched_at or 0.0, a.assignment_id or ""))
     # A review dispatched after the newest leg finished already saw its head
@@ -5590,10 +5610,7 @@ def heal_unreviewed_newest_work_legs(
             continue
         if newest_done_work_leg(board, c.repo_name, effective_issue_number(c)) is not c:
             continue
-        if any(
-            r.type == "review" and r.review_of_assignment_id == c.assignment_id
-            for r in pool
-        ):
+        if any(review_covers(r, c.assignment_id) for r in pool):
             continue
         head_ready_at = c.finished_at or c.dispatched_at or 0.0
         if any(
@@ -5854,8 +5871,7 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             (
                 r.review_verdict
                 for r in board.active + board.completed
-                if r.type == "review"
-                and r.review_of_assignment_id == c.assignment_id
+                if review_covers(r, c.assignment_id)
                 and r.review_verdict is not None
             ),
             None,
@@ -7086,6 +7102,31 @@ def dispatch_scoped_review(
     return None
 
 
+def newest_leg_already_reviewed(
+    board: Board, repo_name: str, issue_number: int, prior_review: Assignment,
+) -> bool:
+    """True when a review dispatched after *prior_review* already covers the
+    issue's newest done work leg.
+
+    The scoped sweeps' own dedupe matches on *prior_review*'s
+    ``review_of_assignment_id``, which stops matching the moment
+    ``propagate_review_verdict`` re-points an earlier scoped review onto the
+    leg it actually reviewed. Asking about the newest leg itself — through
+    :func:`coord.claim.review_covers`, so a scoped review's
+    ``review_scoped_work_id`` counts too — keeps answering correctly after
+    that re-point.
+    """
+    newest = newest_done_work_leg(board, repo_name, issue_number)
+    if newest is None:
+        return False
+    return any(
+        a.assignment_id != prior_review.assignment_id
+        and (a.dispatched_at or 0) > (prior_review.dispatched_at or 0)
+        and review_covers(a, newest.assignment_id, include_dead=False)
+        for a in list(board.active) + list(board.completed)
+    )
+
+
 def dispatch_scoped_reviews_for_queue(
     board: Board,
     config: Config,
@@ -7252,6 +7293,8 @@ def dispatch_scoped_reviews_for_queue(
             and a.assignment_id != prior_review.assignment_id
             and (a.dispatched_at or 0) > (prior_review.dispatched_at or 0)
             for a in pool
+        ) or newest_leg_already_reviewed(
+            board, entry.repo_name, entry.issue_number, prior_review,
         )
         if already_handled:
             continue
@@ -7547,6 +7590,8 @@ def maybe_scoped_review_for_completed_fix(
             and a.assignment_id != prior_review.assignment_id
             and (a.dispatched_at or 0) > (prior_review.dispatched_at or 0)
             for a in pool
+        ) or newest_leg_already_reviewed(
+            board, completed.repo_name, completed.issue_number, prior_review,
         )
         if already_handled:
             return None

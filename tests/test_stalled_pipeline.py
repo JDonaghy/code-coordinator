@@ -388,6 +388,20 @@ class TestDoneNoReview:
         assert len(results) == 1
         assert results[0][0].reason == "done_no_review"
 
+    def test_not_flagged_when_a_scoped_review_covers_the_leg(self, config: Config) -> None:
+        """#4089: a scoped re-review names the leg only in
+        `review_scoped_work_id` until its verdict is re-pointed. Reading
+        that window as `done_no_review` dispatched a second review."""
+        scoped = replace(
+            _review("older-round", aid="scoped-1"),
+            review_scoped_work_id="work-1",
+        )
+        board = _board(_work("work-1", test_state="passed"), scoped)
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert all(r[0].reason != "done_no_review" for r in results)
+
     def test_not_flagged_when_test_verdict_still_missing(self, config: Config) -> None:
         """No review yet is EXPECTED while the test gate hasn't cleared —
         not a stall."""
