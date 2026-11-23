@@ -1251,6 +1251,7 @@ def _fix_model_for_iteration(
     iteration: int,
     failure_text: str | None = None,
     previous_model: str | None = None,
+    issue_labels: list[str] | None = None,
 ) -> str | None:
     """Choose the model alias for a fix worker on a given bounce *iteration*.
 
@@ -1300,12 +1301,22 @@ def _fix_model_for_iteration(
     bottom rung of ``models.escalation`` rather than silently disabling the
     ladder the operator asked for; only a config with BOTH unset can still
     yield ``None``, and that config has no model to name in the first place.
+
+    *issue_labels* set a floor on every rung: an issue that ``models.labels``
+    routes to a model above ``models.default`` (``tier:large`` → ``opus``)
+    starts its first fix there instead of at ``models.default``, and no
+    later round drops below it. Without the floor the Work leg runs on the
+    label's model and every fix of its branch silently runs on a smaller
+    one.
     """
     if not config.pipeline.escalate_fix_model:
         return None
 
-    model = config.models.default or (
-        config.models.escalation[0] if config.models.escalation else ""
+    floor = config.models.model_for_labels(issue_labels or [])
+    model = config.models.at_least(
+        config.models.default
+        or (config.models.escalation[0] if config.models.escalation else ""),
+        floor,
     )
     if not model:
         return None
@@ -1328,11 +1339,27 @@ def _fix_model_for_iteration(
         baseline = model
         for _ in range(steps - 1):
             baseline = config.models.next_model(baseline)
+    baseline = config.models.at_least(baseline, floor)
 
     if failure_text is not None and not classify_failure(failure_text).should_escalate:
         # Compliance nit (or no evidence) — stay on the rung already reached.
         return baseline
     return config.models.next_model(baseline)
+
+
+def cached_issue_labels(repo_name: str, issue_number: int) -> list[str] | None:
+    """The issue's labels from the local ``issues`` cache, or ``None``.
+
+    Best-effort and never a GitHub call: the fix and review dispatch paths
+    use it to apply the ``models.labels`` floor, and an uncached issue (or
+    an unreadable cache) just means no floor.
+    """
+    from coord.state import get_cached_issue_labels  # noqa: PLC0415
+
+    try:
+        return get_cached_issue_labels(repo_name, issue_number)
+    except Exception:  # noqa: BLE001 — a missing floor must never block a dispatch
+        return None
 
 
 def _merge_blocking_review_findings(
@@ -1608,6 +1635,7 @@ def _dispatch_fix_for_review(
     model = _fix_model_for_iteration(
         config, next_iteration,
         failure_text=merged_findings.body,
+        issue_labels=cached_issue_labels(work.repo_name, work.issue_number),
         previous_model=last_fix_model_for_branch(
             board,
             repo_name=work.repo_name,

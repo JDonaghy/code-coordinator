@@ -4942,9 +4942,8 @@ def dispatch_review(
             )
 
         # Pin the reviewer's model to avoid the agent defaulting to Opus (#911).
-        # #1430: deliberately not consulting models.labels — the reviewer's
-        # effort scales with diff size, not the original work issue's tier
-        # label, and #911 already pins this deliberately.
+        # #1430: models.labels never picks the reviewer's model; it only
+        # floors it (below).
         # #1650: `models.pinned["review"]` (default: "opus") wins over
         # `models.default` outright — the final review gates every merge
         # and must never be silently degraded by a cost-driven ladder or a
@@ -4952,9 +4951,14 @@ def dispatch_review(
         # `models.default`, never folded into it.
         # A re-review (`completed.review_iteration > 0` — i.e. `completed`
         # is itself a bounce-fix worker) pins to the fleet default `sonnet`
-        # instead — see `ModelsConfig.model_for_review`.
+        # instead — see `ModelsConfig.model_for_review`. Either way the
+        # issue's `models.labels` model is a floor, so a `tier:large` issue
+        # is never re-reviewed below `opus`.
+        from coord.auto_loop import cached_issue_labels  # noqa: PLC0415
+
         review_model_alias = config.models.model_for_review(
-            getattr(completed, "review_iteration", 0) or 0
+            getattr(completed, "review_iteration", 0) or 0,
+            cached_issue_labels(completed.repo_name, completed.issue_number),
         )
         review_model_wire = config.models.resolve(review_model_alias)
 
@@ -6731,7 +6735,12 @@ def dispatch_scoped_review(
     # iteration (if any) ends up stamped on the new review row; see
     # `ModelsConfig.model_for_review` and the comment at the other
     # `review_model_alias` assignment site (`dispatch_review` above).
-    review_model_alias = config.models.model_for_review(review_iteration=1)
+    from coord.auto_loop import cached_issue_labels  # noqa: PLC0415
+
+    review_model_alias = config.models.model_for_review(
+        review_iteration=1,
+        issue_labels=cached_issue_labels(entry.repo_name, entry.issue_number),
+    )
     review_model_wire = config.models.resolve(review_model_alias)
 
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
@@ -7658,6 +7667,7 @@ def dispatch_headless_fix(
         _fix_model_for_iteration,
         _load_review_findings,
         _work_is_terminal,
+        cached_issue_labels,
         last_fix_model_for_branch,
         next_fix_iteration,
     )
@@ -7739,6 +7749,7 @@ def dispatch_headless_fix(
     model = _fix_model_for_iteration(
         config, next_iteration,
         failure_text=findings_obj.body,
+        issue_labels=cached_issue_labels(work.repo_name, work.issue_number),
         previous_model=last_fix_model_for_branch(
             board,
             repo_name=work.repo_name,
