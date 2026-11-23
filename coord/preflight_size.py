@@ -893,6 +893,19 @@ def build_slice_header(
     :func:`_slice_token` placeholder (resolved to the sibling's real
     issue number once every child has actually been filed — see
     :func:`substitute_slice_tokens`).
+
+    "This slice's own scope" is `_slice_label(this_chunk)` (the chunk's
+    title suffix, or its whole title) followed by `this_chunk.scope`
+    itself, when non-empty. For the rule-based cross-backend split that
+    is a repeat of the same one-liner the label is already drawn from;
+    for the paid size-triage / `coord.brain` split paths `chunk.scope` is
+    the agent-authored "one paragraph of rationale/scope" — the ONLY
+    per-child spec those paths produce (`parse_size_triage_response` /
+    `coord.brain.parse_split_proposals`) — so dropping it here would
+    leave that child's body naming only its own title, the same
+    "the worker had to guess what its slice meant" failure #4081 is
+    about, newly inflicted on the one split path the issue did not ask
+    to change.
     """
     total = len(chunks)
     this_chunk = chunks[position - 1]
@@ -900,14 +913,62 @@ def build_slice_header(
     siblings_desc = "; ".join(
         f"{_slice_label(c)} ({_slice_token(i)})" for i, c in siblings
     )
+    own_scope = this_chunk.scope.strip()
+    own_desc = f"This slice owns: {_slice_label(this_chunk)}."
+    if own_scope:
+        own_desc = f"{own_desc} {own_scope}"
     return (
         f"Slice {position} of {total} slices of #{parent_issue_number}. "
-        f"This slice owns: {_slice_label(this_chunk)}. "
+        f"{own_desc} "
         f"Sibling slices own: {siblings_desc or 'nothing else'}. "
         "Out of scope here: everything named above as a sibling slice's "
         "own scope — the parent's full original scope below is for "
         "context only."
     )
+
+
+#: #4081: `coord.overlap_predict.parse_declared_files` does not
+#: stop at the first `## Files` block it finds — its outer loop keeps
+#: scanning and folds EVERY subsequent `#{1,6} files` / `Files:` block in
+#: the text into the same list. The parent body quoted verbatim in
+#: :func:`build_slice_child_body` below almost always carries its own
+#: `## Files` section (a rule-split parent always does —
+#: :func:`build_cross_backend_split_proposal` returns ``None`` otherwise),
+#: so without defusing it, the resulting child body's declared files
+#: would be "this chunk's own files UNION the whole parent's cross-backend
+#: file list" — destroying the "one backend per child" partition this
+#: whole mechanism exists to pin. These two patterns match exactly the
+#: prefix `coord.overlap_predict._HEADING_RE` / `_INLINE_RE` key a files
+#: block on (hashes-then-"files", or a leading "files"/"**files**" before
+#: a colon) and, via :func:`_defuse_quoted_files_declarations`, insert a
+#: word between that prefix and the literal "files" so neither regex's
+#: required immediate adjacency holds any more — the line stays readable
+#: prose, it just no longer opens a NEW files block.
+_HEADING_FILES_PREFIX_RE = re.compile(r"^(\s{0,3}#{1,6}\s*)(?=files\b)", re.IGNORECASE)
+_INLINE_FILES_PREFIX_RE = re.compile(
+    r"^(\s{0,3})(?=(?:\*\*)?files(?:\s+\w+)?(?:\*\*)?\s*:)", re.IGNORECASE
+)
+
+
+def _defuse_quoted_files_declarations(text: str) -> str:
+    """Rewrite every line in *text* that :func:`coord.overlap_predict.
+    parse_declared_files` would recognise as the START of a files block,
+    so quoting *text* verbatim inside a child body cannot reopen a second
+    block on top of that child's own `## Files` section (see
+    :data:`_HEADING_FILES_PREFIX_RE` above for why).
+
+    Applied line-by-line so the rest of the quoted body — every other
+    heading, every bullet, every paragraph — is untouched; only the exact
+    lines that would start a new files declaration are altered, and only
+    by inserting a word, never by deleting content.
+    """
+    out_lines = []
+    for line in text.splitlines():
+        new_line = _HEADING_FILES_PREFIX_RE.sub(r"\1Quoted ", line, count=1)
+        if new_line == line:
+            new_line = _INLINE_FILES_PREFIX_RE.sub(r"\1Quoted ", line, count=1)
+        out_lines.append(new_line)
+    return "\n".join(out_lines)
 
 
 def build_slice_child_body(
@@ -933,10 +994,13 @@ def build_slice_child_body(
        the parent's scope below is theirs.
     3. This chunk's own pinned ``## Files`` declaration
        (``chunks[position - 1].files_likely``) — the one declaration
-       :func:`coord.overlap_predict.parse_declared_files` should treat as
+       :func:`coord.overlap_predict.parse_declared_files` treats as
        authoritative for THIS child — followed by the parent's COMPLETE
-       original body, verbatim, under its own clearly-labeled heading.
-       Never a one-line summary — that's the whole point of #4081.
+       original body, verbatim (except any `## Files` / `Files:` line of
+       its OWN, defused by :func:`_defuse_quoted_files_declarations` so it
+       cannot reopen a second, parent-wide files block on top of this
+       chunk's own), under its own clearly-labeled heading. Never a
+       one-line summary — that's the whole point of #4081.
     """
     chunk = chunks[position - 1]
     header = build_slice_header(
@@ -945,7 +1009,9 @@ def build_slice_child_body(
         chunks=chunks,
     )
     files_block = "\n".join(f"- {f}" for f in chunk.files_likely)
-    parent_text = str(parent_body or "").rstrip("\n")
+    parent_text = _defuse_quoted_files_declarations(
+        str(parent_body or "").rstrip("\n")
+    )
     return (
         f"{NO_BACKEND_SPLIT_MARKER}\n"
         f"{header}\n\n"
