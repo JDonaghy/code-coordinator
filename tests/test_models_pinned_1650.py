@@ -91,6 +91,40 @@ class TestModelForReview:
         assert cfg.model_for_review(-1) == "opus"
 
 
+class TestModelForReviewLabelFloor:
+    """The reviewed issue's ``models.labels`` model floors the review model."""
+
+    def test_large_issue_rereview_runs_on_the_label_model(self) -> None:
+        cfg = ModelsConfig(labels={"tier:large": "opus"})
+        assert cfg.model_for_review(1, ["tier:large"]) == "opus"
+
+    def test_lower_label_model_never_lowers_the_review_pin(self) -> None:
+        cfg = ModelsConfig(labels={"tier:small": "haiku"})
+        assert cfg.model_for_review(0, ["tier:small"]) == "opus"
+        assert cfg.model_for_review(1, ["tier:small"]) == "sonnet"
+
+    def test_unlabelled_issue_keeps_the_sonnet_rereview(self) -> None:
+        cfg = ModelsConfig(labels={"tier:large": "opus"})
+        assert cfg.model_for_review(1, ["bug"]) == "sonnet"
+        assert cfg.model_for_review(1) == "sonnet"
+
+
+class TestAtLeast:
+    def test_picks_the_higher_rung(self) -> None:
+        cfg = ModelsConfig()
+        assert cfg.at_least("sonnet", "opus") == "opus"
+        assert cfg.at_least("opus", "sonnet") == "opus"
+
+    def test_none_yields_the_other_side(self) -> None:
+        cfg = ModelsConfig()
+        assert cfg.at_least(None, "opus") == "opus"
+        assert cfg.at_least("sonnet", None) == "sonnet"
+
+    def test_off_ladder_model_is_returned_unchanged(self) -> None:
+        cfg = ModelsConfig()
+        assert cfg.at_least("claude-custom", "opus") == "claude-custom"
+
+
 class TestConfigParseValidation:
     """#1650 acceptance: a typo in `models.pinned` fails loudly at config
     load, not silently at dispatch time."""

@@ -2079,6 +2079,7 @@ def _dispatch_fix_of(
         _build_fix_briefing,
         _fix_model_for_iteration,
         _load_review_findings,
+        cached_issue_labels,
         last_fix_model_for_branch as _last_fix_model_fx,
     )
     from coord.agent import (  # noqa: PLC0415
@@ -2255,6 +2256,7 @@ def _dispatch_fix_of(
         or _fix_model_for_iteration(
             cfg, next_iteration,
             failure_text=_findings_body,
+            issue_labels=cached_issue_labels(work.repo_name, work.issue_number),
             previous_model=_last_fix_model_fx(
                 _fx_board,
                 repo_name=work.repo_name,

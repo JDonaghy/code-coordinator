@@ -1082,7 +1082,9 @@ class ModelsConfig:
             return None
         return self.pinned.get(assignment_type)
 
-    def model_for_review(self, review_iteration: int) -> str:
+    def model_for_review(
+        self, review_iteration: int, issue_labels: list[str] | None = None,
+    ) -> str:
         """Return the model alias to dispatch a review leg on.
 
         *review_iteration* is the fix-round counter already carried by the
@@ -1110,10 +1112,35 @@ class ModelsConfig:
         (or different) re-review model still win outright by setting
         ``models.pinned["review_rereview"]`` explicitly, same as any other
         pinned route.
+
+        *issue_labels* (the reviewed issue's GitHub labels) set a floor:
+        when ``labels`` routes the issue to a model higher on
+        ``escalation`` than the one chosen above, that model is used
+        instead. A ``tier:large`` issue routed to ``opus`` therefore gets
+        ``opus`` re-reviews rather than the ``sonnet`` re-review default.
         """
         if review_iteration > 0:
-            return self.pinned.get("review_rereview", "sonnet")
-        return self.model_for_type("review") or self.default
+            model = self.pinned.get("review_rereview", "sonnet")
+        else:
+            model = self.model_for_type("review") or self.default
+        return self.at_least(model, self.model_for_labels(issue_labels or []))
+
+    def at_least(self, model: str | None, floor: str | None) -> str | None:
+        """Return whichever of *model* and *floor* sits higher on ``escalation``.
+
+        A ``None`` on either side yields the other. When either alias is
+        off the ladder there is no order to compare, so *model* is
+        returned unchanged.
+        """
+        if not floor:
+            return model
+        if not model:
+            return floor
+        if model not in self.escalation or floor not in self.escalation:
+            return model
+        if self.escalation.index(floor) > self.escalation.index(model):
+            return floor
+        return model
 
     def next_model(self, current: str) -> str:
         """Return the next model in the escalation ladder.

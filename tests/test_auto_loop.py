@@ -1822,6 +1822,36 @@ class TestFixModelForIterationHonoursPreviousRung:
         assert _fix_model_for_iteration(cfg, 2) == "opus"
 
 
+class TestFixModelForIterationLabelFloor:
+    """The issue's ``models.labels`` model floors every fix rung."""
+
+    def _cfg(self) -> Config:
+        cfg = _config_with_models(default="sonnet")
+        cfg.models.labels = {"tier:large": "opus", "tier:small": "haiku"}
+        return cfg
+
+    def test_first_fix_of_a_large_issue_starts_at_the_label_model(self) -> None:
+        assert _fix_model_for_iteration(
+            self._cfg(), 1, issue_labels=["tier:large"],
+        ) == "opus"
+
+    def test_compliance_nit_never_drops_below_the_label_model(self) -> None:
+        assert _fix_model_for_iteration(
+            self._cfg(), 3,
+            failure_text="ratchet baseline exceeded",
+            previous_model="sonnet",
+            issue_labels=["tier:large"],
+        ) == "opus"
+
+    def test_a_lower_label_model_does_not_lower_the_default(self) -> None:
+        assert _fix_model_for_iteration(
+            self._cfg(), 1, issue_labels=["tier:small"],
+        ) == "sonnet"
+
+    def test_no_labels_keeps_the_default(self) -> None:
+        assert _fix_model_for_iteration(self._cfg(), 1, issue_labels=None) == "sonnet"
+
+
 class TestLastFixModelForBranch:
     """#3360 round-2 review: the board-backed answer to 'what rung did the
     previous fix round actually dispatch at?'."""
