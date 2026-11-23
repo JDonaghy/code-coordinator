@@ -2502,18 +2502,28 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
         raise click.ClickException(f"{entry_key(repo, issue)} is not in the drive queue")
     _record_operator_release(before, resolution="operator_removed")
 
-    # #4085: `remove` IS the "cause went away" signal for this entry's own
+    # `remove` IS the "cause went away" signal for this entry's own
     # `QUEUE_ALERT_STAGE` escalation — the "pre-req X is queued but
-    # blocked — it will never satisfy" record, among others. Without this
-    # the record sits open until the NEXT tick's own reaping pass notices
-    # the row is gone; `coord/commands/drive.py`'s `escalate dismiss`/
-    # `decide` paths already clear their escalation the moment a human
-    # acts on it, and a removal is exactly that kind of act. Best-effort: a
-    # failed dismissal must never block the remove itself.
+    # blocked — it will never satisfy" record, among others; otherwise the
+    # record sits open until the NEXT tick's own reaping pass notices the
+    # row is gone. `drive_escalations` is one row per `(repo, issue)` with
+    # `stage` as a plain column, and other callers (`coord drive`'s own
+    # `--stage merge` / dead-end writes, `checks_stale`,
+    # `board-doctor:<queue>`) can leave a record on this exact key for a
+    # cause this removal does nothing about — a NEEDS_ATTENTION merge
+    # verdict or a stale-checks block do not go away just because the row
+    # left the drive queue. So read the record first and only dismiss it
+    # when its stage is actually this tick's own `QUEUE_ALERT_STAGE`,
+    # mirroring `coord.board_doctor_policy.dismiss_resolved_escalation`'s
+    # same "only an escalation this module itself filed" guard. Any other
+    # stage on the same key is left untouched. Best-effort: a failed read
+    # or dismissal must never block the remove itself.
     try:
-        from coord.state import dismiss_drive_escalation  # noqa: PLC0415
+        from coord.state import dismiss_drive_escalation, get_drive_escalation  # noqa: PLC0415
 
-        dismiss_drive_escalation(repo, issue)
+        existing = get_drive_escalation(repo, issue)
+        if existing is not None and existing.get("stage") == QUEUE_ALERT_STAGE:
+            dismiss_drive_escalation(repo, issue)
     except Exception:  # noqa: BLE001 — cosmetic; never fail a remove on it
         pass
 
@@ -8402,6 +8412,41 @@ def _escalate(
         written.add((repo, issue))
 
 
+def _confirmed_drive_queue_rows_by_key() -> dict[tuple[str, int], dict] | None:
+    """A confirmed drive-queue read, keyed by `(repo, issue)` — or `None`
+    when the read could not be confirmed.
+
+    In host mode (no `board_service`), `coord.state.list_drive_queue()`
+    reads the local DB directly: it either returns the real rows or raises,
+    which the one caller here already treats as "skip the pass" via its own
+    `try`/`except`. On a thin client it instead routes through
+    `coord.client.fetch_drive_queue()`, which fails SOFT to `[]` on ANY
+    daemon failure — a 404 from a daemon predating the `/drive-queue` route,
+    a network error, bad JSON, *or* a genuinely empty queue, all collapsed
+    to the same empty list (see that function's own docstring). Reaping
+    against that collapsed result cannot tell "every row is gone" from
+    "the read never happened", which would mass-dismiss every open
+    per-entry escalation in the fleet on a single transient. Going through
+    `coord.client.fetch_drive_queue_result` instead — the same primitive
+    `coord drive-queue list` uses to keep "unreadable" out of "empty" —
+    keeps that distinction here: a failed thin-client read returns `None`,
+    never a dict that looks like a drained queue.
+    """
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+    from coord.client import fetch_drive_queue_result  # noqa: PLC0415
+    from coord.state import list_drive_queue  # noqa: PLC0415
+
+    svc = resolve_board_service()
+    if svc is None:
+        rows = list_drive_queue()
+    else:
+        result = fetch_drive_queue_result(svc)
+        if not result.ok:
+            return None
+        rows = result.entries
+    return {(row.get("repo_name"), row.get("issue_number")): row for row in rows}
+
+
 def _reap_resolved_drive_queue_escalations(
     escalated_this_tick: set[tuple[str, int]],
 ) -> None:
@@ -8421,14 +8466,15 @@ def _reap_resolved_drive_queue_escalations(
 
     Mirrors the #3396 cleanup pass's posture exactly: "absence from a REAL
     observation means resolved", never "we didn't look so it must still be
-    fine". The `list_drive_queue()` read here is taken fresh, AFTER this
-    tick's own `_apply_writes(plan)` already landed — the post-action
-    observation epic #2096 requires — never the pre-tick `entries`
-    snapshot `plan_tick` reconciled against. Best-effort end to end: a
-    failed re-read (the board/queue-read-failure case the issue calls out
-    by name), or any other hiccup, dismisses nothing rather than guessing,
-    and none of this may turn an otherwise-successful tick into a reported
-    CLI failure.
+    fine". The queue read here is taken fresh, AFTER this tick's own
+    `_apply_writes(plan)` already landed — the post-action observation
+    epic #2096 requires — never the pre-tick `entries` snapshot `plan_tick`
+    reconciled against. Best-effort end to end: a failed re-read — see
+    :func:`_confirmed_drive_queue_rows_by_key`, which tells "confirmed
+    empty" apart from "could not read" rather than collapsing them — or
+    any other hiccup, dismisses nothing rather than guessing, and none of
+    this may turn an otherwise-successful tick into a reported CLI
+    failure.
 
     *escalated_this_tick* is the set of (repo, issue) keys `_escalate`
     itself was just called for, THIS tick, elsewhere in
@@ -8440,7 +8486,6 @@ def _reap_resolved_drive_queue_escalations(
         from coord.state import (  # noqa: PLC0415
             dismiss_drive_escalation,
             list_drive_escalations,
-            list_drive_queue,
         )
 
         escalations = [
@@ -8452,10 +8497,13 @@ def _reap_resolved_drive_queue_escalations(
         ]
         if not escalations:
             return
-        rows_by_key = {
-            (row.get("repo_name"), row.get("issue_number")): row
-            for row in list_drive_queue()
-        }
+        rows_by_key = _confirmed_drive_queue_rows_by_key()
+        if rows_by_key is None:
+            # Could not confirm the read: an unreadable queue is not
+            # "everything is gone", it is "we do not know", so skip the
+            # whole pass rather than treating every open record as an
+            # orphan.
+            return
     except Exception:  # noqa: BLE001 — best-effort, see docstring: a failed
         # read must dismiss nothing, never guess.
         return
