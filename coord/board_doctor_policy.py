@@ -2788,6 +2788,20 @@ def _consume_decomposition_leg(
         _alert_fallback(row)
         return False
 
+    from coord.upstream_gaps import final_message_from_log_text  # noqa: PLC0415
+
+    # `raw_log` is the stream-json log exactly as the agent wrote it — the
+    # worker's final message lives inside it as an escaped string (``\n``
+    # for line breaks, ``\'`` for quotes), so `consume_split_verdict`'s own
+    # `## Child N:` heading regex (MULTILINE) can never match it directly.
+    # Decode the SAME way `coord.notify._capture_needs_decomposition_split`
+    # already does for the worker-message path, so both paths parse an
+    # identical shape (#2096/#2085 — "one question, one answer").
+    text = final_message_from_log_text(raw_log)
+    if not text:
+        _alert_fallback(row)
+        return False
+
     from coord.decomposition_chat import (  # noqa: PLC0415
         BOARD_DOCTOR_DECOMPOSITION_ORIGIN,
         SizeTriageError,
@@ -2819,7 +2833,7 @@ def _consume_decomposition_leg(
 
     try:
         epic_number = consume_split_verdict(
-            raw_log,
+            text,
             repo=repo,
             issue_number=issue_number,
             issue_title=issue_title,
