@@ -2627,6 +2627,32 @@ def test_remove_dismisses_the_entrys_own_drive_queue_escalation(cli, seed, launc
     assert state._get_drive_escalation_local(REPO, 1654) is None
 
 
+def test_remove_leaves_a_differently_staged_escalation_on_the_same_issue_untouched(
+    cli, seed,
+):
+    """`remove` is only the "cause went away" signal for THIS tick's own
+    `QUEUE_ALERT_STAGE` record — `drive_escalations` is one row per
+    `(repo, issue)` and `coord drive`'s own `--stage merge`/dead-end
+    writes, `checks_stale`, and `board-doctor:<queue>` can all leave a
+    record on this exact key for a cause the drive queue knows nothing
+    about. Dropping the queue row must not silently destroy that record;
+    mirrors `coord.board_doctor_policy.dismiss_resolved_escalation`'s own
+    "only an escalation this module itself filed" guard."""
+    seed(issues={1654: "open"})
+    cli("add", REPO, "1654")
+    state._record_drive_escalation_local(
+        REPO, 1654, stage="checks_stale", reason="checks have been pending too long",
+        gate_readings="", proposed_command=f"coord merge --only {REPO} 1654",
+    )
+
+    result = cli("remove", REPO, "1654")
+
+    assert result.exit_code == 0, result.output
+    escalation = state._get_drive_escalation_local(REPO, 1654)
+    assert escalation is not None
+    assert escalation["stage"] == "checks_stale"
+
+
 # ── clear-refusal (#3339) ────────────────────────────────────────────────────
 #
 # `coord retry`/the printed #3164 remedy both used to name `drive-queue
@@ -3227,6 +3253,44 @@ def test_a_failed_queue_read_dismisses_nothing(cli, seed, launches, monkeypatch)
     escalation = state._get_drive_escalation_local(REPO, 1654)
     assert escalation is not None
     assert escalation["reason"] == dep_reason
+
+
+def test_a_fail_soft_thin_client_queue_read_dismisses_nothing(monkeypatch):
+    """`coord.client.fetch_drive_queue` (what `coord.state.list_drive_queue`
+    routes through once `board_service` is configured) fails SOFT to `[]`
+    on ANY daemon failure — a 404 from a daemon predating the
+    `/drive-queue` route, a network error, bad JSON, or a genuinely empty
+    queue, all collapsed to the same empty list by that function's own
+    docstring. A single such transient must not look like the queue
+    draining to nothing and reap every open per-entry escalation in the
+    fleet — this is the failure mode the raising sibling test above does
+    NOT cover, since it never raises. Exercised directly against the reap
+    pass, through its own `fetch_drive_queue_result` confirmation seam."""
+    import coord.board_service as board_service
+    from coord.client import DriveQueueRead, ServiceConfig
+    from coord.commands.drive_queue import _reap_resolved_drive_queue_escalations
+    from coord.drive_queue import QUEUE_ALERT_STAGE
+
+    state._record_drive_escalation_local(
+        REPO, 1654, stage=QUEUE_ALERT_STAGE,
+        reason="pre-req claude-coordinator#1650 is queued but blocked — "
+        "it will never satisfy",
+        gate_readings="", proposed_command=f"coord drive-queue remove {REPO} 1654",
+    )
+
+    monkeypatch.setattr(
+        board_service, "resolve", lambda: ServiceConfig(url="http://daemon.example")
+    )
+    monkeypatch.setattr(
+        "coord.client.fetch_drive_queue_result",
+        lambda *args, **kwargs: DriveQueueRead(
+            ok=False, entries=[], error="HTTP 404 from http://daemon.example/drive-queue"
+        ),
+    )
+
+    _reap_resolved_drive_queue_escalations(set())
+
+    assert state._get_drive_escalation_local(REPO, 1654) is not None
 
 
 def test_other_escalation_stages_are_never_touched_by_the_reap_pass():
