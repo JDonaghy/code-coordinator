@@ -2461,6 +2461,16 @@ class TestFileAndQueueSplitProposalCrossBackendOrderingAndBody:
         for call in mock_create_issue.call_args_list[1:]:
             assert self._PARENT_BODY in call.kwargs["body"]
 
+        # And each child's own `chunk.scope` — the only per-child spec the
+        # paid size-triage / `coord.brain` split paths ever produce — is
+        # carried in its header, not dropped (#4081 review).
+        seam_body, tui_body, gtk_body = (
+            call.kwargs["body"] for call in mock_create_issue.call_args_list[1:]
+        )
+        assert "seam scope" in seam_body
+        assert "tui scope" in tui_body
+        assert "gtk scope" in gtk_body
+
         # The drive-queue rows: the seam (a root — no declared `after`)
         # inherits the original's own prereq; both backend children are
         # chained after the seam's REAL number.

@@ -13,6 +13,7 @@ import pytest
 from coord.config import PreflightGuardConfig, PreflightGuardRepoConfig, load
 from coord.milestone_order import parse_sub_issues
 from coord.models import SplitChunk, SplitProposal
+from coord.overlap_predict import parse_declared_files
 from coord.preflight_size import (
     DEFAULT_THRESHOLDS,
     NO_BACKEND_SPLIT_MARKER,
@@ -893,6 +894,22 @@ class TestDetectCrossBackendScope:
         )
         assert named == ()
 
+    def test_every_backend_phrase_names_the_full_configured_list(self) -> None:
+        """An "every backend"/"all backends" phrase picks every configured
+        backend, in `backends`' own order — even one this particular text
+        never names by word — via `_ALL_BACKENDS_RE`. Still exercised here
+        (independent of the mechanical split itself, which now skips a
+        body matching this exact phrase, #4081) because
+        `coord.board_doctor_followthrough`'s auto-filed-follow-up validator
+        is the OTHER caller of this function and still needs this branch
+        to answer "every backend", full stop."""
+        named = detect_cross_backend_scope(
+            title="Port the ListView widget to every backend",
+            body="## Files\n- src/shared/list_view_contract.rs\n",
+            backends=["gtk", "cocoa", "windows"],
+        )
+        assert named == ("gtk", "cocoa", "windows")
+
     def test_repo_with_fewer_than_two_backends_never_fires(self) -> None:
         named = detect_cross_backend_scope(
             title="touches gtk and cocoa",
@@ -1227,3 +1244,94 @@ class TestBuildSliceChildBody:
         resolved = substitute_slice_tokens(body, {1: 2937})
         assert "{{child:3}}" in resolved
         assert "#2937" in resolved
+
+    def test_header_includes_this_chunks_own_scope_text(self) -> None:
+        """#4081 review: `chunk.scope` is the ONLY per-child spec the paid
+        size-triage / `coord.brain` split paths ever produce — dropping it
+        from the header would leave a child from either of THOSE paths
+        naming only its own title, with no scope of its own at all."""
+        chunks = self._chunks()
+        seam_body = build_slice_child_body(
+            parent_issue_number=2823,
+            parent_body=_PARENT_FIXTURE_BODY,
+            position=1,
+            chunks=chunks,
+        )
+        assert "seam scope" in seam_body
+        tui_body = build_slice_child_body(
+            parent_issue_number=2823,
+            parent_body=_PARENT_FIXTURE_BODY,
+            position=2,
+            chunks=chunks,
+        )
+        assert "tui scope" in tui_body
+
+
+_PARENT_FIXTURE_BODY_WITH_FILES = """\
+Approved design: ListView becomes a seam-backed widget with one concrete
+implementation per backend.
+
+## Files
+
+- src/tui/list_view.rs
+- src/gtk/list_view.rs
+- src/macos/list_view.rs
+
+## Acceptance
+
+- [ ] every backend renders identically
+"""
+
+
+class TestBuildSliceChildBodyDoesNotDuplicateAParentFilesBlock:
+    """#4081 review (blocking): a rule-split parent ALWAYS has a `## Files`
+    section (`build_cross_backend_split_proposal` returns ``None``
+    otherwise), so quoting it verbatim is the common case this needs to
+    hold for, not an edge case. `parse_declared_files` does not stop at
+    the first files block — it keeps scanning and folds every subsequent
+    one into the same list — so without defusing the parent's own `##
+    Files` heading, a filed child's DECLARED scope (as any consumer that
+    reads the issue body, e.g. `coord.commands.drive_queue`, would see it)
+    would be this chunk's own files UNION every backend's files from the
+    parent, destroying the one-backend-per-child partition the split
+    exists to produce."""
+
+    def _chunks(self) -> list[SplitChunk]:
+        return [
+            SplitChunk(
+                title="Pilot 1: ListView end to end (seam)",
+                scope="seam scope",
+                files_likely=["src/shared/list_view_contract.rs"],
+            ),
+            SplitChunk(
+                title="Pilot 1: ListView end to end (tui)",
+                scope="tui scope",
+                files_likely=["src/tui/list_view.rs"],
+                after=(1,),
+            ),
+        ]
+
+    def test_declared_files_on_the_child_body_are_only_this_chunks_own(self) -> None:
+        chunks = self._chunks()
+        body = build_slice_child_body(
+            parent_issue_number=2823,
+            parent_body=_PARENT_FIXTURE_BODY_WITH_FILES,
+            position=2,  # the "tui" child
+            chunks=chunks,
+        )
+        assert parse_declared_files(body) == ["src/tui/list_view.rs"]
+
+    def test_full_parent_body_text_is_still_present_verbatim(self) -> None:
+        """The defusing only alters the `## Files` heading line itself —
+        every other line of the parent's quoted body, including the
+        files it lists, is untouched."""
+        chunks = self._chunks()
+        body = build_slice_child_body(
+            parent_issue_number=2823,
+            parent_body=_PARENT_FIXTURE_BODY_WITH_FILES,
+            position=2,
+            chunks=chunks,
+        )
+        assert "src/gtk/list_view.rs" in body
+        assert "src/macos/list_view.rs" in body
+        assert "every backend renders identically" in body
