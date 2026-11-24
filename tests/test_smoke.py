@@ -6902,26 +6902,35 @@ def test_cross_platform_checks_config_defaults_to_empty() -> None:
     assert cfg2.cross_platform_checks == {}
 
 
-def test_cross_platform_checks_config_parses_capability_command_map() -> None:
+def test_cross_platform_checks_config_parses_repo_scoped_capability_command_map() -> None:
+    """#4098 review: keyed by LOCAL REPO NAME first, then capability — never
+    a flat `{capability: command}` map, which would run one repo's compile
+    command inside every OTHER repo's own worktree too."""
     from coord.config import _parse_smoke_tests
 
     cfg = _parse_smoke_tests({
         "auto_queue": True,
         "cross_platform_checks": {
+            "quadraui": {
+                "macos": "cargo check -p quadraui --features macos --all-targets",
+                "win": (
+                    "cargo check -p quadraui --features win --all-targets "
+                    "--target x86_64-pc-windows-msvc"
+                ),
+            },
+            "other-repo": {"macos": "make check-macos"},
+        },
+    })
+
+    assert cfg.cross_platform_checks == {
+        "quadraui": {
             "macos": "cargo check -p quadraui --features macos --all-targets",
             "win": (
                 "cargo check -p quadraui --features win --all-targets "
                 "--target x86_64-pc-windows-msvc"
             ),
         },
-    })
-
-    assert cfg.cross_platform_checks == {
-        "macos": "cargo check -p quadraui --features macos --all-targets",
-        "win": (
-            "cargo check -p quadraui --features win --all-targets "
-            "--target x86_64-pc-windows-msvc"
-        ),
+        "other-repo": {"macos": "make check-macos"},
     }
 
 
@@ -6932,18 +6941,32 @@ def test_cross_platform_checks_config_rejects_non_mapping() -> None:
         _parse_smoke_tests({"cross_platform_checks": ["not", "a", "mapping"]})
 
 
+def test_cross_platform_checks_config_rejects_non_mapping_repo_value() -> None:
+    from coord.config import ConfigError, _parse_smoke_tests
+
+    with pytest.raises(ConfigError, match="mapping of capability to command"):
+        _parse_smoke_tests({"cross_platform_checks": {"quadraui": "cargo check"}})
+
+
+def test_cross_platform_checks_config_rejects_empty_repo_key() -> None:
+    from coord.config import ConfigError, _parse_smoke_tests
+
+    with pytest.raises(ConfigError, match="non-empty repo-name strings"):
+        _parse_smoke_tests({"cross_platform_checks": {"": {"macos": "cargo check"}}})
+
+
 def test_cross_platform_checks_config_rejects_empty_capability_key() -> None:
     from coord.config import ConfigError, _parse_smoke_tests
 
     with pytest.raises(ConfigError, match="non-empty capability strings"):
-        _parse_smoke_tests({"cross_platform_checks": {"": "cargo check"}})
+        _parse_smoke_tests({"cross_platform_checks": {"quadraui": {"": "cargo check"}}})
 
 
 def test_cross_platform_checks_config_rejects_empty_command() -> None:
     from coord.config import ConfigError, _parse_smoke_tests
 
     with pytest.raises(ConfigError, match="non-empty command string"):
-        _parse_smoke_tests({"cross_platform_checks": {"macos": ""}})
+        _parse_smoke_tests({"cross_platform_checks": {"quadraui": {"macos": ""}}})
 
 
 def test_pending_cross_platform_checks_excludes_the_work_machines_own_capabilities() -> None:
@@ -6957,12 +6980,14 @@ def test_pending_cross_platform_checks_excludes_the_work_machines_own_capabiliti
     cfg = Config(
         repos=[], machines=[],
         smoke_tests=SmokeTestsConfig(cross_platform_checks={
-            "macos": "cargo check --features macos",
-            "win": "cargo check --features win",
+            "api": {
+                "macos": "cargo check --features macos",
+                "win": "cargo check --features win",
+            },
         }),
     )
 
-    assert pending_cross_platform_checks(["win", "rust"], cfg) == [
+    assert pending_cross_platform_checks(["win", "rust"], "api", cfg) == [
         ("macos", "cargo check --features macos"),
     ]
 
@@ -6974,11 +6999,11 @@ def test_pending_cross_platform_checks_empty_when_work_machine_covers_everything
     cfg = Config(
         repos=[], machines=[],
         smoke_tests=SmokeTestsConfig(cross_platform_checks={
-            "macos": "cargo check --features macos",
+            "api": {"macos": "cargo check --features macos"},
         }),
     )
 
-    assert pending_cross_platform_checks(["macos", "rust"], cfg) == []
+    assert pending_cross_platform_checks(["macos", "rust"], "api", cfg) == []
 
 
 def test_pending_cross_platform_checks_empty_when_unconfigured() -> None:
@@ -6986,7 +7011,26 @@ def test_pending_cross_platform_checks_empty_when_unconfigured() -> None:
     from coord.config import Config
     from coord.smoke import pending_cross_platform_checks
 
-    assert pending_cross_platform_checks(["win"], Config(repos=[], machines=[])) == []
+    assert pending_cross_platform_checks(["win"], "api", Config(repos=[], machines=[])) == []
+
+
+def test_pending_cross_platform_checks_scoped_to_the_completed_rows_own_repo() -> None:
+    """#4098 review (blocking): a `cross_platform_checks` entry configured
+    for ONE repo must never apply to a different repo's own Work row — a
+    `cargo check -p quadraui` command only compiles inside quadraui's own
+    checkout, so it must not be dispatched for `other-repo` just because
+    both repos share the one fleet-wide `smoke_tests:` block."""
+    from coord.config import Config
+    from coord.smoke import pending_cross_platform_checks
+
+    cfg = Config(
+        repos=[], machines=[],
+        smoke_tests=SmokeTestsConfig(cross_platform_checks={
+            "quadraui": {"macos": "cargo check -p quadraui --features macos"},
+        }),
+    )
+
+    assert pending_cross_platform_checks(["win"], "other-repo", cfg) == []
 
 
 def test_dispatch_smoke_legs_unaffected_when_cross_platform_checks_unconfigured(
@@ -7033,8 +7077,10 @@ def test_dispatch_cross_platform_precheck_runs_only_missing_capability_on_anothe
         smoke_tests=SmokeTestsConfig(
             auto_queue=True,
             cross_platform_checks={
-                "win": "cargo check --features win",
-                "macos": "cargo check --features macos",
+                "api": {
+                    "win": "cargo check --features win",
+                    "macos": "cargo check --features macos",
+                },
             },
         ),
     )
@@ -7065,7 +7111,7 @@ def test_dispatch_cross_platform_precheck_fails_open_when_unroutable(repo: Repo)
         machines=[_machine("winbox", "winbox.tail", caps=["win"], path="/w/api")],
         smoke_tests=SmokeTestsConfig(
             auto_queue=True,
-            cross_platform_checks={"macos": "cargo check --features macos"},
+            cross_platform_checks={"api": {"macos": "cargo check --features macos"}},
         ),
     )
     completed = _completed(machine="winbox")
@@ -7082,6 +7128,56 @@ def test_dispatch_cross_platform_precheck_fails_open_when_unroutable(repo: Repo)
     assert len(legs) == 1
     assert legs[0].machine_name == "winbox"
     assert legs[0].assignment_id == "ordinary-leg"
+
+
+def test_dispatch_cross_platform_precheck_carries_prior_retry_tallies_forward(
+    repo: Repo, coord_db,
+) -> None:
+    """#4098 review (blocking): dispatching a precheck round must not
+    replace `test_reason` wholesale — any #2272/#3315/#3737 retry tally
+    already on the row (from an earlier REAL Test-stage dispatch attempt
+    that this precheck now runs ahead of) must still be readable
+    afterwards, or those budgets silently reset to zero every round."""
+    from coord.smoke import (
+        ENVIRONMENTAL_SMOKE_MARKER,
+        NO_SMOKE_VERDICT_MARKER,
+        _dispatch_smoke_legs,
+        environmental_smoke_legs,
+        mute_smoke_legs,
+    )
+    from coord.state import _record_dispatched_assignment_local
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("winbox", "winbox.tail", caps=["win"], path="/w/api"),
+            _machine("macbox", "macbox.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            cross_platform_checks={"api": {"macos": "cargo check --features macos"}},
+        ),
+    )
+    completed = _completed(machine="winbox")
+    completed.assignment_id = "xcheck-tally-work"
+    completed.test_reason = f"{NO_SMOKE_VERDICT_MARKER}\n{ENVIRONMENTAL_SMOKE_MARKER}"
+    _record_dispatched_assignment_local(
+        assignment=Assignment(
+            assignment_id="xcheck-tally-work", machine_name="winbox", repo_name="api",
+            issue_number=completed.issue_number, issue_title=completed.issue_title,
+            type="work", status="done", branch=completed.branch,
+        ),
+        repo_github="acme/api",
+    )
+    client = _MultiHostClient(assign={"macbox.tail": {"id": "macos-xcheck"}})
+
+    _dispatch_smoke_legs(
+        completed, Board(), cfg, http_client=client,
+        diff_lookup=lambda r, b: [],
+    )
+
+    assert mute_smoke_legs(completed.test_reason) == 1
+    assert environmental_smoke_legs(completed.test_reason) == 1
 
 
 def _seed_xcheck_work(*, assignment_id: str = "xcheck-work") -> None:
@@ -7136,7 +7232,7 @@ def test_resolve_cross_platform_precheck_is_a_noop_for_an_ordinary_running_leg(
     from coord.smoke import _resolve_cross_platform_precheck
 
     completed = _xcheck_completed(test_reason="dispatched: Test stage running (#1426)")
-    assert _resolve_cross_platform_precheck(completed) is None
+    assert _resolve_cross_platform_precheck(completed, Board()) is None
     assert completed.test_state == "running"
 
 
@@ -7155,7 +7251,7 @@ def test_resolve_cross_platform_precheck_pending_when_a_leg_has_not_reported(
     )
     completed = _xcheck_completed(test_reason=manifest)
 
-    assert _resolve_cross_platform_precheck(completed) == "pending"
+    assert _resolve_cross_platform_precheck(completed, Board()) == "pending"
     assert completed.test_state == "running"
 
 
@@ -7183,7 +7279,7 @@ def test_resolve_cross_platform_precheck_failed_skips_fanout_and_triggers_triage
     )
     completed = _xcheck_completed(test_reason=manifest)
 
-    outcome = _resolve_cross_platform_precheck(completed)
+    outcome = _resolve_cross_platform_precheck(completed, Board())
 
     assert outcome == "failed"
     assert completed.test_state == "failed"
@@ -7211,11 +7307,204 @@ def test_resolve_cross_platform_precheck_passed_clears_verdict_for_the_real_fano
     )
     completed = _xcheck_completed(test_reason=manifest)
 
-    outcome = _resolve_cross_platform_precheck(completed)
+    outcome = _resolve_cross_platform_precheck(completed, Board())
 
     assert outcome == "passed"
     assert completed.test_state is None
     assert load_assignment_test_state("xcheck-work") is None
+
+
+def test_resolve_cross_platform_precheck_dead_leg_fails_open(coord_db) -> None:
+    """#4098 review (blocking): a leg cleared by a #2272 mute or #1605
+    environmental-death path (`test_state=None`) while its own `status` has
+    already reached `"done"` is never retried under this precheck's leg id
+    — without this, `any(state in (None, "running") ...)` held the round at
+    "pending" forever. The resolver must instead fail OPEN (proceed to the
+    real Test-stage fan-out) rather than hang, distinguishing this from a
+    genuinely still-running leg via the leg's own row on `board`."""
+    from coord.smoke import _encode_xcheck_manifest, _resolve_cross_platform_precheck
+    from coord.state import load_assignment_test_state, record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(leg_id="leg-macos", state="passed", reason="ok")
+    # `leg-win`'s own row reached `status="done"` but recorded NO verdict —
+    # the dead-leg shape. `_seed_xcheck_leg`'s `state=None` branch already
+    # leaves `test_state` unset; override its `status` to "done" directly.
+    dead_leg = Assignment(
+        assignment_id="leg-win", machine_name="macbox", repo_name="api",
+        issue_number=77, issue_title="[smoke:xcheck-win] leg", type="smoke",
+        status="done", branch="issue-77-fix", review_of_assignment_id="xcheck-work",
+    )
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos"), ("leg-win", "win")])
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=manifest,
+    )
+    completed = _xcheck_completed(test_reason=manifest)
+    board = Board(completed=[dead_leg])
+
+    outcome = _resolve_cross_platform_precheck(completed, board)
+
+    assert outcome == "passed"
+    assert completed.test_state is None
+    assert load_assignment_test_state("xcheck-work") is None
+    assert "inconclusive" in (completed.test_reason or "")
+    assert "win" in (completed.test_reason or "")
+
+
+def test_resolve_cross_platform_precheck_dead_leg_does_not_mask_a_real_failure(
+    coord_db,
+) -> None:
+    """A dead leg never suppresses a REAL failure recorded by a sibling —
+    fail-open only applies when nothing else failed."""
+    from coord.smoke import _encode_xcheck_manifest, _resolve_cross_platform_precheck
+    from coord.state import load_assignment_test_state, record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(
+        leg_id="leg-macos", state="failed", reason="compile error on macos",
+    )
+    dead_leg = Assignment(
+        assignment_id="leg-win", machine_name="macbox", repo_name="api",
+        issue_number=77, issue_title="[smoke:xcheck-win] leg", type="smoke",
+        status="done", branch="issue-77-fix", review_of_assignment_id="xcheck-work",
+    )
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos"), ("leg-win", "win")])
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=manifest,
+    )
+    completed = _xcheck_completed(test_reason=manifest)
+    board = Board(completed=[dead_leg])
+
+    outcome = _resolve_cross_platform_precheck(completed, board)
+
+    assert outcome == "failed"
+    assert load_assignment_test_state("xcheck-work") == "failed"
+    assert "compile error on macos" in (completed.test_reason or "")
+
+
+def test_resolve_cross_platform_precheck_still_pending_when_leg_is_genuinely_running(
+    coord_db,
+) -> None:
+    """A leg whose own row is still `"running"`/`"pending"` on `board` is
+    genuinely in flight — never classified as dead just because
+    `test_state` hasn't landed yet."""
+    from coord.smoke import _encode_xcheck_manifest, _resolve_cross_platform_precheck
+    from coord.state import record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(leg_id="leg-macos", state="passed", reason="ok")
+    running_leg = Assignment(
+        assignment_id="leg-win", machine_name="macbox", repo_name="api",
+        issue_number=77, issue_title="[smoke:xcheck-win] leg", type="smoke",
+        status="running", branch="issue-77-fix", review_of_assignment_id="xcheck-work",
+    )
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos"), ("leg-win", "win")])
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=manifest,
+    )
+    completed = _xcheck_completed(test_reason=manifest)
+    board = Board(active=[running_leg])
+
+    assert _resolve_cross_platform_precheck(completed, board) == "pending"
+    assert completed.test_state == "running"
+
+
+def test_resolve_cross_platform_precheck_pass_carries_prior_retry_tallies_forward(
+    coord_db,
+) -> None:
+    """#4098 review (blocking): a pass must not erase the #2272/#3315/#3737
+    retry tallies already accrued on the row from an EARLIER real
+    Test-stage dispatch attempt — a flat-prose replacement here would
+    silently reset every one of those budgets to zero on every precheck
+    round."""
+    from coord.smoke import (
+        ENVIRONMENTAL_SMOKE_MARKER,
+        NO_SMOKE_VERDICT_MARKER,
+        _encode_xcheck_manifest,
+        _resolve_cross_platform_precheck,
+        environmental_smoke_legs,
+        mute_smoke_legs,
+    )
+    from coord.state import record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(leg_id="leg-macos", state="passed", reason="ok")
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos")])
+    # Simulate a round dispatched while an earlier REAL Test-stage attempt
+    # had already accrued a mute-leg and an environmental-death tally.
+    prior_reason = (
+        f"{manifest}\n{NO_SMOKE_VERDICT_MARKER}\n{ENVIRONMENTAL_SMOKE_MARKER}"
+    )
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=prior_reason,
+    )
+    completed = _xcheck_completed(test_reason=prior_reason)
+
+    outcome = _resolve_cross_platform_precheck(completed, Board())
+
+    assert outcome == "passed"
+    assert mute_smoke_legs(completed.test_reason) == 1
+    assert environmental_smoke_legs(completed.test_reason) == 1
+
+
+def test_dispatch_cross_platform_precheck_never_clobbers_a_verdict_that_landed_mid_dispatch(
+    repo: Repo, coord_db,
+) -> None:
+    """#4098 review (blocking): mirrors `_dispatch_smoke_single_leg`'s own
+    #3343 guard — if another in-flight leg on this branch lands a terminal
+    verdict WHILE this precheck round's own candidate walk is still in
+    flight, the final "running" stamp must never clobber it back."""
+    from coord.smoke import _dispatch_smoke_legs
+    from coord.state import _record_dispatched_assignment_local, record_test_verdict
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("winbox", "winbox.tail", caps=["win"], path="/w/api"),
+            _machine("macbox", "macbox.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            cross_platform_checks={"api": {"macos": "cargo check --features macos"}},
+        ),
+    )
+    completed = _completed(machine="winbox")
+    completed.assignment_id = "xcheck-race-work"
+    _record_dispatched_assignment_local(
+        assignment=Assignment(
+            assignment_id="xcheck-race-work", machine_name="winbox", repo_name="api",
+            issue_number=completed.issue_number, issue_title=completed.issue_title,
+            type="work", status="done", branch=completed.branch,
+        ),
+        repo_github="acme/api",
+    )
+
+    class _LandsATerminalVerdictMidDispatchClient(_MultiHostClient):
+        def post(self, url, *, json, timeout) -> _FakeResp:  # noqa: ANN001
+            # Simulate another in-flight leg on this branch recording a
+            # real Test-stage "passed" verdict WHILE this precheck round's
+            # own HTTP dispatch is still happening.
+            record_test_verdict(
+                assignment_id="xcheck-race-work", test_state="passed",
+                test_reason="a sibling leg already passed",
+            )
+            return super().post(url, json=json, timeout=timeout)
+
+    client = _LandsATerminalVerdictMidDispatchClient(
+        assign={"macbox.tail": {"id": "macos-xcheck"}},
+    )
+
+    _dispatch_smoke_legs(
+        completed, Board(), cfg, http_client=client,
+        diff_lookup=lambda r, b: [],
+    )
+
+    # The already-landed "passed" verdict must survive untouched — never
+    # clobbered back to "running" by this precheck round's manifest stamp.
+    assert completed.test_state == "passed"
+    from coord.state import load_assignment_test_state  # noqa: PLC0415
+
+    assert load_assignment_test_state("xcheck-race-work") == "passed"
 
 
 def test_dispatch_pending_smoke_proceeds_to_the_real_fanout_after_a_passed_precheck(
@@ -7238,7 +7527,7 @@ def test_dispatch_pending_smoke_proceeds_to_the_real_fanout_after_a_passed_prech
         machines=[_machine("winbox", "winbox.tail", caps=["win"], path="/w/api")],
         smoke_tests=SmokeTestsConfig(
             auto_queue=True,
-            cross_platform_checks={"macos": "cargo check --features macos"},
+            cross_platform_checks={"api": {"macos": "cargo check --features macos"}},
         ),
     )
 

@@ -1069,6 +1069,187 @@ def test_run_drain_invokes_the_sweep_before_smoke_dispatch(monkeypatch, config) 
     )
 
 
+# ── #4098 review: an xcheck precheck round must never be laundered ──────────
+
+
+def _xcheck_store(
+    monkeypatch, *, states: dict[str, str | None], reasons: dict[str, str | None],
+) -> list[dict]:
+    """Same fake single-row verdict seam as `_fanout_store`, reused for the
+    #4098 precheck's `[[xcheck:...]]` manifest — both the generic
+    classification this sweep must NOT apply to it, and
+    `coord.smoke._resolve_cross_platform_precheck`'s own reads/writes, go
+    through the same `coord.state` functions."""
+    recorded: list[dict] = []
+
+    def _record(**kw) -> None:
+        recorded.append(kw)
+        states[kw["assignment_id"]] = kw["test_state"]
+        reasons[kw["assignment_id"]] = kw["test_reason"]
+
+    monkeypatch.setattr("coord.state.record_test_verdict", _record)
+    monkeypatch.setattr("coord.state.load_assignment_test_state", lambda aid: states.get(aid))
+    monkeypatch.setattr("coord.state.load_assignment_test_reason", lambda aid: reasons.get(aid))
+    return recorded
+
+
+def test_xcheck_round_with_a_passed_leg_is_never_propagated_verbatim(monkeypatch, config) -> None:
+    """The literal #4098 review regression: a precheck leg (`s1`) that
+    itself reached `status='done'` with its own recorded `test_state=
+    'passed'` must NOT be folded onto the parent as a `passed` TEST
+    verdict by the generic single-leg classification — that would launder
+    a cheap compile-only check into a full Test-stage `passed`, satisfying
+    the merge gate without the real suite ever running. The correct
+    resolution (deferred to `coord.smoke._resolve_cross_platform_precheck`)
+    clears the parent back to `test_state=None` instead, so the next
+    dispatch tick runs the real Test-stage fan-out."""
+    from coord.smoke import _encode_xcheck_manifest
+
+    now = time.time()
+    states: dict[str, str | None] = {"s1": "passed"}
+    reasons: dict[str, str | None] = {"s1": "ok"}
+    recorded = _xcheck_store(monkeypatch, states=states, reasons=reasons)
+
+    def _boom(**kw):
+        raise AssertionError(
+            "an xcheck round must never be routed through the environmental/"
+            "work classifier or the generic single-leg propagation"
+        )
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    monkeypatch.setattr("coord.smoke.finalize_smoke_fanout", _boom)
+
+    manifest = _encode_xcheck_manifest([("s1", "macos")])
+    work = _work(finished_at=now - 3600)
+    work.test_reason = manifest
+    leg = _smoke(aid="s1", review_of="w1", status="done", finished_at=now - 3600)
+    board = Board(completed=[work, leg])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(healed) == 1
+    assert healed[0].assignment_id == "w1"
+    assert "4098" in healed[0].action
+    assert states["w1"] is None  # cleared, never stamped "passed"
+    assert recorded[-1]["test_state"] is None
+
+
+def test_xcheck_round_with_a_failed_leg_folds_a_real_failed_verdict(monkeypatch, config) -> None:
+    """A precheck leg that genuinely failed still resolves to a terminal
+    `test_state='failed'` on the parent (#4098's "goes straight to
+    triage") — the sweep must route it through the resolver, not discard
+    it as an environmental death."""
+    from coord.smoke import _encode_xcheck_manifest
+
+    now = time.time()
+    states: dict[str, str | None] = {"s1": "failed"}
+    reasons: dict[str, str | None] = {
+        "s1": "error[E0599]: no field `foo` on type `Bar`",
+    }
+    _xcheck_store(monkeypatch, states=states, reasons=reasons)
+
+    def _boom(**kw):
+        raise AssertionError("must not classify environmentally")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+
+    manifest = _encode_xcheck_manifest([("s1", "win")])
+    work = _work(finished_at=now - 3600)
+    work.test_reason = manifest
+    leg = _smoke(aid="s1", review_of="w1", status="done", finished_at=now - 3600)
+    board = Board(completed=[work, leg])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(healed) == 1
+    assert states["w1"] == "failed"
+    assert "no field `foo`" in reasons["w1"]
+
+
+def test_xcheck_round_with_a_dead_leg_fails_open_instead_of_stranding_forever(
+    monkeypatch, config,
+) -> None:
+    """#4098 review (blocking): a leg cleared by a #2272 mute or #1605
+    environmental-death path (`test_state=None` on its own row) while its
+    own `status` has already reached a terminal value is never retried
+    under this precheck's leg id — without this, the round sat at
+    `test_state='running'` forever. The resolver fails OPEN (clears the
+    parent for the real Test-stage fan-out) rather than hanging."""
+    from coord.smoke import _encode_xcheck_manifest
+
+    now = time.time()
+    states: dict[str, str | None] = {"s1": None}
+    reasons: dict[str, str | None] = {"s1": None}
+    _xcheck_store(monkeypatch, states=states, reasons=reasons)
+
+    manifest = _encode_xcheck_manifest([("s1", "macos")])
+    work = _work(finished_at=now - 3600)
+    work.test_reason = manifest
+    # The leg's own row reached a terminal `status` but recorded no
+    # verdict of its own — the "dead leg" shape.
+    leg = _smoke(aid="s1", review_of="w1", status="done", finished_at=now - 3600)
+    board = Board(completed=[work, leg])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(healed) == 1
+    assert states["w1"] is None
+    assert "inconclusive" in reasons["w1"]
+
+
+def test_xcheck_round_still_genuinely_in_flight_is_left_alone(monkeypatch, config) -> None:
+    """A leg that is genuinely still executing (`status='running'` on its
+    own row, no verdict yet) must never be resolved early — this sweep has
+    no elapsed-time gate for xcheck rounds precisely because the resolver
+    itself is side-effect-free while pending, so leaving it alone here
+    proves that safety, not an accidental grace window."""
+    from coord.smoke import _encode_xcheck_manifest
+
+    now = time.time()
+    states: dict[str, str | None] = {"s1": None}
+    reasons: dict[str, str | None] = {"s1": None}
+    _xcheck_store(monkeypatch, states=states, reasons=reasons)
+
+    manifest = _encode_xcheck_manifest([("s1", "macos")])
+    work = _work(finished_at=None, dispatched_at=now - 7200)
+    work.test_reason = manifest
+    leg = _smoke(aid="s1", review_of="w1", status="running", finished_at=None)
+    board = Board(active=[leg], completed=[work])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert healed == []
+    assert "w1" not in states  # untouched — nothing was ever written for it
+
+
+def test_xcheck_round_dry_run_reports_without_writing(monkeypatch, config) -> None:
+    """A dry-run peek must report the same outcome a live sweep would
+    resolve to, without calling the write-performing resolver at all."""
+    from coord.smoke import _encode_xcheck_manifest
+
+    now = time.time()
+    states: dict[str, str | None] = {"s1": "passed"}
+    reasons: dict[str, str | None] = {"s1": "ok"}
+    _xcheck_store(monkeypatch, states=states, reasons=reasons)
+
+    def _boom(**kw):
+        raise AssertionError("a dry run must never write a verdict")
+
+    monkeypatch.setattr("coord.state.record_test_verdict", _boom)
+
+    manifest = _encode_xcheck_manifest([("s1", "macos")])
+    work = _work(finished_at=now - 3600)
+    work.test_reason = manifest
+    leg = _smoke(aid="s1", review_of="w1", status="done", finished_at=now - 3600)
+    board = Board(completed=[work, leg])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now, dry_run=True)
+
+    assert len(healed) == 1
+    assert "dry-run" in healed[0].action
+    assert "w1" not in states  # nothing was written
+
+
 # ── config parsing ───────────────────────────────────────────────────────────
 
 
