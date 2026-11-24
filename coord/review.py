@@ -4442,7 +4442,9 @@ def dispatch_review(
         (
             a for a in list(board.active) + list(board.completed)
             if a.review_scoped_work_id == completed.assignment_id
-            and review_covers(a, completed.assignment_id, include_dead=False)
+            and review_covers(
+                a, completed.assignment_id, include_dead=False, board=board,
+            )
         ),
         None,
     )
@@ -5534,7 +5536,7 @@ def superseded_review_gap(
     ]
     if not reviews:
         return None
-    if any(review_covers(r, newest.assignment_id) for r in reviews):
+    if any(review_covers(r, newest.assignment_id, board=board) for r in reviews):
         return None
     latest = max(reviews, key=lambda a: (a.dispatched_at or 0.0, a.assignment_id or ""))
     # A review dispatched after the newest leg finished already saw its head
@@ -5610,7 +5612,7 @@ def heal_unreviewed_newest_work_legs(
             continue
         if newest_done_work_leg(board, c.repo_name, effective_issue_number(c)) is not c:
             continue
-        if any(review_covers(r, c.assignment_id) for r in pool):
+        if any(review_covers(r, c.assignment_id, board=board) for r in pool):
             continue
         head_ready_at = c.finished_at or c.dispatched_at or 0.0
         if any(
@@ -5871,7 +5873,7 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             (
                 r.review_verdict
                 for r in board.active + board.completed
-                if review_covers(r, c.assignment_id)
+                if review_covers(r, c.assignment_id, board=board)
                 and r.review_verdict is not None
             ),
             None,
@@ -7122,7 +7124,9 @@ def newest_leg_already_reviewed(
     return any(
         a.assignment_id != prior_review.assignment_id
         and (a.dispatched_at or 0) > (prior_review.dispatched_at or 0)
-        and review_covers(a, newest.assignment_id, include_dead=False)
+        and review_covers(
+            a, newest.assignment_id, include_dead=False, board=board,
+        )
         for a in list(board.active) + list(board.completed)
     )
 

@@ -1334,3 +1334,235 @@ def test_has_active_followup_sees_an_in_flight_scoped_review() -> None:
     ])
     assert has_active_followup(board, of_assignment_id="w", assignment_type="review")
     assert not has_active_followup(board, of_assignment_id="w", assignment_type="smoke")
+
+
+# ── #4111: a review can never cover a leg dispatched after it finished ──────
+
+
+def test_review_covers_rejects_leg_dispatched_after_review_finished() -> None:
+    """Belt-and-braces guard: even when `review_scoped_work_id` names a leg,
+    a review that already finished before that leg was even dispatched does
+    not cover it — whatever the (mis-stamped) field claims."""
+    from coord.claim import review_covers
+
+    leg_b = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        assignment_id="leg-b", status="done", type="work",
+        dispatched_at=200.0, finished_at=250.0,
+    )
+    review = _rev(
+        review_of_assignment_id="leg-a",
+        review_scoped_work_id="leg-b",
+        status="done",
+        finished_at=100.0,  # finished BEFORE leg_b was even dispatched
+    )
+    board = Board(active=[], completed=[leg_b, review])
+
+    # Without a board the plain id match still reports "covers" — every
+    # existing caller that has no board handy keeps its old behaviour.
+    assert review_covers(review, "leg-b")
+    # With the board, the timestamp mismatch is caught.
+    assert not review_covers(review, "leg-b", board=board)
+
+
+def test_review_covers_accepts_leg_dispatched_before_review_finished() -> None:
+    """The guard must not reject the ordinary, correct shape: a review that
+    finished AFTER the leg it names was dispatched genuinely covers it."""
+    from coord.claim import review_covers
+
+    leg_b = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        assignment_id="leg-b", status="done", type="work",
+        dispatched_at=100.0, finished_at=150.0,
+    )
+    review = _rev(
+        review_of_assignment_id="leg-a",
+        review_scoped_work_id="leg-b",
+        status="done",
+        finished_at=200.0,  # finished AFTER leg_b was dispatched
+    )
+    board = Board(active=[], completed=[leg_b, review])
+
+    assert review_covers(review, "leg-b", board=board)
+
+
+def test_has_active_followup_rejects_leg_dispatched_after_review_finished() -> None:
+    """#4111 regression: review R reviews leg A and requests changes; fix
+    leg B is dispatched (and finishes) after R's finish time. `R` naming `B`
+    in `review_scoped_work_id` (the observed mis-stamp) must not make
+    `has_active_followup`/`review_covers` read as "B already reviewed"."""
+    from coord.claim import has_active_followup
+
+    leg_b = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        assignment_id="leg-b", status="done", type="work",
+        dispatched_at=200.0, finished_at=250.0,
+    )
+    review_r = _rev(
+        review_of_assignment_id="leg-a",
+        review_scoped_work_id="leg-b",
+        status="done",
+        finished_at=100.0,
+    )
+    board = Board(active=[review_r], completed=[leg_b])
+
+    assert not has_active_followup(
+        board, of_assignment_id="leg-b", assignment_type="review"
+    )
+
+
+def test_dispatch_review_dispatches_despite_stale_scoped_stamp_on_finished_review() -> None:
+    """#4111 regression, end to end: a finished review R (request-changes of
+    leg A) carries a `review_scoped_work_id` stamped onto fix leg B, which was
+    dispatched only after R finished. `coord review B` (`dispatch_review`)
+    must still dispatch a real review for B instead of refusing it as
+    "already covered by scoped review"."""
+    from coord.config import Config, ReviewsConfig
+    from coord.models import Machine, Repo
+    from coord.review import dispatch_review
+
+    repo = Repo(name="api", github="acme/api", depends_on=[], default_branch="main")
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            Machine(name="laptop", host="laptop.tail", repos=["api"],
+                    repo_paths={"api": "/w"}, capabilities=[]),
+            Machine(name="server", host="server.tail", repos=["api"],
+                    repo_paths={"api": "/s"}, capabilities=[]),
+        ],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    leg_a = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=16,
+        issue_title="X", status="done", branch="issue-16-fix-1",
+        assignment_id="leg-a", type="work",
+        dispatched_at=0.0, finished_at=50.0,
+    )
+    review_r = _active(
+        issue=16, type_="review", review_of="leg-a", aid="review-r",
+    )
+    review_r.status = "done"
+    review_r.finished_at = 100.0
+    review_r.review_verdict = "request-changes"
+    # The observed #4111 mis-stamp: names leg B, which doesn't exist (and
+    # isn't dispatched) until 100 seconds AFTER review_r already finished.
+    review_r.review_scoped_work_id = "leg-b"
+
+    leg_b = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=16,
+        issue_title="X", status="done", branch="issue-16-fix",
+        assignment_id="leg-b", type="work",
+        dispatched_at=200.0, finished_at=250.0,
+    )
+    board = Board(active=[], completed=[leg_a, review_r, leg_b])
+
+    class _Response:
+        status_code = 202
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"id": "review-s"}
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def post(self, url, *, json, timeout):
+            self.calls.append((url, json))
+            return _Response()
+
+    client = _Client()
+    result = dispatch_review(
+        leg_b, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 1, "url": "u", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+    assert result is not None, leg_b.review_dispatch_reason
+    assert result.assignment_id == "review-s"
+    assert result.type == "review"
+    assert len(client.calls) == 1
+
+
+def test_whole_board_upsert_never_attaches_review_scoped_work_id_across_rows(
+    coord_db,
+) -> None:
+    """#4111: `save_board()`'s `COALESCE(excluded.review_scoped_work_id,
+    assignments.review_scoped_work_id)` must only ever fill in a value for
+    the exact row it was written for (keyed by `assignment_id`) — a later
+    whole-board snapshot that also carries a DIFFERENT, newly-dispatched
+    scoped review must never stamp that scoped review's leg onto an
+    earlier, unrelated review row still sitting at `review_scoped_work_id
+    =NULL`."""
+    from coord.state import build_board, save_board
+
+    review_r = _active(
+        issue=16, type_="review", review_of="leg-a", aid="review-r",
+    )
+    review_r.status = "done"
+    review_r.finished_at = 100.0
+    review_r.review_verdict = "request-changes"
+    assert review_r.review_scoped_work_id is None
+
+    # First save: only review_r exists, with no scoped leg.
+    save_board(Board(active=[], completed=[review_r]))
+
+    # A later pass dispatches a genuinely NEW scoped review for leg-b,
+    # under its own, distinct assignment_id, and saves the whole board
+    # again — review_r's in-memory object is unchanged (still carries
+    # review_scoped_work_id=None).
+    review_s = _active(
+        issue=16, type_="review", review_of="leg-a", aid="review-s",
+    )
+    review_s.review_scoped_work_id = "leg-b"
+    save_board(Board(active=[review_s], completed=[review_r]))
+
+    board = build_board()
+    stored_r = board.find_by_id("review-r")
+    stored_s = board.find_by_id("review-s")
+    assert stored_r is not None and stored_s is not None
+    assert stored_r.review_scoped_work_id is None
+    assert stored_s.review_scoped_work_id == "leg-b"
+
+
+def test_superseded_review_gap_catches_mis_stamped_scoped_review() -> None:
+    """#4111 acceptance: `coord diagnose --stage review` (no `--reset`) must
+    report this shape as unhealthy rather than healthy. It reads through
+    `coord.review.superseded_review_gap`, which itself goes through
+    `review_covers` — the same belt-and-braces guard this module's own
+    `review_covers` tests exercise directly."""
+    from coord.review import superseded_review_gap
+
+    leg_a = Assignment(
+        machine_name="m", repo_name="api", issue_number=16, issue_title="t",
+        assignment_id="leg-a", status="done", type="work",
+        dispatched_at=0.0, finished_at=50.0,
+    )
+    review_r = Assignment(
+        machine_name="m", repo_name="api", issue_number=16, issue_title="t",
+        assignment_id="review-r", status="done", type="review",
+        review_of_assignment_id="leg-a", review_verdict="request-changes",
+        dispatched_at=90.0, finished_at=100.0,
+        # The observed mis-stamp: names leg-b, dispatched only below, AFTER
+        # review-r already finished.
+        review_scoped_work_id="leg-b",
+    )
+    leg_b = Assignment(
+        machine_name="m", repo_name="api", issue_number=16, issue_title="t",
+        assignment_id="leg-b", status="done", type="work",
+        dispatched_at=200.0, finished_at=250.0,
+    )
+    board = Board(active=[], completed=[leg_a, review_r, leg_b])
+
+    gap = superseded_review_gap(board, "api", 16)
+    assert gap is not None
+    newest, latest = gap
+    assert newest.assignment_id == "leg-b"
+    assert latest.assignment_id == "review-r"

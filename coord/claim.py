@@ -246,7 +246,13 @@ def adopt_remote_branch_claim(
 _DEAD_REVIEW_STATUSES = frozenset({"failed", "cancelled", "stopped"})
 
 
-def review_covers(a, work_id: str | None, *, include_dead: bool = True) -> bool:
+def review_covers(
+    a,
+    work_id: str | None,
+    *,
+    include_dead: bool = True,
+    board: Board | None = None,
+) -> bool:
     """True when *a* is a review of work leg *work_id*.
 
     A full review names the leg in ``review_of_assignment_id``. A scoped
@@ -257,14 +263,39 @@ def review_covers(a, work_id: str | None, *, include_dead: bool = True) -> bool:
     With ``include_dead=False`` a review that died (``failed``/
     ``cancelled``/``stopped``) covers nothing, which is what a dedupe check
     wants: the leg may be reviewed again.
+
+    #4111 belt-and-braces guard: a review can never cover a leg dispatched
+    *after* the review itself finished — no matter what either id field
+    claims. ``review_scoped_work_id`` is meant to be stamped once, at the
+    dispatch time of the scoped review that actually covers that leg, but a
+    mis-attributed write (a stale board snapshot's whole-board upsert
+    COALESCE-filling a NULL on an older, already-terminal review row) can
+    leave a finished review naming a leg that didn't exist yet when it
+    finished. Passing *board* lets this be caught here, in the one function
+    every caller agrees on, rather than re-derived ad hoc at each call site.
+    Omit *board* (or leave the leg/timestamps unresolvable) to fall back to
+    the plain id match — every existing caller that doesn't have a board
+    handy keeps its old behaviour.
     """
     if not work_id or getattr(a, "type", None) != "review":
         return False
     if not include_dead and getattr(a, "status", None) in _DEAD_REVIEW_STATUSES:
         return False
-    return work_id in (
+    if work_id not in (
         a.review_of_assignment_id, getattr(a, "review_scoped_work_id", None),
-    )
+    ):
+        return False
+    if board is not None:
+        leg = board.find_by_id(work_id)
+        finished_at = getattr(a, "finished_at", None)
+        if (
+            leg is not None
+            and leg.dispatched_at is not None
+            and finished_at is not None
+            and leg.dispatched_at > finished_at
+        ):
+            return False
+    return True
 
 
 def has_active_followup(
@@ -289,7 +320,7 @@ def has_active_followup(
         if a.review_of_assignment_id == of_assignment_id:
             return True
         if assignment_type == "review" and review_covers(
-            a, of_assignment_id, include_dead=False,
+            a, of_assignment_id, include_dead=False, board=board,
         ):
             return True
     return False
