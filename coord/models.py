@@ -159,13 +159,41 @@ class BoardDoctorRepoConfig:
     of spending a full fix round, review and test fan-out on it. `False`
     (the default) leaves every Test-stage failure on this repo going
     through today's ordinary fix-round path regardless of the triage
-    verdict. Unlike `investigate`/`finish` above, there is deliberately no
-    paired fleet-wide `Config.board_doctor.mechanic` switch yet — see
-    `coord.board_doctor_policy._mechanic_tier_enabled`'s own docstring for
-    why (no production caller exists to arm one against).
-    `coord.board_doctor_policy._mechanic_tier_enabled` is the single
-    function that reads this alongside its
+    verdict. There is deliberately no paired fleet-wide
+    `Config.board_doctor.mechanic` switch: the fleet-wide ``triage`` switch
+    below already gates whether the classifier runs at ALL, upstream of
+    this field's own per-repo opt-in, so a repo opted into ``mechanic``
+    still never reaches the mechanic leg while ``triage`` is off fleet-wide
+    or for that repo. `coord.board_doctor_policy._mechanic_tier_enabled` is
+    the single function that reads this alongside its
     `COORD_BOARD_DOCTOR_NO_MECHANIC` env-var override.
+
+    ``triage`` (#4100) is this repo's opt-in to #4093's triage-first
+    routing ACROSS every edge it reaches — the Test-stage retry/route
+    table (`coord.drive.MergeVerifier.triage_test_failure`), the CI-red
+    merge-gate route (`coord.ci_fix.triage_ci_failure`) and the
+    merge-conflict route (`coord.ci_fix.triage_conflict_failure`). `False`
+    (the default) means NONE of those call sites ever invoke
+    `coord.failure_triage.triage_failure` for this repo — every edge
+    behaves exactly as it did before #4093 existed, including #3714's
+    Test-stage retry firing unconditionally rather than consulting a
+    bucket. `coord.board_doctor_policy._triage_tier_enabled` is the single
+    function every one of those call sites reads this alongside the
+    fleet-wide kill switch (`Config.board_doctor.triage`) and its
+    `COORD_BOARD_DOCTOR_NO_TRIAGE` env-var override through — never a
+    second, independently-gated copy of the same decision (#2096).
+
+    ``mechanic_leg_cap`` (#4100) is this repo's OWN budget for mechanic
+    legs running *concurrently* — distinct from the #4094 one-per-SHA
+    budget (which blocks a second attempt at the SAME failure) and from
+    the shared `max_parallel`-keyed capacity cap
+    (`coord.board_doctor_policy._at_repo_capacity`) the investigate/
+    finisher tiers also draw from. Default ``1``, mirroring
+    :data:`coord.board_doctor_policy.FIXIT_LEG_BUDGET_DEFAULT`'s own
+    posture: a bounded, pre-review fixer dispatched autonomously is not
+    ordinary throughput and should not scale with the repo's normal
+    concurrency. `coord.board_doctor_policy._at_mechanic_leg_capacity`
+    reads this.
     """
 
     investigate: bool = False
@@ -177,6 +205,8 @@ class BoardDoctorRepoConfig:
     auto_split: bool = False
     config_drift_autofix: bool = False
     mechanic: bool = False
+    triage: bool = False
+    mechanic_leg_cap: int = 1
 
 
 @dataclass

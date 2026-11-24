@@ -1729,6 +1729,18 @@ class BoardDoctorConfig:
     repo must still opt in via ``repos[].board_doctor.
     config_drift_autofix`` (``BoardDoctorRepoConfig.config_drift_autofix``,
     default ``False``).
+
+    ``triage`` (#4100) is the fleet-wide kill switch for #4093's
+    triage-first routing — every edge it reaches (the Test-stage retry/
+    route table, the CI-red merge-gate route, the merge-conflict route)
+    — mirroring ``auto_refile``/``auto_split``/``config_drift_autofix``
+    exactly: a repo must still opt in via ``repos[].board_doctor.triage``
+    (``BoardDoctorRepoConfig.triage``, default ``False``), so the system
+    ships OFF everywhere until BOTH this fleet switch and a repo's own
+    opt-in are true. Read fresh on every call
+    (``coord.board_doctor_policy._triage_tier_enabled``, never cached), so
+    flipping it here takes effect on the very next tick/poll — no daemon
+    or ``coord drive`` restart needed.
     """
 
     investigate: bool = True
@@ -1745,6 +1757,7 @@ class BoardDoctorConfig:
     auto_refile: bool = True
     auto_split: bool = True
     config_drift_autofix: bool = True
+    triage: bool = True
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3852,6 +3865,11 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         if not isinstance(config_drift_autofix, bool):
             raise ConfigError("board_doctor.config_drift_autofix must be a boolean")
         cfg.config_drift_autofix = config_drift_autofix
+    if "triage" in raw:
+        triage = raw["triage"]
+        if not isinstance(triage, bool):
+            raise ConfigError("board_doctor.triage must be a boolean")
+        cfg.triage = triage
     return cfg
 
 
@@ -4361,6 +4379,25 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 f"repos[{repo_index}].board_doctor.mechanic must be a boolean"
             )
         cfg.mechanic = mechanic
+    if "triage" in raw:
+        triage = raw["triage"]
+        if not isinstance(triage, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.triage must be a boolean"
+            )
+        cfg.triage = triage
+    if "mechanic_leg_cap" in raw:
+        mechanic_leg_cap = raw["mechanic_leg_cap"]
+        if (
+            isinstance(mechanic_leg_cap, bool)
+            or not isinstance(mechanic_leg_cap, int)
+            or mechanic_leg_cap < 1
+        ):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.mechanic_leg_cap must be "
+                "a positive integer"
+            )
+        cfg.mechanic_leg_cap = mechanic_leg_cap
     return cfg
 
 

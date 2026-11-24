@@ -464,6 +464,7 @@ def _dispatch_conflict_fixes(
         return
 
     from coord.audit import record_audit  # noqa: PLC0415
+    from coord.board_doctor_policy import _triage_tier_enabled  # noqa: PLC0415
     from coord.ci_fix import (  # noqa: PLC0415
         dispatch_mechanic_leg_for_conflict,
         triage_conflict_failure,
@@ -547,7 +548,15 @@ def _dispatch_conflict_fixes(
             # recognizes, so this ordinarily declines and falls straight
             # through to the unchanged retry-cap/dispatch logic below —
             # never a worse outcome than before this existed.
-            conflict_verdict = triage_conflict_failure(ev.entry)
+            # #4100: skip the triage pass entirely when this entry's repo
+            # has not opted into triage-first routing (or the fleet kill
+            # switch is off) — the one gate every triage-first edge reads
+            # before ever calling the classifier.
+            conflict_verdict = (
+                triage_conflict_failure(ev.entry)
+                if _triage_tier_enabled(ev.entry.repo_name, config)
+                else None
+            )
             if conflict_verdict is not None and conflict_verdict.bucket == BUCKET_MECHANICAL:
                 mech_fix = dispatch_mechanic_leg_for_conflict(
                     ev.entry, fix_board, config, conflict_verdict,

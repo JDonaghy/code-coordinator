@@ -81,6 +81,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from coord import github_ops
+from coord.board_doctor_policy import _triage_tier_enabled
 from coord.ci_store import CIFailureDetail
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
@@ -1129,8 +1130,18 @@ def dispatch_ci_fix(
     # pre-#4097 caller/test that never passes `detail`. `triage_ci_failure`
     # would return `None` for this input regardless; this just avoids
     # paying for its inputs when the answer is already known.
+    # #4100: also skip when the entry's own repo has not opted into
+    # triage-first routing (or the fleet kill switch is off) — the one
+    # gate every triage-first edge reads before ever calling the
+    # classifier (`coord.board_doctor_policy._triage_tier_enabled`), read
+    # fresh here on every call since *config* is passed in fresh by the
+    # caller each tick.
     verdict: TriageVerdict | None = None
-    if detail is not None and (detail.log_excerpt or "").strip():
+    if (
+        detail is not None
+        and (detail.log_excerpt or "").strip()
+        and _triage_tier_enabled(entry.repo_name, config)
+    ):
         from coord.overlap_predict import parse_declared_files  # noqa: PLC0415
 
         verdict = triage_ci_failure(

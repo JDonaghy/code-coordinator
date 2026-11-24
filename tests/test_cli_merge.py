@@ -4217,7 +4217,10 @@ class TestDispatchConflictFixesMechanicalTriage:
         return Config(
             repos=[Repo(
                 name="api", github="acme/api",
-                board_doctor=BoardDoctorRepoConfig(mechanic=True),
+                # #4100: `triage` must also be armed — it gates whether
+                # `triage_conflict_failure` runs at all, upstream of
+                # `mechanic`'s own per-repo opt-in.
+                board_doctor=BoardDoctorRepoConfig(mechanic=True, triage=True),
             )],
             machines=[],
         )
@@ -4309,6 +4312,60 @@ class TestDispatchConflictFixesMechanicalTriage:
         ):
             merge_cmd._dispatch_conflict_fixes(
                 events, self._config(), dry_run=False, gh_ops=gh,
+            )
+
+        mech_dispatch.assert_not_called()
+        conflict_dispatch.assert_called_once()
+        assert entry.state == mq.CONFLICT
+
+    def test_triage_off_by_default_never_classifies(
+        self, coord_dir: Path,
+    ) -> None:
+        """#4100: a repo that opted into `mechanic` but NOT `triage` (the
+        default for a brand-new repo) must never reach the classifier at
+        all — a mechanical-looking error still routes through the
+        unchanged conflict-fix worker, exactly as before #4097."""
+        from coord.commands import merge as merge_cmd
+        from coord.config import Config
+        from coord.models import Board, BoardDoctorRepoConfig, IssueResolution, Repo
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry(error=(
+            "merge conflict: ratchet check failed — coverage ratchet: "
+            "may only shrink, never grow"
+        ))
+        ev = mq.MergeEvent(
+            entry, "conflict", "became CONFLICTING",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+        config = Config(
+            repos=[Repo(
+                name="api", github="acme/api",
+                board_doctor=BoardDoctorRepoConfig(mechanic=True),
+            )],
+            machines=[],
+        )
+        assert config.repo("api").board_doctor.triage is False
+
+        with (
+            patch.object(mq, "conflict_base_move_is_inert", return_value=False),
+            patch(
+                "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage",
+            ) as mech_dispatch,
+            patch(
+                "coord.conflict_fix.dispatch_conflict_fix",
+                return_value=fake_fix,
+            ) as conflict_dispatch,
+        ):
+            merge_cmd._dispatch_conflict_fixes(
+                events, config, dry_run=False, gh_ops=gh,
             )
 
         mech_dispatch.assert_not_called()

@@ -3551,3 +3551,63 @@ def test_repo_board_doctor_mechanic_rejects_non_bool() -> None:
         ConfigError, match=r"repos\[0\].board_doctor.mechanic must be a boolean"
     ):
         _parse_board_doctor_repo_config({"mechanic": "true"}, 0)
+
+
+# ── #4100: board_doctor.triage / repos[].board_doctor.triage / ────────────
+# repos[].board_doctor.mechanic_leg_cap
+
+
+def test_board_doctor_triage_defaults_to_true() -> None:
+    """Absent `board_doctor:` -> the fleet-wide switch stays at its
+    default (`True`) — the per-repo opt-in (default `False`) is the
+    actual safety gate, same posture as `auto_refile`/`auto_split`/
+    `config_drift_autofix`."""
+    cfg = _parse_board_doctor(None)
+    assert cfg.triage is True
+
+
+def test_board_doctor_triage_parses_bool() -> None:
+    assert _parse_board_doctor({"triage": True}).triage is True
+    assert _parse_board_doctor({"triage": False}).triage is False
+
+
+def test_board_doctor_triage_rejects_non_bool() -> None:
+    with pytest.raises(ConfigError, match="board_doctor.triage must be a boolean"):
+        _parse_board_doctor({"triage": "true"})
+
+
+def test_repo_board_doctor_triage_defaults_to_false() -> None:
+    """#4100: the triage-first system ships OFF everywhere until a repo
+    explicitly opts in — same safety-by-default posture as `mechanic`."""
+    cfg = _parse_board_doctor_repo_config(None, 0)
+    assert cfg.triage is False
+
+
+def test_repo_board_doctor_triage_parses_bool() -> None:
+    assert _parse_board_doctor_repo_config({"triage": True}, 0).triage is True
+    assert _parse_board_doctor_repo_config({"triage": False}, 0).triage is False
+
+
+def test_repo_board_doctor_triage_rejects_non_bool() -> None:
+    with pytest.raises(
+        ConfigError, match=r"repos\[0\].board_doctor.triage must be a boolean"
+    ):
+        _parse_board_doctor_repo_config({"triage": "true"}, 0)
+
+
+def test_repo_board_doctor_mechanic_leg_cap_defaults_to_one() -> None:
+    cfg = _parse_board_doctor_repo_config(None, 0)
+    assert cfg.mechanic_leg_cap == 1
+
+
+def test_repo_board_doctor_mechanic_leg_cap_parses_positive_int() -> None:
+    assert _parse_board_doctor_repo_config({"mechanic_leg_cap": 3}, 0).mechanic_leg_cap == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "3"])
+def test_repo_board_doctor_mechanic_leg_cap_rejects_non_positive_int(bad) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"repos\[0\].board_doctor.mechanic_leg_cap must be a positive integer",
+    ):
+        _parse_board_doctor_repo_config({"mechanic_leg_cap": bad}, 0)
