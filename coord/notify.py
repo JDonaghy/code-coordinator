@@ -872,7 +872,7 @@ def detect_stalled_pipeline(
             # `review_scoped_work_id` until its verdict is propagated; it is
             # a review of this leg, and dispatching another would repeat it.
             and not any(
-                review_covers(a, work.assignment_id, include_dead=False)
+                review_covers(a, work.assignment_id, include_dead=False, board=board)
                 for a in all_assignments
             )
         ):

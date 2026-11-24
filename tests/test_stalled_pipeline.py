@@ -402,6 +402,28 @@ class TestDoneNoReview:
         )
         assert all(r[0].reason != "done_no_review" for r in results)
 
+    def test_flags_when_scoped_review_predates_the_leg_it_names(
+        self, config: Config
+    ) -> None:
+        """#4111: a review that finished BEFORE `work-1` was even dispatched
+        still has `review_scoped_work_id="work-1"` (a mis-attributed write
+        on an unrelated board upsert). Without the `board=` guard in
+        `review_covers`, this id match alone made the row look reviewed and
+        `done_no_review` could never fire for exactly this shape."""
+        scoped = replace(
+            _review("older-round", aid="scoped-1", finished_at=1140.0),
+            review_scoped_work_id="work-1",
+        )
+        board = _board(
+            _work("work-1", test_state="passed", dispatched_at=1200.0),
+            scoped,
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "done_no_review"
+
     def test_not_flagged_when_test_verdict_still_missing(self, config: Config) -> None:
         """No review yet is EXPECTED while the test gate hasn't cleared —
         not a stall."""
