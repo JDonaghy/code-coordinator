@@ -53,16 +53,23 @@ extract_failure_evidence` and :func:`coord.failure_triage.triage_failure`
 ``mechanical`` verdict routes to the #4094 mechanic leg via ``coord.
 board_doctor_policy.dispatch_mechanic_leg_for_triage`` — the one gated
 entry point that primitive already has, shared with the Test-stage route
-rather than re-derived. An ``infra`` verdict triggers a plain CI rerun
-(mirroring ``coord.merge_queue``'s own ``ci_infra_rerun`` remedy) instead
-of spending a worker on a failure the log itself says is the runner's
-fault, not the code's. Both decline gracefully (tier off, no capable
-machine, budget already spent, no log to triage, ...) straight through to
-the unconditional ci-fix worker dispatch below — never a worse outcome
-than before #4097. Every other verdict (``substantive``/``flaky``/
-``human``, or no verdict at all) also falls through to that worker, now
-carrying the verdict's own diagnosis in the briefing instead of a bare
+rather than re-derived. An ``infra`` verdict triggers a plain CI rerun,
+spending the SAME ``entry.ci_infra_reruns``/``MAX_CI_INFRA_RERUNS`` budget
+``coord.merge_queue``'s own ``ci_infra_rerun`` remedy spends — never a
+second, independent rerun lane — instead of spending a worker on a
+failure the log itself says is the runner's fault, not the code's. Both
+decline gracefully (tier off, no capable machine, budget already spent,
+rerun capability missing, no log to triage, ...) straight through to the
+unconditional ci-fix worker dispatch below — never a worse outcome than
+before #4097. Every other verdict (``substantive``/``flaky``/``human``, or
+no verdict at all) also falls through to that worker, now carrying the
+verdict's own diagnosis in the briefing instead of a bare
 ``checks_summary`` one-liner.
+
+:func:`triage_conflict_failure`/:func:`dispatch_mechanic_leg_for_conflict`
+extend the SAME triage-first routing to the merge-failure edge
+(``coord.commands.merge._dispatch_conflict_fixes``) for a "rebaseable"
+conflict the finisher's #3836 Trigger B did not already resolve directly.
 """
 
 from __future__ import annotations
