@@ -1,0 +1,44 @@
+=== stage 1/8: cargo fmt --all -- --check ===
+fmt: nothing to reformat
+=== stage 1/8 OK ===
+
+=== stage 2/8: cargo build --workspace ===
+   Compiling mycrate v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 3.21s
+=== stage 2/8 OK ===
+
+=== stage 3/8: cargo clippy --workspace --all-targets -- -D warnings ===
+    Checking mycrate v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 1.85s
+=== stage 3/8 OK ===
+
+=== stage 4/8: cargo test --workspace --lib ===
+running 128 tests
+.............................................................................
+.............................................................................
+test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+=== stage 4/8 OK ===
+
+=== stage 5/8: cargo test --workspace --doc ===
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+=== stage 5/8 OK ===
+
+=== stage 6/8: cargo bench --no-run ===
+   Compiling mycrate v0.1.0
+    Finished bench [optimized] target(s) in 4.02s
+=== stage 6/8 OK ===
+
+=== stage 7/8: cargo doc --workspace --no-deps ===
+    Documenting mycrate v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 1.10s
+=== stage 7/8 OK ===
+
+=== stage 8/8: cargo audit ===
+    Fetching advisory database from `https://github.com/rustsec/advisory-db.git`
+    Loaded 500 security advisories
+    Scanning Cargo.lock for vulnerabilities (42 crate dependencies)
+=== stage 8/8 OK ===
+
+RESULT: PASS

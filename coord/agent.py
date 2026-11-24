@@ -31,6 +31,7 @@ from coord import cargo_cache
 from coord.claude_setup_token import inject_setup_token
 from coord.config_reload import reload_config_if_stale
 from coord.decomposition_chat import is_size_triage_review_target
+from coord.failure_evidence import FailureEvidence, extract_failure_evidence, format_evidence_block
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
 from coord.smoke_tags import smoke_leg_capabilities
@@ -4358,6 +4359,18 @@ class AgentAssignment:
     # in the SAME `_ahead == 0` branch of `_reap`, and this one is checked
     # first — see that method.
     truncation_reason: str | None = None
+    # #4092: a plain-runner smoke leg's `coord.failure_evidence.
+    # FailureEvidence.to_dict()` — the failing stage(s), the error lines
+    # that explain them (bounded to a few KB), and boolean signals —
+    # extracted from the FULL log before `_tail_text` truncated it for
+    # display. Set for every plain-runner leg (#3673) regardless of
+    # pass/fail (a pass gets an "empty" record, never a stale leftover);
+    # `None` for every other assignment type and for a plain-runner leg
+    # that predates this field. Exposed via `/status` and persisted in the
+    # agent state JSON (#715) so a later reader — the fix briefing,
+    # `coord log`'s summary, and the sibling triage pass — can read the
+    # cause of a failure without re-opening (or re-parsing) the raw log.
+    failure_evidence: dict | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -6802,7 +6815,12 @@ def _user_message_line(text: str) -> bytes:
 PLAIN_RUNNER_LOG_TAIL_CHARS = 8000
 
 
-def _tail_text(text: str, limit: int = PLAIN_RUNNER_LOG_TAIL_CHARS) -> str:
+def _tail_text(
+    text: str,
+    limit: int = PLAIN_RUNNER_LOG_TAIL_CHARS,
+    *,
+    evidence: FailureEvidence | None = None,
+) -> str:
     """Keep the first and last portions of *text* when it exceeds *limit*.
 
     Split 1/4 head + 3/4 tail: biased toward the tail (summary markers,
@@ -6810,17 +6828,30 @@ def _tail_text(text: str, limit: int = PLAIN_RUNNER_LOG_TAIL_CHARS) -> str:
     compiler error — which is the output that matters most for a fix
     worker and is otherwise lost when later stages pile on compilation
     noise (#3715).
+
+    #4092: a multi-stage command's real failure routinely lands in the
+    OMITTED middle, not the kept head/tail — the #3715 head/tail split
+    reduces that risk but can't eliminate it. When *evidence* (extracted
+    from the FULL, pre-truncation *text* by `coord.failure_evidence.
+    extract_failure_evidence`) names a failure, its rendered block is
+    spliced in right after the head, before the tail, so the cause
+    survives this truncation even when the raw lines that explain it
+    don't make either kept slice.
     """
     if len(text) <= limit:
         return text
     head_budget = limit // 4
     tail_budget = limit - head_budget
     omitted = len(text) - limit
-    return (
-        f"{text[:head_budget]}\n"
-        f"...[truncated, {omitted} chars omitted — first {head_budget} + last {tail_budget} shown]...\n"
-        f"{text[-tail_budget:]}"
-    )
+    evidence_block = format_evidence_block(evidence) if evidence is not None else ""
+    pieces = [
+        f"{text[:head_budget]}\n",
+        f"...[truncated, {omitted} chars omitted — first {head_budget} + last {tail_budget} shown]...\n",
+    ]
+    if evidence_block:
+        pieces.append(f"{evidence_block}\n")
+    pieces.append(text[-tail_budget:])
+    return "".join(pieces)
 
 
 @dataclass(frozen=True)
@@ -6856,6 +6887,14 @@ class PlainRunnerVerdict:
     #: case, not anything that requires judging whether output "looks like"
     #: a real failure.
     harness_crash: bool = False
+    #: #4092: the structured record `coord.failure_evidence.
+    #: extract_failure_evidence` pulled from the FULL combined stdout+
+    #: stderr — before `log_tail` truncated it. Set on every outcome
+    #: (including a clean pass, where it is simply empty — see
+    #: `FailureEvidence.is_empty`) rather than only on failure, so a caller
+    #: never has to treat `None` here as ambiguous between "not extracted"
+    #: and "extracted, found nothing".
+    failure_evidence: FailureEvidence | None = None
 
 
 def run_plain_runner_command(
@@ -6907,15 +6946,20 @@ def run_plain_runner_command(
         )
     except subprocess.TimeoutExpired as exc:
         combined = (exc.stdout or "") + (exc.stderr or "")
-        tail = _tail_text(
+        text = (
             f"timed out after {timeout:.0f}s\n{combined}" if combined else f"timed out after {timeout:.0f}s"
         )
-        return PlainRunnerVerdict(passed=False, exit_code=-1, log_tail=tail)
+        evidence = extract_failure_evidence(text)
+        tail = _tail_text(text, evidence=evidence)
+        return PlainRunnerVerdict(passed=False, exit_code=-1, log_tail=tail, failure_evidence=evidence)
 
     combined = (result.stdout or "") + (result.stderr or "")
-    tail = _tail_text(combined)
+    # #4092: extract from the FULL `combined` text, before `_tail_text` has
+    # a chance to drop the very lines that explain a multi-stage failure.
+    evidence = extract_failure_evidence(combined)
+    tail = _tail_text(combined, evidence=evidence)
     if result.returncode == 0:
-        return PlainRunnerVerdict(passed=True, exit_code=0, log_tail=tail)
+        return PlainRunnerVerdict(passed=True, exit_code=0, log_tail=tail, failure_evidence=evidence)
     baseline_red = (
         result.returncode == RUNNER_BASELINE_RED_EXIT
         and BASELINE_RED_OUTPUT_MARKER in combined
@@ -6924,6 +6968,7 @@ def run_plain_runner_command(
     return PlainRunnerVerdict(
         passed=False, exit_code=result.returncode, log_tail=tail,
         baseline_red=baseline_red, harness_crash=harness_crash,
+        failure_evidence=evidence,
     )
 
 
@@ -11080,6 +11125,12 @@ class AgentServer:
             assignment.status = DONE
             assignment.exit_code = verdict.exit_code
             assignment.finished_at = time.time()
+            # #4092: persist on the smoke assignment row so a later reader
+            # (the fix briefing, `coord log`'s summary, the sibling triage
+            # pass) can read the extracted cause without re-opening the log.
+            assignment.failure_evidence = (
+                verdict.failure_evidence.to_dict() if verdict.failure_evidence is not None else None
+            )
         self._persist()
 
     def _spawn_plain_runner_failure_summary(

@@ -1,0 +1,20 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.4, pytest-8.1.1, pluggy-1.4.0
+rootdir: /home/worker/repo
+collected 42 items
+
+tests/test_widgets.py ..................F.......................        [100%]
+
+=================================== FAILURES ====================================
+____________________________ test_widget_resize ________________________________
+
+    def test_widget_resize():
+        widget = Widget()
+        widget.resize(80)
+>       assert widget.width == 100
+E       assert 80 == 100
+
+tests/test_widgets.py:55: AssertionError
+=========================== short test summary info =============================
+FAILED tests/test_widgets.py::test_widget_resize - assert 80 == 100
+========================= 1 failed, 41 passed in 1.23s ===========================
