@@ -17,6 +17,10 @@ running 128 tests
 .............................................................................
 .............................................................................
 test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 === stage 4/8 OK ===
 
 === stage 5/8: cargo test --workspace --doc ===
@@ -24,6 +28,19 @@ running 4 tests
 ....
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
 === stage 5/8 OK ===
+
+=== stage 9/9: python -m pytest -q --tb=short ===
+============================= test session starts ==============================
+platform linux -- Python 3.12.4, pytest-8.1.1, pluggy-1.4.0
+rootdir: /home/worker/repo
+collected 60 items
+
+tests/test_things.py ..................s...........................s...  [100%]
+
+=========================== short test summary info =============================
+SKIPPED [2] tests/test_things.py:12: only fires off macOS
+======================== 58 passed, 2 skipped in 0.77s ===========================
+=== stage 9/9 OK ===
 
 === stage 6/8: cargo bench --no-run ===
    Compiling mycrate v0.1.0
