@@ -3913,6 +3913,100 @@ def test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file(
     assert matching, caplog.text
 
 
+def test_dispatch_review_refetches_diff_when_pr_head_lags_a_hand_push(
+    two_machine_config: Config,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#4106 regression: a drive resumed on an existing PR after an operator
+    hand-pushed commits the board never recorded a work row for. The work
+    row's branch is still at `X`; the branch (and PR) now actually sits at
+    `Y`. `gh pr diff` (`diff_fetcher`) still reflects the PR object's
+    last-computed diff, pinned to `X` — and crucially, `X` and `Y` touch the
+    SAME file, so the #3196 file-list cross-check (which only compares
+    *names*) sees no mismatch and would otherwise keep the stale text. The
+    SHA cross-check must catch what the file-list one can't: `pr_head_sha_
+    fetcher` (standing in for the PR object's own recorded head) returns
+    `X`, `branch_sha_fetcher` (the branch's LIVE head) returns `Y` — the
+    mismatch must discard `pr_diff` and refetch a direct compare against the
+    live branch, and the dispatched review's own `review_head_sha` must be
+    `Y`, never `X`."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "hand-push-review-1"})
+
+    stale_diff_at_x = (
+        "diff --git a/converter.py b/converter.py\n"
+        "--- a/converter.py\n"
+        "+++ b/converter.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "+def convert_old():\n"
+        "+    return call_old_api()\n"
+    )
+    live_diff_at_y = (
+        "diff --git a/converter.py b/converter.py\n"
+        "--- a/converter.py\n"
+        "+++ b/converter.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def convert_new():\n"
+        "+    return call_new_api()\n"
+    )
+
+    compare_calls: list[tuple] = []
+
+    def _compare_files(repo_github: str, base: str, head: str) -> list[str]:
+        compare_calls.append((repo_github, base, head))
+        # Same file names at X and at Y — the #3196 file-list check alone
+        # would see no mismatch and never fire.
+        return ["converter.py"]
+
+    def _compare_diff(repo_github: str, base: str, head: str) -> str:
+        compare_calls.append((repo_github, base, head))
+        return live_diff_at_y
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 44, "url": "https://github.com/acme/api/pull/44", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "sha-y-live-head",
+        pr_head_sha_fetcher=lambda repo, number: "sha-x-stale-pr-head",
+        diff_fetcher=lambda repo, num, **kw: stale_diff_at_x,
+        compare_files_fetcher=_compare_files,
+        compare_diff_fetcher=_compare_diff,
+    )
+
+    assert result is not None
+    assert client.calls, "expected a dispatch POST"
+    _, payload = client.calls[0]
+    briefing = payload["briefing"]
+
+    # The reviewer is briefed on the live head's content, never the stale
+    # PR-object diff.
+    assert "convert_new" in briefing
+    assert "convert_old" not in briefing
+
+    # The approval binding (review_head_sha, used for the patch-id check at
+    # merge time) is the reviewed commit — the live head, Y — never the
+    # PR object's stale recorded head, X.
+    assert result.review_head_sha == "sha-y-live-head"
+
+    # The replacement compare ran against the branch's own current refs.
+    assert compare_calls
+    for _repo, base, head in compare_calls:
+        assert base == two_machine_config.repo("api").default_branch
+        assert head == completed.branch
+
+    matching = [
+        rec for rec in caplog.records
+        if "disagrees with branch" in rec.message
+    ]
+    assert matching, caplog.text
+
+
 def test_dispatch_review_keeps_diff_when_compare_agrees(
     two_machine_config: Config,
 ) -> None:

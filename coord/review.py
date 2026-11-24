@@ -4240,6 +4240,7 @@ def dispatch_review(
     compare_diff_fetcher=None,
     gate_a_manifest_fetcher=None,
     exempt_dependency_issue_is_closed_fetcher=None,
+    pr_head_sha_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -4330,6 +4331,15 @@ def dispatch_review(
     layer (a manifest/parse failure yields no warnings), but the dependency
     check itself is fail-CLOSED once a manifest is in hand — see
     :func:`coord.acceptance.verify_exempt_dependency`'s docstring.
+
+    *pr_head_sha_fetcher* is an optional ``(repo_github: str, pr_number: int)
+    -> str | None`` callable (#4106) that reads the PR object's own recorded
+    head commit. Defaults to :func:`coord.github_ops.get_pr_head_sha`; inject
+    a stub in tests so this cross-check never shells out to a live ``gh``.
+    Used only to decide whether ``pr_diff``'s output (fetched above into
+    ``full_diff_text``) is trustworthy — see the #4106 comment at that call
+    site for why a resumed drive on a hand-pushed branch needs this on top of
+    the existing #3196 file-list cross-check.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -4816,6 +4826,48 @@ def dispatch_review(
                 )
             except Exception:  # noqa: BLE001 — fail-safe: missing diff is not blocking
                 full_diff_text = None
+
+        # #4106: cross-check the PR object's OWN recorded head commit against
+        # the branch's live head (`review_head_sha`, already fetched above
+        # for the #821/#4002 gates) before trusting `pr_diff`'s output. A
+        # drive resumed on a PR that was hand-pushed to AFTER the work row
+        # being reviewed left the branch at an older commit hits exactly the
+        # shape the #3196 check below can't catch: the hand push rarely
+        # touches a file set the earlier commit didn't already touch, so the
+        # file-list cross-check agrees with `pr_diff` even though `pr_diff`'s
+        # content still reflects the PR object's last-computed commit, not
+        # the branch's current tip. Mirrors `coord.merge_queue.
+        # has_approved_review`'s own "re-read the live branch, never trust a
+        # recorded value" posture one stage earlier, at dispatch time rather
+        # than at merge time.
+        if full_diff_text and pr:
+            _get_pr_head_sha = pr_head_sha_fetcher or github_ops.get_pr_head_sha
+            try:
+                _pr_head_sha = _get_pr_head_sha(repo.github, pr["number"])
+            except Exception:  # noqa: BLE001 — fail-open: keep pr_diff's output
+                _pr_head_sha = None
+            if (
+                _pr_head_sha is not None
+                and review_head_sha is not None
+                and _pr_head_sha != review_head_sha
+            ):
+                log.warning(
+                    "[review] %s: PR #%s head %s disagrees with branch %r's "
+                    "live head %s (#4106 — likely a hand push after the PR "
+                    "object's diff was last computed) — discarding pr_diff "
+                    "and refetching a direct compare against the live branch",
+                    completed.assignment_id, pr["number"], _pr_head_sha,
+                    completed.branch, review_head_sha,
+                )
+                _compare_diff_stale_pr = compare_diff_fetcher or github_ops.get_compare_diff
+                try:
+                    replacement = _compare_diff_stale_pr(
+                        repo.github, base_branch, completed.branch
+                    )
+                except Exception:  # noqa: BLE001 — fail-safe: keep pr_diff on error
+                    replacement = None
+                if replacement is not None:
+                    full_diff_text = replacement
 
         # #3196: cross-check `pr_diff`'s file list against a fresh, explicit
         # compare of the branch's own current refs before trusting it. A
