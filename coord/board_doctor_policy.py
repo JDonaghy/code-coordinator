@@ -1945,9 +1945,10 @@ string) to disarm the mechanic leg fleet-wide without touching
 #: #4094's own cause string, passed through to `coord.board_doctor_
 #: permissions.sweep_dispatch_mechanic_leg` as ``cause=``. Not a
 #: `coord.board_doctor` `StuckRow.cause` — like `CAUSE_NIT_ONLY_REQUEST_
-#: CHANGES` this fires synchronously from a future Test-stage caller
-#: (wiring that caller in is explicitly out of scope here, same posture as
-#: `coord.failure_triage` itself), never from the periodic sweep.
+#: CHANGES` this fires synchronously from the Test-stage triage-first
+#: route (`coord.drive.MergeVerifier.triage_test_failure` /
+#: `coord.commands.drive`'s ``coord mechanic-dispatch``), never from the
+#: periodic sweep.
 CAUSE_TEST_TRIAGE_MECHANICAL = "test_triage_mechanical"
 
 #: #4097's own cause string for the CI-red triage-first route
@@ -1964,21 +1965,72 @@ CAUSE_CI_TRIAGE_MECHANICAL = "ci_triage_mechanical"
 CAUSE_CONFLICT_TRIAGE_MECHANICAL = "conflict_triage_mechanical"
 
 
-def _mechanic_tier_enabled(repo_name: str, config: "Config") -> bool:
-    """Decide whether a Test-stage failure's #4093 triage verdict may route
-    here (#4094).
+NO_TRIAGE_ENV_VAR = "COORD_BOARD_DOCTOR_NO_TRIAGE"
+"""Process-wide kill switch read by :func:`_triage_tier_enabled` (#4100)
+— mirrors :data:`NO_MECHANIC_ENV_VAR` and friends: set (to any truthy
+string) to disarm #4093's triage-first routing fleet-wide, across every
+edge it reaches, without touching ``coordinator.yml``."""
 
-    Two gates, mirroring :func:`_finisher_tier_enabled`'s shape with the
-    fleet-wide YAML switch omitted on purpose: unlike `finish`/`investigate`,
-    nothing in this repo dispatches `coord.failure_triage.triage_failure`'s
-    output yet (see that module's own "no production caller yet" posture),
-    so there is no live call site for a `coordinator.yml` switch to arm or
-    disarm — adding one now would be an unreachable knob (#2096: a gate
-    that can never actually be exercised one way is worse than no gate).
-    The env-var kill switch alone already covers "pause this fleet-wide
-    without an operator edit", the same emergency-brake role every sibling
-    env var plays; a `Config.board_doctor.mechanic` fleet switch can be
-    added alongside the real call site once one exists.
+
+def _triage_tier_enabled(repo_name: str, config: "Config | None") -> bool:
+    """Decide whether a failure on *repo_name* may be routed through
+    #4093's triage-first classifier AT ALL (#4100) — one level upstream of
+    :func:`_mechanic_tier_enabled`, which only governs whether an ALREADY
+    PRODUCED ``BUCKET_MECHANICAL`` verdict may dispatch a mechanic leg.
+    This is the single question "should this failure even be classified",
+    answered once here and read by every triage-first edge before it ever
+    calls `coord.failure_triage.triage_failure` — never a second,
+    independently-gated copy of the same decision (#2096):
+    `coord.drive.MergeVerifier.triage_test_failure` (the Test-stage
+    retry/route table), `coord.ci_fix.triage_ci_failure` (the CI-red
+    merge-gate route), and `coord.ci_fix.triage_conflict_failure` (the
+    merge-conflict route, via `coord.commands.merge._dispatch_conflict_
+    fixes`, whose own *config* is legitimately `None` for the one call
+    site — a real local ``git merge`` attempt — that verifies conflicts a
+    stronger way already).
+
+    Three gates, mirroring :func:`_finisher_tier_enabled`'s shape:
+
+    0. *config* of `None` — no `coordinator.yml` in scope at all — fails
+       closed to `False`, the same direction every switch below already
+       defaults to.
+    1. :data:`NO_TRIAGE_ENV_VAR` — the process-wide kill switch.
+    2. ``board_doctor.triage`` (`coord.config.BoardDoctorConfig.triage`,
+       default `True`) — the fleet-wide operator switch. Read fresh on
+       every call, never cached, so flipping it in ``coordinator.yml``
+       takes effect on the very next tick/poll with no daemon or
+       ``coord drive`` restart.
+    3. ``repos[].board_doctor.triage`` (`coord.models.
+       BoardDoctorRepoConfig.triage`, default `False`) — the per-repo
+       opt-in. A repo that has not opted in (or either switch above is
+       off) gets EXACTLY the pre-#4093 behaviour on every edge: the
+       Test-stage edge's #3714 one-shot retry fires unconditionally
+       (never consulting a bucket), the CI-red edge dispatches its worker
+       unconditionally, and the merge-failure edge's conflict-fix worker
+       dispatches unconditionally.
+    """
+    if config is None:
+        return False
+    if os.environ.get(NO_TRIAGE_ENV_VAR):
+        return False
+    if not config.board_doctor.triage:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.triage)
+
+
+def _mechanic_tier_enabled(repo_name: str, config: "Config") -> bool:
+    """Decide whether an ALREADY PRODUCED ``BUCKET_MECHANICAL`` #4093
+    triage verdict may route to the #4094 mechanic leg (#4094).
+
+    This gate is reached only once :func:`_triage_tier_enabled` has
+    already allowed the classifier to run and it returned a mechanical
+    verdict — it does not re-decide "should this repo be triaged at all",
+    only "may a mechanical verdict dispatch a mechanic leg". There is
+    deliberately no paired fleet-wide `Config.board_doctor.mechanic`
+    switch: :data:`NO_TRIAGE_ENV_VAR` / ``board_doctor.triage`` above
+    already cover the fleet-wide emergency-brake role for the whole
+    triage-first system, upstream of this one.
 
     1. :data:`NO_MECHANIC_ENV_VAR` — the process-wide kill switch.
     2. ``board_doctor.mechanic`` — the per-repo opt-in
@@ -1991,6 +2043,89 @@ def _mechanic_tier_enabled(repo_name: str, config: "Config") -> bool:
         return False
     repo = config.repo(repo_name)
     return bool(repo is not None and repo.board_doctor.mechanic)
+
+
+#: #4100: fallback mechanic-leg concurrency budget used when *repo_name*
+#: has no `coordinator.yml` entry at all (:func:`_at_mechanic_leg_capacity`
+#: reads `BoardDoctorRepoConfig.mechanic_leg_cap`, default ``1``, for every
+#: configured repo — this constant only covers the "no such repo" edge,
+#: mirroring :data:`FIXIT_LEG_BUDGET_DEFAULT`'s own posture).
+MECHANIC_LEG_BUDGET_DEFAULT = 1
+
+
+def _mechanic_leg_in_flight_count(repo_name: str, board: "Board") -> int:
+    """How many mechanic legs this doctor dispatched for *repo_name* are
+    still ``running``/``pending`` — never ordinary drive-queue, review or
+    smoke work, which must not consume this dedicated budget. Mirrors
+    :func:`_fixit_leg_in_flight_count` exactly, reading `coord.board_
+    doctor_permissions.MECHANIC_LEG_DISPATCHED_EVENT` instead of
+    ``fixit_leg_dispatched`` — the one event every confirmed mechanic-leg
+    dispatch records (`coord.board_doctor_permissions.
+    sweep_dispatch_mechanic_leg`), and the only writer of that event type.
+    """
+    from coord.audit import query_audit_log  # noqa: PLC0415
+    from coord.board_doctor_permissions import (  # noqa: PLC0415
+        MECHANIC_LEG_DISPATCHED_EVENT,
+    )
+
+    try:
+        entries = (
+            query_audit_log(
+                event_type=MECHANIC_LEG_DISPATCHED_EVENT, repo=repo_name, limit=200,
+            ).get("entries")
+            or []
+        )
+    except Exception:  # noqa: BLE001 — an unreadable audit log fails open
+        # ("nothing confirmed in flight") rather than permanently refusing
+        # every future mechanic-leg dispatch for this repo. Failing open is
+        # the expensive direction for a budget this tight (default 1), so
+        # at least make it visible rather than silently granting a fresh
+        # dispatch every call.
+        _log.warning(
+            "board-doctor: could not read %s audit log for %s — mechanic-leg "
+            "concurrency check fails open to 0 in-flight",
+            MECHANIC_LEG_DISPATCHED_EVENT,
+            repo_name,
+            exc_info=True,
+        )
+        return 0
+    dispatched_ids = {e.get("assignment_id") for e in entries if e.get("assignment_id")}
+    if not dispatched_ids:
+        return 0
+    return sum(
+        1
+        for assignment in board.active
+        if assignment.repo_name == repo_name
+        and assignment.assignment_id in dispatched_ids
+        and assignment.status in ("running", "pending")
+    )
+
+
+def _at_mechanic_leg_capacity(
+    repo_name: str, config: "Config", board: "Board", *, claimed: int = 0,
+) -> bool:
+    """Is *repo_name* at or over its OWN per-repo mechanic-leg concurrency
+    cap (#4100)?
+
+    Distinct from :func:`_at_repo_capacity` (shared `max_parallel`-keyed
+    cap, also drawn on by the investigate/finisher tiers) and from
+    :func:`_mechanic_leg_already_attempted_at_sha` in `coord.board_doctor_
+    permissions` (the #4094 one-per-SHA budget, which blocks a SECOND
+    attempt at the SAME failure rather than bounding how many DIFFERENT
+    mechanic legs run at once). *claimed* mirrors :func:`_at_repo_capacity`'s
+    own parameter — the caller's own additional in-flight count not yet
+    reflected in *board*.
+    """
+    repo = config.repo(repo_name)
+    cap = (
+        repo.board_doctor.mechanic_leg_cap
+        if repo is not None
+        else MECHANIC_LEG_BUDGET_DEFAULT
+    )
+    if cap <= 0:
+        return False
+    in_flight = _mechanic_leg_in_flight_count(repo_name, board) + claimed
+    return in_flight >= cap
 
 
 def dispatch_mechanic_leg_for_triage(
@@ -2034,17 +2169,29 @@ def dispatch_mechanic_leg_for_triage(
     sweep_dispatch_mechanic_leg` (via :data:`_MECHANIC_ACTION`) actually
     confirms ``dispatched=True`` — never from the mere absence of an
     exception (#2096). The caller must fall through to its own existing
-    behaviour on ``False``, for any reason: the tier is off, the repo
-    hasn't opted in, *verdict* isn't ``BUCKET_MECHANICAL``, the repo is
-    already at its per-repo capacity cap (:func:`_at_repo_capacity`,
-    shared with the finisher tier), a mechanic/fix-it/finisher leg or
-    drive-session is already in flight, the #4094 one-per-SHA budget is
-    already spent at *branch_sha*, no machine declares the verdict's
-    ``repro_capability``, or the dispatch itself declined.
+    behaviour on ``False``, for any reason: #4100's triage-first tier is
+    off (:func:`_triage_tier_enabled`), the mechanic tier itself is off,
+    the repo hasn't opted in, *verdict* isn't ``BUCKET_MECHANICAL``, the
+    repo is already at its per-repo capacity cap (:func:`_at_repo_capacity`,
+    shared with the finisher tier), the repo is already at its OWN
+    mechanic-leg concurrency cap (:func:`_at_mechanic_leg_capacity`,
+    #4100), a mechanic/fix-it/finisher leg or drive-session is already in
+    flight, the #4094 one-per-SHA budget is already spent at *branch_sha*,
+    no machine declares the verdict's ``repro_capability``, or the
+    dispatch itself declined.
+
+    The :func:`_triage_tier_enabled` check here is a second, independent
+    confirmation of the SAME question every caller already asked before
+    ever producing *verdict* in the first place (#4100) — never a looser
+    one: a future caller that forgot its own upstream gate still cannot
+    reach a mechanic-leg dispatch through this, the one and only entry
+    point every edge shares.
     """
     from coord.failure_triage import BUCKET_MECHANICAL  # noqa: PLC0415
 
     if getattr(verdict, "bucket", None) != BUCKET_MECHANICAL:
+        return False
+    if not _triage_tier_enabled(repo_name, config):
         return False
     if not _mechanic_tier_enabled(repo_name, config):
         return False
@@ -2056,6 +2203,17 @@ def dispatch_mechanic_leg_for_triage(
             f"{repo_name}#{issue_number} — the repo is already at its "
             "per-repo capacity cap (_at_repo_capacity, #3837); falling back "
             "to an ordinary fix round instead",
+            err=True,
+        )
+        return False
+    if _at_mechanic_leg_capacity(repo_name, config, board):
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor NOT dispatching a mechanic leg for "
+            f"{repo_name}#{issue_number} — the repo is already at its own "
+            "mechanic-leg concurrency cap (_at_mechanic_leg_capacity, "
+            "#4100); falling back to an ordinary fix round instead",
             err=True,
         )
         return False

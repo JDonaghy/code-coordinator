@@ -601,11 +601,15 @@ class TestDispatchMechanicLegForTriage:
     `dispatch_nit_only_finisher`'s own shape exactly."""
 
     @staticmethod
-    def _config(*, mechanic: bool) -> Config:
+    def _config(*, mechanic: bool, triage: bool = True) -> Config:
+        # #4100: `triage` defaults to armed so every pre-#4100 test below
+        # keeps exercising exactly the `mechanic`-tier question it always
+        # asked — `_triage_tier_enabled` only matters to the tests that
+        # pass it explicitly.
         return Config(
             repos=[Repo(
                 name="acme/widgets", github="acme/widgets",
-                board_doctor=BoardDoctorRepoConfig(mechanic=mechanic),
+                board_doctor=BoardDoctorRepoConfig(mechanic=mechanic, triage=triage),
             )],
             machines=[],
         )
@@ -666,6 +670,56 @@ class TestDispatchMechanicLegForTriage:
 
         result = board_doctor_policy.dispatch_mechanic_leg_for_triage(
             "acme/widgets", 40, Board(), config,
+            verdict=_verdict(), branch_sha="sha-1",
+        )
+
+        assert result is False
+
+    def test_returns_false_when_triage_tier_itself_is_off(self) -> None:
+        """#4100: the `mechanic` opt-in alone is not enough — the broader
+        `triage` switch (one level upstream, gating whether a failure is
+        ever classified at all) must also be armed."""
+        config = self._config(mechanic=True, triage=False)
+
+        result = board_doctor_policy.dispatch_mechanic_leg_for_triage(
+            "acme/widgets", 40, Board(), config,
+            verdict=_verdict(), branch_sha="sha-1",
+        )
+
+        assert result is False
+
+    def test_triage_env_var_kill_switch_disarms_it(self, monkeypatch) -> None:
+        monkeypatch.setenv("COORD_BOARD_DOCTOR_NO_TRIAGE", "1")
+        config = self._config(mechanic=True)
+
+        result = board_doctor_policy.dispatch_mechanic_leg_for_triage(
+            "acme/widgets", 40, Board(), config,
+            verdict=_verdict(), branch_sha="sha-1",
+        )
+
+        assert result is False
+
+    def test_returns_false_at_mechanic_leg_concurrency_cap(self, monkeypatch) -> None:
+        """#4100: the repo's OWN mechanic-leg concurrency cap (default 1)
+        refuses a second dispatch while one is already running/pending —
+        distinct from `_at_repo_capacity`'s shared `max_parallel` cap."""
+        config = self._config(mechanic=True)
+        board = Board()
+        board.active.append(
+            Assignment(
+                machine_name="mac1", repo_name="acme/widgets", issue_number=99,
+                issue_title="in flight", assignment_id="mech-already-running",
+                status="running", type="work", branch="issue-99-fix",
+            )
+        )
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "_mechanic_leg_in_flight_count",
+            lambda repo_name, b: 1,
+        )
+
+        result = board_doctor_policy.dispatch_mechanic_leg_for_triage(
+            "acme/widgets", 40, board, config,
             verdict=_verdict(), branch_sha="sha-1",
         )
 

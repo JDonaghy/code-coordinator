@@ -838,6 +838,15 @@ class TestDispatchCiFixTriageMechanical:
     signal routes to the #4094 mechanic leg instead of a full ci-fix
     worker."""
 
+    @pytest.fixture(autouse=True)
+    def _triage_enabled(self, two_machine_config: Config) -> None:
+        # #4100: this class exercises the triage-first CI-red route, so
+        # `api`'s own opt-in must be armed — `two_machine_config`'s `api`
+        # repo defaults to `board_doctor.triage=False`, same as every
+        # other repo, so a test exercising the classifier must opt in
+        # explicitly rather than rely on a fixture-wide default.
+        two_machine_config.repo("api").board_doctor.triage = True
+
     def test_clippy_error_routes_to_mechanic_leg(
         self, two_machine_config: Config, coord_db,
     ) -> None:
@@ -949,6 +958,11 @@ class TestDispatchCiFixTriageMechanical:
 class TestDispatchCiFixTriageInfra:
     """A CI-red failure whose log says the runner/infrastructure itself
     failed (not the code) triggers a plain CI rerun instead of a worker."""
+
+    @pytest.fixture(autouse=True)
+    def _triage_enabled(self, two_machine_config: Config) -> None:
+        # #4100: see TestDispatchCiFixTriageMechanical's own fixture.
+        two_machine_config.repo("api").board_doctor.triage = True
 
     def test_runner_not_acquired_cancellation_routes_to_rerun(
         self, two_machine_config: Config, coord_db,
@@ -1080,6 +1094,11 @@ class TestDispatchCiFixTriageSubstantive:
     """A CI-red failure the deterministic rules can't resolve falls through
     to the ordinary ci-fix worker, now carrying the triage diagnosis."""
 
+    @pytest.fixture(autouse=True)
+    def _triage_enabled(self, two_machine_config: Config) -> None:
+        # #4100: see TestDispatchCiFixTriageMechanical's own fixture.
+        two_machine_config.repo("api").board_doctor.triage = True
+
     def test_test_assertion_dispatches_ci_fix_with_diagnosis(
         self, two_machine_config: Config, coord_db,
     ) -> None:
@@ -1112,6 +1131,89 @@ class TestDispatchCiFixTriageSubstantive:
         _, payload = client.calls[0]
         assert "## Triage diagnosis" in payload["briefing"]
         assert "model tier call failed" in payload["briefing"]
+
+
+class TestDispatchCiFixTriageGating:
+    """#4100: `api`'s `board_doctor.triage` stays at its default `False` —
+    unlike every class above, no `_triage_enabled` autouse fixture arms it
+    — so the triage-first route must never fire at all, even for a log
+    that would otherwise classify mechanical."""
+
+    def test_triage_off_by_default_falls_through_to_ordinary_worker(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        assert two_machine_config.repo("api").board_doctor.triage is False
+        board = Board()
+        board.completed.append(_work_assignment())
+        entry = _entry()
+        entry.branch_head_sha = "sha123"
+        detail = CIFailureDetail(
+            check_name="lint", job_name="lint", step_name="Run clippy",
+            log_excerpt=(
+                "error: this loop never actually loops\n"
+                "  --> src/foo.rs:10:5\n"
+                "   = note: `#[deny(clippy::never_loop)]` on by default\n"
+            ),
+        )
+        client = _FakeHTTPClient({"id": "ci-fix-no-triage"})
+
+        with (
+            patch("coord.ci_fix.github_ops.get_issue", return_value={"body": ""}),
+            patch("coord.ci_fix.github_ops.get_compare_diff", return_value="diff --git a/src/foo.rs"),
+            patch("coord.ci_fix.github_ops.diff_file_paths", return_value=["src/foo.rs"]),
+            patch(
+                "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage",
+            ) as mech_dispatch,
+        ):
+            result = dispatch_ci_fix(
+                entry, board, two_machine_config, detail=detail, http_client=client,
+            )
+
+        # Never even asked the mechanic-leg primitive the question — the
+        # classifier itself never ran.
+        mech_dispatch.assert_not_called()
+        assert result is not None
+        assert result.issue_title.startswith(CI_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert "## Triage diagnosis" not in payload["briefing"]
+
+    def test_fleet_kill_switch_overrides_a_repo_opt_in(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A repo that DID opt in still gets nothing once the fleet-wide
+        switch is off — #4100's kill switch wins over the per-repo one."""
+        two_machine_config.repo("api").board_doctor.triage = True
+        two_machine_config.board_doctor.triage = False
+        board = Board()
+        board.completed.append(_work_assignment())
+        entry = _entry()
+        entry.branch_head_sha = "sha123"
+        detail = CIFailureDetail(
+            check_name="lint", job_name="lint", step_name="Run clippy",
+            log_excerpt=(
+                "error: this loop never actually loops\n"
+                "  --> src/foo.rs:10:5\n"
+                "   = note: `#[deny(clippy::never_loop)]` on by default\n"
+            ),
+        )
+        client = _FakeHTTPClient({"id": "ci-fix-no-triage-2"})
+
+        with (
+            patch("coord.ci_fix.github_ops.get_issue", return_value={"body": ""}),
+            patch("coord.ci_fix.github_ops.get_compare_diff", return_value="diff --git a/src/foo.rs"),
+            patch("coord.ci_fix.github_ops.diff_file_paths", return_value=["src/foo.rs"]),
+            patch(
+                "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage",
+            ) as mech_dispatch,
+        ):
+            result = dispatch_ci_fix(
+                entry, board, two_machine_config, detail=detail, http_client=client,
+            )
+
+        mech_dispatch.assert_not_called()
+        assert result is not None
+        _, payload = client.calls[0]
+        assert "## Triage diagnosis" not in payload["briefing"]
 
 
 # ── CLI classification wrapper ───────────────────────────────────────────────

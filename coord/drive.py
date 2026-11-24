@@ -2343,14 +2343,26 @@ class GitMergeVerifier:
         every other optional :func:`triage_failure` input this verifier has
         no cheap way to produce; the deterministic infra/mechanical tiers
         and the model tier all degrade gracefully without them.
+
+        #4100: gated by `coord.board_doctor_policy._triage_tier_enabled`
+        on `self.config` — read fresh every call, so the SAME mid-run
+        config reload `set_config` already propagates (#3933) also governs
+        this switch with no restart. A repo that has not opted in (or the
+        fleet kill switch being off) returns ``None`` here, exactly like
+        "nothing to classify" above — `_decide_test` then falls straight
+        to #3714's unconditional one-shot retry, byte-for-byte the
+        pre-#4093 behaviour.
         """
         reason = (state.work_test_reason or "").strip()
         if not reason:
             return None
         try:
+            from coord.board_doctor_policy import _triage_tier_enabled  # noqa: PLC0415
             from coord.failure_evidence import extract_failure_evidence  # noqa: PLC0415
             from coord.failure_triage import triage_failure  # noqa: PLC0415
         except Exception:  # noqa: BLE001 — fail closed: no verdict, not a guess
+            return None
+        if not _triage_tier_enabled(state.repo, self.config):
             return None
         try:
             evidence = extract_failure_evidence(reason)

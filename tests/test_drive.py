@@ -101,6 +101,17 @@ def make_config() -> Config:
     )
 
 
+def _config_with_triage_enabled() -> Config:
+    """#4100: both switches `_triage_tier_enabled` reads armed for *REPO* —
+    the fleet-wide `board_doctor.triage` (``True`` by default, same as
+    `make_config()` already gets) and the per-repo opt-in (``False`` by
+    default, so tests exercising the REAL classifier must opt in
+    explicitly)."""
+    cfg = make_config()
+    cfg.repo(REPO).board_doctor.triage = True
+    return cfg
+
+
 def make_config_no_stall_overrides() -> Config:
     """#2649: ``make_config()`` with ``PipelineConfig.stall_thresholds``
     cleared. The generic re-nudge/monotonicity/fingerprint-clear tests below
@@ -3890,6 +3901,95 @@ def test_git_merge_verifier_triage_test_failure_blank_reason_is_none(tmp_path):
     assert verifier.triage_test_failure(s) is None
 
 
+def test_git_merge_verifier_triage_test_failure_no_config_is_none(tmp_path, monkeypatch):
+    """#4100: with no config at all (every real caller's `set_config` never
+    ran — not the live fleet's shape, but the pre-opt-in-safe default
+    regardless), the classifier must never even be called, never mind what
+    it would have returned."""
+    import coord.failure_triage as failure_triage
+
+    calls = {"n": 0}
+
+    def must_not_be_called(**_kw):
+        calls["n"] += 1
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="should never run",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.9,
+            via="model",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", must_not_be_called)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    s = state(work_test_reason="3 failed")
+    assert verifier.triage_test_failure(s) is None
+    assert calls["n"] == 0
+
+
+def test_git_merge_verifier_triage_test_failure_repo_not_opted_in_is_none(
+    tmp_path, monkeypatch
+):
+    """#4100: a config IS present and the fleet switch is armed, but THIS
+    repo's own `board_doctor.triage` opt-in is still `False` (the default)
+    — must behave exactly like "no config at all": the classifier never
+    runs."""
+    import coord.failure_triage as failure_triage
+
+    calls = {"n": 0}
+
+    def must_not_be_called(**_kw):
+        calls["n"] += 1
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="should never run",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.9,
+            via="model",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", must_not_be_called)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    cfg = make_config()
+    assert cfg.repo(REPO).board_doctor.triage is False
+    verifier.set_config(cfg)
+    s = state(work_test_reason="3 failed")
+    assert verifier.triage_test_failure(s) is None
+    assert calls["n"] == 0
+
+
+def test_git_merge_verifier_triage_test_failure_fleet_kill_switch_is_none(
+    tmp_path, monkeypatch
+):
+    """#4100: the repo opted in, but the fleet-wide `board_doctor.triage`
+    kill switch is off — must still never reach the classifier."""
+    import coord.failure_triage as failure_triage
+
+    calls = {"n": 0}
+
+    def must_not_be_called(**_kw):
+        calls["n"] += 1
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="should never run",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.9,
+            via="model",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", must_not_be_called)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    cfg = _config_with_triage_enabled()
+    cfg.board_doctor.triage = False
+    verifier.set_config(cfg)
+    s = state(work_test_reason="3 failed")
+    assert verifier.triage_test_failure(s) is None
+    assert calls["n"] == 0
+
+
 def test_git_merge_verifier_triage_test_failure_classifier_exception_is_none(
     tmp_path, monkeypatch
 ):
@@ -3903,6 +4003,7 @@ def test_git_merge_verifier_triage_test_failure_classifier_exception_is_none(
 
     monkeypatch.setattr(failure_triage, "triage_failure", boom)
     verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(_config_with_triage_enabled())
     s = state(work_test_reason="3 failed")
     assert verifier.triage_test_failure(s) is None
 
@@ -3933,6 +4034,7 @@ def test_git_merge_verifier_triage_test_failure_maps_degraded_verdict_to_none(
 
     monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
     verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(_config_with_triage_enabled())
     s = state(work_test_reason="3 failed")
     assert verifier.triage_test_failure(s) is None
 
@@ -3957,6 +4059,7 @@ def test_git_merge_verifier_triage_test_failure_returns_a_real_substantive_verdi
 
     monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
     verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(_config_with_triage_enabled())
     s = state(work_test_reason="3 failed")
     assert verifier.triage_test_failure(s).bucket == "substantive"
 
@@ -3995,6 +4098,7 @@ def test_git_merge_verifier_triage_test_failure_compile_error_guard_is_not_degra
 
     monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
     verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(_config_with_triage_enabled())
     s = state(work_test_reason="error[E0063]: missing field")
     assert verifier.triage_test_failure(s).bucket == "substantive"
 
