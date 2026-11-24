@@ -148,6 +148,13 @@ class FakeVerifier:
         # preserved byte-for-byte; the #3933 tests below pass a real
         # `EntryTruth` to exercise it.
         entry_truth: "EntryTruth | None" = None,
+        # #4093: the triage bucket this fake returns from
+        # `triage_test_failure`. `None` (the default) is "no verdict
+        # available" — every pre-#4093 test never touched this, so
+        # `_decide_test`'s retry-gate degrades to the unconditional
+        # #3714 retry and every existing assertion is preserved
+        # byte-for-byte; the #4093 tests below pass an explicit bucket.
+        triage_bucket: str | None = None,
     ) -> None:
         self._has_commits = has_commits
         self._merged = merged
@@ -155,12 +162,14 @@ class FakeVerifier:
         self._epic_snapshot = epic_snapshot
         self._github_backoff = github_backoff
         self._entry_truth = entry_truth
+        self._triage_bucket = triage_bucket
         self.commits_calls = 0
         self.merged_calls = 0
         self.head_sha_calls = 0
         self.epic_snapshot_calls = 0
         self.github_backoff_calls = 0
         self.entry_truth_calls = 0
+        self.triage_test_failure_calls = 0
         self.config = None
         self.set_config_calls = 0
 
@@ -191,6 +200,10 @@ class FakeVerifier:
     def set_config(self, config) -> None:
         self.set_config_calls += 1
         self.config = config
+
+    def triage_test_failure(self, s: IssueState) -> str | None:
+        self.triage_test_failure_calls += 1
+        return self._triage_bucket
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -3475,6 +3488,79 @@ def test_a_failed_test_retries_once_before_fix_round():
     assert counters.fix_rounds == 1
     assert "smoke_test" in fix.error_message
     assert fix.on_error == "die"
+
+
+# ── #4093: gate the #3714 retry on the triage classifier's verdict ─────────
+
+
+def test_a_flaky_triage_verdict_retries_once_before_fix_round():
+    """#4093: an explicit ``flaky`` verdict behaves exactly like the
+    no-verdict default — one retry, no fix round spent."""
+    counters = DriveCounters()
+    v = FakeVerifier(head_sha="aaa", triage_bucket="flaky")
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    retry = step(s, counters=counters, verifier=v)
+    assert retry.command[0] == "diagnose"
+    assert "--reset" in retry.command
+    assert counters.fix_rounds == 0
+    assert counters.test_retry_sha == "aaa"
+    assert v.triage_test_failure_calls == 1
+
+
+@pytest.mark.parametrize("bucket", ["mechanical", "substantive", "human"])
+def test_a_mechanical_or_substantive_triage_verdict_skips_the_retry(bucket):
+    """#4093: quadraui#2992's shape — a compile error (or any other verdict
+    that cannot change on an unmodified re-run) must not spend the #3714
+    retry; it goes straight to the fix round on the FIRST failure."""
+    counters = DriveCounters()
+    v = FakeVerifier(head_sha="aaa", triage_bucket=bucket)
+    s = done_work(work_test_state="failed", work_test_reason="error[E0063]: missing field")
+
+    fix = step(s, counters=counters, verifier=v)
+    assert fix.command == ("fix", "w1")
+    assert counters.fix_rounds == 1
+    # The one-shot latch is still recorded (at this SHA) even though no
+    # retry Action was returned — a repeat `decide()` call before the fix
+    # dispatch executes must not re-run the classifier.
+    assert counters.test_retry_sha == "aaa"
+    assert v.triage_test_failure_calls == 1
+
+
+def test_no_triage_verdict_preserves_todays_unconditional_retry():
+    """#4093: when the classifier has nothing to say (``None``), behaviour
+    is byte-for-byte the pre-#4093 #3714 retry."""
+    counters = DriveCounters()
+    v = FakeVerifier(head_sha="aaa", triage_bucket=None)
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    retry = step(s, counters=counters, verifier=v)
+    assert retry.command[0] == "diagnose"
+    assert "--reset" in retry.command
+    assert counters.fix_rounds == 0
+    assert counters.test_retry_sha == "aaa"
+    assert v.triage_test_failure_calls == 1
+
+
+def test_an_infra_triage_verdict_retries_without_spending_the_latch():
+    """#4093: an ``infra`` verdict retries like ``flaky``, but must NOT set
+    ``test_retry_sha`` — an environmental hit deserves another retest every
+    time, not a verdict charged against this SHA's one free retry."""
+    counters = DriveCounters()
+    v = FakeVerifier(head_sha="aaa", triage_bucket="infra")
+    s = done_work(work_test_state="failed", work_test_reason="usage limit reached")
+
+    retry = step(s, counters=counters, verifier=v)
+    assert retry.command[0] == "diagnose"
+    assert "--reset" in retry.command
+    assert counters.fix_rounds == 0
+    assert counters.test_retry_sha == ""
+
+    # A second failure at the SAME SHA retries AGAIN rather than proceeding
+    # to the fix round, as long as triage keeps saying infra.
+    retry_again = step(s, counters=counters, verifier=v)
+    assert retry_again.command[0] == "diagnose"
+    assert counters.fix_rounds == 0
 
 
 def test_empty_fix_round_does_not_spend_the_budget():

@@ -130,6 +130,13 @@ from coord.failure_class import (
     environmental_backoff_secs,
     plan_usage_limit_resume,
 )
+# #4093: the two buckets that qualify for #3714's one-shot pre-fix-round
+# retry — see `MergeVerifier.triage_test_failure` / `_decide_test` below.
+# Just the constants, not `triage_failure` itself: the actual classifier
+# call (a subprocess, possibly a `claude -p` model call) is lazily
+# imported inside `GitMergeVerifier.triage_test_failure`, same posture as
+# the `github_ops` imports elsewhere in this module.
+from coord.failure_triage import BUCKET_FLAKY, BUCKET_INFRA
 from coord import machine_fault
 from coord.models import (
     DELIVERABLE_ANALYSIS_LABEL,
@@ -619,10 +626,13 @@ class DriveCounters:
     # #3713: SHA for which we already gave one free empty-fix-round retry.
     # Prevents infinite undo→redispatch when a fix worker never pushes.
     empty_fix_retried_sha: str = ""
-    # #3714: one-shot retry latch — the branch SHA for which we already
-    # retried the test stage before dispatching a fix round.  A first
-    # test failure at a given SHA retries the test; only the second
-    # failure at the same SHA proceeds to a fix round.
+    # #3714/#4093: one-shot retry latch — the branch SHA for which we have
+    # already EITHER retried the test stage OR decided (via the #4093
+    # triage classifier) that a retry isn't worth spending. A first test
+    # failure at a given SHA gets this decision made once; any repeat
+    # `decide()` call at the same SHA goes straight to the fix round. An
+    # `infra` triage verdict is the one exception — see `_decide_test`'s
+    # `BUCKET_INFRA` arm — it retries WITHOUT setting this latch.
     test_retry_sha: str = ""
     merge_attempts: int = 0
     review_dispatches: int = 0
@@ -1927,6 +1937,8 @@ class MergeVerifier(Protocol):
 
     def set_config(self, config: Any) -> None: ...
 
+    def triage_test_failure(self, state: IssueState) -> str | None: ...
+
 
 def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
     """Loosely compare a ``git remote get-url origin`` URL against the
@@ -2272,6 +2284,39 @@ class GitMergeVerifier:
         `__post_init__` only sets ``self.config`` once, at construction.
         """
         self.config = config
+
+    def triage_test_failure(self, state: IssueState) -> str | None:
+        """WHY the Test stage failed, per :func:`coord.failure_triage.
+        triage_failure` (#4093) — the one question "is this failure even
+        the work's fault", answered once and reused here rather than
+        re-derived (#2096). :func:`_decide_test`'s #3714 one-shot retry
+        consults this to decide whether a failure is even worth retrying
+        before spending a fix round: ``None`` (nothing to classify, or the
+        classifier itself is unusable) degrades to the pre-#4093 behaviour
+        of an unconditional retry — never a worse outcome than today's.
+
+        Evidence is built from ``state.work_test_reason`` alone — the one
+        failure text `coord drive` already has on hand for this issue,
+        without a second log fetch. ``diff_stat``/``declared_files``/
+        ``machine_capabilities`` are left at their empty defaults, same as
+        every other optional :func:`triage_failure` input this verifier has
+        no cheap way to produce; the deterministic infra/mechanical tiers
+        and the model tier all degrade gracefully without them.
+        """
+        reason = (state.work_test_reason or "").strip()
+        if not reason:
+            return None
+        try:
+            from coord.failure_evidence import extract_failure_evidence  # noqa: PLC0415
+            from coord.failure_triage import triage_failure  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 — fail closed: no verdict, not a guess
+            return None
+        try:
+            evidence = extract_failure_evidence(reason)
+            verdict = triage_failure(evidence=evidence)
+        except Exception:  # noqa: BLE001 — classifier trouble must never block drive
+            return None
+        return verdict.bucket
 
 
 # ── preflight (pure) ─────────────────────────────────────────────────────────
@@ -4018,28 +4063,59 @@ def _decide_test(
                 f"{state.work_aid}"
             )
 
-        # #3714: retry the test once before consuming a fix round.  A
-        # first failure at a given SHA gets one automatic retest; only the
-        # second failure at the same SHA dispatches the fix worker.  This
-        # avoids burning a fix slot on a transient / flaky failure.
+        # #3714: retry the test once before consuming a fix round — but
+        # only when it is actually worth retrying. A first failure at a
+        # given SHA asks #4093's triage classifier WHY it failed:
+        # `flaky` (or `None`, meaning no verdict is available — the
+        # classifier is unusable, or `verifier` itself has none — which
+        # degrades to the pre-#4093 behaviour) gets the automatic retest;
+        # `mechanical`/`substantive`/`human` (the quadraui#2992 shape — a
+        # compile error can never pass on retry) skips straight to the fix
+        # round instead of burning a retry on a failure that cannot change.
+        # `infra` also retries, but does NOT spend the one-shot latch —
+        # an environmental hit deserves another retest every time, not a
+        # verdict charged against this SHA's one free retry.
         branch_sha = current_sha or (
             verifier.branch_head_sha(state) if verifier is not None else None
         )
         if branch_sha and counters.test_retry_sha != branch_sha:
-            counters.test_retry_sha = branch_sha
-            return Action(
-                kind=RUN,
-                label="TEST: failed — retrying once before fix round (#3714)",
-                command=(
-                    "diagnose", state.repo, str(state.issue),
-                    "--stage", "test", "--reset",
-                ),
-                error_message=(
-                    f"coord diagnose {state.repo} {state.issue} "
-                    "--stage test --reset failed."
-                ),
-                sleep_after=10.0,
+            bucket = (
+                verifier.triage_test_failure(state) if verifier is not None else None
             )
+            if bucket == BUCKET_INFRA:
+                return Action(
+                    kind=RUN,
+                    label="TEST: failed (infra) — retrying before fix round (#4093)",
+                    command=(
+                        "diagnose", state.repo, str(state.issue),
+                        "--stage", "test", "--reset",
+                    ),
+                    error_message=(
+                        f"coord diagnose {state.repo} {state.issue} "
+                        "--stage test --reset failed."
+                    ),
+                    sleep_after=10.0,
+                )
+            if bucket is None or bucket == BUCKET_FLAKY:
+                counters.test_retry_sha = branch_sha
+                return Action(
+                    kind=RUN,
+                    label="TEST: failed — retrying once before fix round (#3714)",
+                    command=(
+                        "diagnose", state.repo, str(state.issue),
+                        "--stage", "test", "--reset",
+                    ),
+                    error_message=(
+                        f"coord diagnose {state.repo} {state.issue} "
+                        "--stage test --reset failed."
+                    ),
+                    sleep_after=10.0,
+                )
+            # mechanical/substantive/human: record the SHA so a repeat
+            # `decide()` call before the fix dispatch below actually
+            # executes doesn't re-run the classifier, then fall straight
+            # through to the fix round.
+            counters.test_retry_sha = branch_sha
 
         counters.fix_rounds += 1
         # Record the branch SHA so #3713 can detect an empty fix round.
