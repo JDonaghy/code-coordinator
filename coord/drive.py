@@ -4017,6 +4017,15 @@ def _decide_test(
     below.  ``--skip-test`` is the one Test-stage action taken here, and it is
     a ``coord test --skipped`` CLI call — never a direct
     ``record_test_verdict()`` (#1384).
+
+    #4098: a repo with ``smoke_tests.cross_platform_checks`` configured may
+    reach ``test_state == "failed"`` below from a cheap, compile-only
+    pre-Test cross-platform check rather than the full Test-stage fan-out —
+    ``coord.smoke._resolve_cross_platform_precheck`` folds that failure onto
+    this SAME field with a non-empty reason, before ``dispatch_pending_
+    smoke`` ever dispatches the real fan-out. This gate does not — and must
+    not — distinguish the two: a failed cross-check is a failed Test stage,
+    and gets the identical triage-first routing below.
     """
     test_state = state.work_test_state
     if test_state in ("passed", "skipped"):

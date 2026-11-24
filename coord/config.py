@@ -422,6 +422,27 @@ class SmokeTestsConfig:
     partition's capabilities. When set, `coord.smoke.partition_command_stages`
     takes over per-partition command construction instead — see that
     function and `coord.smoke._dispatch_smoke_fanout`.
+
+    `cross_platform_checks` (#4098) maps a machine capability (e.g.
+    `"macos"`, `"win"`) to a cheap COMPILE-ONLY command for it — e.g.
+    quadraui's `win: cargo check -p quadraui --features win --all-targets
+    --target x86_64-pc-windows-msvc`. A Work leg can only build its own
+    platform (a Windows worker cannot build `macos`-feature code and a
+    Linux worker cannot build `win`), so the first time any OTHER platform
+    even compiles the branch used to be inside the full Test-stage fan-out
+    — an ~11-minute, multi-machine run on quadraui. `coord.smoke.
+    dispatch_pending_smoke` now runs each entry here whose capability the
+    Work leg's own machine does NOT declare (`coord.smoke.
+    pending_cross_platform_checks`) on a capability-matched machine OTHER
+    than that one, BEFORE ever dispatching the real fan-out: a compile
+    failure is recorded as a terminal `test_state="failed"` straight away
+    (skipping the fan-out entirely and handing off to `coord drive`'s
+    existing triage-first routing in `_decide_test`, exactly like any other
+    Test-stage failure — no separate triage path of its own), and a pass
+    clears the row back to its pre-dispatch state so the real fan-out runs
+    exactly as it does today. Empty (the default) means "behaves exactly as
+    before this field existed" — no precheck of any kind, every repo
+    without this configured is byte-for-byte unaffected.
     """
 
     auto_queue: bool = False
@@ -430,6 +451,7 @@ class SmokeTestsConfig:
     capability_rules: list[SmokeRule] = field(default_factory=list)
     native_execution_capabilities: list[str] = field(default_factory=lambda: ["windows"])
     command_stages: tuple[SmokeStage, ...] = ()
+    cross_platform_checks: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -4853,6 +4875,24 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
             SmokeStage(name=name, command=stage_command, requires=tuple(stage_requires))
         )
     cfg.command_stages = tuple(stages)
+
+    checks_raw = raw.get("cross_platform_checks", {}) or {}
+    if not isinstance(checks_raw, dict):
+        raise ConfigError("smoke_tests.cross_platform_checks must be a mapping")
+    checks: dict[str, str] = {}
+    for capability, command in checks_raw.items():
+        if not isinstance(capability, str) or not capability.strip():
+            raise ConfigError(
+                "smoke_tests.cross_platform_checks keys must be non-empty "
+                "capability strings"
+            )
+        if not isinstance(command, str) or not command.strip():
+            raise ConfigError(
+                f"smoke_tests.cross_platform_checks[{capability!r}] must be "
+                "a non-empty command string"
+            )
+        checks[capability] = command
+    cfg.cross_platform_checks = checks
     return cfg
 
 
