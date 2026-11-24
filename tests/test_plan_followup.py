@@ -313,3 +313,24 @@ class TestCheapFixModelSelection:
         assert "using cheap fix model" not in result.output
         (proposal, _cfg_arg), _kwargs = dispatch_mock.call_args
         assert proposal.model == "opus"
+
+    def test_pinned_cheap_model_not_used_when_scope_unestimated(
+        self, fix_config_cheap_pin: Path, coord_dir: Path
+    ) -> None:
+        """A high-confidence verdict with NO scope guess at all (no
+        `--proposed-file`, no `--proposed-line-delta` — the `ProposedScope`
+        defaults) must not be scored as the smallest possible scope just
+        because 0 files and a 0 line delta both happen to be under the
+        ceiling."""
+        _seed_failed_work(TEST_REASON_WITH_EVIDENCE)
+
+        result, dispatch_mock = _invoke_fix(
+            fix_config_cheap_pin,
+            "--diagnosis", "a real bug",
+            "--triage-confidence", "0.95",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "using cheap fix model" not in result.output
+        (proposal, _cfg_arg), _kwargs = dispatch_mock.call_args
+        assert proposal.model == "opus"

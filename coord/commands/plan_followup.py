@@ -1370,12 +1370,19 @@ def fix(
     # option existed. An operator opts in with e.g.
     # `models.pinned: {fix_triage_cheap: haiku}`.
     cheap_fix_model = cfg.models.pinned.get(_TRIAGE_CHEAP_FIX_PINNED_KEY)
+    # An unestimated `proposed_scope` (no `--proposed-file` and no
+    # `--proposed-line-delta` — the `ProposedScope` defaults, meaning triage
+    # had no scope guess at all) must NOT read as the smallest possible
+    # scope: require a non-empty file list AND a non-zero line delta before
+    # "small scope" can fire, not just numbers that happen to be under the
+    # ceiling because nothing was estimated.
     use_cheap_fix_model = bool(
         cheap_fix_model
         and triage_diagnosis
         and triage_confidence >= _TRIAGE_CHEAP_FIX_MIN_CONFIDENCE
+        and proposed_files
         and len(proposed_files) <= _TRIAGE_CHEAP_FIX_MAX_SCOPE_FILES
-        and abs(proposed_line_delta) <= _TRIAGE_CHEAP_FIX_MAX_SCOPE_LINES
+        and 0 < abs(proposed_line_delta) <= _TRIAGE_CHEAP_FIX_MAX_SCOPE_LINES
     )
     if use_cheap_fix_model:
         escalated = cheap_fix_model

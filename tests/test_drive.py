@@ -3535,13 +3535,21 @@ def test_a_flaky_triage_verdict_retries_once_before_fix_round():
 def test_a_substantive_triage_verdict_skips_the_retry():
     """#4093/#4095: quadraui#2992's shape — a compile error (or any other
     verdict that cannot change on an unmodified re-run) must not spend the
-    #3714 retry; it goes straight to the fix round on the FIRST failure."""
+    #3714 retry; it goes straight to the fix round on the FIRST failure.
+
+    #4096: the fix round itself now carries the SAME verdict into `coord
+    fix --diagnosis ...`, mirroring the `mechanic-dispatch` arm's own
+    verdict-to-CLI-options mapping."""
     counters = DriveCounters()
     v = FakeVerifier(head_sha="aaa", triage_bucket="substantive")
     s = done_work(work_test_state="failed", work_test_reason="error[E0063]: missing field")
 
     fix = step(s, counters=counters, verifier=v)
-    assert fix.command == ("fix", "w1")
+    assert fix.command == (
+        "fix", "w1",
+        "--diagnosis", "stub diagnosis for bucket=substantive",
+        "--triage-confidence", "0.9",
+    )
     assert counters.fix_rounds == 1
     # The one-shot latch is still recorded (at this SHA) even though no
     # retry Action was returned — a repeat `decide()` call before the fix
@@ -3549,6 +3557,51 @@ def test_a_substantive_triage_verdict_skips_the_retry():
     assert counters.test_retry_sha == "aaa"
     assert v.triage_test_failure_calls == 1
     assert "triage=substantive" in fix.label
+
+
+def test_a_substantive_triage_verdict_carries_its_proposed_scope_into_the_fix_round():
+    """#4096: `--proposed-file`/`--proposed-line-delta` are forwarded onto
+    `coord fix` too, exactly like the `mechanic-dispatch` arm, when the
+    verdict's own `proposed_scope` actually estimated one."""
+    import coord.failure_triage as failure_triage
+
+    counters = DriveCounters()
+    verdict = failure_triage.TriageVerdict(
+        bucket=failure_triage.BUCKET_SUBSTANTIVE,
+        diagnosis="missing field on the Widget struct",
+        repro_capability=None,
+        proposed_scope=failure_triage.ProposedScope(
+            files=("coord/widget.py",), estimated_line_delta=12,
+        ),
+        confidence=0.88,
+        via="model",
+    )
+    v = FakeVerifier(head_sha="aaa", triage_verdict=verdict)
+    s = done_work(work_test_state="failed", work_test_reason="error[E0063]: missing field")
+
+    fix = step(s, counters=counters, verifier=v)
+    assert fix.command == (
+        "fix", "w1",
+        "--diagnosis", "missing field on the Widget struct",
+        "--triage-confidence", "0.88",
+        "--proposed-file", "coord/widget.py",
+        "--proposed-line-delta", "12",
+    )
+    assert counters.fix_rounds == 1
+
+
+def test_no_triage_verdict_leaves_the_fix_round_command_unchanged():
+    """No verdict available (the #4093 default) must not add anything onto
+    `coord fix` — the pre-#4096 behaviour is preserved byte-for-byte."""
+    counters = DriveCounters()
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    # First failure at this SHA spends the #3714 retry (no verdict at all).
+    step(s, counters=counters)
+    # Second failure at the same SHA proceeds to the fix round.
+    fix = step(s, counters=counters)
+    assert fix.command == ("fix", "w1")
+    assert counters.fix_rounds == 1
 
 
 # ── #4095: route the Test-failure edge on the triage verdict ───────────────
