@@ -194,6 +194,32 @@ def _fallback_substantive(*, reason: str, via: str) -> TriageVerdict:
     )
 
 
+#: `via` values meaning the classifier had NOTHING usable to say — a
+#: missing/misbehaving ``claude`` binary, an unparseable reply, or a
+#: confidence below ``DEFAULT_MIN_CONFIDENCE`` (see ``_run_model_tier``).
+#: Every member is produced by :func:`_fallback_substantive`, but NOT every
+#: :func:`_fallback_substantive` call belongs here: ``"model:
+#: compile_error_guard"`` is a confident, evidence-backed override (a
+#: compile error can never be flaky, enforced regardless of what the model
+#: answered) — that IS a real verdict about the code, not a "nothing to
+#: classify" sentinel, and a caller that conflated the two would retry the
+#: exact quadraui#2992 compile-error shape this module exists to stop
+#: retrying.
+DEGRADED_VIA = frozenset({"model:call_failed", "model:schema_error", "model:low_confidence"})
+
+
+def is_degraded_verdict(verdict: TriageVerdict) -> bool:
+    """True when ``verdict`` is one of :data:`DEGRADED_VIA`'s "classifier is
+    unusable" sentinels rather than a real decision about the code.
+
+    The one normalized answer to "is this verdict real" — a caller that
+    wants "no usable verdict degrades to some pre-existing default"
+    semantics (e.g. :mod:`coord.drive`'s ``_decide_test``) should check this
+    instead of re-deriving it from ``confidence``/``via`` itself.
+    """
+    return verdict.via in DEGRADED_VIA
+
+
 # ── tier 1a: infra (delegates to coord.failure_class) ───────────────────────
 
 

@@ -136,7 +136,14 @@ from coord.failure_class import (
 # call (a subprocess, possibly a `claude -p` model call) is lazily
 # imported inside `GitMergeVerifier.triage_test_failure`, same posture as
 # the `github_ops` imports elsewhere in this module.
-from coord.failure_triage import BUCKET_FLAKY, BUCKET_INFRA
+from coord.failure_triage import (
+    BUCKET_FLAKY,
+    BUCKET_HUMAN,
+    BUCKET_INFRA,
+    BUCKET_MECHANICAL,
+    BUCKET_SUBSTANTIVE,
+    is_degraded_verdict,
+)
 from coord import machine_fault
 from coord.models import (
     DELIVERABLE_ANALYSIS_LABEL,
@@ -634,6 +641,25 @@ class DriveCounters:
     # `infra` triage verdict is the one exception — see `_decide_test`'s
     # `BUCKET_INFRA` arm — it retries WITHOUT setting this latch.
     test_retry_sha: str = ""
+    # #4093 review (blocking finding 2): the `BUCKET_INFRA` arm's OWN budget
+    # — it does not set `test_retry_sha`, so without this it is an unbounded
+    # re-test loop that never reaches `fix_rounds`/`_die()` for as long as
+    # triage keeps answering `infra` at the same SHA (a real multi-hour
+    # usage limit, a persistently UNMET capability, or one repeating
+    # misclassification). Bounded the same way `work_retries` is — `opts.
+    # max_work_retries`, the established "how many times do we retry a
+    # flaky infra thing" budget — scoped to ONE SHA via
+    # `test_infra_retries_sha` below, same "a fresh SHA gets its own full
+    # budget" shape as `acceptance_gate_attempts`/`acceptance_gate_attempts_
+    # sha`. Once spent, `_decide_test` falls through to the ordinary
+    # mechanical/substantive path: set `test_retry_sha` and dispatch the fix
+    # round (or `_die()`, if `fix_rounds` is also exhausted) instead of
+    # looping forever.
+    test_infra_retries: int = 0
+    # #4093 review: the SHA `test_infra_retries` above is counting retries
+    # FOR — mirrors `acceptance_gate_attempts_sha`'s role for `acceptance_
+    # gate_attempts`.
+    test_infra_retries_sha: str = ""
     merge_attempts: int = 0
     review_dispatches: int = 0
     # #1584: bounded retry for a review WORKER that died (transient API
@@ -2291,9 +2317,16 @@ class GitMergeVerifier:
         the work's fault", answered once and reused here rather than
         re-derived (#2096). :func:`_decide_test`'s #3714 one-shot retry
         consults this to decide whether a failure is even worth retrying
-        before spending a fix round: ``None`` (nothing to classify, or the
-        classifier itself is unusable) degrades to the pre-#4093 behaviour
-        of an unconditional retry — never a worse outcome than today's.
+        before spending a fix round: ``None`` (nothing to classify, an
+        import/classifier exception, or a verdict
+        :func:`~coord.failure_triage.is_degraded_verdict` reports as the
+        classifier having nothing usable to say) degrades to the pre-#4093
+        behaviour of an unconditional retry — never a worse outcome than
+        today's. A REAL verdict — including the ``"model:
+        compile_error_guard"`` override, which is a confident decision about
+        the code, not a degraded one — is always returned as its own
+        bucket, so a genuine ``substantive``/``mechanical`` call still skips
+        the retry rather than being mistaken for "no verdict available".
 
         Evidence is built from ``state.work_test_reason`` alone — the one
         failure text `coord drive` already has on hand for this issue,
@@ -2315,6 +2348,8 @@ class GitMergeVerifier:
             evidence = extract_failure_evidence(reason)
             verdict = triage_failure(evidence=evidence)
         except Exception:  # noqa: BLE001 — classifier trouble must never block drive
+            return None
+        if is_degraded_verdict(verdict):
             return None
         return verdict.bucket
 
@@ -3934,6 +3969,14 @@ def _decide_acceptance_gate(
     )
 
 
+# #4093 review (nit): the buckets that explicitly skip #3714's retry,
+# matched by name rather than "anything that isn't flaky/infra/None" — so a
+# bucket #4093 grows later that this module doesn't recognize degrades to
+# the SAFER default (retry once, same as `None`) instead of silently
+# skipping straight to the fix round.
+_TEST_SKIP_RETRY_BUCKETS = frozenset({BUCKET_MECHANICAL, BUCKET_SUBSTANTIVE, BUCKET_HUMAN})
+
+
 def _decide_test(
     state: IssueState,
     opts: DriveOptions,
@@ -4072,9 +4115,16 @@ def _decide_test(
         # `mechanical`/`substantive`/`human` (the quadraui#2992 shape — a
         # compile error can never pass on retry) skips straight to the fix
         # round instead of burning a retry on a failure that cannot change.
-        # `infra` also retries, but does NOT spend the one-shot latch —
-        # an environmental hit deserves another retest every time, not a
-        # verdict charged against this SHA's one free retry.
+        # `infra` also retries without spending the one-shot latch — an
+        # environmental hit deserves another retest, not a verdict charged
+        # against this SHA's one free retry — but review finding 2 bounds
+        # that lane too, at `opts.max_work_retries` per SHA
+        # (`test_infra_retries`/`test_infra_retries_sha`): an `infra`
+        # verdict that keeps repeating at the SAME SHA (a real multi-hour
+        # usage limit, a persistently UNMET capability, a repeating
+        # misclassification) must still fall through to the fix round / the
+        # `max_fix_rounds` `_die()` above, never loop until `deadline_mins`
+        # with nothing actionable surfaced.
         branch_sha = current_sha or (
             verifier.branch_head_sha(state) if verifier is not None else None
         )
@@ -4082,21 +4132,41 @@ def _decide_test(
             bucket = (
                 verifier.triage_test_failure(state) if verifier is not None else None
             )
+            # Skip-the-retry buckets fall through to this: True once the
+            # verdict (or the `infra` lane's own exhausted budget) says the
+            # fix round is the only thing left worth dispatching.
+            skip_retry = False
             if bucket == BUCKET_INFRA:
-                return Action(
-                    kind=RUN,
-                    label="TEST: failed (infra) — retrying before fix round (#4093)",
-                    command=(
-                        "diagnose", state.repo, str(state.issue),
-                        "--stage", "test", "--reset",
-                    ),
-                    error_message=(
-                        f"coord diagnose {state.repo} {state.issue} "
-                        "--stage test --reset failed."
-                    ),
-                    sleep_after=10.0,
-                )
-            if bucket is None or bucket == BUCKET_FLAKY:
+                if counters.test_infra_retries_sha != branch_sha:
+                    counters.test_infra_retries_sha = branch_sha
+                    counters.test_infra_retries = 0
+                if counters.test_infra_retries < opts.max_work_retries:
+                    counters.test_infra_retries += 1
+                    return Action(
+                        kind=RUN,
+                        label=(
+                            "TEST: failed (infra) — retrying before fix "
+                            f"round (#4093) (attempt {counters.test_infra_retries}"
+                            f"/{opts.max_work_retries})"
+                        ),
+                        command=(
+                            "diagnose", state.repo, str(state.issue),
+                            "--stage", "test", "--reset",
+                        ),
+                        error_message=(
+                            f"coord diagnose {state.repo} {state.issue} "
+                            "--stage test --reset failed."
+                        ),
+                        sleep_after=10.0,
+                    )
+                # Budget spent: an `infra` verdict that keeps repeating at
+                # this SHA is no longer worth another retest.
+                skip_retry = True
+            elif bucket in _TEST_SKIP_RETRY_BUCKETS:
+                # mechanical/substantive/human: the quadraui#2992 shape,
+                # where retrying cannot change the outcome.
+                skip_retry = True
+            if not skip_retry:
                 counters.test_retry_sha = branch_sha
                 return Action(
                     kind=RUN,
@@ -4111,10 +4181,9 @@ def _decide_test(
                     ),
                     sleep_after=10.0,
                 )
-            # mechanical/substantive/human: record the SHA so a repeat
-            # `decide()` call before the fix dispatch below actually
-            # executes doesn't re-run the classifier, then fall straight
-            # through to the fix round.
+            # Record the SHA so a repeat `decide()` call before the fix
+            # dispatch below actually executes doesn't re-run the
+            # classifier, then fall straight through to the fix round.
             counters.test_retry_sha = branch_sha
 
         counters.fix_rounds += 1

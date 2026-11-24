@@ -32,6 +32,7 @@ from coord.failure_triage import (
     DiffStat,
     ProposedScope,
     TriageVerdict,
+    is_degraded_verdict,
     triage_failure,
 )
 
@@ -261,6 +262,7 @@ class TestModelTier:
         assert verdict.bucket == BUCKET_SUBSTANTIVE
         assert verdict.via == "model:call_failed"
         assert verdict.confidence == 0.0
+        assert is_degraded_verdict(verdict) is True
 
     def test_json_missing_required_field_falls_back_to_substantive(self) -> None:
         with patch("subprocess.run") as mock_run:
@@ -268,6 +270,7 @@ class TestModelTier:
             verdict = triage_failure(evidence=_evidence(test_assertion=True))
         assert verdict.bucket == BUCKET_SUBSTANTIVE
         assert verdict.via == "model:schema_error"
+        assert is_degraded_verdict(verdict) is True
 
     def test_unknown_bucket_falls_back_to_substantive(self) -> None:
         with patch("subprocess.run") as mock_run:
@@ -281,6 +284,7 @@ class TestModelTier:
             verdict = triage_failure(evidence=_evidence(test_assertion=True))
         assert verdict.bucket == BUCKET_SUBSTANTIVE
         assert verdict.via == "model:schema_error"
+        assert is_degraded_verdict(verdict) is True
 
     def test_low_confidence_falls_back_to_substantive(self) -> None:
         with patch("subprocess.run") as mock_run:
@@ -293,6 +297,7 @@ class TestModelTier:
             })
             verdict = triage_failure(evidence=_evidence(test_assertion=True), min_confidence=0.5)
         assert verdict.bucket == BUCKET_SUBSTANTIVE
+        assert is_degraded_verdict(verdict) is True
         assert verdict.via == "model:low_confidence"
 
     def test_compile_error_can_never_be_flaky_even_from_model(self) -> None:
@@ -313,6 +318,12 @@ class TestModelTier:
             verdict = triage_failure(evidence=evidence, diff_stat=DiffStat(files=("src/a.rs",)))
         assert verdict.bucket == BUCKET_SUBSTANTIVE
         assert verdict.via == "model:compile_error_guard"
+        # #4093 review (blocking finding 1): this is a CONFIDENT,
+        # evidence-backed override, not "the classifier had nothing to
+        # say" — callers must not treat it as a degraded/no-verdict
+        # sentinel (coord.drive's `_decide_test` would otherwise retry
+        # the exact quadraui#2992 shape this guard exists to catch).
+        assert is_degraded_verdict(verdict) is False
 
     def test_nonzero_exit_falls_back_to_substantive(self) -> None:
         with patch("subprocess.run") as mock_run:
@@ -322,6 +333,7 @@ class TestModelTier:
             verdict = triage_failure(evidence=_evidence(test_assertion=True))
         assert verdict.bucket == BUCKET_SUBSTANTIVE
         assert verdict.via == "model:call_failed"
+        assert is_degraded_verdict(verdict) is True
 
     def test_timeout_falls_back_to_substantive(self) -> None:
         timeout_error = subprocess.TimeoutExpired(cmd="claude", timeout=30)
@@ -329,6 +341,7 @@ class TestModelTier:
             verdict = triage_failure(evidence=_evidence(test_assertion=True))
         assert verdict.bucket == BUCKET_SUBSTANTIVE
         assert verdict.via == "model:call_failed"
+        assert is_degraded_verdict(verdict) is True
 
     def test_configured_model_and_low_thinking_budget_are_used(self) -> None:
         with patch("subprocess.run") as mock_run:
@@ -457,3 +470,40 @@ def test_triage_verdict_to_dict_round_trips_shape() -> None:
     assert d["repro_capability"] == "macos"
     assert d["proposed_scope"] == {"files": ["a.py"], "estimated_line_delta": 1}
     assert d["confidence"] == 0.75
+
+
+# ── #4093 review (blocking finding 1): `is_degraded_verdict` ─────────────────
+
+
+def _verdict(via: str, confidence: float = 0.0, bucket: str = BUCKET_SUBSTANTIVE) -> TriageVerdict:
+    return TriageVerdict(
+        bucket=bucket,
+        diagnosis="x",
+        repro_capability=None,
+        proposed_scope=ProposedScope(),
+        confidence=confidence,
+        via=via,
+    )
+
+
+@pytest.mark.parametrize(
+    "via", ["model:call_failed", "model:schema_error", "model:low_confidence"]
+)
+def test_is_degraded_verdict_true_for_classifier_unusable_sentinels(via: str) -> None:
+    assert is_degraded_verdict(_verdict(via)) is True
+
+
+@pytest.mark.parametrize(
+    "via",
+    [
+        "model",
+        "model:compile_error_guard",
+        "deterministic:infra:usage_limit",
+        "deterministic:mechanical:compile_error",
+    ],
+)
+def test_is_degraded_verdict_false_for_real_decisions(via: str) -> None:
+    """A real model verdict, the compile-error guard override, and both
+    deterministic tiers are all confident decisions ABOUT THE CODE — none
+    of them is "the classifier had nothing to say"."""
+    assert is_degraded_verdict(_verdict(via)) is False
