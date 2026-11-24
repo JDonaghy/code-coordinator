@@ -3826,7 +3826,7 @@ def test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file(
     branch's real merge-base diff. Reproduces that shape: `diff_fetcher`
     (standing in for a stale `pr_diff`/`gh pr diff` result) returns a diff
     naming a file the branch never touched, while a fresh compare of the
-    branch's own current refs (`compare_files_fetcher`) reports only the
+    branch's own current refs (`compare_diff_fetcher`) reports only the
     file the branch actually changed. Asserts the briefed diff is replaced
     wholesale by the compare-derived diff, so the reviewer only ever sees
     the branch's own files."""
@@ -3864,10 +3864,6 @@ def test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file(
 
     compare_calls: list[tuple] = []
 
-    def _compare_files(repo_github: str, base: str, head: str) -> list[str]:
-        compare_calls.append((repo_github, base, head))
-        return ["converter.py"]
-
     def _compare_diff(repo_github: str, base: str, head: str) -> str:
         compare_calls.append((repo_github, base, head))
         return fresh_diff
@@ -3882,7 +3878,6 @@ def test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file(
         issue_body_fetcher=lambda repo, num: "",
         remote_branch_checker=lambda repo, branch: True,
         diff_fetcher=lambda repo, num, **kw: stale_diff,
-        compare_files_fetcher=_compare_files,
         compare_diff_fetcher=_compare_diff,
     )
 
@@ -3899,7 +3894,7 @@ def test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file(
     assert "diff --git a/converter.py" in briefing
     assert briefing.count("diff --git") == 1
 
-    # Both the file-list and the replacement-diff cross-checks ran against
+    # The cross-check (and its replacement diff, the same fetch) ran against
     # the branch's own current refs (base branch, `completed.branch`), not
     # some cached/stale base.
     assert compare_calls
@@ -3922,14 +3917,17 @@ def test_dispatch_review_refetches_diff_when_pr_head_lags_a_hand_push(
     row's branch is still at `X`; the branch (and PR) now actually sits at
     `Y`. `gh pr diff` (`diff_fetcher`) still reflects the PR object's
     last-computed diff, pinned to `X` — and crucially, `X` and `Y` touch the
-    SAME file, so the #3196 file-list cross-check (which only compares
-    *names*) sees no mismatch and would otherwise keep the stale text. The
-    SHA cross-check must catch what the file-list one can't: `pr_head_sha_
-    fetcher` (standing in for the PR object's own recorded head) returns
-    `X`, `branch_sha_fetcher` (the branch's LIVE head) returns `Y` — the
-    mismatch must discard `pr_diff` and refetch a direct compare against the
-    live branch, and the dispatched review's own `review_head_sha` must be
-    `Y`, never `X`."""
+    SAME file, so a file-list-only cross-check would see no mismatch and
+    keep the stale text. A hand push also moves the PR object's own
+    recorded head-commit field in lockstep with the branch tip, so a SHA
+    comparison can't observe the staleness either — only the diff's own
+    CONTENT can. `compare_diff_fetcher` (standing in for a fresh, direct
+    compare of the branch's live refs) returns `Y`'s content, which
+    disagrees with `diff_fetcher`'s `X`-pinned text even though both name
+    the same file; the mismatch must discard `pr_diff` and use the live
+    compare diff instead, and the dispatched review's own `review_head_sha`
+    (already sourced from the branch's live head via `branch_sha_fetcher`,
+    not from the PR object) must be `Y`, never `X`."""
     board = Board()
     completed = _completed_assignment(machine="laptop")
     client = _FakeHTTPClient({"id": "hand-push-review-1"})
@@ -3953,14 +3951,10 @@ def test_dispatch_review_refetches_diff_when_pr_head_lags_a_hand_push(
 
     compare_calls: list[tuple] = []
 
-    def _compare_files(repo_github: str, base: str, head: str) -> list[str]:
-        compare_calls.append((repo_github, base, head))
-        # Same file names at X and at Y — the #3196 file-list check alone
-        # would see no mismatch and never fire.
-        return ["converter.py"]
-
     def _compare_diff(repo_github: str, base: str, head: str) -> str:
         compare_calls.append((repo_github, base, head))
+        # Same file name (converter.py) as the stale diff at X — a
+        # file-list-only cross-check alone would see no mismatch here.
         return live_diff_at_y
 
     result = dispatch_review(
@@ -3973,9 +3967,7 @@ def test_dispatch_review_refetches_diff_when_pr_head_lags_a_hand_push(
         issue_body_fetcher=lambda repo, num: "",
         remote_branch_checker=lambda repo, branch: True,
         branch_sha_fetcher=lambda repo, branch: "sha-y-live-head",
-        pr_head_sha_fetcher=lambda repo, number: "sha-x-stale-pr-head",
         diff_fetcher=lambda repo, num, **kw: stale_diff_at_x,
-        compare_files_fetcher=_compare_files,
         compare_diff_fetcher=_compare_diff,
     )
 
@@ -4002,17 +3994,19 @@ def test_dispatch_review_refetches_diff_when_pr_head_lags_a_hand_push(
 
     matching = [
         rec for rec in caplog.records
-        if "disagrees with branch" in rec.message
+        if "content disagrees with a fresh compare" in rec.message
     ]
     assert matching, caplog.text
 
 
 def test_dispatch_review_keeps_diff_when_compare_agrees(
     two_machine_config: Config,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#3196: the cross-check must be silent (no replacement) when the
-    fetched diff's files already match a fresh compare of the branch's
-    current refs — the common case, where `pr_diff` was correct all along."""
+    """#3196/#4106: the cross-check must leave `full_diff_text` untouched
+    (no replacement, no warning) when a fresh compare of the branch's
+    current refs agrees with `pr_diff` both in file set AND in content —
+    the common case, where `pr_diff` was correct all along."""
     board = Board()
     completed = _completed_assignment(machine="laptop")
     client = _FakeHTTPClient({"id": "agreeing-diff-review-1"})
@@ -4025,9 +4019,6 @@ def test_dispatch_review_keeps_diff_when_compare_agrees(
         "+    return None\n"
     )
 
-    def _boom(*args, **kwargs):
-        raise AssertionError("compare_diff_fetcher must not be called when files agree")
-
     result = dispatch_review(
         completed, board, two_machine_config,
         http_client=client,
@@ -4038,13 +4029,18 @@ def test_dispatch_review_keeps_diff_when_compare_agrees(
         issue_body_fetcher=lambda repo, num: "",
         remote_branch_checker=lambda repo, branch: True,
         diff_fetcher=lambda repo, num, **kw: diff,
-        compare_files_fetcher=lambda repo, base, head: ["converter.py"],
-        compare_diff_fetcher=_boom,
+        # Identical content — the live compare agrees exactly.
+        compare_diff_fetcher=lambda repo, base, head: diff,
     )
 
     assert result is not None
     _, payload = client.calls[0]
     assert "converter.py" in payload["briefing"]
+    matching = [
+        rec for rec in caplog.records
+        if "stale/incorrect diff base" in rec.message or "content disagrees" in rec.message
+    ]
+    assert not matching, caplog.text
 
 
 def test_dispatch_review_pure_rename_does_not_trigger_false_stale_diff_replacement(
@@ -4054,13 +4050,16 @@ def test_dispatch_review_pure_rename_does_not_trigger_false_stale_diff_replaceme
     """#3196 review follow-up: a pure rename (`git mv old new`, no content
     change) makes `diff_file_paths` report BOTH `old.py` and `new.py` as
     "touched" — the `diff --git a/old b/new` header line alone carries no
-    signal they're the same content moving. GitHub's compare API only ever
-    reports the NEW path under `.files[].filename` (`previous_filename` is a
-    separate field the cross-check doesn't read), so `old.py` is legitimately
-    absent from `known_files` even though nothing is stale. This must NOT be
-    treated as an unexpected file and must NOT trigger a diff replacement —
-    unlike the genuinely-stale case in
-    `test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file`."""
+    signal they're the same content moving. This must NOT be treated as an
+    unexpected file and must NOT trigger a diff replacement — unlike the
+    genuinely-stale case in
+    `test_dispatch_review_replaces_stale_diff_that_names_an_untouched_file`.
+    The fresh compare here reports the identical rename (the live branch
+    really did just rename the file, with no further change), exercising
+    the common case where a pure rename's old-side path is already present
+    in `known_files_set` and the `renamed_old_paths` exclusion is a no-op —
+    it only matters as defense-in-depth should the compare's own diff ever
+    omit the old-side header a genuine rename carries."""
     board = Board()
     completed = _completed_assignment(machine="laptop")
     client = _FakeHTTPClient({"id": "pure-rename-review-1"})
@@ -4074,12 +4073,6 @@ def test_dispatch_review_pure_rename_does_not_trigger_false_stale_diff_replaceme
         "rename to bar.py\n"
     )
 
-    def _boom(*args, **kwargs):
-        raise AssertionError(
-            "compare_diff_fetcher must not be called — the rename is not a "
-            "genuine mismatch and must not trigger a replacement"
-        )
-
     result = dispatch_review(
         completed, board, two_machine_config,
         http_client=client,
@@ -4090,10 +4083,8 @@ def test_dispatch_review_pure_rename_does_not_trigger_false_stale_diff_replaceme
         issue_body_fetcher=lambda repo, num: "",
         remote_branch_checker=lambda repo, branch: True,
         diff_fetcher=lambda repo, num, **kw: rename_diff,
-        # A fresh compare only ever reports the rename's NEW path — GitHub's
-        # `previous_filename` field is never surfaced through this seam.
-        compare_files_fetcher=lambda repo, base, head: ["bar.py"],
-        compare_diff_fetcher=_boom,
+        # Identical content — the live compare agrees exactly.
+        compare_diff_fetcher=lambda repo, base, head: rename_diff,
     )
 
     assert result is not None
@@ -4104,10 +4095,10 @@ def test_dispatch_review_pure_rename_does_not_trigger_false_stale_diff_replaceme
     assert not matching, caplog.text
 
 
-def test_dispatch_review_cross_check_fails_open_when_compare_files_unavailable(
+def test_dispatch_review_cross_check_fails_open_when_compare_diff_unavailable(
     two_machine_config: Config,
 ) -> None:
-    """#3196 review follow-up: when `compare_files_fetcher` itself fails
+    """#3196 review follow-up: when `compare_diff_fetcher` itself fails
     (raises, or the compare API is unreachable), the cross-check must fail
     open — dispatch proceeds with the original `full_diff_text` untouched
     rather than blocking review dispatch on an unrelated GitHub outage."""
@@ -4123,11 +4114,8 @@ def test_dispatch_review_cross_check_fails_open_when_compare_files_unavailable(
         "+    return None\n"
     )
 
-    def _compare_files_boom(*args, **kwargs):
-        raise RuntimeError("gh api compare: rate limited")
-
     def _compare_diff_boom(*args, **kwargs):
-        raise AssertionError("compare_diff_fetcher must not be called — cross-check skipped")
+        raise RuntimeError("gh api compare: rate limited")
 
     result = dispatch_review(
         completed, board, two_machine_config,
@@ -4139,7 +4127,6 @@ def test_dispatch_review_cross_check_fails_open_when_compare_files_unavailable(
         issue_body_fetcher=lambda repo, num: "",
         remote_branch_checker=lambda repo, branch: True,
         diff_fetcher=lambda repo, num, **kw: diff,
-        compare_files_fetcher=_compare_files_boom,
         compare_diff_fetcher=_compare_diff_boom,
     )
 
@@ -4147,56 +4134,6 @@ def test_dispatch_review_cross_check_fails_open_when_compare_files_unavailable(
     _, payload = client.calls[0]
     # The original diff is embedded verbatim — the cross-check never ran.
     assert "diff --git a/converter.py" in payload["briefing"]
-
-
-def test_dispatch_review_keeps_stale_diff_when_compare_diff_replacement_unavailable(
-    two_machine_config: Config,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """#3196 review follow-up: a genuine mismatch is detected (the compare
-    confirms the diff is stale), but the replacement fetch
-    (`compare_diff_fetcher`) itself fails. This must fail SAFE — keep the
-    original (untrusted) diff rather than crash dispatch — while still
-    logging the mismatch so it's visible in the coordinator's own log."""
-    board = Board()
-    completed = _completed_assignment(machine="laptop")
-    client = _FakeHTTPClient({"id": "compare-diff-unavailable-1"})
-    # A plain source file (not a coordinator-owned doc, which would instead
-    # trip the separate mechanical #3180 short-circuit and never dispatch a
-    # review leg at all — irrelevant to what this test is checking).
-    stale_diff = (
-        "diff --git a/spurious.py b/spurious.py\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/spurious.py\n"
-        "@@ -0,0 +1 @@\n"
-        "+SPURIOUS = True\n"
-    )
-
-    def _compare_diff_boom(*args, **kwargs):
-        raise RuntimeError("gh api compare: rate limited")
-
-    result = dispatch_review(
-        completed, board, two_machine_config,
-        http_client=client,
-        pr_lookup=lambda repo_github, **kw: {
-            "number": 35, "url": "https://github.com/acme/api/pull/35", "existed": True,
-        },
-        claude_md_reader=lambda p: "",
-        issue_body_fetcher=lambda repo, num: "",
-        remote_branch_checker=lambda repo, branch: True,
-        diff_fetcher=lambda repo, num, **kw: stale_diff,
-        compare_files_fetcher=lambda repo, base, head: ["converter.py"],
-        compare_diff_fetcher=_compare_diff_boom,
-    )
-
-    assert result is not None
-    _, payload = client.calls[0]
-    # Replacement was unavailable, so the original (untrusted) diff rides
-    # along — the mismatch is logged rather than silently swallowed.
-    assert "diff --git a/spurious.py" in payload["briefing"]
-    matching = [rec for rec in caplog.records if "stale/incorrect diff base" in rec.message]
-    assert matching, caplog.text
 
 
 def test_dispatch_review_logs_missing_test_coverage_but_still_dispatches(
