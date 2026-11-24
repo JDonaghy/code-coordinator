@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -578,6 +579,16 @@ def escalate_group() -> None:
 )
 @click.option("--command", "proposed_command", required=True, help="The proposed fix, as a shell command.")
 @click.option("--assignment", "assignment_id", default=None, help="The merge-queue/work assignment id, if known.")
+@click.option(
+    "--annotate-test-reason", "annotate_test_reason", default=None,
+    help=(
+        "#4095: also stamp the originating work row's own test_reason with "
+        "this text (typically the Test-stage triage verdict this escalation "
+        "quotes), so `coord gates` shows WHY without a second lookup. "
+        "Meaningful only for --stage test; a best-effort no-op if no "
+        "work-like row is found."
+    ),
+)
 @_CONFIG_OPTION
 def escalate_record(
     repo: str,
@@ -587,6 +598,7 @@ def escalate_record(
     gates: tuple[str, ...],
     proposed_command: str,
     assignment_id: str | None,
+    annotate_test_reason: str | None,
     config_path: Path,
 ) -> None:
     """Write (or replace) the escalation record for REPO ISSUE."""
@@ -601,6 +613,16 @@ def escalate_record(
         proposed_command=proposed_command,
         assignment_id=assignment_id,
     )
+    if annotate_test_reason:
+        try:
+            _annotate_test_reason(_board_for_annotation(), repo, issue, annotate_test_reason)
+        except Exception as exc:  # noqa: BLE001 — best-effort: the escalation
+            # record above already landed; a failure annotating test_reason
+            # must not make this command report failure over it.
+            click.echo(
+                f"warning: failed to annotate test_reason for {repo} #{issue}: {exc}",
+                err=True,
+            )
     click.echo(f"escalation recorded for {repo} #{issue}: {reason}")
 
 
@@ -811,6 +833,61 @@ def decide(
 # (#2096, "one question, one answer").
 
 
+def _board_for_annotation() -> Any:
+    """The read :func:`_annotate_test_reason` needs, thin-client-safe —
+    ``coord.state.build_board`` refuses off the daemon host
+    (``_thin_client_local_board_guard``), so a caller (``escalate record``)
+    that may run from a thin client goes through the SAME ``GET /board`` +
+    :func:`coord.client.board_from_payload` reassembly ``coord status``
+    already uses there, instead of a second, divergent projection.
+    """
+    from coord.client import board_from_payload, fetch_board_payload, resolve_board_service  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    svc = resolve_board_service()
+    if svc is not None:
+        return board_from_payload(fetch_board_payload(svc))
+    return build_board()
+
+
+def _annotate_test_reason(board: Any, repo: str, issue: int, text: str) -> bool:
+    """#4095: stamp *text* onto the originating work row's own
+    ``test_reason`` column — the one column ``coord gates`` already
+    renders — so a Test-stage triage verdict (or the human-escalation
+    reason quoting it) is visible from that read-only surface without a
+    second, out-of-band lookup. No new column, no schema migration: this
+    reuses the existing ``test_reason``/`coord.state.record_test_verdict`
+    plumbing every other Test-gate writer already goes through.
+
+    A no-op (returns ``False``) when no work-like row exists for
+    *repo*/*issue* — never raises; both call sites (``mechanic-dispatch``,
+    ``escalate record``) treat the annotation as best-effort and must not
+    fail their own primary job over it.
+    """
+    from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    work_like = [
+        a for a in assignments_for_issue(board, repo, issue) if a.type in WORK_LIKE_TYPES
+    ]
+    if not work_like:
+        return False
+    winner = _select_winning_work_assignment(work_like)
+    if not winner.assignment_id:
+        return False
+    original = (winner.test_reason or "").strip()
+    annotated = text if (not original or original == text) else f"{text} || {original}"
+    # test_state="failed" keeps the row's own verdict exactly as it was —
+    # this never clears it back to the `record_test_verdict(test_state=
+    # None)` "un-stick for re-dispatch" meaning, it only refreshes the
+    # text describing the SAME failed verdict.
+    record_test_verdict(
+        assignment_id=winner.assignment_id, test_state="failed", test_reason=annotated,
+    )
+    return True
+
+
 @click.command("mechanic-dispatch")
 @click.argument("repo")
 @click.argument("issue", type=int)
@@ -833,6 +910,20 @@ def decide(
     "--proposed-line-delta", type=int, default=0,
     help="The triage verdict's own estimated changed-line count.",
 )
+@click.option(
+    "--evidence", "evidence", multiple=True,
+    help=(
+        "One line of supporting evidence for the leg's briefing — the "
+        "failure text the triage call classified. Repeatable."
+    ),
+)
+@click.option(
+    "--failed-stage-command", "failed_stage_commands", multiple=True,
+    help=(
+        "A command the leg should run to reproduce the failure, instead "
+        "of the full suite. Repeatable."
+    ),
+)
 @_CONFIG_OPTION
 def mechanic_dispatch(
     repo: str,
@@ -844,6 +935,8 @@ def mechanic_dispatch(
     repro_capability: str | None,
     proposed_files: tuple[str, ...],
     proposed_line_delta: int,
+    evidence: tuple[str, ...],
+    failed_stage_commands: tuple[str, ...],
     config_path: Path,
 ) -> None:
     """Route a BUCKET_MECHANICAL Test-stage triage verdict to the #4094
@@ -889,7 +982,24 @@ def mechanic_dispatch(
     )
     dispatched = dispatch_mechanic_leg_for_triage(
         repo, issue, board, config, verdict=verdict, branch_sha=branch_sha,
+        evidence=evidence, failed_stage_commands=failed_stage_commands,
     )
+    # #4095: persist the verdict onto the work row regardless of whether
+    # the dispatch itself was confirmed or declined — `coord gates` should
+    # show WHY Test failed either way, not only on the confirmed path.
+    try:
+        _annotate_test_reason(
+            board, repo, issue,
+            f"[triage=mechanical via={via or 'unknown'} confidence={confidence:.2f} "
+            f"sha={branch_sha}] {diagnosis.strip() or 'no diagnosis text'}",
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort: the dispatch
+        # decision above already happened; a failure annotating
+        # test_reason must not change this command's own exit code.
+        click.echo(
+            f"warning: failed to annotate test_reason for {repo} #{issue}: {exc}",
+            err=True,
+        )
     if dispatched:
         click.echo(f"mechanic leg dispatched for {repo} #{issue} at sha={branch_sha}")
         return

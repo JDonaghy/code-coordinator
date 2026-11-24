@@ -3585,12 +3585,49 @@ def test_a_mechanical_triage_verdict_dispatches_the_mechanic_leg():
         "--repro-capability", "windows",
         "--proposed-file", "tests/test_foo.py",
         "--proposed-line-delta", "1",
+        "--evidence", "ratchet off by one",
     )
     assert action.on_error == "warn"
     assert counters.fix_rounds == 0
     assert counters.test_retry_sha == "aaa"
     assert "triage=mechanical" in action.label
     assert "ratchet off by one in tests/test_foo.py" in action.label
+
+
+def test_a_mechanical_dispatch_carries_evidence_and_the_repo_test_command():
+    """#4095 fix review: the mechanic leg's briefing is self-contradictory
+    without BOTH the failure evidence and a bounded reproduce command — so
+    `_decide_test` must forward `state.work_test_reason` as `--evidence` and
+    `state.repo_test_command` (when configured) as `--failed-stage-command`,
+    never drop either."""
+    import coord.failure_triage as failure_triage
+
+    counters = DriveCounters()
+    verdict = failure_triage.TriageVerdict(
+        bucket=failure_triage.BUCKET_MECHANICAL,
+        diagnosis="off-by-one",
+        repro_capability=None,
+        proposed_scope=failure_triage.ProposedScope(),
+        confidence=0.8,
+        via="model",
+    )
+    v = FakeVerifier(head_sha="aaa", triage_verdict=verdict)
+    s = done_work(
+        work_test_state="failed",
+        work_test_reason="FAILED tests/test_foo.py::test_bar - AssertionError",
+        repo_test_command="pytest tests/test_foo.py",
+    )
+
+    action = step(s, counters=counters, verifier=v)
+    assert action.kind == RUN
+    assert "--evidence" in action.command
+    idx = action.command.index("--evidence")
+    assert action.command[idx + 1] == (
+        "FAILED tests/test_foo.py::test_bar - AssertionError"
+    )
+    assert "--failed-stage-command" in action.command
+    idx = action.command.index("--failed-stage-command")
+    assert action.command[idx + 1] == "pytest tests/test_foo.py"
 
 
 def test_a_declined_mechanic_leg_falls_back_to_an_ordinary_fix_round():
@@ -3646,6 +3683,12 @@ def test_a_human_triage_verdict_stops_and_alerts_once():
     assert "design disagreement: the spec itself is ambiguous" in action.message
     assert "triage=human" in action.message
     assert counters.fix_rounds == 0
+    # #4095: the SAME diagnosis is also carried as `--annotate-test-reason`
+    # so `escalate record` stamps it onto the work row's own `test_reason`
+    # — `coord gates` then shows WHY without a second lookup.
+    assert "--annotate-test-reason" in action.command
+    idx = action.command.index("--annotate-test-reason")
+    assert "design disagreement: the spec itself is ambiguous" in action.command[idx + 1]
 
 
 def test_replay_quadraui_2992_reaches_review_with_one_mechanic_leg_no_fix_rounds():
@@ -3682,9 +3725,9 @@ def test_replay_quadraui_2992_reaches_review_with_one_mechanic_leg_no_fix_rounds
     assert mechanic.command[0] == "mechanic-dispatch"
     assert counters.fix_rounds == 0
     assert counters.test_retry_sha == "windows-sha"
-    # Zero #3714 retries: the one-shot retry Action (`coord diagnose
-    # --stage test --reset`) was never returned for this SHA.
-    assert mechanic.command[0] != "diagnose"
+    # One classifier call for this SHA, reused by the route above — never a
+    # second, independent `triage_test_failure` run (#2096).
+    assert v.triage_test_failure_calls == 1
 
     # The mechanic leg lands (a confirmed, scoped Test PASS on ITS OWN
     # work row — #4094's `mechanic_leg_verdict`) — from `coord drive`'s own
@@ -3694,7 +3737,14 @@ def test_replay_quadraui_2992_reaches_review_with_one_mechanic_leg_no_fix_rounds
     # full-suite.
     s2 = done_work(work_test_state="passed")
     after = decide(s2, DriveOptions(machine="precision"), counters, v, machine="precision")
+    # Same shape `test_a_passed_or_skipped_test_falls_through_to_the_review_
+    # gate` asserts for a plain, non-triaged passed Test with no review row
+    # yet: `WAIT` with an EMPTY command. A drive still parked at the Test
+    # gate would have returned a RUN (another mechanic-dispatch/fix/retry)
+    # here instead, so this is "Review, nothing to dispatch yet" — never
+    # "Test, still failing".
     assert after.kind == WAIT
+    assert after.command == ()
     assert counters.fix_rounds == 0
 
 

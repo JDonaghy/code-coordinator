@@ -3982,7 +3982,7 @@ def _decide_acceptance_gate(
 # bucket #4093 grows later that this module doesn't recognize degrades to
 # the SAFER default (retry once, same as `None`) instead of silently
 # skipping straight to the fix round.
-_TEST_SKIP_RETRY_BUCKETS = frozenset({BUCKET_MECHANICAL, BUCKET_SUBSTANTIVE, BUCKET_HUMAN})
+_TEST_SKIP_RETRY_BUCKETS = frozenset({BUCKET_SUBSTANTIVE})
 
 
 def _triage_route_label(verdict: "TriageVerdict | None", route: str) -> str:
@@ -4229,6 +4229,11 @@ def _decide_test(
                         "--gate", f"test_reason={state.work_test_reason or '(none)'}",
                         "--command", inspect_cmd,
                         "--assignment", state.work_aid,
+                        # #4095: persist the SAME verdict onto the work
+                        # row's own `test_reason` (not just the separate
+                        # escalation record above), so `coord gates` shows
+                        # WHY Test failed without a second lookup.
+                        "--annotate-test-reason", reason,
                     ),
                     error_message=(
                         "failed to record the escalation on the board (exiting "
@@ -4255,6 +4260,20 @@ def _decide_test(
                             "--proposed-line-delta",
                             str(verdict.proposed_scope.estimated_line_delta),
                         ]
+                # Carry the SAME failure text the triage call above already
+                # classified, and this repo's own configured test command —
+                # both already in hand here (`work_test_reason` is
+                # guaranteed non-empty by the #2596 guard above;
+                # `repo_test_command` is a populated `IssueState` field) —
+                # so the dispatched leg's briefing can tell it to reproduce
+                # via ONLY that command rather than the full suite, instead
+                # of getting zero failure output.
+                reason_text = (state.work_test_reason or "").strip()
+                if reason_text:
+                    mech_command += ["--evidence", reason_text[:4000]]
+                test_command = (state.repo_test_command or "").strip()
+                if test_command:
+                    mech_command += ["--failed-stage-command", test_command]
                 return Action(
                     kind=RUN,
                     label=_triage_route_label(

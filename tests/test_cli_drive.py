@@ -199,11 +199,16 @@ def test_mechanic_dispatch_exits_zero_and_forwards_the_verdict_when_confirmed(
     `dispatch_mechanic_leg_for_triage`, unchanged."""
     seen: dict = {}
 
-    def fake_dispatch(repo_name, issue_number, board, config, *, verdict, branch_sha):
+    def fake_dispatch(
+        repo_name, issue_number, board, config, *,
+        verdict, branch_sha, evidence=(), failed_stage_commands=(),
+    ):
         seen["repo_name"] = repo_name
         seen["issue_number"] = issue_number
         seen["verdict"] = verdict
         seen["branch_sha"] = branch_sha
+        seen["evidence"] = evidence
+        seen["failed_stage_commands"] = failed_stage_commands
         return True
 
     monkeypatch.setattr("coord.board_service.is_remote", lambda: False)
@@ -222,12 +227,16 @@ def test_mechanic_dispatch_exits_zero_and_forwards_the_verdict_when_confirmed(
             "--repro-capability", "windows",
             "--proposed-file", "tests/test_foo.py",
             "--proposed-line-delta", "1",
+            "--evidence", "3 failed, 1 passed",
+            "--failed-stage-command", "pytest tests/test_foo.py",
         ],
     )
     assert result.exit_code == 0, result.output
     assert seen["repo_name"] == "somerepo"
     assert seen["issue_number"] == 1392
     assert seen["branch_sha"] == "deadbeef"
+    assert seen["evidence"] == ("3 failed, 1 passed",)
+    assert seen["failed_stage_commands"] == ("pytest tests/test_foo.py",)
     verdict = seen["verdict"]
     assert verdict.diagnosis == "ratchet off by one"
     assert verdict.confidence == 0.9
@@ -252,3 +261,91 @@ def test_mechanic_dispatch_exits_nonzero_on_a_decline(monkeypatch, valid_config_
         ],
     )
     assert result.exit_code != 0
+
+
+# ── #4095 fix review: persist the verdict so `coord gates` shows it ───────
+
+
+def test_annotate_test_reason_stamps_the_winning_work_rows_test_reason(monkeypatch):
+    """`_annotate_test_reason` is the shared write both `mechanic-dispatch`
+    and `escalate record --annotate-test-reason` use to persist a triage
+    verdict onto the row `coord gates` already renders `test_reason` from —
+    no new column, the existing `record_test_verdict` plumbing."""
+    from coord.commands.drive import _annotate_test_reason
+    from coord.models import Assignment, Board
+
+    board = Board()
+    board.completed.append(
+        Assignment(
+            machine_name="precision", repo_name="somerepo", issue_number=1392,
+            issue_title="x", type="work", assignment_id="w1", status="done",
+            test_state="failed", test_reason="original failure text",
+            dispatched_at=1.0,
+        )
+    )
+    captured: dict = {}
+
+    def fake_record_test_verdict(*, assignment_id, test_state, test_reason):
+        captured["assignment_id"] = assignment_id
+        captured["test_state"] = test_state
+        captured["test_reason"] = test_reason
+
+    monkeypatch.setattr("coord.state.record_test_verdict", fake_record_test_verdict)
+
+    ok = _annotate_test_reason(board, "somerepo", 1392, "[triage=mechanical] off by one")
+
+    assert ok is True
+    assert captured["assignment_id"] == "w1"
+    assert captured["test_state"] == "failed"
+    assert "[triage=mechanical] off by one" in captured["test_reason"]
+    assert "original failure text" in captured["test_reason"]
+
+
+def test_annotate_test_reason_is_a_noop_for_an_issue_with_no_work_row(monkeypatch):
+    from coord.commands.drive import _annotate_test_reason
+    from coord.models import Board
+
+    calls = []
+    monkeypatch.setattr(
+        "coord.state.record_test_verdict", lambda **kw: calls.append(kw)
+    )
+
+    ok = _annotate_test_reason(Board(), "somerepo", 1392, "text")
+
+    assert ok is False
+    assert calls == []
+
+
+def test_escalate_record_annotate_test_reason_calls_the_shared_helper(
+    monkeypatch, valid_config_path: Path
+):
+    """`escalate record --annotate-test-reason` is the `human`-bucket call
+    site for the same persistence `mechanic-dispatch` does for the
+    `mechanical` bucket."""
+    seen: dict = {}
+
+    monkeypatch.setattr("coord.state.record_drive_escalation", lambda *a, **kw: 1)
+    monkeypatch.setattr(
+        "coord.commands.drive._board_for_annotation", lambda: object()
+    )
+    monkeypatch.setattr(
+        "coord.commands.drive._annotate_test_reason",
+        lambda board, repo, issue, text: seen.update(
+            board=board, repo=repo, issue=issue, text=text
+        ),
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "escalate", "record", "somerepo", "1392",
+            "--stage", "test",
+            "--reason", "test_triage_human — ambiguous spec",
+            "--command", "coord log w1",
+            "--assignment", "w1",
+            "--annotate-test-reason", "test_triage_human — ambiguous spec",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["repo"] == "somerepo"
+    assert seen["issue"] == 1392
+    assert seen["text"] == "test_triage_human — ambiguous spec"
