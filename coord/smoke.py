@@ -113,6 +113,7 @@ from coord.config import (
 )
 from coord.confirm_test import TEST_CONFIRMATION_CI_AND_WORKER
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+from coord.failure_evidence import FailureEvidence
 # #3315 review: the shared environmental-retry-budget knob — see
 # `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` below for why this lives in
 # `coord.failure_class` rather than as this module's own literal.
@@ -494,6 +495,14 @@ class PlainRunnerVerdict:
     passed: bool
     exit_code: int
     log_tail: str
+    #: #4092: mirrors `coord.agent.PlainRunnerVerdict.failure_evidence` —
+    #: the structured record `coord.failure_evidence.
+    #: extract_failure_evidence` pulled from the full (pre-truncation) log.
+    #: `None` here, same as the executor-side field defaulting to one, is
+    #: never constructed by this module (see the class docstring: this is
+    #: a documentation mirror of the shape the OTHER process's verdict
+    #: carries, not a value this side ever produces).
+    failure_evidence: FailureEvidence | None = None
 
 
 # #3673 item 2: "skip re-smoke when it adds nothing" — a work leg that

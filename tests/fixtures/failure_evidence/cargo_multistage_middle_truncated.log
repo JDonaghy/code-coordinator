@@ -1,0 +1,465 @@
+=== stage 1/8: cargo fmt --all -- --check ===
+fmt line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+fmt line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 1/8 OK ===
+
+=== stage 2/8: cargo build --workspace ===
+build line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 40: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 41: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 42: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 43: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 44: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 45: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 46: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 47: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 48: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 49: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 50: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 51: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 52: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 53: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 54: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 55: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 56: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 57: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 58: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+build line 59: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 2/8 OK ===
+
+=== stage 3/8: cargo clippy --workspace --all-targets -- -D warnings ===
+clippy line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 40: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 41: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 42: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 43: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 44: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 45: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 46: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 47: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 48: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 49: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 50: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 51: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 52: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 53: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 54: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 55: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 56: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 57: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 58: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+clippy line 59: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 3/8 OK ===
+
+=== stage 4/8: cargo test --workspace --lib ===
+running 128 tests
+test-noise line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test tests::test_widget_resize ... FAILED
+test-noise line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+test-noise line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+
+failures:
+
+---- tests::test_widget_resize stdout ----
+thread 'tests::test_widget_resize' panicked at src/widget.rs:482:9:
+assertion `left == right` failed
+  left: 80
+  right: 100
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+error[E0308]: mismatched types
+ --> src/widget.rs:120:9
+  |
+120 |     return width
+    |            ^^^^^ expected `u32`, found `i32`
+
+failures:
+    tests::test_widget_resize
+
+test result: FAILED. 127 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.21s
+
+error: test failed, to rerun pass `-p mycrate --lib`
+=== stage 4/8 FAILED ===
+
+=== stage 5/8: cargo test --workspace --doc ===
+doctest line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 40: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 41: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 42: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 43: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 44: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 45: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 46: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 47: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 48: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 49: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 50: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 51: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 52: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 53: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 54: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 55: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 56: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 57: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 58: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doctest line 59: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 5/8 OK ===
+
+=== stage 6/8: cargo bench --no-run ===
+bench line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 40: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 41: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 42: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 43: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 44: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 45: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 46: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 47: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 48: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 49: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 50: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 51: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 52: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 53: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 54: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 55: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 56: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 57: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 58: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+bench line 59: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 6/8 OK ===
+
+=== stage 7/8: cargo doc --workspace --no-deps ===
+doc line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 40: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 41: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 42: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 43: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 44: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 45: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 46: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 47: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 48: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 49: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 50: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 51: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 52: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 53: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 54: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 55: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 56: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 57: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 58: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+doc line 59: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 7/8 OK ===
+
+=== stage 8/8: cargo audit ===
+audit line 0: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 1: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 2: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 3: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 4: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 5: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 6: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 7: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 8: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 9: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 10: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 11: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 12: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 13: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 14: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 15: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 16: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 17: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 18: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 19: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 20: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 21: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 22: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 23: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 24: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 25: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 26: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 27: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 28: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 29: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 30: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 31: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 32: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 33: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 34: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 35: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 36: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 37: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 38: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 39: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 40: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 41: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 42: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 43: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 44: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 45: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 46: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 47: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 48: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 49: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 50: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 51: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 52: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 53: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 54: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 55: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 56: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 57: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 58: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+audit line 59: ok, nothing to see here, just build/doc/bench noise padding this stage's own output out to a realistic size
+=== stage 8/8 OK ===
+
+FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib
+RESULT: FAIL (cargo test --workspace --lib)
