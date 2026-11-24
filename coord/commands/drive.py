@@ -794,3 +794,108 @@ def decide(
             "done (no escalation record to dismiss — rerun "
             "`coord report run decisions` to confirm this card is gone)"
         )
+
+
+# ── coord mechanic-dispatch (#4095) ──────────────────────────────────────
+#
+# `coord drive`'s Test-failure triage router (`coord.drive._decide_test`)
+# dispatches the #4094 mechanic leg through THIS command, never a direct
+# in-process call into `coord.board_doctor_policy` — "every board mutation
+# this driver performs goes through the CLI" (see `coord/drive.py`'s own
+# module docstring, and #1384 which that rule exists to avoid repeating).
+# The verdict is rebuilt from the flags `_decide_test` already derived from
+# its OWN `GitMergeVerifier.triage_test_failure` call, never re-classified
+# here — a second, independent classifier run (`coord.failure_triage.
+# triage_failure` has a model tier) could disagree with the first and
+# dispatch on a different bucket than the one the drive pane just logged
+# (#2096, "one question, one answer").
+
+
+@click.command("mechanic-dispatch")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("branch_sha")
+@click.option("--diagnosis", default="", help="The triage verdict's own diagnosis text.")
+@click.option(
+    "--confidence", type=float, default=0.0,
+    help="The triage verdict's own confidence (0.0-1.0).",
+)
+@click.option("--via", default="", help="Which triage tier produced the verdict.")
+@click.option(
+    "--repro-capability", default=None,
+    help="Machine capability the triage verdict says can reproduce the failure.",
+)
+@click.option(
+    "--proposed-file", "proposed_files", multiple=True,
+    help="A file the triage verdict guesses a fix would touch. Repeatable.",
+)
+@click.option(
+    "--proposed-line-delta", type=int, default=0,
+    help="The triage verdict's own estimated changed-line count.",
+)
+@_CONFIG_OPTION
+def mechanic_dispatch(
+    repo: str,
+    issue: int,
+    branch_sha: str,
+    diagnosis: str,
+    confidence: float,
+    via: str,
+    repro_capability: str | None,
+    proposed_files: tuple[str, ...],
+    proposed_line_delta: int,
+    config_path: Path,
+) -> None:
+    """Route a BUCKET_MECHANICAL Test-stage triage verdict to the #4094
+    mechanic leg — ``coord drive``'s one call site for it (#4095).
+
+    Exits 0 only when `coord.board_doctor_policy.dispatch_mechanic_leg_
+    for_triage` confirms a dispatch actually started; exits 1 for every
+    graceful decline (the per-repo tier not opted in, the env-var kill
+    switch, the repo already at its capacity cap, no machine declaring the
+    needed capability, the one-mechanic-leg-per-SHA budget already spent,
+    ...). `coord drive` treats either non-zero outcome identically: fall
+    back to an ordinary fix round on the next poll — never a worse outcome
+    than before this command existed.
+
+    Daemon-host only, same guard as `coord drive-queue doctor-act` — the
+    board this reads/mutates lives there; a thin client would act on an
+    empty local copy and always decline.
+    """
+    from coord.board_service import is_remote  # noqa: PLC0415
+
+    if is_remote():
+        raise click.ClickException(
+            "mechanic-dispatch mutates the daemon host's board directly — "
+            "run it there (a board_service-configured thin client would act "
+            "on an empty local copy and always decline)."
+        )
+
+    from coord.board_doctor_policy import dispatch_mechanic_leg_for_triage  # noqa: PLC0415
+    from coord.failure_triage import BUCKET_MECHANICAL, ProposedScope, TriageVerdict  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    config = _load_config(config_path)
+    board = build_board()
+    verdict = TriageVerdict(
+        bucket=BUCKET_MECHANICAL,
+        diagnosis=diagnosis,
+        repro_capability=repro_capability,
+        proposed_scope=ProposedScope(
+            files=tuple(proposed_files), estimated_line_delta=proposed_line_delta,
+        ),
+        confidence=confidence,
+        via=via,
+    )
+    dispatched = dispatch_mechanic_leg_for_triage(
+        repo, issue, board, config, verdict=verdict, branch_sha=branch_sha,
+    )
+    if dispatched:
+        click.echo(f"mechanic leg dispatched for {repo} #{issue} at sha={branch_sha}")
+        return
+    click.echo(
+        f"mechanic leg NOT dispatched for {repo} #{issue} — declined; an "
+        "ordinary fix round should follow",
+        err=True,
+    )
+    sys.exit(1)

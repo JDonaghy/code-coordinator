@@ -149,6 +149,7 @@ from coord.commands.drive import (
     drive_sessions,
     drive_stop,
     escalate_group,
+    mechanic_dispatch,
 )
 from coord.commands.drive_queue import drive_queue_group
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
@@ -498,6 +499,7 @@ main.add_command(drive_stop)
 main.add_command(drive_queue_group)
 main.add_command(escalate_group)
 main.add_command(decide)
+main.add_command(mechanic_dispatch)
 main.add_command(pr_group)
 main.add_command(ci_group)
 main.add_command(fix)
