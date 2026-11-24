@@ -168,3 +168,87 @@ def test_no_acceptance_defaults_off(monkeypatch, valid_config_path: Path):
 def test_merge_method_is_constrained_to_the_three_coord_merge_supports():
     result = CliRunner().invoke(main, ["drive", "--merge-method", "octopus", "r", "1"])
     assert result.exit_code != 0
+
+
+# ── coord mechanic-dispatch (#4095) ────────────────────────────────────────
+
+
+def test_mechanic_dispatch_is_registered_on_the_main_cli():
+    assert "mechanic-dispatch" in main.commands
+
+
+def test_mechanic_dispatch_refuses_on_a_thin_client(monkeypatch, valid_config_path: Path):
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: True)
+    result = CliRunner().invoke(
+        main,
+        [
+            "mechanic-dispatch", "--config", str(valid_config_path),
+            "somerepo", "1392", "deadbeef",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "thin client" in result.output or "daemon host" in result.output
+
+
+def test_mechanic_dispatch_exits_zero_and_forwards_the_verdict_when_confirmed(
+    monkeypatch, valid_config_path: Path
+):
+    """`coord.drive._decide_test` only knows "dispatched" from a zero exit —
+    never from the mere absence of an exception (#2096) — so the verdict
+    this command rebuilds from its flags must be the one actually handed to
+    `dispatch_mechanic_leg_for_triage`, unchanged."""
+    seen: dict = {}
+
+    def fake_dispatch(repo_name, issue_number, board, config, *, verdict, branch_sha):
+        seen["repo_name"] = repo_name
+        seen["issue_number"] = issue_number
+        seen["verdict"] = verdict
+        seen["branch_sha"] = branch_sha
+        return True
+
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: False)
+    monkeypatch.setattr("coord.state.build_board", lambda: object())
+    monkeypatch.setattr(
+        "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage", fake_dispatch
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "mechanic-dispatch", "--config", str(valid_config_path),
+            "somerepo", "1392", "deadbeef",
+            "--diagnosis", "ratchet off by one",
+            "--confidence", "0.9",
+            "--via", "model",
+            "--repro-capability", "windows",
+            "--proposed-file", "tests/test_foo.py",
+            "--proposed-line-delta", "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["repo_name"] == "somerepo"
+    assert seen["issue_number"] == 1392
+    assert seen["branch_sha"] == "deadbeef"
+    verdict = seen["verdict"]
+    assert verdict.diagnosis == "ratchet off by one"
+    assert verdict.confidence == 0.9
+    assert verdict.via == "model"
+    assert verdict.repro_capability == "windows"
+    assert verdict.proposed_scope.files == ("tests/test_foo.py",)
+    assert verdict.proposed_scope.estimated_line_delta == 1
+
+
+def test_mechanic_dispatch_exits_nonzero_on_a_decline(monkeypatch, valid_config_path: Path):
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: False)
+    monkeypatch.setattr("coord.state.build_board", lambda: object())
+    monkeypatch.setattr(
+        "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage",
+        lambda *a, **kw: False,
+    )
+    result = CliRunner().invoke(
+        main,
+        [
+            "mechanic-dispatch", "--config", str(valid_config_path),
+            "somerepo", "1392", "deadbeef",
+        ],
+    )
+    assert result.exit_code != 0
