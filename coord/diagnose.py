@@ -2779,6 +2779,98 @@ def _stamp_fanout_heal_marker(
         )
 
 
+def _heal_stuck_xcheck_row(
+    w: "Assignment", board: "Board", *, dry_run: bool,
+) -> "StuckTestStateHeal | None":
+    """Resolve a work row wedged at ``test_state='running'`` with an
+    in-flight #4098 pre-Test cross-platform precheck manifest
+    (``[[xcheck:...]]``), by deferring entirely to
+    :func:`coord.smoke._resolve_cross_platform_precheck` — see
+    :func:`sweep_stuck_test_state_rows`'s call site for why the generic
+    fan-out/single-leg classification there must never run against this
+    manifest shape.
+
+    Unlike every other branch of :func:`sweep_stuck_test_state_rows`, this
+    has no :data:`STUCK_TEST_STATE_GRACE_SECONDS` gate: the resolver is
+    already idempotent and side-effect-free while genuinely waiting (it
+    returns ``"pending"`` without writing anything — see
+    :func:`coord.smoke._classify_xcheck_legs`), so calling it on every
+    sweep tick can never misclassify early the way the other branches'
+    elapsed-time gate exists to guard against.
+
+    Returns ``None`` when there is nothing to report: the round is still
+    genuinely pending, or (live only) the resolver's write could not be
+    confirmed by a re-read (#2096 — a heal is reported only once the
+    verdict is actually observable on the row).
+    """
+    from coord.smoke import _classify_xcheck_legs, _parse_xcheck_manifest  # noqa: PLC0415
+
+    legs = _parse_xcheck_manifest(w.test_reason)
+    if not legs:
+        return None  # malformed/empty manifest — nothing to resolve
+
+    if dry_run:
+        outcome, _failed, _dead = _classify_xcheck_legs(legs, board)
+        if outcome == "pending":
+            return None
+        return StuckTestStateHeal(
+            assignment_id=w.assignment_id,
+            machine_name=w.machine_name or "unknown",
+            repo_name=w.repo_name,
+            issue_number=w.issue_number,
+            detail=(
+                "test_state='running' with an in-flight #4098 pre-Test "
+                f"cross-platform precheck round that resolves {outcome!r} "
+                "on a live re-check"
+            ),
+            action=(
+                f"(dry-run) would resolve the #4098 precheck round "
+                f"({outcome!r}) via coord.smoke._resolve_cross_platform_precheck"
+            ),
+        )
+
+    from coord.smoke import _resolve_cross_platform_precheck  # noqa: PLC0415
+    from coord.state import load_assignment_test_state  # noqa: PLC0415
+
+    outcome = _resolve_cross_platform_precheck(w, board)
+    if outcome not in ("failed", "passed"):
+        return None  # still pending, or a live re-read found no manifest
+        # after all — nothing healed this tick.
+
+    # #2096: confirm the write actually landed before crediting a heal —
+    # the same discipline every other branch of this sweep follows.
+    try:
+        observed = load_assignment_test_state(w.assignment_id)
+    except Exception as exc:  # noqa: BLE001 — never sink the sweep
+        log.warning(
+            "sweep_stuck_test_state_rows: could not confirm the resolved "
+            "#4098 precheck verdict for %s (%s) — not reporting a heal",
+            w.assignment_id, exc,
+        )
+        return None
+    if outcome == "failed" and observed != "failed":
+        return None
+    if outcome == "passed" and observed is not None:
+        # The resolver clears a pass (or a dead-leg fail-open) back to
+        # `None` — if it's anything else the clear never landed.
+        return None
+
+    return StuckTestStateHeal(
+        assignment_id=w.assignment_id,
+        machine_name=w.machine_name or "unknown",
+        repo_name=w.repo_name,
+        issue_number=w.issue_number,
+        detail=(
+            "test_state='running' with an in-flight #4098 pre-Test "
+            f"cross-platform precheck round — resolved {outcome!r}"
+        ),
+        action=(
+            f"resolved the #4098 pre-Test cross-platform precheck round "
+            f"({outcome!r}) via coord.smoke._resolve_cross_platform_precheck"
+        ),
+    )
+
+
 def sweep_stuck_test_state_rows(
     board: "Board",
     config: "Config",
@@ -2896,7 +2988,11 @@ def sweep_stuck_test_state_rows(
     tick (or a human via ``coord diagnose --stage test``) to retry.
     """
     from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
-    from coord.smoke import TEST_STATE_BLOCKED, _parse_fanout_manifest  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        TEST_STATE_BLOCKED,
+        _parse_fanout_manifest,
+        _parse_xcheck_manifest,
+    )
 
     if now is None:
         now = time.time()
@@ -2911,6 +3007,27 @@ def sweep_stuck_test_state_rows(
         if not w.assignment_id or w.assignment_id in seen_ids:
             continue
         seen_ids.add(w.assignment_id)
+
+        if _parse_xcheck_manifest(w.test_reason) is not None:
+            # #4098 review: an in-flight pre-Test cross-platform precheck
+            # round carries a DIFFERENT manifest tag (`[[xcheck:...]]`) than
+            # a #3182 fan-out, deliberately invisible to
+            # `_parse_fanout_manifest` (see `coord.smoke`'s module comment
+            # on `_XCHECK_MANIFEST_RE`) — so without this branch it falls
+            # through the fan-out/single-leg classification below as an
+            # ORDINARY single-leg row, and the latest smoke CHILD this
+            # sweep would find is only the cheap compile-only leg, never a
+            # real Test-stage verdict. Propagating that leg's own verdict
+            # verbatim (as the genuine single-leg case below correctly
+            # does for an ordinary Test leg) would launder a compile-only
+            # pass straight onto the parent's Test-stage `test_state`,
+            # satisfying the merge gate with the real suite never having
+            # run (#2096). Defer entirely to this row's own
+            # `coord.smoke._resolve_cross_platform_precheck` instead.
+            heal = _heal_stuck_xcheck_row(w, board, dry_run=dry_run)
+            if heal is not None:
+                healed.append(heal)
+            continue
 
         smoke = _latest_smoke_child(board, w.assignment_id)
 

@@ -2276,17 +2276,19 @@ SINGLE_LEG_SMOKE_PARTITION_TAG = "single-leg"
 # first time any OTHER platform even *compiles* the branch used to be inside
 # the full Test-stage fan-out (an ~11-minute, multi-machine run on
 # quadraui). `smoke_tests.cross_platform_checks` (`coord.config.
-# SmokeTestsConfig`) declares a cheap, compile-only command per capability;
-# `_dispatch_cross_platform_precheck` runs whichever of those the Work leg's
+# SmokeTestsConfig`) maps a LOCAL REPO NAME to a cheap, compile-only command
+# per capability for that repo only; `_dispatch_cross_platform_precheck`
+# runs whichever of the completed row's OWN repo's entries the Work leg's
 # own machine can't itself verify (`pending_cross_platform_checks`) on a
 # capability-matched machine OTHER than that one, BEFORE ever dispatching
 # the real fan-out. A failure is recorded as a terminal `test_state="failed"`
 # straight away — skipping the fan-out entirely and handing off to `coord
 # drive`'s EXISTING triage-first routing in `_decide_test` (#4093/#4095),
 # exactly like any other Test-stage failure, with no separate triage
-# machinery of its own. A pass clears the row back to its pre-dispatch state
-# (`test_state=None`) so the caller falls through to an ordinary,
-# unmodified Test-stage dispatch next.
+# machinery of its own. A pass (or a leg that died with no verdict of its
+# own — `_classify_xcheck_legs` fails OPEN rather than stranding the round)
+# clears the row back to its pre-dispatch state (`test_state=None`) so the
+# caller falls through to an ordinary, unmodified Test-stage dispatch next.
 #
 # The round's own two-leg-id manifest is stamped at the front of the
 # parent's `test_reason` while it's in flight — the same on-the-board-text
@@ -2296,7 +2298,13 @@ SINGLE_LEG_SMOKE_PARTITION_TAG = "single-leg"
 # every manifest-listed leg into ONE terminal verdict the moment they've all
 # reported in — never mistakes an in-flight precheck round for a fan-out
 # round and finalizes a premature `passed` before the real suite has even
-# been dispatched.
+# been dispatched. For the SAME reason, `coord.diagnose.
+# sweep_stuck_test_state_rows` (the #2803 fleet-wide watchdog on a wedged
+# `test_state="running"` row) checks for this tag before its own generic
+# fan-out/single-leg classification runs — see that function's own
+# `_heal_stuck_xcheck_row` helper — rather than letting a precheck leg's
+# own compile-only verdict get propagated straight onto the parent's
+# Test-stage `test_state`.
 _XCHECK_MANIFEST_RE = re.compile(r"^\[\[xcheck:([^\]]*)\]\]\n?")
 
 
@@ -2332,24 +2340,33 @@ def _parse_xcheck_manifest(test_reason: str | None) -> list[tuple[str, str]] | N
 
 
 def pending_cross_platform_checks(
-    work_capabilities: Iterable[str], config: Config,
+    work_capabilities: Iterable[str], repo_name: str, config: Config,
 ) -> list[tuple[str, str]]:
-    """Which of ``smoke_tests.cross_platform_checks`` still need to run for a
-    Work leg whose own machine declares *work_capabilities* (#4098).
+    """Which of ``smoke_tests.cross_platform_checks[repo_name]`` still need
+    to run for a Work leg whose own machine declares *work_capabilities*
+    (#4098).
+
+    Scoped to *repo_name* — ``cross_platform_checks`` is keyed by LOCAL repo
+    name precisely so a compile-only command written for one repo (e.g.
+    quadraui's `cargo check -p quadraui`) is never run inside a different
+    repo's own worktree (see ``SmokeTestsConfig.cross_platform_checks``'s
+    docstring).
 
     A capability already declared by the Work leg's own machine is excluded
     — that platform was already compiled (the Work leg's own build *is* the
     proof), so cross-checking it again on a different machine would be
-    redundant. Declaration order of ``cross_platform_checks`` is preserved.
+    redundant. Declaration order of *repo_name*'s entry is preserved.
 
-    Returns ``[]`` when `config.smoke_tests.cross_platform_checks` is empty
-    (unconfigured — the default) or when the Work leg's own machine already
-    covers every configured capability — both cases mean "nothing to check
-    here," which is also what every caller of this function treats an empty
-    result as: proceed exactly as if this feature did not exist.
+    Returns ``[]`` when `config.smoke_tests.cross_platform_checks` has no
+    entry for *repo_name* (unconfigured — the default) or when the Work
+    leg's own machine already covers every configured capability — both
+    cases mean "nothing to check here," which is also what every caller of
+    this function treats an empty result as: proceed exactly as if this
+    feature did not exist.
     """
     smoke_cfg = getattr(config, "smoke_tests", None)
-    checks = getattr(smoke_cfg, "cross_platform_checks", None) or {}
+    all_checks = getattr(smoke_cfg, "cross_platform_checks", None) or {}
+    checks = all_checks.get(repo_name) or {}
     have = set(work_capabilities)
     return [
         (capability, command)
@@ -2358,9 +2375,70 @@ def pending_cross_platform_checks(
     ]
 
 
-def _resolve_cross_platform_precheck(completed: Assignment) -> str | None:
+def _classify_xcheck_legs(
+    legs: list[tuple[str, str]], board: Board,
+) -> tuple[str, list[tuple[str, str | None]], list[str]]:
+    """Pure (no writes) leg classification for an in-flight #4098 precheck
+    round's *legs* — the ``(leg_id, capability)`` pairs
+    :func:`_parse_xcheck_manifest` decoded off a parent's ``test_reason``.
+
+    Returns ``(outcome, failed, dead_capabilities)``:
+
+    * *outcome* is ``"pending"`` (at least one leg is genuinely still in
+      flight), ``"failed"`` (every leg has reported in or died, and at
+      least one real failure was recorded), or ``"passed"`` (every leg
+      either passed or died with no verdict of its own, and none failed).
+    * *failed* is the ``(capability, leg_test_reason)`` pairs of any REAL
+      non-passing verdict (only populated when *outcome* is ``"failed"``).
+    * *dead_capabilities* lists any leg whose own row reached a terminal
+      ``status`` with no ``test_state`` of its own ever recorded — see
+      :func:`_resolve_cross_platform_precheck`'s docstring for why that is
+      classified apart from "still pending".
+
+    Split out of :func:`_resolve_cross_platform_precheck` so a caller that
+    must never write anything — :func:`coord.diagnose.sweep_stuck_test_state_rows`'s
+    own ``dry_run`` peek — can ask the IDENTICAL question the live write
+    path answers (#2085: one question, one answer, not two independently
+    drifting classifications of the same manifest).
+    """
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        load_assignment_test_state,
+    )
+
+    board_by_id = {
+        a.assignment_id: a
+        for a in list(board.active) + list(board.completed)
+        if a.assignment_id is not None
+    }
+
+    leg_states: list[tuple[str, str, str]] = []
+    dead_capabilities: list[str] = []
+    for leg_id, capability in legs:
+        state = load_assignment_test_state(leg_id)
+        if state in (None, "running"):
+            leg = board_by_id.get(leg_id)
+            leg_status = leg.status if leg is not None else None
+            if leg_status in (None, "pending", "running"):
+                return "pending", [], []
+            dead_capabilities.append(capability)
+            continue
+        leg_states.append((leg_id, capability, state))
+
+    failed = [
+        (capability, load_assignment_test_reason(leg_id))
+        for leg_id, capability, state in leg_states
+        if state != "passed"
+    ]
+    return ("failed" if failed else "passed"), failed, dead_capabilities
+
+
+def _resolve_cross_platform_precheck(
+    completed: Assignment, board: Board,
+) -> str | None:
     """Poll an in-flight #4098 precheck round for *completed* and resolve it
-    once every leg it dispatched has reported in.
+    once every leg it dispatched has reported in (or died without ever
+    reporting one).
 
     Returns ``None`` when `completed`'s own (freshly re-read) ``test_reason``
     carries no ``[[xcheck:...]]`` manifest at all — an ordinary in-flight
@@ -2369,26 +2447,57 @@ def _resolve_cross_platform_precheck(completed: Assignment) -> str | None:
     wait for its own completion.
 
     Returns ``"pending"`` when a manifest exists but at least one listed leg
-    has not yet reached a terminal ``test_state`` of its own.
+    is genuinely still in flight — ``test_state`` is ``None``/``"running"``
+    AND the leg's own row on *board* is still ``"pending"``/``"running"``
+    (or not found there at all; a thin client's bounded ``board.completed``
+    window may simply not carry a very recently dispatched leg yet).
 
-    Returns ``"failed"`` once every leg has reported in and at least one did
-    not pass: folds a terminal ``test_state="failed"`` onto *completed*'s own
-    row (mutating both the persisted row and *completed* in place) — #4098's
-    "goes straight to triage": the row is now in exactly the same
-    failed-with-a-reason shape every other Test-stage failure reaches, so
-    `coord drive`'s existing triage-first routing in ``_decide_test``
-    (#4093/#4095) takes over with no special case of its own, and the full
-    fan-out this round would otherwise have paid for is never dispatched.
+    A leg whose ``test_state`` is ``None``/``"running"`` but whose OWN row
+    has already reached a terminal ``status`` (``"done"``/``"failed"``/
+    ``"cancelled"``/...) is DEAD, not pending: a #2272 mute clear
+    (``coord.notify._record_smoke_verdict``) or a #1605 environmental-death
+    clear (``coord.reconcile.propagate_smoke_terminal_failure``) both leave
+    ``test_state=None`` on a row that, unlike a #3182 fan-out partition
+    (``_find_leg_for_partition``), is never re-dispatched under the SAME leg
+    id this manifest names — so treating it as "still pending" would strand
+    this round at ``test_state="running"`` forever, with nothing but the
+    #2803 stuck-row watchdog left to (mis)resolve it. A dead leg's
+    capability is therefore excluded from both the pending and the failed
+    set below and the round still resolves once every OTHER leg has:
+    ``"failed"`` if a real failure was recorded elsewhere, otherwise
+    ``"passed"`` (fail OPEN to the real Test-stage fan-out — this precheck
+    is an optimisation, never a hard gate, mirroring the posture
+    ``_dispatch_cross_platform_precheck`` already takes for an unroutable
+    capability).
 
-    Returns ``"passed"`` once every leg has passed: CLEARS the row's verdict
-    back to ``test_state=None`` (mutating both the persisted row and
-    *completed* in place) — mirroring the #1479 stale-verdict clear a few
-    lines below in `dispatch_pending_smoke` — so the caller falls through
-    into an ordinary, unmodified Test-stage dispatch for the real suite.
+    Returns ``"failed"`` once every leg has reported in (or died) and at
+    least one recorded a real, non-passing verdict: folds a terminal
+    ``test_state="failed"`` onto *completed*'s own row (mutating both the
+    persisted row and *completed* in place) — #4098's "goes straight to
+    triage": the row is now in exactly the same failed-with-a-reason shape
+    every other Test-stage failure reaches, so `coord drive`'s existing
+    triage-first routing in ``_decide_test`` (#4093/#4095) takes over with
+    no special case of its own, and the full fan-out this round would
+    otherwise have paid for is never dispatched.
+
+    Returns ``"passed"`` once every leg has either passed or died with no
+    verdict and none recorded a real failure: CLEARS the row's verdict back
+    to ``test_state=None`` (mutating both the persisted row and *completed*
+    in place) — mirroring the #1479 stale-verdict clear a few lines below in
+    `dispatch_pending_smoke` — so the caller falls through into an ordinary,
+    unmodified Test-stage dispatch for the real suite. The written
+    ``test_reason`` distinguishes a clean pass from a dead-leg fail-open
+    (#2096: "unconfirmed success is a defect" — a dead leg's capability was
+    never actually confirmed to compile, so this must never read as "every
+    platform compiled cleanly") and carries forward any #2272/#3315/#3737
+    retry tally already on the row — this write is NOT the row's final
+    verdict, so a subsequent "running" stamp for the real fan-out must still
+    be able to read those tallies back out of it (see
+    `_dispatch_cross_platform_precheck`'s own carry-forward for why letting
+    this write erase them reproduces the #2272 never-firing-budget shape).
     """
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
-        load_assignment_test_state,
         record_test_verdict,
     )
 
@@ -2408,18 +2517,23 @@ def _resolve_cross_platform_precheck(completed: Assignment) -> str | None:
     if legs is None:
         return None
 
-    leg_states = [
-        (leg_id, capability, load_assignment_test_state(leg_id))
-        for leg_id, capability in legs
-    ]
-    if any(state in (None, "running") for _, _, state in leg_states):
+    outcome, failed, dead_capabilities = _classify_xcheck_legs(legs, board)
+    if outcome == "pending":
         return "pending"
 
-    failed = [
-        (capability, load_assignment_test_reason(leg_id))
-        for leg_id, capability, state in leg_states
-        if state != "passed"
-    ]
+    board_reason = getattr(completed, "test_reason", None)
+    prior_mute = max(
+        mute_smoke_legs(authoritative_reason), mute_smoke_legs(board_reason),
+    )
+    prior_env = max(
+        environmental_smoke_legs(authoritative_reason),
+        environmental_smoke_legs(board_reason),
+    )
+    prior_abandoned = max(
+        abandoned_background_smoke_legs(authoritative_reason),
+        abandoned_background_smoke_legs(board_reason),
+    )
+
     if failed:
         named = "; ".join(
             f"{capability}: {leg_reason or 'no reason recorded'}"
@@ -2430,6 +2544,12 @@ def _resolve_cross_platform_precheck(completed: Assignment) -> str | None:
             "full Test fan-out was skipped — a compile failure here would "
             "fail every fan-out leg too, so it is not worth paying for one."
         )
+        if dead_capabilities:
+            new_reason = (
+                f"{new_reason} (also never got a verdict for "
+                f"{', '.join(sorted(dead_capabilities))} — excluded from "
+                "this failure.)"
+            )
         if completed.assignment_id is not None:
             record_test_verdict(
                 assignment_id=completed.assignment_id,
@@ -2440,17 +2560,36 @@ def _resolve_cross_platform_precheck(completed: Assignment) -> str | None:
         completed.test_reason = new_reason
         return "failed"
 
+    if dead_capabilities:
+        new_reason = (
+            "Pre-Test cross-platform check inconclusive for "
+            f"{', '.join(sorted(dead_capabilities))} (#4098: the leg "
+            "finished with no verdict of its own, and is never retried "
+            "under this precheck round) — failing open to the full "
+            "Test-stage fan-out rather than blocking on it."
+        )
+    else:
+        new_reason = (
+            "Pre-Test cross-platform check passed (#4098) — proceeding to "
+            "the full Test-stage fan-out."
+        )
+    if prior_mute:
+        new_reason = f"{new_reason}\n{mute_smoke_tally(prior_mute)}"
+    if prior_env:
+        new_reason = f"{new_reason}\n{environmental_smoke_tally(prior_env)}"
+    if prior_abandoned:
+        new_reason = (
+            f"{new_reason}\n{abandoned_background_smoke_tally(prior_abandoned)}"
+        )
+
     if completed.assignment_id is not None:
         record_test_verdict(
             assignment_id=completed.assignment_id,
             test_state=None,
-            test_reason=(
-                "Pre-Test cross-platform check passed (#4098) — proceeding "
-                "to the full Test-stage fan-out."
-            ),
+            test_reason=new_reason,
         )
     completed.test_state = None
-    completed.test_reason = None
+    completed.test_reason = new_reason
     return "passed"
 
 
@@ -2491,7 +2630,7 @@ def _dispatch_cross_platform_precheck(
         (m for m in config.machines if m.name == completed.machine_name), None
     )
     work_caps = work_machine.capabilities if work_machine is not None else []
-    pending = pending_cross_platform_checks(work_caps, config)
+    pending = pending_cross_platform_checks(work_caps, completed.repo_name, config)
     if not pending:
         return None
 
@@ -2627,16 +2766,68 @@ def _dispatch_cross_platform_precheck(
         return None
 
     manifest = _encode_xcheck_manifest(leg_entries)
+    running_reason = manifest
     if completed.assignment_id is not None:
-        from coord.state import record_test_verdict  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            load_assignment_test_reason,
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        # #4098 review, #3343-style: re-check the authoritative `test_state`
+        # ONE MORE TIME, right before this write — `_walk_candidates_and_
+        # dispatch` above does an HTTP round trip PER pending capability, and
+        # another in-flight leg on this same branch can land a terminal
+        # verdict during that window. Trusting the pre-loop snapshot would
+        # blindly clobber a just-landed `passed`/`skipped`/`failed`/
+        # `TEST_STATE_BLOCKED` back to `"running"` — un-satisfying a gate
+        # that was already satisfied (#1819) and deadlocking the merge
+        # queue. Mirrors `_dispatch_smoke_single_leg`'s identical guard a few
+        # hundred lines below.
+        authoritative_state = load_assignment_test_state(completed.assignment_id)
+        if authoritative_state in ("passed", "skipped", "failed", TEST_STATE_BLOCKED):
+            completed.test_state = authoritative_state
+            return dispatched
+
+        # #4098 review: carry the #2272/#3315/#3737 retry tallies forward —
+        # this write is the SAME kind of "running" stamp
+        # `_dispatch_smoke_single_leg`/`_dispatch_smoke_fanout` already carry
+        # them across (see their own docstrings), and this one runs FIRST on
+        # exactly the re-dispatch ticks those tallies exist for (a mute or
+        # environmentally-dead leg clears `test_state` back to `None`, which
+        # is precisely when this hook fires next). Replacing `test_reason`
+        # wholesale with just the manifest would silently reset every one of
+        # those budgets to zero on every round — the never-firing-budget
+        # shape behind the #2272/#3315 incidents.
+        authoritative_reason = load_assignment_test_reason(completed.assignment_id)
+        board_reason = getattr(completed, "test_reason", None)
+        prior_mute = max(
+            mute_smoke_legs(authoritative_reason), mute_smoke_legs(board_reason),
+        )
+        prior_env = max(
+            environmental_smoke_legs(authoritative_reason),
+            environmental_smoke_legs(board_reason),
+        )
+        prior_abandoned = max(
+            abandoned_background_smoke_legs(authoritative_reason),
+            abandoned_background_smoke_legs(board_reason),
+        )
+        if prior_mute:
+            running_reason = f"{running_reason}\n{mute_smoke_tally(prior_mute)}"
+        if prior_env:
+            running_reason = f"{running_reason}\n{environmental_smoke_tally(prior_env)}"
+        if prior_abandoned:
+            running_reason = (
+                f"{running_reason}\n{abandoned_background_smoke_tally(prior_abandoned)}"
+            )
 
         record_test_verdict(
             assignment_id=completed.assignment_id,
             test_state="running",
-            test_reason=manifest,
+            test_reason=running_reason,
         )
     completed.test_state = "running"
-    completed.test_reason = manifest
+    completed.test_reason = running_reason
     return dispatched
 
 
@@ -5075,7 +5266,7 @@ def dispatch_pending_smoke(
             # cleared pass doesn't immediately re-trigger the same round.
             precheck_resolved_pass = False
             if completed.test_state == "running":
-                precheck_outcome = _resolve_cross_platform_precheck(completed)
+                precheck_outcome = _resolve_cross_platform_precheck(completed, board)
                 if precheck_outcome == "passed":
                     precheck_resolved_pass = True
                     # Falls through below exactly like a fresh, never-

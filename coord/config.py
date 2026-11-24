@@ -423,16 +423,23 @@ class SmokeTestsConfig:
     takes over per-partition command construction instead — see that
     function and `coord.smoke._dispatch_smoke_fanout`.
 
-    `cross_platform_checks` (#4098) maps a machine capability (e.g.
-    `"macos"`, `"win"`) to a cheap COMPILE-ONLY command for it — e.g.
-    quadraui's `win: cargo check -p quadraui --features win --all-targets
-    --target x86_64-pc-windows-msvc`. A Work leg can only build its own
-    platform (a Windows worker cannot build `macos`-feature code and a
-    Linux worker cannot build `win`), so the first time any OTHER platform
-    even compiles the branch used to be inside the full Test-stage fan-out
-    — an ~11-minute, multi-machine run on quadraui. `coord.smoke.
-    dispatch_pending_smoke` now runs each entry here whose capability the
-    Work leg's own machine does NOT declare (`coord.smoke.
+    `cross_platform_checks` (#4098) maps a LOCAL REPO NAME (matching
+    `repos[].name`) to a `{capability: command}` mapping of cheap,
+    COMPILE-ONLY commands — e.g. `quadraui: {win: cargo check -p quadraui
+    --features win --all-targets --target x86_64-pc-windows-msvc}`. Scoped
+    per repo deliberately: the fleet runs many repos against this one
+    `smoke_tests:` block, and a command like `cargo check -p quadraui`
+    only compiles inside quadraui's own checkout — a flat
+    `{capability: command}` map with no repo key would run quadraui's
+    check inside every OTHER repo's worktree too, on any capability-
+    matched machine, and fold the resulting unrelated compile failure onto
+    that repo's row. A Work leg can only build its own platform (a Windows
+    worker cannot build `macos`-feature code and a Linux worker cannot
+    build `win`), so the first time any OTHER platform even compiles the
+    branch used to be inside the full Test-stage fan-out — an ~11-minute,
+    multi-machine run on quadraui. `coord.smoke.dispatch_pending_smoke`
+    now runs each entry for the completed row's own `repo_name` whose
+    capability the Work leg's own machine does NOT declare (`coord.smoke.
     pending_cross_platform_checks`) on a capability-matched machine OTHER
     than that one, BEFORE ever dispatching the real fan-out: a compile
     failure is recorded as a terminal `test_state="failed"` straight away
@@ -440,9 +447,10 @@ class SmokeTestsConfig:
     existing triage-first routing in `_decide_test`, exactly like any other
     Test-stage failure — no separate triage path of its own), and a pass
     clears the row back to its pre-dispatch state so the real fan-out runs
-    exactly as it does today. Empty (the default) means "behaves exactly as
-    before this field existed" — no precheck of any kind, every repo
-    without this configured is byte-for-byte unaffected.
+    exactly as it does today. Empty (the default), or a repo name absent
+    from this mapping, means "behaves exactly as before this field
+    existed" — no precheck of any kind, every repo without an entry here
+    is byte-for-byte unaffected.
     """
 
     auto_queue: bool = False
@@ -451,7 +459,7 @@ class SmokeTestsConfig:
     capability_rules: list[SmokeRule] = field(default_factory=list)
     native_execution_capabilities: list[str] = field(default_factory=lambda: ["windows"])
     command_stages: tuple[SmokeStage, ...] = ()
-    cross_platform_checks: dict[str, str] = field(default_factory=dict)
+    cross_platform_checks: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -4879,19 +4887,32 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
     checks_raw = raw.get("cross_platform_checks", {}) or {}
     if not isinstance(checks_raw, dict):
         raise ConfigError("smoke_tests.cross_platform_checks must be a mapping")
-    checks: dict[str, str] = {}
-    for capability, command in checks_raw.items():
-        if not isinstance(capability, str) or not capability.strip():
+    checks: dict[str, dict[str, str]] = {}
+    for repo_name, repo_checks_raw in checks_raw.items():
+        if not isinstance(repo_name, str) or not repo_name.strip():
             raise ConfigError(
                 "smoke_tests.cross_platform_checks keys must be non-empty "
-                "capability strings"
+                "repo-name strings"
             )
-        if not isinstance(command, str) or not command.strip():
+        if not isinstance(repo_checks_raw, dict):
             raise ConfigError(
-                f"smoke_tests.cross_platform_checks[{capability!r}] must be "
-                "a non-empty command string"
+                f"smoke_tests.cross_platform_checks[{repo_name!r}] must be a "
+                "mapping of capability to command"
             )
-        checks[capability] = command
+        repo_checks: dict[str, str] = {}
+        for capability, command in repo_checks_raw.items():
+            if not isinstance(capability, str) or not capability.strip():
+                raise ConfigError(
+                    f"smoke_tests.cross_platform_checks[{repo_name!r}] keys "
+                    "must be non-empty capability strings"
+                )
+            if not isinstance(command, str) or not command.strip():
+                raise ConfigError(
+                    f"smoke_tests.cross_platform_checks[{repo_name!r}]"
+                    f"[{capability!r}] must be a non-empty command string"
+                )
+            repo_checks[capability] = command
+        checks[repo_name] = repo_checks
     cfg.cross_platform_checks = checks
     return cfg
 
