@@ -17,6 +17,21 @@ from coord.failure_classifier import classify_failure
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 
+#: #4096: `models.pinned` key an operator opts into for a cheaper fix-round
+#: model when a passed-in triage verdict (`coord fix --diagnosis ...`) is
+#: both confident and small-scoped — see `fix()`'s `use_cheap_fix_model`.
+#: Not consulted at all unless this key is actually set in
+#: `coordinator.yml`, so an operator who never sets it sees no behaviour
+#: change.
+_TRIAGE_CHEAP_FIX_PINNED_KEY = "fix_triage_cheap"
+#: #4096: the "confident" floor and "small scope" ceiling the cheap-fix
+#: override requires — deliberately conservative and NOT themselves
+#: configurable (only the model `_TRIAGE_CHEAP_FIX_PINNED_KEY` resolves to
+#: is).
+_TRIAGE_CHEAP_FIX_MIN_CONFIDENCE = 0.85
+_TRIAGE_CHEAP_FIX_MAX_SCOPE_FILES = 3
+_TRIAGE_CHEAP_FIX_MAX_SCOPE_LINES = 40
+
 
 @click.command(help="Create sub-issues from a split proposal (e.g. coord split S1).")
 @click.argument("ids")
@@ -913,9 +928,49 @@ def _fix_from_review(
         "ASSIGNMENT_ID."
     ),
 )
+@click.option(
+    "--diagnosis",
+    "triage_diagnosis",
+    default=None,
+    help=(
+        "#4096: a `coord.failure_triage.TriageVerdict.diagnosis` for a "
+        "substantive Test-stage failure — the SAME verdict a caller (e.g. a "
+        "future `coord drive` wiring, mirroring `coord mechanic-dispatch`'s "
+        "own `--diagnosis`) already triaged this failure to, rather than "
+        "re-deriving it here. When set, the fix briefing quotes this "
+        "diagnosis plus the evidence record extracted from the stored test "
+        "output (`coord.failure_evidence.extract_failure_evidence`) instead "
+        "of the raw test output. Unset (the default): the briefing is "
+        "exactly what it was before this flag existed."
+    ),
+)
+@click.option(
+    "--triage-confidence",
+    type=float,
+    default=0.0,
+    help="The triage verdict's confidence (0.0-1.0), paired with --diagnosis.",
+)
+@click.option(
+    "--proposed-file",
+    "proposed_files",
+    multiple=True,
+    help=(
+        "A file the triage verdict's `proposed_scope` names (repeatable), "
+        "paired with --diagnosis. Also feeds the #4096 cheap-fix-model rule "
+        "— see models.pinned['fix_triage_cheap']."
+    ),
+)
+@click.option(
+    "--proposed-line-delta",
+    type=int,
+    default=0,
+    help="The triage verdict's `proposed_scope.estimated_line_delta`, paired with --diagnosis.",
+)
 def fix(
     assignment_id: str, config_path: Path, guidance: str, force: bool,
     machine_override: str | None, no_finish: bool,
+    triage_diagnosis: str | None, triage_confidence: float,
+    proposed_files: tuple[str, ...], proposed_line_delta: int,
 ) -> None:
     from coord.board_service import read_board
     from coord.state import COORD_DIR
@@ -1127,6 +1182,52 @@ def fix(
     # to NOT escalating.
     classification = classify_failure(test_output)
 
+    # #4096: triage-first — brief the fix worker with the triage diagnosis
+    # already decided upstream (`--diagnosis`, mirroring `coord
+    # mechanic-dispatch`'s own CLI surface for the SAME `TriageVerdict`,
+    # #4093/#4095) plus the evidence record extracted from the already-
+    # loaded `test_output`, instead of dumping that raw text and making the
+    # fix worker re-derive what triage already established. Deliberately
+    # does NOT call `coord.failure_triage.triage_failure` itself — that
+    # would be a second (and possibly different) model call for the same
+    # failure, re-deriving rather than reusing the one upstream already
+    # made (#2096, "one question, one answer"), and would reach a real
+    # `claude -p` subprocess from every `coord fix` invocation with a
+    # failed Test gate, including every existing caller and test that has
+    # no reason to expect one. No `--diagnosis` (today's every caller,
+    # until something upstream is wired to pass it): the raw fallback below
+    # is untouched.
+    triage_diagnosis = (triage_diagnosis or "").strip()
+    evidence = None
+    if test_failed and triage_diagnosis and test_output:
+        from coord.failure_evidence import extract_failure_evidence  # noqa: PLC0415
+
+        evidence = extract_failure_evidence(test_output)
+        if evidence.is_empty:
+            # No evidence record (#4092's extractor found no stage, no
+            # error block, no signal in the stored text) — nothing to
+            # splice in beyond the diagnosis alone, so fall back to the raw
+            # text exactly as if --diagnosis had never been passed.
+            evidence = None
+
+    if evidence is not None:
+        from coord.failure_evidence import format_evidence_block  # noqa: PLC0415
+
+        scope_files = ", ".join(proposed_files) or "(not estimated)"
+        scope_line = (
+            f"{scope_files} (~{proposed_line_delta} line delta)"
+            if proposed_files
+            else scope_files
+        )
+        failure_body = (
+            f"Triage diagnosis (#4093, confidence={triage_confidence:.2f}): "
+            f"{triage_diagnosis}\n\n"
+            f"{format_evidence_block(evidence)}\n\n"
+            f"Proposed scope: {scope_line}"
+        )
+    else:
+        failure_body = test_output
+
     guidance_text = guidance or "Fix the failing tests and push."
     if forced_without_evidence and uat_failed and assignment.uat_reason:
         # #3208: a real, board-recorded UAT failure — not the caller merely
@@ -1180,7 +1281,7 @@ def fix(
         f"Run `git fetch origin && git log --oneline origin/{default_branch}..HEAD` to see what was done.\n"
         f"Run `git diff origin/{default_branch}...HEAD` to see the full diff.\n\n"
         f"## {_failure_heading}\n"
-        f"{test_output}\n"
+        f"{failure_body}\n"
         f"{_compliance_note}"
         f"## Guidance\n"
         f"{guidance_text}\n\n"
@@ -1259,11 +1360,39 @@ def fix(
     # Only a failure classified as "capability" climbs; "compliance" and
     # "unknown" (no evidence to classify) both stay on the current rung.
     original_model = assignment.model or cfg.models.default
-    if classification.should_escalate:
+
+    # #4096: the inverse move — a CONFIDENT, SMALL-scoped triage verdict is
+    # evidence the fix needs no extra capability at all, so an operator can
+    # opt into a cheaper model for it instead. Reuses `models.pinned`
+    # (coord/config.py) rather than adding a new config field: unset (every
+    # repo today) means `cheap_fix_model` is `None` and nothing below ever
+    # fires, so the model stays exactly what it would have been before this
+    # option existed. An operator opts in with e.g.
+    # `models.pinned: {fix_triage_cheap: haiku}`.
+    cheap_fix_model = cfg.models.pinned.get(_TRIAGE_CHEAP_FIX_PINNED_KEY)
+    use_cheap_fix_model = bool(
+        cheap_fix_model
+        and triage_diagnosis
+        and triage_confidence >= _TRIAGE_CHEAP_FIX_MIN_CONFIDENCE
+        and len(proposed_files) <= _TRIAGE_CHEAP_FIX_MAX_SCOPE_FILES
+        and abs(proposed_line_delta) <= _TRIAGE_CHEAP_FIX_MAX_SCOPE_LINES
+    )
+    if use_cheap_fix_model:
+        escalated = cheap_fix_model
+    elif classification.should_escalate:
         escalated = cfg.models.next_model(original_model)
     else:
         escalated = original_model
-    if escalated != original_model:
+
+    if use_cheap_fix_model:
+        click.echo(
+            f"  using cheap fix model (#4096, models.pinned"
+            f"[{_TRIAGE_CHEAP_FIX_PINNED_KEY!r}]): {original_model} → "
+            f"{escalated} (triage confidence={triage_confidence:.2f}, "
+            f"proposed scope={len(proposed_files)} file(s)/"
+            f"{proposed_line_delta} line(s))"
+        )
+    elif escalated != original_model:
         click.echo(f"  escalating model: {original_model} → {escalated}")
     elif not classification.should_escalate:
         click.echo(
@@ -1324,7 +1453,14 @@ def fix(
     click.echo(f"Fix-up worker dispatched (assignment {new_id})")
     click.echo(f"  branch: {assignment.branch}")
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
-    if test_output:
+    if evidence is not None:
+        # #4096: the briefing quoted the triage diagnosis + evidence record,
+        # not the raw test output — say so, and size what was actually
+        # included rather than the raw text's (now unused) length.
+        click.echo(
+            f"  triage diagnosis included in briefing ({len(failure_body)} chars)"
+        )
+    elif test_output:
         _label = "CI failure summary" if ci_story is not None else "test output"
         click.echo(f"  {_label} included in briefing ({len(test_output)} chars)")
 
