@@ -3544,23 +3544,185 @@ def test_no_triage_verdict_preserves_todays_unconditional_retry():
 
 def test_an_infra_triage_verdict_retries_without_spending_the_latch():
     """#4093: an ``infra`` verdict retries like ``flaky``, but must NOT set
-    ``test_retry_sha`` — an environmental hit deserves another retest every
-    time, not a verdict charged against this SHA's one free retry."""
+    ``test_retry_sha`` — an environmental hit deserves another retest, not
+    a verdict charged against this SHA's one free #3714 retry. Uses a
+    2-retry budget so the second retry (still within budget) is visibly
+    distinct from the review-finding-2 exhaustion case below."""
     counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=2)
     v = FakeVerifier(head_sha="aaa", triage_bucket="infra")
     s = done_work(work_test_state="failed", work_test_reason="usage limit reached")
 
-    retry = step(s, counters=counters, verifier=v)
+    retry = step(s, opts, counters=counters, verifier=v)
     assert retry.command[0] == "diagnose"
     assert "--reset" in retry.command
     assert counters.fix_rounds == 0
     assert counters.test_retry_sha == ""
 
     # A second failure at the SAME SHA retries AGAIN rather than proceeding
-    # to the fix round, as long as triage keeps saying infra.
-    retry_again = step(s, counters=counters, verifier=v)
+    # to the fix round, as long as triage keeps saying infra AND the
+    # per-SHA infra budget (`opts.max_work_retries`) is not yet spent.
+    retry_again = step(s, opts, counters=counters, verifier=v)
     assert retry_again.command[0] == "diagnose"
     assert counters.fix_rounds == 0
+    assert counters.test_retry_sha == ""
+
+
+def test_an_infra_triage_verdict_eventually_falls_through_to_fix_round():
+    """#4093 review (blocking finding 2): the ``infra`` lane is NOT an
+    unbounded re-test loop. Once its own per-SHA budget
+    (``opts.max_work_retries``) is spent, a REPEATING ``infra`` verdict at
+    the same SHA (a real multi-hour usage limit, a persistently UNMET
+    capability, a model misclassification that keeps reproducing) falls
+    through to the ordinary fix round instead of re-testing forever —
+    making the `max_fix_rounds` `_die()` reachable again."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    v = FakeVerifier(head_sha="aaa", triage_bucket="infra")
+    s = done_work(work_test_state="failed", work_test_reason="usage limit reached")
+
+    retry = step(s, opts, counters=counters, verifier=v)
+    assert retry.command[0] == "diagnose"
+    assert counters.fix_rounds == 0
+    assert counters.test_retry_sha == ""
+
+    # Budget (1 retry) is now spent at this SHA. The SAME failure, still
+    # classified `infra`, must stop re-testing and dispatch the fix round.
+    fix = step(s, opts, counters=counters, verifier=v)
+    assert fix.command == ("fix", "w1")
+    assert counters.fix_rounds == 1
+    assert counters.test_retry_sha == "aaa"
+
+    # And a THIRD poll at the same SHA does not re-run the classifier or
+    # re-enter the infra lane at all — `test_retry_sha` already matches this
+    # SHA, so it goes straight back to dispatching a fix round (#3713's own
+    # empty-fix-round undo fires first, since the branch still hasn't
+    # advanced — net `fix_rounds` stays at 1, exactly like
+    # `test_empty_fix_round_does_not_spend_the_budget` below).
+    calls_before = v.triage_test_failure_calls
+    fix_again = step(s, opts, counters=counters, verifier=v)
+    assert fix_again.command == ("fix", "w1")
+    assert counters.fix_rounds == 1
+    assert v.triage_test_failure_calls == calls_before
+
+
+# ── #4093 review (blocking finding 1): `GitMergeVerifier.triage_test_failure`
+# itself, not just `FakeVerifier` — this is the seam the real fleet drives.
+
+
+def test_git_merge_verifier_triage_test_failure_blank_reason_is_none(tmp_path):
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    s = state(work_test_reason="   ")
+    assert verifier.triage_test_failure(s) is None
+
+
+def test_git_merge_verifier_triage_test_failure_classifier_exception_is_none(
+    tmp_path, monkeypatch
+):
+    """Classifier trouble (a raised exception from `triage_failure` itself)
+    must never block drive — degrades to `None`, same as "nothing to
+    classify"."""
+    import coord.failure_triage as failure_triage
+
+    def boom(**_kw):
+        raise RuntimeError("claude binary not found")
+
+    monkeypatch.setattr(failure_triage, "triage_failure", boom)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    s = state(work_test_reason="3 failed")
+    assert verifier.triage_test_failure(s) is None
+
+
+@pytest.mark.parametrize("via", ["model:call_failed", "model:schema_error", "model:low_confidence"])
+def test_git_merge_verifier_triage_test_failure_maps_degraded_verdict_to_none(
+    tmp_path, monkeypatch, via
+):
+    """#4093 review (blocking finding 1): a classifier that is UNUSABLE
+    (no ``claude`` on PATH, a timeout, a malformed reply, a low-confidence
+    guess) returns `_fallback_substantive`'s sentinel — `bucket=
+    "substantive"`, `confidence=0.0`. That sentinel is NOT a real verdict
+    about the code and must map to `None` here, so `_decide_test` takes
+    the "no verdict available" unconditional-retry arm instead of silently
+    disabling #3714's retry on every usage-limit window / missing binary /
+    low-confidence reply."""
+    import coord.failure_triage as failure_triage
+
+    def fake_triage_failure(**_kw):
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="classifier unusable",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.0,
+            via=via,
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    s = state(work_test_reason="3 failed")
+    assert verifier.triage_test_failure(s) is None
+
+
+def test_git_merge_verifier_triage_test_failure_returns_a_real_substantive_verdict(
+    tmp_path, monkeypatch
+):
+    """A REAL `substantive` verdict (full confidence, not a degraded
+    fallback) must still come back as `"substantive"` — only the degraded
+    sentinel maps to `None`, never every `substantive` bucket."""
+    import coord.failure_triage as failure_triage
+
+    def fake_triage_failure(**_kw):
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="a real bug",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.9,
+            via="model",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    s = state(work_test_reason="3 failed")
+    assert verifier.triage_test_failure(s) == "substantive"
+
+
+def test_git_merge_verifier_triage_test_failure_compile_error_guard_is_not_degraded(
+    tmp_path, monkeypatch
+):
+    """`"model:compile_error_guard"` is a confident, evidence-backed
+    override (a compile error can never be flaky), not a "classifier is
+    unusable" sentinel — it must be returned as `"substantive"`, not
+    collapsed to `None`. Collapsing it would retry the exact
+    quadraui#2992 compile-error shape #3714's rescope exists to stop
+    retrying."""
+    import coord.failure_triage as failure_triage
+
+    assert not failure_triage.is_degraded_verdict(
+        failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="guarded",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.0,
+            via="model:compile_error_guard",
+        )
+    )
+
+    def fake_triage_failure(**_kw):
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="guarded",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.0,
+            via="model:compile_error_guard",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    s = state(work_test_reason="error[E0063]: missing field")
+    assert verifier.triage_test_failure(s) == "substantive"
 
 
 def test_empty_fix_round_does_not_spend_the_budget():
