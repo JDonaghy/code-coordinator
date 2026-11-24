@@ -1851,14 +1851,20 @@ def _select_mechanic_machine(
     *repro_capability* (`coord.failure_triage.TriageVerdict.repro_
     capability`) names the capability that can reproduce the failure —
     e.g. ``"macos"`` for a machine like macmini. When set, this ALWAYS
-    routes to a machine declaring that capability (case-insensitively, same
-    comparison `coord.failure_triage._infer_repro_capability` already uses
-    for the matching question in the other direction) — preferring the
-    original worker's own machine when IT has the capability, else the
-    first capable machine in `config.machines`' own declared order
-    (deterministic, never a random pick). Returns ``None`` when no machine
-    declares the capability at all — the caller must decline rather than
-    guess a machine that cannot actually reproduce the failure.
+    routes to a machine that both declares that capability AND can build
+    *work*'s repo — via `coord.smoke._capability_matched_machines`, the
+    canonical answer to "which machines can reproduce a platform-specific
+    failure for this repo" (#2085/#2096, one question one answer), rather
+    than re-deriving the capability filter here a second time. That helper
+    already applies `Machine.can_work_on`/`repo_path` and the EXACT-match
+    `capability in machine.capabilities` comparison `coord.config` documents
+    as canonical (capabilities are not case-normalized at parse time) —
+    preferring the original worker's own machine when IT is in that matched
+    set, else the first match in `config.machines`' own declared order
+    (deterministic, never a random pick). Returns ``None`` when no
+    repo-capable machine declares the capability at all — the caller must
+    decline rather than guess a machine that cannot actually reproduce the
+    failure or even check out the repo.
 
     When *repro_capability* is ``None`` (the triage verdict could not infer
     one), falls back to the original work's own machine — the same default
@@ -1868,11 +1874,12 @@ def _select_mechanic_machine(
         return next(
             (m for m in config.machines if m.name == work.machine_name), None,
         )
-    capability = repro_capability.lower()
-    matches = [
-        m for m in config.machines
-        if capability in (c.lower() for c in m.capabilities)
-    ]
+
+    from coord.smoke import _capability_matched_machines  # noqa: PLC0415
+
+    matches = _capability_matched_machines(
+        [repro_capability], work.repo_name, config,
+    )
     if not matches:
         return None
     for m in matches:
@@ -2238,8 +2245,11 @@ class MechanicLegVerdictResult(TypedDict):
 
     ``scoped_pass`` is the one answer to "did this mechanic leg's diff earn
     a scoped Test pass on its own authority" — ``True`` means `coord.state.
-    record_test_verdict` was actually called with ``test_state="passed"``
-    (never from the mere absence of an exception). ``False`` means the
+    record_test_verdict` was called with ``test_state="passed"`` AND the
+    write was confirmed by re-reading the row back (never from the mere
+    absence of an exception; a read-back mismatch raises
+    :class:`SweepWriteNotConfirmedError` instead of returning here at all).
+    ``False`` means the
     fallback fix round ran instead (`actions` carries its
     :class:`FixitLegDispatch`-shaped detail wrapped as a single-item list
     for symmetry with :class:`FinisherSelfBlessResult`); ``detail`` explains
@@ -2272,6 +2282,20 @@ def mechanic_leg_verdict(
     """Decide whether a mechanic leg's own diff earns a scoped Test PASS —
     the bounded-authority core of a mechanic leg (#4094).
 
+    *work* is the MECHANIC LEG'S OWN work-like assignment — the row
+    `sweep_dispatch_mechanic_leg` returned as ``assignment_id``, never the
+    original work row the mechanic leg was dispatched to fix.
+    `sweep_dispatch_mechanic_leg` dispatches via `coord.auto_loop._dispatch_
+    fix`, which creates a brand-new ``type="work"`` assignment on the same
+    branch (same shape as any other fix round) — that new row, not the
+    original, is what `coord.smoke.dispatch_pending_smoke`/`coord.review`'s
+    bulk review-eligibility pass will next examine as the newest done
+    work-like completion for this issue. Recording the verdict on the
+    ORIGINAL row instead would leave the mechanic leg's own row with
+    ``test_state=None``, which `dispatch_pending_smoke` would then pick up
+    and dispatch a full Test leg against — exactly the second fan-out #4094
+    exists to eliminate.
+
     *repro_succeeded*/*stages_green* are the leg's own attestation (and, for
     a caller that has it, a re-run's observation) of whether it could even
     reproduce the failure and get the failed stage commands green again —
@@ -2291,9 +2315,22 @@ def mechanic_leg_verdict(
     EXISTING Test-gate consumer (`coord.auto_loop`'s review-dispatch gate
     foremost) already treats a ``"passed"`` write as a green Test stage, so
     this is what makes Review run next without touching a single one of
-    those call sites. A diff OUTSIDE the bound falls back to a fix round
-    exactly like a reproduction failure does, carrying the bound check's own
-    *reasons* as evidence too.
+    those call sites. The write also carries ``test_confirmation=
+    TEST_CONFIRMATION_UNCONFIRMED`` (#3378/#2096: "unconfirmed success is a
+    defect" applied to the one column the repo already uses to answer that
+    question) — true here in the most literal sense, since only the failed
+    stage commands re-ran, never the full suite, so this (a) keeps `coord.
+    state`'s baseline-red-streak clear gated on a REAL full-suite pass
+    (`test_confirmation != "unconfirmed"`), which a scoped mechanic re-run
+    is not, and (b) makes `coord gates`' `_row_test_confirmation` renderer
+    annotate the line distinctly from an ordinary, fully-validated pass. The
+    write is then CONFIRMED by re-reading the row, per this module's own
+    documented write-confirmation invariant — never trusted from the mere
+    absence of an exception. The read-back disagreeing raises
+    :class:`SweepWriteNotConfirmedError` rather than reporting
+    ``scoped_pass=True`` for a write that did not actually persist. A diff
+    OUTSIDE the bound falls back to a fix round exactly like a reproduction
+    failure does, carrying the bound check's own *reasons* as evidence too.
 
     This function never merges, never force-merges, and never overrides
     `human_required` — its only two possible actions are "record a Test
@@ -2392,7 +2429,13 @@ def mechanic_leg_verdict(
             ),
         )
 
-    from coord.state import record_test_verdict  # noqa: PLC0415
+    from coord.confirm_test import TEST_CONFIRMATION_UNCONFIRMED  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_confirmation,
+        load_assignment_test_reason,
+        load_assignment_test_state,
+        record_test_verdict,
+    )
 
     test_reason = (
         f"{MECHANIC_SCOPED_TEST_REASON_PREFIX}: {verdict.diagnosis} "
@@ -2403,7 +2446,34 @@ def mechanic_leg_verdict(
         assignment_id=work.assignment_id or "",
         test_state="passed",
         test_reason=test_reason,
+        test_confirmation=TEST_CONFIRMATION_UNCONFIRMED,
     )
+
+    # Confirm the write by re-reading the row — per this module's own
+    # documented write-confirmation invariant (never trust a write call's
+    # own return), same pattern :func:`sweep_smoke_requeue` applies to its
+    # own `test_state` write.
+    read_state = load_assignment_test_state(work.assignment_id or "")
+    read_reason = load_assignment_test_reason(work.assignment_id or "")
+    read_confirmation = load_assignment_test_confirmation(work.assignment_id or "")
+    if (
+        read_state != "passed"
+        or read_reason != test_reason
+        or read_confirmation != TEST_CONFIRMATION_UNCONFIRMED
+    ):
+        log.error(
+            "board-doctor sweep: mechanic-leg scoped-pass write for %s#%s "
+            "(assignment_id=%s) could not be confirmed — read back "
+            "test_state=%r test_reason=%r test_confirmation=%r",
+            work.repo_name, work.issue_number, work.assignment_id,
+            read_state, read_reason, read_confirmation,
+        )
+        raise SweepWriteNotConfirmedError(
+            f"mechanic leg scoped Test pass for {work.repo_name}#"
+            f"{work.issue_number} (assignment_id={work.assignment_id!r}) did "
+            "not read back as written — the write did not persist"
+        )
+
     record_audit(
         tier="business",
         category="test",

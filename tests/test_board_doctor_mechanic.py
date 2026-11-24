@@ -18,14 +18,18 @@ from coord.auto_loop import next_fix_iteration
 from coord.board_doctor_permissions import (
     SAFE_TIER_ACTIONS,
     SweepPermissionError,
+    SweepWriteNotConfirmedError,
     authorize_sweep_action,
     mechanic_leg_verdict,
     mechanic_leg_within_bound,
     sweep_dispatch_mechanic_leg,
 )
-from coord.config import BoardDoctorConfig, Config
+from coord.config import BoardDoctorConfig, Config, SmokeTestsConfig
+from coord.confirm_test import TEST_CONFIRMATION_UNCONFIRMED
 from coord.failure_triage import BUCKET_MECHANICAL, BUCKET_SUBSTANTIVE, ProposedScope, TriageVerdict
 from coord.models import Assignment, Board, BoardDoctorRepoConfig, Machine, Repo
+from coord.review import bulk_review_eligibility_blockers
+from coord.smoke import dispatch_pending_smoke
 
 
 class _FakeHTTPResponse:
@@ -86,6 +90,29 @@ def _work_assignment(*, aid: str = "w1", status: str = "done", review_iteration:
         branch="issue-1-fix",
         review_iteration=review_iteration,
         dispatched_at=10.0,
+    )
+
+
+def _mechanic_leg_assignment(
+    *, aid: str = "mech-1", status: str = "done", review_iteration: int = 0,
+) -> Assignment:
+    """The mechanic leg's OWN work-like row — a brand-new assignment
+    `sweep_dispatch_mechanic_leg` dispatches via `_dispatch_fix`, distinct
+    from the ORIGINAL work row it was dispatched to fix (#4094 review:
+    `mechanic_leg_verdict` must record its scoped Test pass on THIS row,
+    never the original, so `coord.smoke.dispatch_pending_smoke` does not
+    see a `test_state=None` row and dispatch a redundant full Test leg)."""
+    return Assignment(
+        machine_name="macmini",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix the thing",
+        assignment_id=aid,
+        status=status,
+        type="work",
+        branch="issue-1-fix",
+        review_iteration=review_iteration,
+        dispatched_at=20.0,
     )
 
 
@@ -385,15 +412,20 @@ class TestMechanicLegVerdict:
         coord_db.commit()
 
     def test_bounded_diff_with_green_repro_records_a_scoped_pass(self, coord_db) -> None:
-        self._seed_row(coord_db)
+        # Seed BOTH rows: the original work row ("w1") this mechanic leg
+        # was dispatched to fix, and the mechanic leg's OWN row ("mech-1").
+        # The verdict must land on the mechanic's own row, never "w1".
+        self._seed_row(coord_db, aid="w1")
+        self._seed_row(coord_db, aid="mech-1")
         repo = _repo()
-        config = _config(repo)
+        config = _config(repo, smoke_tests=SmokeTestsConfig(auto_queue=True))
         board = Board()
-        work = _work_assignment()
-        board.completed.append(work)
+        board.completed.append(_work_assignment(aid="w1"))
+        mechanic_leg = _mechanic_leg_assignment(aid="mech-1")
+        board.completed.append(mechanic_leg)
 
         result = mechanic_leg_verdict(
-            work, board, config,
+            mechanic_leg, board, config,
             cause="test_triage_mechanical",
             verdict=_verdict(),
             repro_succeeded=True,
@@ -408,31 +440,79 @@ class TestMechanicLegVerdict:
         assert result["actions"] == []
 
         row = coord_db.execute(
-            "SELECT test_state, test_reason FROM assignments WHERE assignment_id='w1'"
+            "SELECT test_state, test_reason, test_confirmation "
+            "FROM assignments WHERE assignment_id='mech-1'"
         ).fetchone()
         assert row["test_state"] == "passed"
         assert "mechanic-leg-scoped" in row["test_reason"]
+        # #4094 review: provenance-tagged, never a bare unqualified pass —
+        # and `!= "unconfirmed"` is what keeps `coord.state`'s baseline-red
+        # streak clear gated on a REAL full-suite pass, which this is not.
+        assert row["test_confirmation"] == TEST_CONFIRMATION_UNCONFIRMED
+
+        # The ORIGINAL work row is untouched — this is what proves the
+        # verdict landed on the mechanic's own row, not the parent's.
+        original_row = coord_db.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id='w1'"
+        ).fetchone()
+        assert original_row["test_state"] is None
 
         log = query_audit_log(event_type="mechanic_leg_scoped_pass", repo="api", issue=1)
         assert len(log["entries"]) == 1
         assert log["entries"][0]["details"]["new_head_sha"] == "deadbeef"
 
-        # Every existing Test-gate consumer already treats a plain
-        # "passed" write as a real pass — this is what makes Review run
-        # next without touching any of those call sites.
-        assert row["test_state"] in ("passed", "skipped")
+        # Real consumer #1: Review's bulk eligibility pass must no longer
+        # report a Test-gate blocker for the mechanic leg's own row — the
+        # scoped pass is what unblocks Review, not a bare assertion on the
+        # column in isolation.
+        mechanic_leg.test_state = row["test_state"]
+        blockers = bulk_review_eligibility_blockers(mechanic_leg, board, gate_test=True)
+        assert not any("Test" in b for b in blockers)
 
-    def test_repro_failure_falls_back_to_a_fix_round(self, coord_db) -> None:
-        self._seed_row(coord_db)
+        # Real consumer #2: `dispatch_pending_smoke` must NOT dispatch a
+        # second, redundant Test leg against the mechanic's own row — the
+        # second full fan-out #4094 exists to eliminate.
+        dispatched = dispatch_pending_smoke(board, config)
+        assert dispatched == []
+
+    def test_write_not_confirmed_raises(self, coord_db, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._seed_row(coord_db, aid="mech-1")
         repo = _repo()
         config = _config(repo)
         board = Board()
-        work = _work_assignment()
-        board.completed.append(work)
+        mechanic_leg = _mechanic_leg_assignment(aid="mech-1")
+        board.completed.append(mechanic_leg)
+
+        # Simulate a write that did not persist (e.g. a lost lock race) by
+        # making the re-read disagree with what was just written.
+        monkeypatch.setattr(
+            "coord.state.load_assignment_test_state", lambda assignment_id: "failed",
+        )
+
+        with pytest.raises(SweepWriteNotConfirmedError):
+            mechanic_leg_verdict(
+                mechanic_leg, board, config,
+                cause="test_triage_mechanical",
+                verdict=_verdict(),
+                repro_succeeded=True,
+                stages_green=True,
+                diff_text=self._SMALL_DIFF,
+                touches_public_api=False,
+                branch_known_files=("src/foo.py",),
+                new_head_sha="deadbeef",
+            )
+
+    def test_repro_failure_falls_back_to_a_fix_round(self, coord_db) -> None:
+        self._seed_row(coord_db, aid="mech-1")
+        repo = _repo()
+        config = _config(repo)
+        board = Board()
+        mechanic_leg = _mechanic_leg_assignment(aid="mech-1")
+        board.completed.append(mechanic_leg)
         client = _FakeHTTPClient({"id": "fallback-1"})
 
         result = mechanic_leg_verdict(
-            work, board, config,
+            mechanic_leg, board, config,
             cause="test_triage_mechanical",
             verdict=_verdict(),
             repro_succeeded=False,
@@ -450,7 +530,7 @@ class TestMechanicLegVerdict:
         assert len(client.calls) == 1
 
         row = coord_db.execute(
-            "SELECT test_state FROM assignments WHERE assignment_id='w1'"
+            "SELECT test_state FROM assignments WHERE assignment_id='mech-1'"
         ).fetchone()
         assert row["test_state"] is None
 
@@ -458,18 +538,18 @@ class TestMechanicLegVerdict:
         assert len(log["entries"]) == 1
 
     def test_over_bound_diff_falls_back_to_a_fix_round(self, coord_db) -> None:
-        self._seed_row(coord_db)
+        self._seed_row(coord_db, aid="mech-1")
         repo = _repo()
         config = _config(repo)
         board = Board()
-        work = _work_assignment()
-        board.completed.append(work)
+        mechanic_leg = _mechanic_leg_assignment(aid="mech-1")
+        board.completed.append(mechanic_leg)
         client = _FakeHTTPClient({"id": "fallback-2"})
         big_diff = "diff --git a/src/foo.py b/src/foo.py\n--- a/src/foo.py\n+++ b/src/foo.py\n"
         big_diff += "\n".join(f"+line {i}" for i in range(50))
 
         result = mechanic_leg_verdict(
-            work, board, config,
+            mechanic_leg, board, config,
             cause="test_triage_mechanical",
             verdict=_verdict(),
             repro_succeeded=True,
@@ -486,7 +566,7 @@ class TestMechanicLegVerdict:
         assert result["actions"][0]["dispatched"] is True
 
         row = coord_db.execute(
-            "SELECT test_state FROM assignments WHERE assignment_id='w1'"
+            "SELECT test_state FROM assignments WHERE assignment_id='mech-1'"
         ).fetchone()
         assert row["test_state"] is None
 
