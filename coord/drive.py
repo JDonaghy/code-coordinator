@@ -4333,6 +4333,22 @@ def _decide_test(
         # iteration and not a dead end.  (The interactive `--fix-of` and `coord
         # bounce` paths are NOT usable here: `--fix-of` requires --interactive,
         # and `bounce` needs a request-changes REVIEW id, not a failed test.)
+        fix_command: list[str] = ["fix", state.work_aid]
+        if verdict is not None and verdict.bucket == BUCKET_SUBSTANTIVE:
+            # Carry the SAME verdict just classified above into the fix
+            # briefing (`coord fix --diagnosis ...`), mirroring the
+            # `BUCKET_MECHANICAL` arm's own verdict-to-CLI-options mapping
+            # above — so the fix worker gets the diagnosis + evidence
+            # record instead of re-deriving a hypothesis from raw output.
+            fix_command += ["--diagnosis", verdict.diagnosis]
+            fix_command += ["--triage-confidence", f"{verdict.confidence}"]
+            for proposed_file in verdict.proposed_scope.files:
+                fix_command += ["--proposed-file", proposed_file]
+            if verdict.proposed_scope.estimated_line_delta:
+                fix_command += [
+                    "--proposed-line-delta",
+                    str(verdict.proposed_scope.estimated_line_delta),
+                ]
         return Action(
             kind=RUN,
             label=_triage_route_label(
@@ -4340,7 +4356,7 @@ def _decide_test(
                 f"fix round {counters.fix_rounds}/{opts.max_fix_rounds} "
                 f"(coord fix {state.work_aid})",
             ),
-            command=("fix", state.work_aid),
+            command=tuple(fix_command),
             error_message=(
                 f"coord fix {state.work_aid} failed to dispatch.\n"
                 "   Most likely the assignment's legacy smoke_test field is not "
