@@ -5627,10 +5627,11 @@ def test_dispatch_pending_smoke_redispatch_round_trip_records_new_verdict_not_st
     real_dispatch_smoke_legs = smoke_mod._dispatch_smoke_legs
     fake_client = _FakeClient({"id": "smoke-1"})
 
-    def _stubbed_network(completed, board, config, *, now=None):
+    def _stubbed_network(completed, board, config, *, now=None, **kwargs):
         return real_dispatch_smoke_legs(
             completed, board, config,
             http_client=fake_client, diff_lookup=lambda r, b: [], now=now,
+            **kwargs,
         )
 
     monkeypatch.setattr(smoke_mod, "_dispatch_smoke_legs", _stubbed_network)
@@ -6886,3 +6887,388 @@ def test_cancel_stale_smoke_legs_tolerates_cancel_failure(
     )
 
     assert cancelled == [leg]
+
+
+# ── #4098: pre-Test cross-platform compile check ────────────────────────────
+
+
+def test_cross_platform_checks_config_defaults_to_empty() -> None:
+    from coord.config import _parse_smoke_tests
+
+    cfg = _parse_smoke_tests(None)
+    assert cfg.cross_platform_checks == {}
+
+    cfg2 = _parse_smoke_tests({"auto_queue": True})
+    assert cfg2.cross_platform_checks == {}
+
+
+def test_cross_platform_checks_config_parses_capability_command_map() -> None:
+    from coord.config import _parse_smoke_tests
+
+    cfg = _parse_smoke_tests({
+        "auto_queue": True,
+        "cross_platform_checks": {
+            "macos": "cargo check -p quadraui --features macos --all-targets",
+            "win": (
+                "cargo check -p quadraui --features win --all-targets "
+                "--target x86_64-pc-windows-msvc"
+            ),
+        },
+    })
+
+    assert cfg.cross_platform_checks == {
+        "macos": "cargo check -p quadraui --features macos --all-targets",
+        "win": (
+            "cargo check -p quadraui --features win --all-targets "
+            "--target x86_64-pc-windows-msvc"
+        ),
+    }
+
+
+def test_cross_platform_checks_config_rejects_non_mapping() -> None:
+    from coord.config import ConfigError, _parse_smoke_tests
+
+    with pytest.raises(ConfigError, match="cross_platform_checks must be a mapping"):
+        _parse_smoke_tests({"cross_platform_checks": ["not", "a", "mapping"]})
+
+
+def test_cross_platform_checks_config_rejects_empty_capability_key() -> None:
+    from coord.config import ConfigError, _parse_smoke_tests
+
+    with pytest.raises(ConfigError, match="non-empty capability strings"):
+        _parse_smoke_tests({"cross_platform_checks": {"": "cargo check"}})
+
+
+def test_cross_platform_checks_config_rejects_empty_command() -> None:
+    from coord.config import ConfigError, _parse_smoke_tests
+
+    with pytest.raises(ConfigError, match="non-empty command string"):
+        _parse_smoke_tests({"cross_platform_checks": {"macos": ""}})
+
+
+def test_pending_cross_platform_checks_excludes_the_work_machines_own_capabilities() -> None:
+    """The literal #4098 acceptance line: the cross-check only runs for
+    capabilities OTHER than the Work leg's own machine — a Windows worker
+    already proved `win` compiles by building there, so only `macos` is
+    still unverified."""
+    from coord.config import Config
+    from coord.smoke import pending_cross_platform_checks
+
+    cfg = Config(
+        repos=[], machines=[],
+        smoke_tests=SmokeTestsConfig(cross_platform_checks={
+            "macos": "cargo check --features macos",
+            "win": "cargo check --features win",
+        }),
+    )
+
+    assert pending_cross_platform_checks(["win", "rust"], cfg) == [
+        ("macos", "cargo check --features macos"),
+    ]
+
+
+def test_pending_cross_platform_checks_empty_when_work_machine_covers_everything() -> None:
+    from coord.config import Config
+    from coord.smoke import pending_cross_platform_checks
+
+    cfg = Config(
+        repos=[], machines=[],
+        smoke_tests=SmokeTestsConfig(cross_platform_checks={
+            "macos": "cargo check --features macos",
+        }),
+    )
+
+    assert pending_cross_platform_checks(["macos", "rust"], cfg) == []
+
+
+def test_pending_cross_platform_checks_empty_when_unconfigured() -> None:
+    """#4098 acceptance: no config, no behaviour change."""
+    from coord.config import Config
+    from coord.smoke import pending_cross_platform_checks
+
+    assert pending_cross_platform_checks(["win"], Config(repos=[], machines=[])) == []
+
+
+def test_dispatch_smoke_legs_unaffected_when_cross_platform_checks_unconfigured(
+    repo: Repo,
+) -> None:
+    """#4098 acceptance: with no `cross_platform_checks` configured, the
+    ordinary single-leg Test-stage dispatch fires exactly as it always
+    has — the precheck hook is a complete no-op."""
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[_machine("server", "server.tail", caps=["python"])],
+        smoke_tests=SmokeTestsConfig(auto_queue=True),
+    )
+    completed = _completed()
+    client = _MultiHostClient(assign={"server.tail": {"id": "ordinary-leg"}})
+
+    legs = _dispatch_smoke_legs(
+        completed, Board(), cfg, http_client=client,
+        diff_lookup=lambda r, b: [],
+    )
+
+    assert len(legs) == 1
+    assert legs[0].assignment_id == "ordinary-leg"
+    assert legs[0].issue_title == "[smoke] GTK key routing fix"
+
+
+def test_dispatch_cross_platform_precheck_runs_only_missing_capability_on_another_machine(
+    repo: Repo,
+) -> None:
+    """End-to-end #4098: the Work leg ran on `winbox` (declares `win`), so
+    only the `macos` cross-check is pending, and it is dispatched to
+    `macbox` — the one OTHER machine that declares it — never to `winbox`
+    itself and never for `win`."""
+    from coord.smoke import _dispatch_smoke_legs, _parse_xcheck_manifest
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("winbox", "winbox.tail", caps=["win"], path="/w/api"),
+            _machine("macbox", "macbox.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            cross_platform_checks={
+                "win": "cargo check --features win",
+                "macos": "cargo check --features macos",
+            },
+        ),
+    )
+    completed = _completed(machine="winbox")
+    client = _MultiHostClient(assign={"macbox.tail": {"id": "macos-xcheck"}})
+
+    legs = _dispatch_smoke_legs(
+        completed, Board(), cfg, http_client=client,
+        diff_lookup=lambda r, b: [],
+    )
+
+    assert len(legs) == 1
+    assert legs[0].machine_name == "macbox"
+    assert client.assigned_hosts == ["macbox.tail"]
+    assert completed.test_state == "running"
+    assert _parse_xcheck_manifest(completed.test_reason) == [("macos-xcheck", "macos")]
+
+
+def test_dispatch_cross_platform_precheck_fails_open_when_unroutable(repo: Repo) -> None:
+    """A configured capability with NO capable machine must never
+    permanently block the real Test stage — it fails open (logs and
+    proceeds) rather than returning an empty, stuck-forever precheck
+    round."""
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[_machine("winbox", "winbox.tail", caps=["win"], path="/w/api")],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            cross_platform_checks={"macos": "cargo check --features macos"},
+        ),
+    )
+    completed = _completed(machine="winbox")
+    client = _MultiHostClient(assign={"winbox.tail": {"id": "ordinary-leg"}})
+
+    legs = _dispatch_smoke_legs(
+        completed, Board(), cfg, http_client=client,
+        diff_lookup=lambda r, b: [],
+    )
+
+    # No machine declares `macos` — the precheck fails open, and the
+    # ordinary single-leg dispatch (the only remaining capable machine,
+    # `winbox` itself) runs exactly as if nothing were configured.
+    assert len(legs) == 1
+    assert legs[0].machine_name == "winbox"
+    assert legs[0].assignment_id == "ordinary-leg"
+
+
+def _seed_xcheck_work(*, assignment_id: str = "xcheck-work") -> None:
+    """Dispatch a bare WORK row so `record_test_verdict`/`load_assignment_
+    test_*` have a real row to read/write — mirrors `_seed_fanout_parent`'s
+    own setup for the #3182 fan-out finalize tests."""
+    from coord.state import _record_dispatched_assignment_local  # noqa: PLC0415
+
+    work = Assignment(
+        assignment_id=assignment_id, machine_name="winbox", repo_name="api",
+        issue_number=77, issue_title="cross-platform fix", type="work",
+        status="done", branch="issue-77-fix",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+
+def _seed_xcheck_leg(
+    *, leg_id: str, state: str | None, reason: str | None,
+    parent_id: str = "xcheck-work",
+) -> None:
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        record_test_verdict,
+    )
+
+    leg = Assignment(
+        assignment_id=leg_id, machine_name="macbox", repo_name="api",
+        issue_number=77, issue_title="[smoke:xcheck-macos] leg", type="smoke",
+        status="done" if state not in (None, "running") else "running",
+        branch="issue-77-fix", review_of_assignment_id=parent_id,
+    )
+    _record_dispatched_assignment_local(assignment=leg, repo_github="acme/api")
+    if state is not None or reason is not None:
+        record_test_verdict(assignment_id=leg_id, test_state=state, test_reason=reason)
+
+
+def _xcheck_completed(*, test_reason: str | None) -> Assignment:
+    return Assignment(
+        assignment_id="xcheck-work", machine_name="winbox", repo_name="api",
+        issue_number=77, issue_title="cross-platform fix", type="work",
+        status="done", branch="issue-77-fix", test_state="running",
+        test_reason=test_reason,
+    )
+
+
+def test_resolve_cross_platform_precheck_is_a_noop_for_an_ordinary_running_leg(
+    coord_db,
+) -> None:
+    """A plain in-flight Test leg (no `[[xcheck:...]]` manifest) is left
+    completely untouched — this function must never mistake it for a
+    #4098 precheck round."""
+    from coord.smoke import _resolve_cross_platform_precheck
+
+    completed = _xcheck_completed(test_reason="dispatched: Test stage running (#1426)")
+    assert _resolve_cross_platform_precheck(completed) is None
+    assert completed.test_state == "running"
+
+
+def test_resolve_cross_platform_precheck_pending_when_a_leg_has_not_reported(
+    coord_db,
+) -> None:
+    from coord.smoke import _encode_xcheck_manifest, _resolve_cross_platform_precheck
+    from coord.state import record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(leg_id="leg-macos", state="passed", reason="ok")
+    _seed_xcheck_leg(leg_id="leg-win", state=None, reason=None)
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos"), ("leg-win", "win")])
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=manifest,
+    )
+    completed = _xcheck_completed(test_reason=manifest)
+
+    assert _resolve_cross_platform_precheck(completed) == "pending"
+    assert completed.test_state == "running"
+
+
+def test_resolve_cross_platform_precheck_failed_skips_fanout_and_triggers_triage(
+    coord_db,
+) -> None:
+    """#4098 acceptance: a compile failure goes straight to triage — the
+    row is folded onto a terminal `test_state="failed"` with a non-empty
+    reason, the exact shape `coord drive`'s existing triage-first
+    `_decide_test` routing requires (#2596's "never a bare failed with no
+    reason") — no separate triage machinery of its own, and the full
+    fan-out is never dispatched."""
+    from coord.smoke import _encode_xcheck_manifest, _resolve_cross_platform_precheck
+    from coord.state import load_assignment_test_state, record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(leg_id="leg-macos", state="passed", reason="ok")
+    _seed_xcheck_leg(
+        leg_id="leg-win", state="failed",
+        reason="error[E0599]: no field `foo` on type `Bar`",
+    )
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos"), ("leg-win", "win")])
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=manifest,
+    )
+    completed = _xcheck_completed(test_reason=manifest)
+
+    outcome = _resolve_cross_platform_precheck(completed)
+
+    assert outcome == "failed"
+    assert completed.test_state == "failed"
+    assert completed.test_reason
+    assert "error[E0599]: no field `foo` on type `Bar`" in completed.test_reason
+    assert load_assignment_test_state("xcheck-work") == "failed"
+
+
+def test_resolve_cross_platform_precheck_passed_clears_verdict_for_the_real_fanout(
+    coord_db,
+) -> None:
+    """#4098 acceptance: a clean precheck proceeds to the fan-out — the
+    row's verdict is CLEARED back to `None` rather than left `running` or
+    stamped `passed`, so the next dispatch tick runs the real Test-stage
+    suite exactly as if no precheck had ever happened."""
+    from coord.smoke import _encode_xcheck_manifest, _resolve_cross_platform_precheck
+    from coord.state import load_assignment_test_state, record_test_verdict
+
+    _seed_xcheck_work()
+    _seed_xcheck_leg(leg_id="leg-macos", state="passed", reason="ok")
+    _seed_xcheck_leg(leg_id="leg-win", state="passed", reason="ok")
+    manifest = _encode_xcheck_manifest([("leg-macos", "macos"), ("leg-win", "win")])
+    record_test_verdict(
+        assignment_id="xcheck-work", test_state="running", test_reason=manifest,
+    )
+    completed = _xcheck_completed(test_reason=manifest)
+
+    outcome = _resolve_cross_platform_precheck(completed)
+
+    assert outcome == "passed"
+    assert completed.test_state is None
+    assert load_assignment_test_state("xcheck-work") is None
+
+
+def test_dispatch_pending_smoke_proceeds_to_the_real_fanout_after_a_passed_precheck(
+    repo: Repo, monkeypatch, coord_db,
+) -> None:
+    """End-to-end #4098 acceptance: once a precheck round has resolved
+    "passed" (the row's verdict freshly cleared back to `None`), the VERY
+    SAME `dispatch_pending_smoke` tick falls through into an ordinary Test-
+    stage dispatch for the row — with `skip_cross_platform_precheck=True`,
+    so it never re-triggers the same precheck round it just resolved."""
+    from unittest.mock import patch as _patch
+
+    from coord.smoke import _encode_xcheck_manifest
+    from coord.state import _record_dispatched_assignment_local, record_test_verdict
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    cfg = Config(
+        repos=[repo],
+        machines=[_machine("winbox", "winbox.tail", caps=["win"], path="/w/api")],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            cross_platform_checks={"macos": "cargo check --features macos"},
+        ),
+    )
+
+    work = Assignment(
+        assignment_id="xcheck-work-2", machine_name="winbox", repo_name="api",
+        issue_number=78, issue_title="cross-platform fix 2", type="work",
+        status="done", branch="issue-78-fix",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+    _seed_xcheck_leg(
+        leg_id="leg-macos-2", state="passed", reason="ok", parent_id="xcheck-work-2",
+    )
+    manifest = _encode_xcheck_manifest([("leg-macos-2", "macos")])
+    record_test_verdict(
+        assignment_id="xcheck-work-2", test_state="running", test_reason=manifest,
+    )
+    work.test_state = "running"
+    work.test_reason = manifest
+
+    board = Board(completed=[work])
+    sentinel = object()
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(board, cfg)
+
+    assert result == [sentinel]
+    mock_dispatch.assert_called_once()
+    assert mock_dispatch.call_args.kwargs["skip_cross_platform_precheck"] is True
+    # The row's verdict was cleared BEFORE the fall-through dispatch, not
+    # left `running` — the whole point of #4098's "a pass proceeds to the
+    # fan-out exactly as if no precheck had run".
+    assert work.test_state is None
