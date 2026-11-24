@@ -1966,6 +1966,8 @@ class MergeVerifier(Protocol):
 
     def triage_test_failure(self, state: IssueState) -> "TriageVerdict | None": ...
 
+    def has_scoped_review_candidate(self, state: IssueState) -> bool: ...
+
 
 def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
     """Loosely compare a ``git remote get-url origin`` URL against the
@@ -2372,6 +2374,62 @@ class GitMergeVerifier:
         if is_degraded_verdict(verdict):
             return None
         return verdict
+
+    def has_scoped_review_candidate(self, state: IssueState) -> bool:
+        """#4114: True when a prior APPROVED review for *state*'s work row
+        exists whose own recorded patch-id no longer matches the branch's
+        LIVE current one — i.e. the merge gate's "review required but not
+        approved" refusal is explained by the approval going patch-id-stale
+        (a rebase, `coord merge`'s own conflict-fix, or a hand push), never
+        by the two sides disagreeing about the SAME patch.
+
+        Delegates to :func:`coord.merge_queue.find_scoped_review_candidate`
+        — the one function the #1476 scoped-review sweep
+        (:func:`coord.review.dispatch_scoped_reviews_for_queue`) and
+        ``coord review-reaffirm`` already use to answer this exact question
+        (#2096, "one question, one answer") — rather than re-deriving a
+        second patch-id comparison here that could silently drift from it.
+
+        ``False`` (never raises) for anything this can't confirm: no local
+        board, no live `gh_ops` resolution for the work row, or the helper
+        itself finding nothing — the caller's fallback is to escalate, the
+        same conservative posture every other "can't confirm, don't guess"
+        branch in this module already takes.
+        """
+        if not state.work_aid or not state.repo_github:
+            return False
+        from coord import github_ops  # noqa: PLC0415
+        from coord import merge_queue as mq  # noqa: PLC0415
+        from coord.state import build_board  # noqa: PLC0415
+
+        try:
+            board = build_board()
+        except Exception:  # noqa: BLE001 — fail closed: no board, no answer
+            return False
+        work = board.find_by_id(state.work_aid)
+        if work is None or not work.branch:
+            return False
+        target_branch = state.repo_default_branch
+        repo_cfg = self.config.repo(state.repo) if self.config is not None else None
+        if repo_cfg is not None:
+            try:
+                from coord.branch_model import (  # noqa: PLC0415
+                    resolve_base_branch_for_issue_number,
+                )
+
+                target_branch = resolve_base_branch_for_issue_number(
+                    repo_cfg, repo_cfg.github, state.issue,
+                )
+            except Exception:  # noqa: BLE001 — fall back to the repo default
+                pass
+        try:
+            entry = mq.live_gate_entry(work, state.repo_github, target_branch, github_ops)
+            candidate = mq.find_scoped_review_candidate(
+                entry, board, github_ops, config=self.config,
+            )
+        except Exception:  # noqa: BLE001 — live gh/patch-id trouble: fail closed
+            return False
+        return candidate is not None
 
 
 # ── preflight (pure) ─────────────────────────────────────────────────────────
@@ -5640,6 +5698,52 @@ def _decide_merge(
                 f"   Continue by hand: coord test {state.work_aid} --passed   "
                 "# ONLY if the suite genuinely still passes against the "
                 "CURRENT base — otherwise dispatch a fresh smoke test"
+            ),
+        )
+    if (
+        divergence == "review"
+        and not verifier.github_backoff_active()
+        and verifier.has_scoped_review_candidate(state)
+    ):
+        # #4114: the merge gate's "review required but not approved" and
+        # this driver's own cached `review_verdict == "approve"` only
+        # disagree because the approval is bound to a patch-id
+        # (`coord.merge_queue.has_approved_review`) and the branch's live
+        # patch-id has since moved — `coord merge`'s own conflict-fix
+        # rebase, or a hand-pushed rebase/fast-forward, neither of which
+        # this driver's cached verdict ever re-observes. A LIVE check
+        # (`verifier.has_scoped_review_candidate`, backed by
+        # `merge_queue.find_scoped_review_candidate` — the same function
+        # the #1476 scoped-review sweep and `coord review-reaffirm` use)
+        # confirms a prior approval exists whose patch-id no longer
+        # matches the live one: exactly the shape a fresh review resolves,
+        # never the genuine #1526 divergence (two sources disagreeing
+        # about the IDENTICAL patch), which still escalates below. Bounded
+        # by the same `fix_rounds` budget the other self-service
+        # merge-stage repairs already share, so a verdict that keeps going
+        # stale still converges to an escalation instead of spinning
+        # forever.
+        if counters.fix_rounds >= opts.max_fix_rounds:
+            return _escalate_merge(
+                state, state.merge_status, gate_kind=divergence, gate_reason=gate_reason
+            )
+        counters.fix_rounds += 1
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: review approval patch-id-stale → re-review round "
+                f"{counters.fix_rounds}/{opts.max_fix_rounds} "
+                f"(coord diagnose {state.repo} {state.issue} --stage review --reset)"
+            ),
+            command=(
+                "diagnose", state.repo, str(state.issue),
+                "--stage", "review", "--reset",
+            ),
+            error_message=(
+                f"coord diagnose {state.repo} {state.issue} --stage review "
+                "--reset failed to clear the stale approval.\n"
+                f"   Continue by hand: coord review {state.work_aid}   "
+                "# dispatches a fresh review of the CURRENT head"
             ),
         )
     if divergence is not None:
