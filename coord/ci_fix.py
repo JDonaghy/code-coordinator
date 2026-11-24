@@ -42,6 +42,27 @@ and lets ``coord.commands.merge._dispatch_ci_fixes`` latch straight to a
 human "needs a design decision" page instead — the post-dispatch
 counterpart to ``coord.board_doctor_policy._sealed_confined_lines``'s
 PRE-dispatch recognition of the same shape.
+
+#4097: ``dispatch_ci_fix`` no longer dispatches a worker unconditionally —
+:func:`triage_ci_failure` first runs ``detail.log_excerpt`` (the failed
+job's log, already fetched through the ``coord.ci_github``/``coord.
+ci_gitlab`` CI seam) through :func:`coord.failure_evidence.
+extract_failure_evidence` and :func:`coord.failure_triage.triage_failure`
+— the SAME taxonomy/extractor the Test-stage triage-first route
+(``coord.drive``) uses, never a second independent classifier (#2096). A
+``mechanical`` verdict routes to the #4094 mechanic leg via ``coord.
+board_doctor_policy.dispatch_mechanic_leg_for_triage`` — the one gated
+entry point that primitive already has, shared with the Test-stage route
+rather than re-derived. An ``infra`` verdict triggers a plain CI rerun
+(mirroring ``coord.merge_queue``'s own ``ci_infra_rerun`` remedy) instead
+of spending a worker on a failure the log itself says is the runner's
+fault, not the code's. Both decline gracefully (tier off, no capable
+machine, budget already spent, no log to triage, ...) straight through to
+the unconditional ci-fix worker dispatch below — never a worse outcome
+than before #4097. Every other verdict (``substantive``/``flaky``/
+``human``, or no verdict at all) also falls through to that worker, now
+carrying the verdict's own diagnosis in the briefing instead of a bare
+``checks_summary`` one-liner.
 """
 
 from __future__ import annotations
@@ -56,6 +77,15 @@ from coord import github_ops
 from coord.ci_store import CIFailureDetail
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
+from coord.failure_evidence import extract_failure_evidence
+from coord.failure_triage import (
+    BUCKET_INFRA,
+    BUCKET_MECHANICAL,
+    DiffStat,
+    ProposedScope,
+    TriageVerdict,
+    triage_failure,
+)
 from coord.merge_queue import QueuedMerge, _chain_work_ids
 from coord.models import Assignment, Board, WORK_LIKE_TYPES
 
@@ -88,6 +118,216 @@ MAX_CI_FIX_NOOP_STREAK = 2
 # Pipeline row and the fix briefing itself both make it obvious WHY this
 # round was dispatched (a CI failure, not a review request-changes bounce).
 CI_FIX_TITLE_PREFIX = "[ci-fix]"
+
+# #4097: same visibility purpose as CI_FIX_TITLE_PREFIX, for the #4094
+# mechanic leg dispatched off a BUCKET_MECHANICAL CI-red triage verdict
+# instead of a full ci-fix worker.
+CI_MECHANIC_TITLE_PREFIX = "[ci-mechanic]"
+
+# #4097: known CI-infrastructure phrases a failed job's own log can carry
+# even when the job ran real steps and reported a genuine completed/failure
+# conclusion — the shape `coord.merge_queue._ci_infra_reason` cannot see,
+# since that check only reads CheckRun/JobRun STATUS/CONCLUSION metadata,
+# never log content. Complements that check rather than re-deriving it
+# (#2096): the metadata check answers "did this job report a verdict at
+# all"; this answers "does the log the job DID produce say its own
+# environment failed it." Deliberately narrow and anchored to known
+# GitHub-Actions-runner/transport wording — a false positive here means a
+# real regression gets re-run instead of fixed, so this stays a short,
+# literal allow-list, never a catch-all.
+_CI_INFRA_LOG_RE = re.compile(
+    r"the\s+operation\s+was\s+canceled"
+    r"|runner\s+has\s+received\s+a\s+shutdown\s+signal"
+    r"|lost\s+communication\s+with\s+the\s+(?:server|runner)"
+    r"|no\s+hosted\s+runner\s+(?:was\s+)?(?:ever\s+)?(?:acquired|available)"
+    r"|could\s+not\s+resolve\s+host"
+    r"|failed\s+to\s+start\s+the\s+container",
+    re.IGNORECASE,
+)
+
+
+def _ci_log_infra_signature(log_excerpt: str) -> str | None:
+    """The matched :data:`_CI_INFRA_LOG_RE` phrase in *log_excerpt*, or
+    ``None`` when it carries none (#4097)."""
+    match = _CI_INFRA_LOG_RE.search(log_excerpt)
+    return match.group(0) if match else None
+
+
+def triage_ci_failure(
+    *,
+    detail: CIFailureDetail | None,
+    diff_stat: DiffStat | None = None,
+    declared_files: "Sequence[str]" = (),
+    model: str | None = None,
+    claude_bin: str | None = None,
+) -> TriageVerdict | None:
+    """Triage a CONFIRMED CI failure using the #4093 taxonomy (#4097).
+
+    *detail* is the structured failing-job/step/log-excerpt data
+    :func:`coord.ci_github.build_ci_failure_detail` already fetched through
+    the CI seam at dispatch time — ``detail.log_excerpt`` IS "the failed
+    job's log" this function triages. Returns ``None`` — "nothing to
+    triage" — when there is no log text at all (no *detail*, no job
+    matched the check, the log fetch failed/was throttled/empty): a caller
+    must fall back to the pre-#4097 unconditional ci-fix dispatch, never
+    guess a bucket from nothing.
+
+    Tries, in order: :func:`_ci_log_infra_signature` (a known CI-infra log
+    phrase — deterministic, no model call, no evidence extraction needed);
+    then :func:`coord.failure_evidence.extract_failure_evidence` plus
+    :func:`coord.failure_triage.triage_failure` over the extracted
+    evidence — the SAME extractor/classifier the Test-stage triage-first
+    route uses, never a second independent one (#2096). *diff_stat*/
+    *declared_files* feed that classifier's mechanical-confinement check
+    exactly as they do for a Test-stage failure.
+    """
+    if detail is None:
+        return None
+    log_excerpt = detail.log_excerpt or ""
+    if not log_excerpt.strip():
+        return None
+
+    infra_signature = _ci_log_infra_signature(log_excerpt)
+    if infra_signature is not None:
+        return TriageVerdict(
+            bucket=BUCKET_INFRA,
+            diagnosis=(
+                "CI log carries a known infra signature "
+                f"({infra_signature!r}) — the job/runner itself failed "
+                "before producing a verdict about the code, not a defect "
+                "in the work (#4097). No model call was needed."
+            ),
+            repro_capability=None,
+            proposed_scope=ProposedScope(),
+            confidence=1.0,
+            via="deterministic:ci_infra_log",
+        )
+
+    evidence = extract_failure_evidence(log_excerpt)
+    if evidence.is_empty:
+        return None
+
+    kwargs: dict[str, object] = {}
+    if model is not None:
+        kwargs["model"] = model
+    if claude_bin is not None:
+        kwargs["claude_bin"] = claude_bin
+    return triage_failure(
+        evidence=evidence,
+        diff_stat=diff_stat or DiffStat(),
+        declared_files=declared_files,
+        **kwargs,
+    )
+
+
+def _diff_stat_for_entry(entry: QueuedMerge) -> DiffStat:
+    """Best-effort :class:`~coord.failure_triage.DiffStat` for *entry*'s
+    branch (#4097) — just the touched-file list, the only part
+    :func:`coord.failure_triage.triage_failure`'s mechanical-confinement
+    check consults. Fails soft to an empty ``DiffStat`` on any read
+    failure (no ``gh`` available, a throttled/malformed compare, ...) —
+    this is classification input, never a dispatch precondition, same
+    posture as :func:`_fetch_issue_body`.
+    """
+    try:
+        diff_text = github_ops.get_compare_diff(
+            entry.repo_github, entry.target_branch, entry.branch,
+        )
+    except Exception:  # noqa: BLE001 — see docstring
+        diff_text = None
+    if not diff_text:
+        return DiffStat()
+    try:
+        files = tuple(github_ops.diff_file_paths(diff_text))
+    except Exception:  # noqa: BLE001 — see docstring
+        return DiffStat()
+    return DiffStat(files=files)
+
+
+def _dispatch_mechanic_leg_for_ci(
+    entry: QueuedMerge,
+    board: Board,
+    config: Config,
+    verdict: TriageVerdict,
+    *,
+    http_client: httpx.Client | None = None,
+) -> Assignment | None:
+    """Route a ``BUCKET_MECHANICAL`` CI-red verdict to the #4094 mechanic
+    leg instead of a full ci-fix worker (#4097).
+
+    Calls :func:`coord.board_doctor_policy.dispatch_mechanic_leg_for_triage`
+    — the SAME gated entry point ``coord mechanic-dispatch`` calls for the
+    Test-stage triage-first route — so the tier kill-switch, per-repo
+    capacity cap, and one-mechanic-leg-per-SHA budget all apply identically
+    here, never a second, independently-gated path (#2096).
+
+    That function reports only a confirmed ``bool`` (never the dispatched
+    assignment itself), so the dispatched :class:`~coord.models.Assignment`
+    is recovered by diffing *board*'s own active-assignment ids before and
+    after the call — safe because ``dispatch_mechanic_leg_for_triage``
+    mutates *board* synchronously, in this same call, before returning.
+    Returns ``None`` — never raises — on any decline: the tier off, the
+    repo at capacity, already attempted at this SHA, no capable machine, or
+    the dispatch itself failing to confirm started; the caller falls
+    through to the ordinary ci-fix worker dispatch exactly as if no
+    mechanical verdict had fired.
+    """
+    branch_sha = entry.branch_head_sha or ""
+    if not branch_sha:
+        return None
+
+    from coord.board_doctor_policy import dispatch_mechanic_leg_for_triage  # noqa: PLC0415
+
+    before_ids = {getattr(a, "assignment_id", None) for a in board.active}
+    dispatched = dispatch_mechanic_leg_for_triage(
+        entry.repo_name,
+        entry.issue_number,
+        board,
+        config,
+        verdict=verdict,
+        branch_sha=branch_sha,
+        evidence=(verdict.diagnosis,) if verdict.diagnosis else (),
+        http_client=http_client,
+    )
+    if not dispatched:
+        return None
+    fix = next(
+        (a for a in board.active if getattr(a, "assignment_id", None) not in before_ids),
+        None,
+    )
+    if fix is not None and getattr(fix, "issue_title", None) is not None:
+        fix.issue_title = f"{CI_MECHANIC_TITLE_PREFIX} {fix.issue_title}"
+    return fix
+
+
+def _rerun_ci_for_infra_verdict(entry: QueuedMerge, config: Config) -> bool:
+    """Trigger a plain CI rerun for *entry*'s PR (#4097) — mirrors
+    ``coord.merge_queue``'s own ``ci_infra_rerun`` remedy (``ci.
+    rerun_for_pr``), reusing the SAME ``coord.ci_store.build_ci_store``
+    factory every other CI caller in this codebase builds its store
+    through, rather than a second construction path.
+
+    Returns ``False`` — never raises — when *entry* has no PR number yet,
+    the configured backend has no rerun capability (e.g. ``NoOpCi``), or
+    the rerun call itself fails; the caller must treat that identically to
+    "no remedy available" and fall through accordingly.
+    """
+    if not entry.pr_number:
+        return False
+    from coord.ci_store import build_ci_store  # noqa: PLC0415
+
+    try:
+        ci_store = build_ci_store(
+            config.ci_store.type, host=config.ci_store.host,
+            token_env=config.ci_store.token_env,
+        )
+        rerun_for_pr = getattr(ci_store, "rerun_for_pr", None)
+        if rerun_for_pr is None:
+            return False
+        return bool(rerun_for_pr(entry.repo_github, entry.pr_number))
+    except Exception:  # noqa: BLE001 — a failed rerun attempt is "no remedy", not a crash
+        return False
+
 
 # #3900: the machine-parseable marker a ci-fix leg's `STUCK:` line carries
 # when `build_ci_fix_briefing`'s sealed-path guard (#3882) fires — mirrors
@@ -257,6 +497,7 @@ def build_ci_fix_briefing(
     detail: CIFailureDetail | None = None,
     issue_body: str | None = None,
     sealed_paths: Sequence[str] = (),
+    triage_diagnosis: str | None = None,
 ) -> str:
     """Assemble the CI-fix worker's briefing. Pure function — testable.
 
@@ -280,6 +521,15 @@ def build_ci_fix_briefing(
     the merge-ref step every ci-fix briefing now carries unconditionally,
     the reason this module is no longer blind to a green-branch/red-CI
     split (quadraui#2028).
+
+    *triage_diagnosis* (#4097) is :func:`triage_ci_failure`'s own verdict
+    text — the SAME diagnosis already classified this failure as
+    something a deterministic rule or the one-shot model tier could not
+    confidently resolve to ``infra``/``mechanical``, so it fell through to
+    this worker. Carries the hypothesis the triage call already formed
+    instead of leaving the worker to re-derive one from scratch. Optional
+    and additive, same shape as *detail*/*issue_body*: ``None`` or blank
+    leaves the briefing byte-identical to before #4097.
     """
     lines: list[str] = [
         f"# CI failure fix: {entry.repo_github} branch `{entry.branch}`",
@@ -297,6 +547,16 @@ def build_ci_fix_briefing(
         lines.extend(_format_issue_body(issue_body))
     if detail is not None and _detail_has_content(detail):
         lines.extend(_format_ci_failure_detail(detail))
+    if triage_diagnosis is not None and triage_diagnosis.strip():
+        lines += [
+            "## Triage diagnosis",
+            "",
+            "An automated triage pass (#4097) already formed this "
+            "hypothesis about the failure before dispatching you:",
+            "",
+            triage_diagnosis.strip(),
+            "",
+        ]
     lines += [
         f"This is fix attempt {attempt}/{MAX_CI_FIX_DISPATCHES} for this "
         "failure streak — the coordinator will escalate to a human if this "
@@ -669,7 +929,7 @@ def dispatch_ci_fix(
     the retry cap exhausted, and for persisting the board/queue.
 
     Does NOT increment ``entry.ci_fix_dispatches`` on a ``None`` return —
-    only a successful dispatch spends the budget, mirroring how
+    only a successful dispatch/remedy spends the budget, mirroring how
     ``ci_infra_reruns``/``ci_flaky_reruns`` are only bumped when their
     respective remedy actually fired.
 
@@ -680,6 +940,20 @@ def dispatch_ci_fix(
     ``dispatch_was_noop(entry)`` and route through ``refund_noop_ci_fix``
     BEFORE calling this function again for the same entry, so a worker
     that pushed nothing doesn't silently spend a second real attempt.
+
+    #4097: before any of the above, triages the failure via
+    :func:`triage_ci_failure`. ``infra`` triggers a plain CI rerun
+    (:func:`_rerun_ci_for_infra_verdict`) and returns ``None`` — no worker,
+    no ``Assignment`` — spending one unit of :data:`MAX_CI_FIX_DISPATCHES`
+    only when the rerun actually fired, so the caller's existing retry-cap/
+    escalation logic bounds it exactly like any other remedy here.
+    ``mechanical`` routes to the #4094 mechanic leg
+    (:func:`_dispatch_mechanic_leg_for_ci`); on success that leg's own
+    ``Assignment`` is returned in place of a ci-fix worker's, so the caller
+    sees a normal confirmed dispatch. Either verdict falling through
+    (declined, or no log to triage at all) proceeds to the unconditional
+    worker dispatch below exactly as before #4097 — now with the verdict's
+    own diagnosis (if any) carried into the briefing.
     """
     work = dispatch_precheck(entry, board)
     if work is None:
@@ -687,6 +961,83 @@ def dispatch_ci_fix(
 
     summary = checks_summary or entry.error or "CI checks failed"
     issue_body = _fetch_issue_body(entry)
+
+    # #4097: `_diff_stat_for_entry`/`parse_declared_files` each cost a `gh`
+    # call or a parse — skip both entirely when there is no log text to
+    # triage at all (`detail` is `None`/empty), the common case for every
+    # pre-#4097 caller/test that never passes `detail`. `triage_ci_failure`
+    # would return `None` for this input regardless; this just avoids
+    # paying for its inputs when the answer is already known.
+    verdict: TriageVerdict | None = None
+    if detail is not None and (detail.log_excerpt or "").strip():
+        from coord.overlap_predict import parse_declared_files  # noqa: PLC0415
+
+        verdict = triage_ci_failure(
+            detail=detail,
+            diff_stat=_diff_stat_for_entry(entry),
+            declared_files=parse_declared_files(issue_body),
+        )
+
+    if verdict is not None and verdict.bucket == BUCKET_INFRA:
+        if (
+            entry.ci_fix_dispatches < MAX_CI_FIX_DISPATCHES
+            and _rerun_ci_for_infra_verdict(entry, config)
+        ):
+            entry.ci_fix_dispatches += 1
+            entry.error = (
+                f"{summary} — triaged as CI infra (#4097): "
+                f"{verdict.diagnosis} Auto-rerun triggered "
+                f"({entry.ci_fix_dispatches}/{MAX_CI_FIX_DISPATCHES})."
+            )
+            from coord.audit import record_audit  # noqa: PLC0415
+
+            record_audit(
+                tier="operational",
+                category="merge",
+                event_type="ci_fix_triage_infra_rerun",
+                actor="daemon",
+                summary=(
+                    f"ci-fix triage classified infra, rerun triggered: "
+                    f"{entry.repo_name}#{entry.issue_number}"
+                ),
+                repo=entry.repo_name,
+                issue=entry.issue_number,
+                assignment_id=entry.assignment_id,
+                details={"via": verdict.via, "diagnosis": verdict.diagnosis},
+            )
+        return None
+
+    if verdict is not None and verdict.bucket == BUCKET_MECHANICAL:
+        mech_fix = _dispatch_mechanic_leg_for_ci(
+            entry, board, config, verdict, http_client=http_client,
+        )
+        if mech_fix is not None:
+            entry.ci_fix_head_sha = entry.branch_head_sha or ""
+            entry.ci_fix_dispatches += 1
+            from coord.audit import record_audit  # noqa: PLC0415
+
+            record_audit(
+                tier="operational",
+                category="merge",
+                event_type="ci_fix_triage_mechanical",
+                actor="daemon",
+                summary=(
+                    "ci-fix triage classified mechanical, mechanic leg "
+                    f"dispatched: {entry.repo_name}#{entry.issue_number} -> "
+                    f"{mech_fix.machine_name}"
+                ),
+                repo=entry.repo_name,
+                issue=entry.issue_number,
+                assignment_id=mech_fix.assignment_id,
+                machine=mech_fix.machine_name,
+                details={"via": verdict.via, "diagnosis": verdict.diagnosis},
+            )
+            return mech_fix
+        # Declined (tier off, at capacity, already attempted at this SHA,
+        # no capable machine, ...) — fall straight through to the ordinary
+        # ci-fix worker dispatch below exactly as if no mechanical verdict
+        # had fired; never a worse outcome than before #4097.
+
     # #3882: thread this repo's sealed acceptance-oracle paths into the
     # briefing so a worker whose merged-tree failure lives only there
     # knows to stop (`STUCK:`) rather than trip the mandatory
@@ -698,6 +1049,7 @@ def dispatch_ci_fix(
     briefing = build_ci_fix_briefing(
         entry=entry, checks_summary=summary, attempt=entry.ci_fix_dispatches + 1,
         detail=detail, issue_body=issue_body, sealed_paths=sealed_paths,
+        triage_diagnosis=verdict.diagnosis if verdict is not None else None,
     )
 
     from coord.auto_loop import _dispatch_fix  # noqa: PLC0415
