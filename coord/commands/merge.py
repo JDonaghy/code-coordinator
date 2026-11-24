@@ -448,17 +448,32 @@ def _dispatch_conflict_fixes(
     reads its own ``events`` afterward (the sibling sweep's
     ``MERGE_LANDED_KINDS`` check, #2246) sees the merge land instead of
     only ever observing the superseded ``"conflict"`` event.
+
+    #4097: a ``"rebaseable"`` conflict Trigger B's takeover above did NOT
+    already resolve this tick gets one triage pass
+    (:func:`coord.ci_fix.triage_conflict_failure`) before the full
+    conflict-fix worker — the merge-failure edge of the CI-red/Test-stage
+    triage-first routing, reusing the SAME extractor/classifier (#2096).
+    A ``BUCKET_MECHANICAL`` verdict routes to the #4094 mechanic leg
+    (:func:`coord.ci_fix.dispatch_mechanic_leg_for_conflict`) instead;
+    declining (or any other verdict/no verdict at all) falls straight
+    through to the unchanged retry-cap/dispatch logic below.
     """
     conflict_events = [ev for ev in events if ev.kind == "conflict"]
     if not conflict_events or dry_run:
         return
 
     from coord.audit import record_audit  # noqa: PLC0415
+    from coord.ci_fix import (  # noqa: PLC0415
+        dispatch_mechanic_leg_for_conflict,
+        triage_conflict_failure,
+    )
     from coord.conflict_fix import (  # noqa: PLC0415
         describe_conflict_fix_decline,
         dispatch_conflict_fix,
         has_prior_conflict_fix,
     )
+    from coord.failure_triage import BUCKET_MECHANICAL  # noqa: PLC0415
     from coord.merge_queue import (  # noqa: PLC0415
         HUMAN_REQUIRED,
         attempt_direct_merge_for_inert_base_move,
@@ -521,6 +536,53 @@ def _dispatch_conflict_fixes(
                             details={"reason": "inert_base_move_skew"},
                         )
                         continue
+            # #4097: a rebaseable conflict Trigger B's direct-merge takeover
+            # above did NOT already resolve (not an inert base-move skew, or
+            # the gate was unavailable this tick) gets one triage pass
+            # before the full conflict-fix worker — mirrors the CI-red
+            # route in `coord.ci_fix`, reusing the SAME extractor/
+            # classifier (never a second independent one, #2096). Most
+            # genuine conflicts' own error text ("merge conflict", "not
+            # mergeable", ...) carries nothing an evidence extractor
+            # recognizes, so this ordinarily declines and falls straight
+            # through to the unchanged retry-cap/dispatch logic below —
+            # never a worse outcome than before this existed.
+            conflict_verdict = triage_conflict_failure(ev.entry)
+            if conflict_verdict is not None and conflict_verdict.bucket == BUCKET_MECHANICAL:
+                mech_fix = dispatch_mechanic_leg_for_conflict(
+                    ev.entry, fix_board, config, conflict_verdict,
+                )
+                if mech_fix is not None:
+                    click.echo(
+                        f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                        "conflict triaged mechanical, mechanic leg "
+                        f"dispatched to {mech_fix.machine_name}"
+                    )
+                    dispatched_any = True
+                    record_audit(
+                        tier="operational",
+                        category="merge",
+                        event_type="conflict_triage_mechanical",
+                        actor="daemon",
+                        summary=(
+                            "conflict triage classified mechanical, "
+                            f"mechanic leg dispatched: {ev.entry.repo_name}#"
+                            f"{ev.entry.issue_number} -> {mech_fix.machine_name}"
+                        ),
+                        repo=ev.entry.repo_name,
+                        issue=ev.entry.issue_number,
+                        assignment_id=mech_fix.assignment_id,
+                        machine=mech_fix.machine_name,
+                        details={
+                            "via": conflict_verdict.via,
+                            "diagnosis": conflict_verdict.diagnosis,
+                        },
+                    )
+                    continue
+                # Declined (tier off, at capacity, already attempted at
+                # this SHA, no capable machine, ...) — fall straight
+                # through to the ordinary conflict-fix worker dispatch
+                # below exactly as if no mechanical verdict had fired.
             # Retry cap (#241/#784): if a conflict-fix already ran and
             # failed for this entry in this session, don't loop — mark
             # HUMAN_REQUIRED so the user takes over.  A successful

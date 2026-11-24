@@ -862,9 +862,16 @@ class TestDispatchCiFixTriageMechanical:
             status="pending", type="work", branch="issue-1-fix",
         )
 
-        def _fake_dispatch(repo_name, issue_number, b, cfg, *, verdict, branch_sha, evidence=(), http_client=None):
+        captured: dict = {}
+
+        def _fake_dispatch(
+            repo_name, issue_number, b, cfg, *,
+            verdict, branch_sha, cause=None, evidence=(), http_client=None,
+        ):
             assert verdict.bucket == "mechanical"
             assert branch_sha == "sha123"
+            captured["cause"] = cause
+            captured["evidence"] = evidence
             b.active.append(mechanic_fix)
             return True
 
@@ -887,6 +894,17 @@ class TestDispatchCiFixTriageMechanical:
         assert result.issue_title.startswith(CI_MECHANIC_TITLE_PREFIX)
         assert entry.ci_fix_dispatches == 1
         assert entry.ci_fix_head_sha == "sha123"
+        # #4097 review: the leg must be briefed with the REAL failure
+        # evidence (job/step/log excerpt), not just the generic bucket
+        # diagnosis — and must be audited/briefed as a CI-red cause, not
+        # the Test-stage one.
+        from coord.board_doctor_policy import CAUSE_CI_TRIAGE_MECHANICAL
+
+        assert captured["cause"] == CAUSE_CI_TRIAGE_MECHANICAL
+        evidence_text = "\n".join(captured["evidence"])
+        assert "Failing job: lint" in evidence_text
+        assert "Failing step: Run clippy" in evidence_text
+        assert "this loop never actually loops" in evidence_text
 
     def test_declined_mechanic_leg_falls_back_to_ordinary_ci_fix_worker(
         self, two_machine_config: Config, coord_db,
@@ -967,7 +985,10 @@ class TestDispatchCiFixTriageInfra:
 
         assert result is None
         assert rerun_calls == [("acme/api", 42)]
-        assert entry.ci_fix_dispatches == 1
+        # Budgeted off the SAME counter `coord.merge_queue`'s own #1892
+        # remedy spends — never a second, independent rerun budget.
+        assert entry.ci_infra_reruns == 1
+        assert entry.ci_fix_dispatches == 0
         assert "infra" in (entry.error or "").lower()
         # No worker was ever spawned — the rerun is the whole remedy.
         assert not board.active
@@ -975,6 +996,11 @@ class TestDispatchCiFixTriageInfra:
     def test_rerun_failing_to_trigger_falls_through_to_ordinary_dispatch(
         self, two_machine_config: Config, coord_db,
     ) -> None:
+        """A rerun that cannot fire (no capability, the call itself
+        failing) must fall straight through to the unconditional ci-fix
+        worker dispatch — never stranded with no remedy and no worker,
+        which would make the retry-cap/HUMAN_REQUIRED escalation
+        unreachable."""
         board = Board()
         board.completed.append(_work_assignment())
         entry = _entry()
@@ -998,10 +1024,56 @@ class TestDispatchCiFixTriageInfra:
                 entry, board, two_machine_config, detail=detail, http_client=client,
             )
 
-        # The rerun could not be triggered — this dispatch must still
-        # return None (no remedy fired), never fall through to a worker
-        # for a verdict that just said "not the code's fault".
-        assert result is None
+        assert result is not None
+        assert result.issue_title.startswith(CI_FIX_TITLE_PREFIX)
+        assert entry.ci_infra_reruns == 0
+        assert entry.ci_fix_dispatches == 1
+        _, payload = client.calls[0]
+        assert "## Triage diagnosis" in payload["briefing"]
+
+    def test_infra_verdict_with_rerun_budget_already_exhausted_falls_through(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#4097 review: when `entry.ci_infra_reruns` is already at
+        `MAX_CI_INFRA_RERUNS` (the budget `coord.merge_queue`'s own #1892
+        remedy also spends from), an infra verdict must NOT open a second,
+        independent rerun budget — it must fall straight through to the
+        ordinary ci-fix worker dispatch exactly like a non-firing rerun
+        does."""
+        from coord.merge_queue import MAX_CI_INFRA_RERUNS
+
+        board = Board()
+        board.completed.append(_work_assignment())
+        entry = _entry()
+        entry.pr_number = 42
+        entry.ci_infra_reruns = MAX_CI_INFRA_RERUNS
+        detail = CIFailureDetail(
+            check_name="Test (Linux)", job_name="Test (Linux)", step_name="",
+            log_excerpt="Error: The runner has received a shutdown signal.",
+        )
+        client = _FakeHTTPClient({"id": "ci-fix-infra-exhausted"})
+        rerun_calls: list[tuple[str, int]] = []
+
+        class _FakeCiStore:
+            def rerun_for_pr(self, repo: str, number: int) -> bool:
+                rerun_calls.append((repo, number))
+                return True
+
+        with (
+            patch("coord.ci_fix.github_ops.get_issue", return_value={"body": ""}),
+            patch("coord.ci_fix.github_ops.get_compare_diff", return_value=None),
+            patch("coord.ci_store.build_ci_store", return_value=_FakeCiStore()),
+        ):
+            result = dispatch_ci_fix(
+                entry, board, two_machine_config, detail=detail, http_client=client,
+            )
+
+        # Budget already exhausted — no rerun attempted at all.
+        assert rerun_calls == []
+        assert result is not None
+        assert result.issue_title.startswith(CI_FIX_TITLE_PREFIX)
+        assert entry.ci_infra_reruns == MAX_CI_INFRA_RERUNS
+        assert entry.ci_fix_dispatches == 1
 
 
 class TestDispatchCiFixTriageSubstantive:

@@ -1950,6 +1950,19 @@ string) to disarm the mechanic leg fleet-wide without touching
 #: `coord.failure_triage` itself), never from the periodic sweep.
 CAUSE_TEST_TRIAGE_MECHANICAL = "test_triage_mechanical"
 
+#: #4097's own cause string for the CI-red triage-first route
+#: (`coord.ci_fix`) — same role as `CAUSE_TEST_TRIAGE_MECHANICAL`, passed
+#: explicitly to `dispatch_mechanic_leg_for_triage` so a mechanic leg
+#: dispatched off a CI-red verdict is never audited/briefed as a Test-stage
+#: one.
+CAUSE_CI_TRIAGE_MECHANICAL = "ci_triage_mechanical"
+
+#: #4097's own cause string for the merge-failure triage-first route
+#: (`coord.ci_fix.dispatch_mechanic_leg_for_conflict`, called from
+#: `coord.commands.merge._dispatch_conflict_fixes`) — same role as
+#: `CAUSE_TEST_TRIAGE_MECHANICAL`/`CAUSE_CI_TRIAGE_MECHANICAL`.
+CAUSE_CONFLICT_TRIAGE_MECHANICAL = "conflict_triage_mechanical"
+
 
 def _mechanic_tier_enabled(repo_name: str, config: "Config") -> bool:
     """Decide whether a Test-stage failure's #4093 triage verdict may route
@@ -1988,27 +2001,34 @@ def dispatch_mechanic_leg_for_triage(
     *,
     verdict: Any,
     branch_sha: str,
+    cause: str = CAUSE_TEST_TRIAGE_MECHANICAL,
     failed_stage_commands: tuple[str, ...] = (),
     evidence: tuple[str, ...] = (),
     http_client: object | None = None,
 ) -> bool:
-    """#4094: route a Test-stage failure `coord.failure_triage.
+    """#4094: route a triage-first failure `coord.failure_triage.
     triage_failure` classified ``BUCKET_MECHANICAL`` to a mechanic leg
     instead of spending a full fix round + review + test fan-out on it.
 
-    Called directly from wherever `coord.drive` decides a Test leg failed
-    and triages it (that call site does not exist yet — building it is
-    explicitly out of scope for #4094, same posture as `coord.failure_
-    triage` itself having no production caller). This is a plain,
-    synchronously-called function, NOT a `coord.board_doctor.sweep` auto-
-    dispatcher — mirrors :func:`dispatch_nit_only_finisher`'s own shape and
-    rationale exactly.
+    Called from each triage-first edge's own routing: `coord drive`'s
+    Test-stage route (via the ``coord mechanic-dispatch`` CLI), and
+    `coord.ci_fix`'s CI-red and merge-failure routes directly. This is a
+    plain, synchronously-called function, NOT a `coord.board_doctor.sweep`
+    auto-dispatcher — mirrors :func:`dispatch_nit_only_finisher`'s own
+    shape and rationale exactly.
 
     *verdict* is a `coord.failure_triage.TriageVerdict` (typed as `Any`
     here to avoid importing that module at this function's call surface
     before a real caller needs it — every attribute this function reads
     off it, ``bucket``/``repro_capability``/``proposed_scope``/
     ``diagnosis``, is part of that dataclass's stable public shape).
+
+    *cause* names which edge triggered this dispatch — defaults to
+    :data:`CAUSE_TEST_TRIAGE_MECHANICAL` for the original Test-stage
+    caller; a CI-red or merge-failure caller passes
+    :data:`CAUSE_CI_TRIAGE_MECHANICAL`/:data:`CAUSE_CONFLICT_TRIAGE_MECHANICAL`
+    explicitly so the dispatched leg's briefing and audit trail name the
+    edge that actually fired, not a hardcoded Test-stage one.
 
     Returns ``True`` only when `coord.board_doctor_permissions.
     sweep_dispatch_mechanic_leg` (via :data:`_MECHANIC_ACTION`) actually
@@ -2045,7 +2065,7 @@ def dispatch_mechanic_leg_for_triage(
         issue_number,
         board,
         config,
-        cause=CAUSE_TEST_TRIAGE_MECHANICAL,
+        cause=cause,
         verdict=verdict,
         branch_sha=branch_sha,
         failed_stage_commands=failed_stage_commands,

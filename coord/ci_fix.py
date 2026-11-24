@@ -86,7 +86,7 @@ from coord.failure_triage import (
     TriageVerdict,
     triage_failure,
 )
-from coord.merge_queue import QueuedMerge, _chain_work_ids
+from coord.merge_queue import MAX_CI_INFRA_RERUNS, QueuedMerge, _chain_work_ids
 from coord.models import Assignment, Board, WORK_LIKE_TYPES
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
@@ -124,6 +124,11 @@ CI_FIX_TITLE_PREFIX = "[ci-fix]"
 # instead of a full ci-fix worker.
 CI_MECHANIC_TITLE_PREFIX = "[ci-mechanic]"
 
+# #4097: same visibility purpose as CI_MECHANIC_TITLE_PREFIX, for the #4094
+# mechanic leg dispatched off a BUCKET_MECHANICAL merge-failure triage
+# verdict instead of a full conflict-fix worker.
+CONFLICT_MECHANIC_TITLE_PREFIX = "[conflict-mechanic]"
+
 # #4097: known CI-infrastructure phrases a failed job's own log can carry
 # even when the job ran real steps and reported a genuine completed/failure
 # conclusion — the shape `coord.merge_queue._ci_infra_reason` cannot see,
@@ -157,7 +162,7 @@ def triage_ci_failure(
     *,
     detail: CIFailureDetail | None,
     diff_stat: DiffStat | None = None,
-    declared_files: "Sequence[str]" = (),
+    declared_files: Sequence[str] = (),
     model: str | None = None,
     claude_bin: str | None = None,
 ) -> TriageVerdict | None:
@@ -200,10 +205,60 @@ def triage_ci_failure(
             repro_capability=None,
             proposed_scope=ProposedScope(),
             confidence=1.0,
-            via="deterministic:ci_infra_log",
+            via="deterministic:infra:ci_log",
         )
 
     evidence = extract_failure_evidence(log_excerpt)
+    if evidence.is_empty:
+        return None
+
+    kwargs: dict[str, object] = {}
+    if model is not None:
+        kwargs["model"] = model
+    if claude_bin is not None:
+        kwargs["claude_bin"] = claude_bin
+    return triage_failure(
+        evidence=evidence,
+        diff_stat=diff_stat or DiffStat(),
+        declared_files=declared_files,
+        **kwargs,
+    )
+
+
+def triage_conflict_failure(
+    entry: QueuedMerge,
+    *,
+    diff_stat: DiffStat | None = None,
+    declared_files: Sequence[str] = (),
+    model: str | None = None,
+    claude_bin: str | None = None,
+) -> TriageVerdict | None:
+    """Triage a merge-queue CONFLICT event using the #4093 taxonomy (#4097).
+
+    Runs the SAME extractor/classifier :func:`triage_ci_failure` and the
+    Test-stage route use — :func:`coord.failure_evidence.
+    extract_failure_evidence` plus :func:`coord.failure_triage.
+    triage_failure` — over *entry*'s own conflict-classification text
+    (``entry.error``, the message ``coord.merge_queue.classify_conflict``
+    and the ``conflict`` ``MergeEvent``s it is read from already carry),
+    never a second independent classifier (#2096).
+
+    Only called by ``coord.commands.merge._dispatch_conflict_fixes`` for a
+    ``"rebaseable"`` conflict that the finisher's #3836 Trigger B (an inert
+    base-move skew merged directly, no fix leg) did NOT already resolve —
+    that path is untouched by this function. Returns ``None`` — "nothing to
+    triage" — when there is no error text, or the extractor finds nothing
+    diagnostic in it: a plain content-conflict message ("merge conflict",
+    "not mergeable", ...) is NOT itself a diagnostic log, so this is the
+    ordinary, expected result for most real conflicts. A caller must fall
+    back to the unconditional conflict-fix worker dispatch on ``None``,
+    exactly as before this function existed.
+    """
+    error_text = entry.error or ""
+    if not error_text.strip():
+        return None
+
+    evidence = extract_failure_evidence(error_text)
     if evidence.is_empty:
         return None
 
@@ -244,22 +299,61 @@ def _diff_stat_for_entry(entry: QueuedMerge) -> DiffStat:
     return DiffStat(files=files)
 
 
-def _dispatch_mechanic_leg_for_ci(
+def _ci_mechanic_evidence(
+    detail: CIFailureDetail | None,
+) -> tuple[str, ...]:
+    """The job/step/log-excerpt facts a CI-red mechanic leg's briefing
+    needs (#4097 review) — the SAME structured data
+    :func:`_format_ci_failure_detail` already renders for a full ci-fix
+    worker, reduced to the flat ``evidence=`` lines
+    :func:`coord.board_doctor_permissions._mechanic_leg_briefing` accepts.
+
+    Without this, a mechanical verdict's generic diagnosis ("N error
+    site(s) matching lint, confined to files the branch already touches")
+    is the ONLY thing the dispatched leg is told — no excerpt of the
+    actual error text, no job/step name. ``None``/an empty *detail*
+    produces an empty tuple, leaving the briefing exactly as it was before
+    this existed.
+    """
+    if detail is None:
+        return ()
+    lines: list[str] = []
+    if detail.job_name:
+        lines.append(f"Failing job: {detail.job_name}")
+    if detail.step_name:
+        lines.append(f"Failing step: {detail.step_name}")
+    if detail.run_url:
+        lines.append(f"Run: {detail.run_url}")
+    if detail.log_excerpt:
+        lines.append(f"Log excerpt:\n{detail.log_excerpt}")
+    return tuple(lines)
+
+
+def _dispatch_mechanic_leg(
     entry: QueuedMerge,
     board: Board,
     config: Config,
     verdict: TriageVerdict,
     *,
+    cause: str,
+    title_prefix: str,
+    evidence: tuple[str, ...] = (),
     http_client: httpx.Client | None = None,
 ) -> Assignment | None:
-    """Route a ``BUCKET_MECHANICAL`` CI-red verdict to the #4094 mechanic
-    leg instead of a full ci-fix worker (#4097).
+    """Route a ``BUCKET_MECHANICAL`` triage verdict to the #4094 mechanic
+    leg instead of a full fix worker (#4097) — shared by the CI-red route
+    (:func:`_dispatch_mechanic_leg_for_ci`) and the merge-failure route
+    (:func:`dispatch_mechanic_leg_for_conflict`), never two independent
+    dispatch paths for the same primitive (#2096).
 
     Calls :func:`coord.board_doctor_policy.dispatch_mechanic_leg_for_triage`
     — the SAME gated entry point ``coord mechanic-dispatch`` calls for the
     Test-stage triage-first route — so the tier kill-switch, per-repo
     capacity cap, and one-mechanic-leg-per-SHA budget all apply identically
-    here, never a second, independently-gated path (#2096).
+    here, never a second, independently-gated path (#2096). *cause* is
+    forwarded through so the dispatched leg's briefing and audit trail
+    correctly name which edge triggered it (Test/CI/merge-failure), rather
+    than a hardcoded Test-stage cause for an edge it never ran against.
 
     That function reports only a confirmed ``bool`` (never the dispatched
     assignment itself), so the dispatched :class:`~coord.models.Assignment`
@@ -269,7 +363,7 @@ def _dispatch_mechanic_leg_for_ci(
     Returns ``None`` — never raises — on any decline: the tier off, the
     repo at capacity, already attempted at this SHA, no capable machine, or
     the dispatch itself failing to confirm started; the caller falls
-    through to the ordinary ci-fix worker dispatch exactly as if no
+    through to the ordinary fix-worker dispatch exactly as if no
     mechanical verdict had fired.
     """
     branch_sha = entry.branch_head_sha or ""
@@ -286,7 +380,8 @@ def _dispatch_mechanic_leg_for_ci(
         config,
         verdict=verdict,
         branch_sha=branch_sha,
-        evidence=(verdict.diagnosis,) if verdict.diagnosis else (),
+        cause=cause,
+        evidence=evidence,
         http_client=http_client,
     )
     if not dispatched:
@@ -296,8 +391,62 @@ def _dispatch_mechanic_leg_for_ci(
         None,
     )
     if fix is not None and getattr(fix, "issue_title", None) is not None:
-        fix.issue_title = f"{CI_MECHANIC_TITLE_PREFIX} {fix.issue_title}"
+        fix.issue_title = f"{title_prefix} {fix.issue_title}"
     return fix
+
+
+def _dispatch_mechanic_leg_for_ci(
+    entry: QueuedMerge,
+    board: Board,
+    config: Config,
+    verdict: TriageVerdict,
+    detail: CIFailureDetail | None,
+    *,
+    http_client: httpx.Client | None = None,
+) -> Assignment | None:
+    """Route a ``BUCKET_MECHANICAL`` CI-red verdict to the #4094 mechanic
+    leg (#4097) — the CI-red specialization of :func:`_dispatch_mechanic_leg`.
+
+    *detail* carries the job/step/log-excerpt facts already fetched for
+    this failure (:func:`_ci_mechanic_evidence`) — forwarded as the leg's
+    ``evidence=`` so its briefing names what actually failed, not just the
+    generic bucket diagnosis.
+    """
+    from coord.board_doctor_policy import CAUSE_CI_TRIAGE_MECHANICAL  # noqa: PLC0415
+
+    return _dispatch_mechanic_leg(
+        entry, board, config, verdict,
+        cause=CAUSE_CI_TRIAGE_MECHANICAL,
+        title_prefix=CI_MECHANIC_TITLE_PREFIX,
+        evidence=_ci_mechanic_evidence(detail),
+        http_client=http_client,
+    )
+
+
+def dispatch_mechanic_leg_for_conflict(
+    entry: QueuedMerge,
+    board: Board,
+    config: Config,
+    verdict: TriageVerdict,
+    *,
+    http_client: httpx.Client | None = None,
+) -> Assignment | None:
+    """Route a ``BUCKET_MECHANICAL`` merge-failure verdict (#4097) to the
+    #4094 mechanic leg — the merge-failure specialization of
+    :func:`_dispatch_mechanic_leg`, called by
+    ``coord.commands.merge._dispatch_conflict_fixes`` for a non-rebaseable-
+    by-Trigger-B conflict whose own error text :func:`triage_conflict_failure`
+    classified as mechanical, instead of the full conflict-fix worker.
+    """
+    from coord.board_doctor_policy import CAUSE_CONFLICT_TRIAGE_MECHANICAL  # noqa: PLC0415
+
+    return _dispatch_mechanic_leg(
+        entry, board, config, verdict,
+        cause=CAUSE_CONFLICT_TRIAGE_MECHANICAL,
+        title_prefix=CONFLICT_MECHANIC_TITLE_PREFIX,
+        evidence=(verdict.diagnosis,) if verdict.diagnosis else (),
+        http_client=http_client,
+    )
 
 
 def _rerun_ci_for_infra_verdict(entry: QueuedMerge, config: Config) -> bool:
@@ -943,17 +1092,22 @@ def dispatch_ci_fix(
 
     #4097: before any of the above, triages the failure via
     :func:`triage_ci_failure`. ``infra`` triggers a plain CI rerun
-    (:func:`_rerun_ci_for_infra_verdict`) and returns ``None`` — no worker,
-    no ``Assignment`` — spending one unit of :data:`MAX_CI_FIX_DISPATCHES`
-    only when the rerun actually fired, so the caller's existing retry-cap/
-    escalation logic bounds it exactly like any other remedy here.
-    ``mechanical`` routes to the #4094 mechanic leg
-    (:func:`_dispatch_mechanic_leg_for_ci`); on success that leg's own
-    ``Assignment`` is returned in place of a ci-fix worker's, so the caller
-    sees a normal confirmed dispatch. Either verdict falling through
-    (declined, or no log to triage at all) proceeds to the unconditional
-    worker dispatch below exactly as before #4097 — now with the verdict's
-    own diagnosis (if any) carried into the briefing.
+    (:func:`_rerun_ci_for_infra_verdict`), budgeted off ``entry.
+    ci_infra_reruns``/:data:`~coord.merge_queue.MAX_CI_INFRA_RERUNS` — the
+    SAME counter ``coord.merge_queue``'s own #1892 remedy spends, never a
+    second, independent rerun budget for the one question "may this entry
+    be re-run for infra reasons?" (#2096). A rerun that actually fires
+    returns ``None`` — no worker, no ``Assignment``; a rerun that cannot
+    fire (budget exhausted, no rerun capability, the call itself failing)
+    falls straight through to the unconditional worker dispatch below,
+    exactly like ``mechanical`` falling through does — never stranding the
+    entry with no remedy and no worker. ``mechanical`` routes to the #4094
+    mechanic leg (:func:`_dispatch_mechanic_leg_for_ci`); on success that
+    leg's own ``Assignment`` is returned in place of a ci-fix worker's, so
+    the caller sees a normal confirmed dispatch. Either verdict falling
+    through (declined, or no log to triage at all) proceeds to the
+    unconditional worker dispatch below exactly as before #4097 — now with
+    the verdict's own diagnosis (if any) carried into the briefing.
     """
     work = dispatch_precheck(entry, board)
     if work is None:
@@ -980,14 +1134,14 @@ def dispatch_ci_fix(
 
     if verdict is not None and verdict.bucket == BUCKET_INFRA:
         if (
-            entry.ci_fix_dispatches < MAX_CI_FIX_DISPATCHES
+            entry.ci_infra_reruns < MAX_CI_INFRA_RERUNS
             and _rerun_ci_for_infra_verdict(entry, config)
         ):
-            entry.ci_fix_dispatches += 1
+            entry.ci_infra_reruns += 1
             entry.error = (
                 f"{summary} — triaged as CI infra (#4097): "
                 f"{verdict.diagnosis} Auto-rerun triggered "
-                f"({entry.ci_fix_dispatches}/{MAX_CI_FIX_DISPATCHES})."
+                f"({entry.ci_infra_reruns}/{MAX_CI_INFRA_RERUNS})."
             )
             from coord.audit import record_audit  # noqa: PLC0415
 
@@ -1005,11 +1159,17 @@ def dispatch_ci_fix(
                 assignment_id=entry.assignment_id,
                 details={"via": verdict.via, "diagnosis": verdict.diagnosis},
             )
-        return None
+            return None
+        # Budget already exhausted (shared with `coord.merge_queue`'s own
+        # #1892 remedy, so a verdict already denied a rerun there can never
+        # re-open a second rerun lane here), or the rerun call itself did
+        # not fire — fall through to the unconditional ci-fix worker
+        # dispatch below exactly as if no infra verdict had fired, never a
+        # strand with no remedy and no worker.
 
     if verdict is not None and verdict.bucket == BUCKET_MECHANICAL:
         mech_fix = _dispatch_mechanic_leg_for_ci(
-            entry, board, config, verdict, http_client=http_client,
+            entry, board, config, verdict, detail, http_client=http_client,
         )
         if mech_fix is not None:
             entry.ci_fix_head_sha = entry.branch_head_sha or ""
