@@ -1913,8 +1913,9 @@ def _mechanic_leg_briefing(
     """
     lines = [
         "The board-doctor sweep dispatched this mechanic leg automatically "
-        "to fix a Test-stage failure a triage classifier diagnosed as "
-        "mechanical — a small, rote fix that needs no design judgement.",
+        "because a triage classifier diagnosed the failure behind it as "
+        "mechanical — a small, rote fix that needs no design judgement. "
+        "See `Cause:` below for which stage/edge the failure came from.",
         "",
         f"Cause: {cause}",
         f"Triage diagnosis: {verdict.diagnosis}",

@@ -4186,6 +4186,136 @@ class TestDispatchConflictFixesInertBaseMoveTakeover:
         assert gh.merge_calls == []
 
 
+class TestDispatchConflictFixesMechanicalTriage:
+    """#4097: the merge-failure edge of triage-first routing. A
+    "rebaseable" conflict Trigger B's direct-merge takeover did NOT already
+    resolve this tick gets one triage pass before the full conflict-fix
+    worker — never touching Trigger B's own inert-base-move path or tests
+    (see ``TestDispatchConflictFixesInertBaseMoveTakeover`` above, which
+    stays green unmodified)."""
+
+    def _entry(self, aid: str = "r1", *, pr: int = 42, error: str) -> mq.QueuedMerge:
+        return mq.QueuedMerge(
+            assignment_id=aid,
+            repo_name="api",
+            repo_github="acme/api",
+            branch=f"worker/{aid}",
+            target_branch="main",
+            issue_number=309,
+            issue_title="t",
+            state=mq.CONFLICT,
+            pr_number=pr,
+            branch_head_sha="sha123",
+            error=error,
+        )
+
+    @staticmethod
+    def _config() -> "object":
+        from coord.config import Config
+        from coord.models import BoardDoctorRepoConfig, Repo
+
+        return Config(
+            repos=[Repo(
+                name="api", github="acme/api",
+                board_doctor=BoardDoctorRepoConfig(mechanic=True),
+            )],
+            machines=[],
+        )
+
+    def test_mechanical_conflict_routes_to_mechanic_leg(
+        self, coord_dir: Path,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.state import save_board
+
+        save_board(Board())
+        # A ratchet signal with no file location — deterministically
+        # mechanical (`_mechanical_verdict`'s confinement check is
+        # vacuously True when nothing is implicated), so this never hits
+        # the model tier.
+        entry = self._entry(error=(
+            "merge conflict: ratchet check failed — coverage ratchet: "
+            "may only shrink, never grow"
+        ))
+        ev = mq.MergeEvent(
+            entry, "conflict", "became CONFLICTING",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+
+        mechanic_fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=309,
+            issue_title="t", assignment_id="mech-1", status="pending",
+            type="work", branch="worker/r1",
+        )
+
+        def _fake_dispatch(repo_name, issue_number, b, cfg, *, verdict, branch_sha, cause=None, evidence=(), http_client=None):
+            assert verdict.bucket == "mechanical"
+            assert branch_sha == "sha123"
+            b.active.append(mechanic_fix)
+            return True
+
+        with (
+            patch.object(mq, "conflict_base_move_is_inert", return_value=False),
+            patch(
+                "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage",
+                side_effect=_fake_dispatch,
+            ) as mech_dispatch,
+            patch("coord.conflict_fix.dispatch_conflict_fix") as conflict_dispatch,
+        ):
+            merge_cmd._dispatch_conflict_fixes(
+                events, self._config(), dry_run=False, gh_ops=None,
+            )
+
+        mech_dispatch.assert_called_once()
+        conflict_dispatch.assert_not_called()
+        assert entry.state == mq.CONFLICT
+
+    def test_non_mechanical_conflict_falls_through_unchanged(
+        self, coord_dir: Path,
+    ) -> None:
+        """An ordinary content-conflict error carries no diagnostic signal
+        at all — `triage_conflict_failure` declines, and the entry gets the
+        unchanged conflict-fix treatment, exactly as before #4097."""
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board, IssueResolution
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry(error="merge conflict: GitHub reports PR as CONFLICTING")
+        ev = mq.MergeEvent(
+            entry, "conflict", "became CONFLICTING",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with (
+            patch.object(mq, "conflict_base_move_is_inert", return_value=False),
+            patch(
+                "coord.board_doctor_policy.dispatch_mechanic_leg_for_triage",
+            ) as mech_dispatch,
+            patch(
+                "coord.conflict_fix.dispatch_conflict_fix",
+                return_value=fake_fix,
+            ) as conflict_dispatch,
+        ):
+            merge_cmd._dispatch_conflict_fixes(
+                events, self._config(), dry_run=False, gh_ops=gh,
+            )
+
+        mech_dispatch.assert_not_called()
+        conflict_dispatch.assert_called_once()
+        assert entry.state == mq.CONFLICT
+
+
 class TestMergeSweepsSiblingsEndToEnd:
     """Black-box acceptance (#2246): two branches on one base; merge the
     first; the second is reported conflicted immediately — the exact shape
