@@ -38,6 +38,7 @@ from coord.commands.dr import dr_group
 from coord.commands.gate_a import gate_a
 from coord.commands.report import report_group
 from coord.commands.scorecard import scorecard
+from coord.commands.stats import stats_group
 
 # Re-exported for back-compat: some tests do `from coord.cli import
 # _save_config_snapshot` / `_load_config` / etc. directly.
@@ -460,6 +461,7 @@ main.add_command(context_group)
 main.add_command(audit)
 main.add_command(report_group)
 main.add_command(scorecard)
+main.add_command(stats_group)
 main.add_command(milestone_group)
 main.add_command(plans_cmd)
 main.add_command(fix_briefing_cmd)
