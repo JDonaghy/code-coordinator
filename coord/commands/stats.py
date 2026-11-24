@@ -63,7 +63,8 @@ def format_waste_report(report, *, verbose: bool = False) -> str:
         f" test_reruns_on_known_broken_sha={t['avoidable']['test_reruns_on_known_broken_sha']}"
         f"   (total={t['avoidable_total']})",
         f"Cost + wall-clock: {_fmt_usd(t['cost_total'])} / {_fmt_hms(t['duration_secs'])}"
-        f"   (captured={_fmt_usd(t['cost_captured'])} estimated={_fmt_usd(t['cost_est'])})",
+        f"   (captured={_fmt_usd(t['cost_captured'])} estimated={_fmt_usd(t['cost_est'])}"
+        f" unknown_model_legs={t['unknown_model_legs']})",
         "Failure->green:  "
         f"issues_with_data={t['failure_to_green']['issues_with_data']}"
         f" resolved={t['failure_to_green']['issues_resolved']}"
@@ -71,6 +72,13 @@ def format_waste_report(report, *, verbose: bool = False) -> str:
         f"   avg={_fmt_hms(t['failure_to_green']['avg_secs'])}"
         f" max={_fmt_hms(t['failure_to_green']['max_secs'])}",
     ]
+
+    if t["unknown_model_legs"]:
+        lines.append(
+            f"  ⚠ {t['unknown_model_legs']} leg(s) ran on a model with no priced rate — "
+            "their cost is NOT included above (not $0, unknown; add a pricing: entry "
+            "in coordinator.yml)."
+        )
 
     if t["cost_by_stage"]:
         lines.append("")
@@ -84,13 +92,14 @@ def format_waste_report(report, *, verbose: bool = False) -> str:
     if verbose:
         lines.append("")
         lines.append(
-            f"{'REPO':<10}{'#':<8}{'LEGS':<8}{'AVOIDABLE':<11}{'COST':<9}{'FAIL->GREEN':<12}"
+            f"{'REPO':<10}{'#':<8}{'LEGS':<8}{'AVOIDABLE':<11}{'COST':<9}"
+            f"{'FAIL->GREEN':<12}{'UNKNOWN_MODEL':<13}"
         )
         for issue in report.issues:
             lines.append(
                 f"{issue.repo_name:<10}#{issue.issue_number:<7}{issue.legs.total:<8}"
                 f"{issue.avoidable.total:<11}{_fmt_usd(issue.cost_total):<9}"
-                f"{_fmt_hms(issue.failure_to_green_secs):<12}"
+                f"{_fmt_hms(issue.failure_to_green_secs):<12}{issue.unknown_model_legs:<13}"
             )
 
     return "\n".join(lines)
@@ -181,6 +190,7 @@ def waste(
         window=window,
         repo=repo,
         audit_entries=audit_entries,
+        pricing=cfg.pricing,
     )
 
     if output_json:

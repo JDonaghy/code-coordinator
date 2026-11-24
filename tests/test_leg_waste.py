@@ -36,6 +36,9 @@ def _row(
     test_reason=None,
     smoke_test_reason=None,
     failure_reason=None,
+    model=None,
+    input_tokens=0,
+    output_tokens=0,
 ):
     return {
         "assignment_id": assignment_id,
@@ -49,6 +52,9 @@ def _row(
         "dispatched_at": dispatched_at,
         "finished_at": finished_at,
         "cost_usd": cost_usd,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "test_reason": test_reason,
         "smoke_test_reason": smoke_test_reason,
         "failure_reason": failure_reason,
@@ -412,3 +418,52 @@ def test_waste_report_to_dict_shape():
     for issue_dict in d["issues"]:
         assert set(LEG_KINDS) <= set(issue_dict["legs"].keys())
         assert set(AVOIDABLE_KINDS) <= set(issue_dict["avoidable"].keys())
+
+
+def test_build_waste_report_uses_the_passed_in_pricing_not_the_builtin_default():
+    """An operator ``pricing:`` override must change the reported cost —
+    the whole point of threading *pricing* through instead of defaulting."""
+    from coord.config import ModelRates, PricingConfig
+
+    rows = [
+        _row(
+            "w1", issue=701, status="merged", dispatched_at=1000.0, finished_at=1100.0,
+            model="sonnet", input_tokens=100, output_tokens=50,
+        ),
+    ]
+    builtin_report = build_waste_report(rows, window=TimeWindow(), repo="api")
+    builtin_cost = _issue(builtin_report, 701).cost_est
+
+    override = PricingConfig(models={"sonnet": ModelRates(input=3000.0, output=15.0)})
+    overridden_report = build_waste_report(rows, window=TimeWindow(), repo="api", pricing=override)
+    overridden_cost = _issue(overridden_report, 701).cost_est
+
+    assert overridden_cost != pytest.approx(builtin_cost)
+    assert overridden_cost == pytest.approx((100 * 3000.0 + 50 * 15.0) / 1_000_000.0)
+
+
+def test_build_waste_report_flags_unknown_model_legs_instead_of_silent_zero():
+    """A leg that ran on a model with no priced rate must surface as
+    ``unknown_model_legs``, not disappear as a silent $0 in cost_total."""
+    rows = [
+        _row(
+            "w1", issue=702, status="merged", dispatched_at=1000.0, finished_at=1100.0,
+            model="opencode/glm-5.2", input_tokens=100, output_tokens=50,
+        ),
+        _row(
+            "w2", issue=703, status="merged", dispatched_at=1000.0, finished_at=1100.0,
+            model="sonnet", input_tokens=100, output_tokens=50,
+        ),
+    ]
+    report = build_waste_report(rows, window=TimeWindow(), repo="api")
+
+    unpriced = _issue(report, 702)
+    assert unpriced.unknown_model_legs == 1
+    assert unpriced.cost_total == 0.0
+    assert unpriced.to_dict()["unknown_model_legs"] == 1
+
+    priced = _issue(report, 703)
+    assert priced.unknown_model_legs == 0
+
+    assert report.totals["unknown_model_legs"] == 1
+    assert report.by_repo["api"]["unknown_model_legs"] == 1

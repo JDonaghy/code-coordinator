@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from click.testing import CliRunner
 
 from coord.cli import main
@@ -166,6 +167,76 @@ def test_stats_waste_audit_log_page_cap_warns_instead_of_hanging(tmp_path, monke
     result = CliRunner().invoke(main, ["stats", "waste", "--config", str(config_path)])
     assert result.exit_code == 0, result.output
     assert "audit log read stopped after" in output_and_stderr(result)
+
+
+def test_stats_waste_threads_configured_pricing_through(tmp_path, monkeypatch) -> None:
+    """A ``pricing:`` override in coordinator.yml must change the reported
+    cost — `coord stats waste` must not silently fall back to the
+    built-in Anthropic rates."""
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        VALID_CONFIG + "\npricing:\n  sonnet:\n    input: 3000.0\n    output: 15.0\n"
+    )
+
+    import coord.usage as usage_mod
+
+    row = _row(
+        assignment_id="r1", issue_number=1, status="merged",
+        cost_usd=None, model="sonnet", input_tokens=100, output_tokens=50,
+    )
+    monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [row])
+
+    import coord.state as state_mod
+
+    monkeypatch.setattr(
+        state_mod, "list_audit_log",
+        lambda *, repo, since, limit, cursor: {"entries": [], "next_cursor": None, "has_more": False},
+    )
+
+    result = CliRunner().invoke(
+        main, ["stats", "waste", "--repo", "api", "--json", "--config", str(config_path)]
+    )
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    (issue1,) = [i for i in body["issues"] if i["issue_number"] == 1]
+    expected = (100 * 3000.0 + 50 * 15.0) / 1_000_000.0
+    assert issue1["cost_est"] == pytest.approx(expected)
+
+
+def test_stats_waste_unknown_model_leg_surfaces_not_silent_zero(tmp_path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+
+    import coord.usage as usage_mod
+
+    row = _row(
+        assignment_id="r1", issue_number=1, status="merged",
+        cost_usd=None, model="opencode/glm-5.2", input_tokens=100, output_tokens=50,
+    )
+    monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [row])
+
+    import coord.state as state_mod
+
+    monkeypatch.setattr(
+        state_mod, "list_audit_log",
+        lambda *, repo, since, limit, cursor: {"entries": [], "next_cursor": None, "has_more": False},
+    )
+
+    json_result = CliRunner().invoke(
+        main, ["stats", "waste", "--repo", "api", "--json", "--config", str(config_path)]
+    )
+    assert json_result.exit_code == 0, json_result.output
+    body = json.loads(json_result.output)
+    (issue1,) = [i for i in body["issues"] if i["issue_number"] == 1]
+    assert issue1["unknown_model_legs"] == 1
+    assert issue1["cost_total"] == 0.0
+    assert body["totals"]["unknown_model_legs"] == 1
+
+    table_result = CliRunner().invoke(
+        main, ["stats", "waste", "--repo", "api", "--config", str(config_path)]
+    )
+    assert table_result.exit_code == 0, table_result.output
+    assert "unknown_model_legs=1" in table_result.output
+    assert "no priced rate" in table_result.output
 
 
 def test_stats_waste_board_fetch_failure_warns_instead_of_crashing(tmp_path, monkeypatch) -> None:

@@ -262,7 +262,15 @@ class AvoidableLegs:
 
 @dataclass
 class IssueWaste:
-    """Everything this module computes for one merged issue."""
+    """Everything this module computes for one merged issue.
+
+    ``unknown_model_legs`` is how many of this issue's legs carried tokens
+    but priced to $0 because *pricing* has no rate for that leg's model
+    (:func:`coord.usage_rollup.leg_cost`'s ``unknown_model`` return) — a
+    cost no captured/estimated figure here ever represents, so a caller
+    that only read ``cost_total`` would otherwise read "cheap" where the
+    true answer is "unknown".
+    """
 
     repo_name: str
     issue_number: int
@@ -275,6 +283,7 @@ class IssueWaste:
     failure_to_green_secs: float | None
     had_unresolved_failure: bool
     has_audit_data: bool
+    unknown_model_legs: int = 0
 
     @property
     def cost_total(self) -> float:
@@ -296,6 +305,7 @@ class IssueWaste:
             "failure_to_green_secs": self.failure_to_green_secs,
             "had_unresolved_failure": self.had_unresolved_failure,
             "has_audit_data": self.has_audit_data,
+            "unknown_model_legs": self.unknown_model_legs,
         }
 
 
@@ -468,12 +478,15 @@ def _score_one_issue(
     cost_captured = 0.0
     cost_est = 0.0
     duration_secs = 0.0
+    unknown_model_legs = 0
     for row in rows_sorted:
-        captured, est, _unknown_model = leg_cost(row, pricing)
+        captured, est, unknown_model = leg_cost(row, pricing)
         duration, _is_open = leg_duration(row)
         cost_captured += captured
         cost_est += est
         duration_secs += duration
+        if unknown_model:
+            unknown_model_legs += 1
     cost_by_stage = _stage_cost_rollup(rows_sorted, pricing)
 
     failure_to_green_secs, had_unresolved_failure, has_audit_data = _failure_to_green(
@@ -492,6 +505,7 @@ def _score_one_issue(
         failure_to_green_secs=failure_to_green_secs,
         had_unresolved_failure=had_unresolved_failure,
         has_audit_data=has_audit_data,
+        unknown_model_legs=unknown_model_legs,
     )
 
 
@@ -513,6 +527,7 @@ def _empty_totals() -> dict:
         "cost_total": 0.0,
         "duration_secs": 0.0,
         "cost_by_stage": {},
+        "unknown_model_legs": 0,
         "failure_to_green": {
             "issues_with_data": 0,
             "issues_resolved": 0,
@@ -535,6 +550,7 @@ def _fold_issue_into_totals(totals: dict, issue: IssueWaste, resolved_secs: list
     totals["cost_est"] += issue.cost_est
     totals["cost_total"] += issue.cost_total
     totals["duration_secs"] += issue.duration_secs
+    totals["unknown_model_legs"] += issue.unknown_model_legs
     _merge_stage_rollups(totals["cost_by_stage"], issue.cost_by_stage)
 
     ftg = totals["failure_to_green"]
