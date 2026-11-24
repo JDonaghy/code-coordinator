@@ -4324,6 +4324,13 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 "must be a boolean"
             )
         cfg.config_drift_autofix = config_drift_autofix
+    if "mechanic" in raw:
+        mechanic = raw["mechanic"]
+        if not isinstance(mechanic, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.mechanic must be a boolean"
+            )
+        cfg.mechanic = mechanic
     return cfg
 
 

@@ -3531,3 +3531,23 @@ def test_repo_board_doctor_stale_race_rejects_non_bool() -> None:
         ConfigError, match=r"repos\[0\].board_doctor.stale_race must be a boolean"
     ):
         _parse_board_doctor_repo_config({"stale_race": "true"}, 0)
+
+
+def test_repo_board_doctor_mechanic_defaults_to_false() -> None:
+    """#4094: unlike `stale_race`, the mechanic leg dispatches a worker leg
+    with its own bounded self-authority, so it needs an explicit per-repo
+    opt-in — same safety-by-default posture as `investigate`/`finish`."""
+    cfg = _parse_board_doctor_repo_config(None, 0)
+    assert cfg.mechanic is False
+
+
+def test_repo_board_doctor_mechanic_parses_bool() -> None:
+    assert _parse_board_doctor_repo_config({"mechanic": True}, 0).mechanic is True
+    assert _parse_board_doctor_repo_config({"mechanic": False}, 0).mechanic is False
+
+
+def test_repo_board_doctor_mechanic_rejects_non_bool() -> None:
+    with pytest.raises(
+        ConfigError, match=r"repos\[0\].board_doctor.mechanic must be a boolean"
+    ):
+        _parse_board_doctor_repo_config({"mechanic": "true"}, 0)

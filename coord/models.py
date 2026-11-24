@@ -150,6 +150,22 @@ class BoardDoctorRepoConfig:
     `coord.board_doctor_policy._config_drift_autofix_enabled` is the
     single function that reads this alongside the fleet-wide kill switch
     (`Config.board_doctor.config_drift_autofix`).
+
+    ``mechanic`` is this repo's opt-in to the #4094 mechanic leg: a Test-
+    stage failure `coord.failure_triage.triage_failure` classifies
+    ``BUCKET_MECHANICAL`` — a small, rote fix needing no design judgement —
+    routes to a bounded pre-review fixer
+    (`coord.board_doctor_permissions.sweep_dispatch_mechanic_leg`) instead
+    of spending a full fix round, review and test fan-out on it. `False`
+    (the default) leaves every Test-stage failure on this repo going
+    through today's ordinary fix-round path regardless of the triage
+    verdict. Unlike `investigate`/`finish` above, there is deliberately no
+    paired fleet-wide `Config.board_doctor.mechanic` switch yet — see
+    `coord.board_doctor_policy._mechanic_tier_enabled`'s own docstring for
+    why (no production caller exists to arm one against).
+    `coord.board_doctor_policy._mechanic_tier_enabled` is the single
+    function that reads this alongside its
+    `COORD_BOARD_DOCTOR_NO_MECHANIC` env-var override.
     """
 
     investigate: bool = False
@@ -160,6 +176,7 @@ class BoardDoctorRepoConfig:
     auto_refile: bool = False
     auto_split: bool = False
     config_drift_autofix: bool = False
+    mechanic: bool = False
 
 
 @dataclass
