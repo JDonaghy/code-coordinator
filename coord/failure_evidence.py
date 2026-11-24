@@ -49,11 +49,15 @@ _CARGO_COULD_NOT_COMPILE_RE = re.compile(r"^error: could not compile `([^`]+)`.*
 _CARGO_TEST_FAILED_RE = re.compile(r"^error: test failed, to rerun pass `([^`]+)`.*$", re.MULTILINE)
 
 #: pytest prints no per-stage marker at all — a bare `FAILED <nodeid>` short
-#: summary line (or the "short test summary info" banner above it) is the
-#: only reliable signal that *some* pytest run failed, so there is exactly
-#: one "stage" to name: the pytest run itself.
+#: summary line, or its closing tally ("1 failed, 41 passed in 1.23s"), is
+#: the only reliable signal that *some* pytest run actually failed, so there
+#: is exactly one "stage" to name: the pytest run itself. Deliberately NOT
+#: matched on the "short test summary info" banner alone: with `-ra` (this
+#: repo's own `addopts`) pytest prints that banner for every non-passed
+#: outcome, including a plain SKIPPED — so a banner-only check would name
+#: "pytest" as a failed stage on an all-green run that merely skipped tests.
 _PYTEST_FAILED_LINE_RE = re.compile(r"^FAILED\s+(?!STAGES\b)\S", re.MULTILINE)
-_PYTEST_SUMMARY_BANNER_RE = re.compile(r"short test summary info", re.IGNORECASE)
+_PYTEST_FAILED_TALLY_RE = re.compile(r"\b[1-9]\d* failed\b")
 
 
 def _parse_failed_stages(log: str) -> list[str]:
@@ -75,7 +79,7 @@ def _parse_failed_stages(log: str) -> list[str]:
     if stages:
         return stages
 
-    if _PYTEST_FAILED_LINE_RE.search(log) or _PYTEST_SUMMARY_BANNER_RE.search(log):
+    if _PYTEST_FAILED_LINE_RE.search(log) or _PYTEST_FAILED_TALLY_RE.search(log):
         return ["pytest"]
 
     return []
@@ -196,9 +200,14 @@ _RATCHET_RE = re.compile(r"may only shrink|grew from \d+ to \d+")
 # fixture's clean-pass stage list says "cargo fmt" whether or not it found
 # anything) — only an actual clippy lint id or a real rustfmt diff does.
 _LINT_RE = re.compile(r"clippy::|^Diff in ", re.MULTILINE)
-_NO_TESTS_RAN_RE = re.compile(
-    r"running 0 tests|collected 0 items|no tests ran", re.IGNORECASE
-)
+#: Per-target "ran zero tests" counterparts — every cargo workspace prints
+#: one of these per target (a `src/main.rs` bin, a doc-test pass with no
+#: examples, an empty integration binary routinely says `running 0 tests`
+#: even on an all-green build), so a bare presence check would flag
+#: `no_tests_ran` on the overwhelming majority of healthy multi-target runs.
+_RUNNING_N_TESTS_RE = re.compile(r"running (\d+) tests?", re.IGNORECASE)
+_COLLECTED_N_ITEMS_RE = re.compile(r"collected (\d+) items?", re.IGNORECASE)
+_NO_TESTS_RAN_PHRASE_RE = re.compile(r"no tests ran", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -232,6 +241,21 @@ class FailureSignals:
         )
 
 
+def _no_tests_ran(log: str) -> bool:
+    """True only when NOTHING in the log actually ran a test — i.e. every
+    `running N tests` / `collected N items` counterpart found is `N == 0`,
+    or the log says so explicitly (`no tests ran`). A single zero-test
+    target alongside another target that ran real tests is normal cargo
+    workspace output, not a failure signal.
+    """
+    counts = [int(n) for n in _RUNNING_N_TESTS_RE.findall(log)] + [
+        int(n) for n in _COLLECTED_N_ITEMS_RE.findall(log)
+    ]
+    if counts:
+        return all(c == 0 for c in counts)
+    return bool(_NO_TESTS_RAN_PHRASE_RE.search(log))
+
+
 def _compute_signals(log: str) -> FailureSignals:
     compile_error = bool(_RUSTC_ERROR_RE.search(log)) or bool(
         _CARGO_COULD_NOT_COMPILE_RE.search(log)
@@ -247,7 +271,7 @@ def _compute_signals(log: str) -> FailureSignals:
         test_assertion=test_assertion,
         ratchet=bool(_RATCHET_RE.search(log)),
         lint=bool(_LINT_RE.search(log)),
-        no_tests_ran=bool(_NO_TESTS_RAN_RE.search(log)),
+        no_tests_ran=_no_tests_ran(log),
     )
 
 

@@ -5,8 +5,12 @@ Three fixtures under ``tests/fixtures/failure_evidence/``:
 - ``cargo_multistage_middle_truncated.log`` — a multi-stage cargo run whose
   only failure sits in the middle, buried under enough padding either side
   that the existing head/tail ``_tail_text`` split (#3715) would drop it.
-- ``clean_pass.log`` — every stage passes; the extractor must report no
-  stages, no errors, and every signal False.
+- ``clean_pass.log`` — every stage passes, but still exercises the two
+  false-positive traps a green run routinely hits: a pytest ``-ra`` "short
+  test summary info" banner with ``SKIPPED`` entries (no actual failure),
+  and a cargo target that prints ``running 0 tests`` alongside others that
+  ran real tests. The extractor must still report no stages, no errors, and
+  every signal False.
 - ``pytest_failure.log`` — a pytest run with one failing test and no cargo
   markers at all.
 
@@ -108,6 +112,26 @@ def test_clean_pass_formats_to_empty_block() -> None:
     assert format_evidence_block(evidence) == ""
 
 
+def test_clean_pass_skip_banner_does_not_name_pytest_as_failed() -> None:
+    # The fixture's `-ra` "short test summary info" banner + SKIPPED lines
+    # must not, by themselves, be read as a pytest failure.
+    log = _read("clean_pass.log")
+    assert "short test summary info" in log
+    assert "SKIPPED" in log
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ()
+
+
+def test_clean_pass_zero_test_target_does_not_set_no_tests_ran() -> None:
+    # The fixture's `running 0 tests` target sits alongside targets that ran
+    # real tests — not every target running zero tests, so this must stay
+    # False.
+    log = _read("clean_pass.log")
+    assert "running 0 tests" in log
+    evidence = extract_failure_evidence(log)
+    assert evidence.signals.no_tests_ran is False
+
+
 # ── Fixture 3: pytest failure ────────────────────────────────────────────
 
 
@@ -190,6 +214,33 @@ def test_no_tests_ran_signal() -> None:
     log = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
     evidence = extract_failure_evidence(log)
     assert evidence.signals.no_tests_ran is True
+
+
+def test_pytest_ra_banner_alone_is_not_a_failure() -> None:
+    # `-ra` (this repo's own addopts) prints the "short test summary info"
+    # banner for ANY non-passed outcome, including a plain SKIPPED — that
+    # banner alone must never be read as a pytest failure.
+    log = (
+        "collected 10 items\n"
+        "tests/test_x.py ..........                                        [100%]\n"
+        "=========================== short test summary info =============================\n"
+        "SKIPPED [1] tests/test_x.py:5: only fires off macOS\n"
+        "============================ 9 passed, 1 skipped in 0.12s ========================\n"
+    )
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ()
+    assert evidence.is_empty
+
+
+def test_pytest_failed_tally_names_pytest_even_without_failed_line() -> None:
+    # A closing tally line ("N failed, ...") is itself a real failure
+    # indication, independent of a `FAILED <nodeid>` short-summary line.
+    log = (
+        "collected 2 items\n"
+        "========================= 1 failed, 1 passed in 0.05s =====================\n"
+    )
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ("pytest",)
 
 
 # ── Round-trip (dict) serialisation — this is what gets persisted ──────────
