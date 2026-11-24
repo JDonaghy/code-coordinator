@@ -176,6 +176,12 @@ class FakeVerifier:
         # stub-wrapping behaviour, so every pre-#4095 test that only sets
         # `triage_bucket` is unaffected.
         triage_verdict: "TriageVerdict | None" = None,
+        # #4114: what `GitMergeVerifier.has_scoped_review_candidate` would
+        # find — `False` (the default) is "no live scoped-review candidate
+        # found", which preserves every pre-#4114 test's escalate assertion
+        # byte-for-byte; the #4114 tests below pass `True` to exercise the
+        # re-review dispatch.
+        scoped_review_candidate: bool = False,
     ) -> None:
         self._has_commits = has_commits
         self._merged = merged
@@ -185,6 +191,7 @@ class FakeVerifier:
         self._entry_truth = entry_truth
         self._triage_bucket = triage_bucket
         self._triage_verdict = triage_verdict
+        self._scoped_review_candidate = scoped_review_candidate
         self.commits_calls = 0
         self.merged_calls = 0
         self.head_sha_calls = 0
@@ -192,6 +199,7 @@ class FakeVerifier:
         self.github_backoff_calls = 0
         self.entry_truth_calls = 0
         self.triage_test_failure_calls = 0
+        self.scoped_review_candidate_calls = 0
         self.config = None
         self.set_config_calls = 0
 
@@ -239,6 +247,10 @@ class FakeVerifier:
             confidence=0.9,
             via="stub",
         )
+
+    def has_scoped_review_candidate(self, s: IssueState) -> bool:
+        self.scoped_review_candidate_calls += 1
+        return self._scoped_review_candidate
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -7041,13 +7053,19 @@ def test_missing_smoke_verdict_divergence_still_escalates_immediately():
 
 
 def test_review_required_with_an_approved_verdict_escalates_instead_of_retrying():
-    """#1526 instance 2 (#1483): board shows review=approve, but a rebase
-    onto a moved `main` correctly voided the approval (#1475's patch-id
-    gate) — `coord merge` leaves 'review required but not approved' as the
-    merge_reason. Retrying cannot reconcile the two readings; the driver
-    must name the gate and propose the safe corrective action (a scoped
-    reaffirm or a full re-review) instead of burning the merge-attempt
-    budget three times over.
+    """#1526 instance 2 (#1483): board shows review=approve, but `coord
+    merge` leaves 'review required but not approved' as the merge_reason.
+    Retrying cannot reconcile the two readings on its own.
+
+    #4114: the default `FakeVerifier()` here reports no live scoped-review
+    candidate (the production default too, whenever a local board/live
+    `gh_ops` read fails) — this is the "can't confirm whether the approval
+    is merely patch-id-stale" shape, which must still fail closed to an
+    escalation naming the safe corrective action (a scoped reaffirm or a
+    full re-review) rather than burn the merge-attempt budget three times
+    over. See `test_review_approval_voided_only_by_a_patch_id_change_*`
+    below for the case a LIVE check CAN confirm — that one must dispatch a
+    re-review instead of escalating.
     """
     counters = DriveCounters()
     action = step(
@@ -7064,6 +7082,119 @@ def test_review_required_with_an_approved_verdict_escalates_instead_of_retrying(
     command_str = " ".join(action.command)
     assert "review-reaffirm w1" in command_str
     assert "coord review w1" in command_str
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #4114: a LIVE scoped-review-candidate confirmation distinguishes a
+# patch-id-stale approval (a rebase, `coord merge`'s own conflict-fix, or a
+# hand push — safe to re-review automatically) from a TRUE #1526 divergence
+# (two sources disagreeing about the identical patch, which only a human can
+# reconcile).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_review_approval_voided_only_by_a_patch_id_change_dispatches_a_re_review():
+    """Approval recorded against patch P1, branch now at P2 with no new
+    tracked work leg (e.g. a hand-pushed fast-forward, quadraui#2992/#2825).
+    `verifier.has_scoped_review_candidate` confirms a prior approval exists
+    whose patch-id no longer matches the live one, so the drive's next
+    action must be the same self-service re-review repair the stale-smoke
+    arm already uses for Test (`coord diagnose --stage review --reset`),
+    never an escalation."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="review required but not approved",
+        ),
+        counters=counters,
+        verifier=FakeVerifier(scoped_review_candidate=True),
+    )
+    assert action.kind == RUN
+    assert not action.is_exit
+    assert action.command == (
+        "diagnose", REPO, str(ISSUE), "--stage", "review", "--reset",
+    )
+    assert counters.fix_rounds == 1
+    assert counters.merge_attempts == 0  # never even tried the doomed merge
+
+
+def test_review_approval_voided_by_coord_merges_own_conflict_fix_rebase_dispatches_a_re_review():
+    """Same shape, but the P1→P2 change comes from `coord merge`'s own
+    conflict-fix rebase (quadraui#2869) rather than a hand push — the drive
+    has no way to tell the two apart from `merge_reason`/`review_verdict`
+    alone, so the same live confirmation must produce the same remedy."""
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason="review not approved",
+        ),
+        verifier=FakeVerifier(scoped_review_candidate=True),
+    )
+    assert action.kind == RUN
+    assert not action.is_exit
+    assert action.command == (
+        "diagnose", REPO, str(ISSUE), "--stage", "review", "--reset",
+    )
+
+
+def test_review_divergence_with_no_live_candidate_still_escalates():
+    """A genuine same-patch disagreement (or anything the live check can't
+    confirm) must still escalate — the live confirmation only ever ADDS a
+    safe automatic path, it never removes the pre-#4114 fail-closed
+    default. Mirrors `test_review_required_with_an_approved_verdict_
+    escalates_instead_of_retrying` but makes the `scoped_review_candidate`
+    input explicit rather than relying on `FakeVerifier()`'s default."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="review required but not approved",
+        ),
+        counters=counters,
+        verifier=FakeVerifier(scoped_review_candidate=False),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert counters.fix_rounds == 0
+
+
+def test_review_scoped_candidate_not_consulted_during_a_github_backoff_window():
+    """#2809/#3479: no probe (real or otherwise) is issued while a GitHub
+    backoff window is in force — `has_scoped_review_candidate` issues its
+    own live `gh` reads, so it must respect the same guard every other
+    live read in this function already does."""
+    verifier = FakeVerifier(github_backoff=True, scoped_review_candidate=True)
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="review required but not approved",
+        ),
+        verifier=verifier,
+    )
+    assert verifier.scoped_review_candidate_calls == 0
+    # Unaffected: falls through to the pre-#4114 escalate behaviour.
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+
+
+def test_review_scoped_candidate_redispatch_is_bounded_by_max_fix_rounds():
+    """Shares the SAME `fix_rounds` budget as the stale-smoke re-test arm
+    (#1738) — a verdict that keeps going patch-id-stale still converges to
+    an escalation, not an infinite loop."""
+    counters = DriveCounters(fix_rounds=3)
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="review required but not approved",
+        ),
+        opts,
+        counters=counters,
+        verifier=FakeVerifier(scoped_review_candidate=True),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
 
 
 def test_divergence_is_named_even_when_plans_own_gate_check_already_blocked():
@@ -7892,6 +8023,113 @@ def test_entry_truth_fails_closed_to_none_on_any_live_read_exception(monkeypatch
     monkeypatch.setattr("coord.state.build_board", boom)
     verifier = GitMergeVerifier(config=make_config())
     assert verifier.entry_truth(state()) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GitMergeVerifier.has_scoped_review_candidate — #4114's live seam
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_has_scoped_review_candidate_false_without_a_work_aid():
+    """No work row to check — fail closed without touching the board/gh at
+    all."""
+    assert (
+        GitMergeVerifier(config=make_config()).has_scoped_review_candidate(state())
+        is False
+    )
+
+
+def test_has_scoped_review_candidate_calls_the_live_scoped_review_seam(monkeypatch):
+    """The happy path: `build_board()`, `merge_queue.live_gate_entry()` and
+    `merge_queue.find_scoped_review_candidate()` are called with the live
+    work row/board/gh_ops — the SAME function the #1476 scoped-review sweep
+    (`coord.review.dispatch_scoped_reviews_for_queue`) and `coord
+    review-reaffirm` already use to answer this exact question (#2096,
+    "one question, one answer"), never a second, independently-derived
+    patch-id comparison."""
+
+    class StubWork:
+        branch = "issue-1392-x"
+
+    class StubBoard:
+        def find_by_id(self, aid):
+            assert aid == "w1"
+            return StubWork()
+
+    sentinel_board = StubBoard()
+    sentinel_entry = object()
+    sentinel_candidate = object()
+    captured: dict = {}
+
+    def fake_build_board():
+        return sentinel_board
+
+    def fake_live_gate_entry(work, repo_github, target_branch, gh_ops):
+        captured["work"] = work
+        captured["repo_github"] = repo_github
+        captured["target_branch"] = target_branch
+        return sentinel_entry
+
+    def fake_find_scoped_review_candidate(entry, board, gh_ops=None, **kwargs):
+        captured["entry"] = entry
+        captured["board"] = board
+        captured["config"] = kwargs.get("config")
+        return sentinel_candidate
+
+    monkeypatch.setattr("coord.state.build_board", fake_build_board)
+    monkeypatch.setattr("coord.merge_queue.live_gate_entry", fake_live_gate_entry)
+    monkeypatch.setattr(
+        "coord.merge_queue.find_scoped_review_candidate",
+        fake_find_scoped_review_candidate,
+    )
+
+    cfg = make_config()
+    verifier = GitMergeVerifier(config=cfg)
+    result = verifier.has_scoped_review_candidate(state(work_aid="w1"))
+
+    assert result is True
+    assert captured["work"].branch == "issue-1392-x"
+    assert captured["repo_github"] == "john/claude-coordinator"
+    assert captured["entry"] is sentinel_entry
+    assert captured["board"] is sentinel_board
+    assert captured["config"] is cfg
+
+
+def test_has_scoped_review_candidate_false_when_nothing_found(monkeypatch):
+    class StubWork:
+        branch = "issue-1392-x"
+
+    class StubBoard:
+        def find_by_id(self, aid):
+            return StubWork()
+
+    monkeypatch.setattr("coord.state.build_board", lambda: StubBoard())
+    monkeypatch.setattr(
+        "coord.merge_queue.live_gate_entry",
+        lambda work, repo_github, target_branch, gh_ops: object(),
+    )
+    monkeypatch.setattr(
+        "coord.merge_queue.find_scoped_review_candidate",
+        lambda entry, board, gh_ops=None, **kwargs: None,
+    )
+
+    verifier = GitMergeVerifier(config=make_config())
+    assert verifier.has_scoped_review_candidate(state(work_aid="w1")) is False
+
+
+def test_has_scoped_review_candidate_fails_closed_on_any_live_read_exception(
+    monkeypatch,
+):
+    """A board/gh read that raises (daemon unreachable, DB locked, a patch-id
+    `gh api compare` failure, ...) must never propagate out of
+    `_decide_merge`'s own poll loop — same fail-closed contract every other
+    live read in this module already has."""
+    def boom():
+        raise RuntimeError("daemon unreachable")
+
+    monkeypatch.setattr("coord.state.build_board", boom)
+    verifier = GitMergeVerifier(config=make_config())
+    assert verifier.has_scoped_review_candidate(state(work_aid="w1")) is False
 
 
 @pytest.mark.parametrize(
