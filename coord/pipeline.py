@@ -337,7 +337,7 @@ def compute_pipeline(
         ),
         None,
     ) or next(
-        (a for a in all_assignments if review_covers(a, aid)),
+        (a for a in all_assignments if review_covers(a, aid, board=board)),
         None,
     )
     smoke_assignment: Assignment | None = next(
