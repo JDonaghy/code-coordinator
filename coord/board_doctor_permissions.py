@@ -89,6 +89,7 @@ two apart — until a real `_HANDLERS["merge"]` entry is built.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, TypedDict, cast
 
 from coord.drive_queue import HOLD_RELEASED
@@ -96,8 +97,9 @@ from coord.drive_queue import HOLD_RELEASED
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
     from coord.drive_queue import QueueEntry
+    from coord.failure_triage import TriageVerdict
     from coord.merge_queue import QueuedMerge
-    from coord.models import Assignment, Board
+    from coord.models import Assignment, Board, Machine
     from coord.review import ProposedFix, ReviewFindings
 
 log = logging.getLogger(__name__)
@@ -202,6 +204,22 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: revisits. Same underlying `dispatch_conflict_fix` primitive as
 #: ``"conflict_fix_redispatch"``, just without that one's head-unmoved
 #: retry-cap carve-out, since this is the ordinary first attempt.
+#: #4094 adds ``"dispatch_mechanic_leg"``: a bounded pre-review fixer for a
+#: Test-stage failure `coord.failure_triage.triage_failure` classified
+#: ``BUCKET_MECHANICAL`` — a small, rote fix (a ratchet number, a
+#: ``..Default::default()``) that needs no design judgement. It spawns a
+#: leg the same way ``"dispatch_fixit_leg"``/``"dispatch_finisher_leg"`` do
+#: (ordinary worker tool-scope, never `--dangerously-skip-permissions`), and
+#: adds the same bounded self-authority shape as the finisher: the leg's own
+#: diff is graded (:func:`mechanic_leg_within_bound`) against a small line
+#: count, no public-API surface, no sealed path, and files confined to the
+#: triage's proposed scope or the branch's already-touched file kinds —
+#: never on the leg's own say-so. A diff that passes records a scoped Test
+#: PASS and lets Review run next; one that fails (an unreproducible failure,
+#: or a diff outside the bound) falls back WHOLESALE to
+#: ``"dispatch_fixit_leg"``'s ordinary fix round, carrying the mechanic's
+#: own notes as evidence. It has no path to ``force_merge`` or
+#: ``override_human_required`` either.
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
         "merge",
@@ -211,6 +229,7 @@ SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
         "ci_rerun",
         "dispatch_fixit_leg",
         "dispatch_finisher_leg",
+        "dispatch_mechanic_leg",
         "conflict_fix_redispatch",
         "conflict_fix_dispatch",
         "smoke_requeue",
@@ -1753,6 +1772,698 @@ def _post_finisher_self_bless_notice(
         )
 
 
+# ── #4094: the mechanic leg — a bounded pre-review fixer for mechanical ────
+# Test-stage failures ──────────────────────────────────────────────────────
+#
+# `coord.failure_triage.triage_failure` has no production caller yet (see
+# its own module docstring) — this is the dispatch + bound-check primitive a
+# future Test-stage caller (the place `coord.drive` decides a Test leg
+# failed) wires in, mirroring exactly how Trigger A's
+# `dispatch_nit_only_finisher` (`coord.board_doctor_policy`) is the
+# synchronous caller for `sweep_dispatch_finisher_leg` below. Building that
+# wire-in is explicitly out of scope here.
+
+#: `test_reason` prefix every scoped mechanic-leg PASS carries (#4094).
+#: Deliberately records the verdict as plain ``test_state="passed"`` —
+#: never a new, unrecognized `test_state` string — so every EXISTING Test-
+#: gate consumer (`coord.auto_loop`'s review-dispatch gate,
+#: `coord.merge_queue`'s staleness re-check, `coord.stage_projection`'s
+#: dashboard box, ...) treats it as a real pass with zero other call sites
+#: touched, which is exactly #4094's "the drive treats it as passed and
+#: proceeds to Review" requirement. This prefix is what makes the write
+#: DISTINGUISHABLE as a mechanic-leg-scoped re-run (only the two failed
+#: stages were re-verified, not the whole suite) rather than a full Test
+#: leg's pass — the same "recognizable prefix, not a new enum value" design
+#: `coord.confirm_test.BASELINE_RED_REASON_PREFIX` already uses for the
+#: identical problem (a skip that must read as a full pass to every
+#: consumer while still being provenance-taggable for a human/report
+#: reading `test_reason`).
+MECHANIC_SCOPED_TEST_REASON_PREFIX = "mechanic-leg-scoped (#4094)"
+
+#: Default "small" line-count bound for a mechanic leg's own diff
+#: (#4094's "about 30 lines") — configurable per call, mirrors
+#: `coord.review._NIT_CLASS_MAX_CHANGED_LINES`'s shape (a line count, not a
+#: byte count, since diff lines are what the bound is actually limiting).
+MECHANIC_LEG_MAX_CHANGED_LINES_DEFAULT = 30
+
+#: Audit `event_type` recorded the moment a mechanic leg is confirmed
+#: dispatched — carries ``sha`` in `details`, which is what
+#: :func:`_mechanic_leg_already_attempted_at_sha` reads back to enforce
+#: #4094's "one mechanic leg per SHA" budget durably across sweep runs
+#: (the audit log, not a new board column — #4094 touches no DB schema).
+MECHANIC_LEG_DISPATCHED_EVENT = "mechanic_leg_dispatched"
+
+
+def _mechanic_leg_already_attempted_at_sha(
+    repo_name: str, issue_number: int, branch_sha: str,
+) -> bool:
+    """True when a mechanic leg has already been dispatched for this issue
+    at *branch_sha* — #4094's "one mechanic leg per SHA" budget.
+
+    Reads :data:`MECHANIC_LEG_DISPATCHED_EVENT` back out of the audit log
+    (`coord.state.list_audit_log`) rather than trusting any in-memory state,
+    so the refusal holds durably across separate sweep processes/runs, the
+    same way every other durable board-doctor fact in this module is read
+    back rather than cached. A later commit on the SAME issue (a different
+    SHA) gets its own fresh mechanic-leg attempt — this is a per-SHA budget,
+    not a per-issue one.
+    """
+    from coord.state import list_audit_log  # noqa: PLC0415
+
+    result = list_audit_log(
+        event_type=MECHANIC_LEG_DISPATCHED_EVENT,
+        repo=repo_name,
+        issue=issue_number,
+        limit=50,
+    )
+    for entry in result.get("entries") or ():
+        details = entry.get("details") or {}
+        if details.get("sha") == branch_sha:
+            return True
+    return False
+
+
+def _select_mechanic_machine(
+    repro_capability: str | None, work: "Assignment", config: "Config",
+) -> "Machine | None":
+    """Which machine a mechanic leg should run on (#4094).
+
+    *repro_capability* (`coord.failure_triage.TriageVerdict.repro_
+    capability`) names the capability that can reproduce the failure —
+    e.g. ``"macos"`` for a machine like macmini. When set, this ALWAYS
+    routes to a machine declaring that capability (case-insensitively, same
+    comparison `coord.failure_triage._infer_repro_capability` already uses
+    for the matching question in the other direction) — preferring the
+    original worker's own machine when IT has the capability, else the
+    first capable machine in `config.machines`' own declared order
+    (deterministic, never a random pick). Returns ``None`` when no machine
+    declares the capability at all — the caller must decline rather than
+    guess a machine that cannot actually reproduce the failure.
+
+    When *repro_capability* is ``None`` (the triage verdict could not infer
+    one), falls back to the original work's own machine — the same default
+    `coord.dispatch.select_fix_machine` applies for an ordinary fix round.
+    """
+    if not repro_capability:
+        return next(
+            (m for m in config.machines if m.name == work.machine_name), None,
+        )
+    capability = repro_capability.lower()
+    matches = [
+        m for m in config.machines
+        if capability in (c.lower() for c in m.capabilities)
+    ]
+    if not matches:
+        return None
+    for m in matches:
+        if m.name == work.machine_name:
+            return m
+    return matches[0]
+
+
+def _mechanic_leg_briefing(
+    *,
+    cause: str,
+    verdict: "TriageVerdict",
+    failed_stage_commands: tuple[str, ...],
+    evidence: tuple[str, ...],
+) -> str:
+    """The briefing text handed to a mechanic leg (#4094) — the triage
+    diagnosis, the evidence record, and the failed stage commands, plus the
+    bounded contract spelled out explicitly so the leg knows the limits of
+    its own authority before it starts.
+
+    A mechanic leg runs like any other fix round right up until it pushes —
+    same worker tool-scope, same `git`/edit/push primitives, no
+    `--dangerously-skip-permissions`. Its whole job is: reproduce the
+    failure by running ONLY *failed_stage_commands* (never the full suite —
+    that is what makes this bounded rather than an ordinary fix round), fix
+    it, re-run those same commands until they are green, then commit (with
+    the WHY in the commit message) and push to the existing branch. Whether
+    its own diff then gets to self-bless a scoped Test PASS, versus fall
+    back to an ordinary fix round, is decided afterward by
+    :func:`mechanic_leg_within_bound` — never by this leg's own say-so.
+    """
+    lines = [
+        "The board-doctor sweep dispatched this mechanic leg automatically "
+        "to fix a Test-stage failure a triage classifier diagnosed as "
+        "mechanical — a small, rote fix that needs no design judgement.",
+        "",
+        f"Cause: {cause}",
+        f"Triage diagnosis: {verdict.diagnosis}",
+    ]
+    if evidence:
+        lines.append("Evidence:")
+        lines.extend(f"- {item}" for item in evidence)
+    if failed_stage_commands:
+        lines.append(
+            "Reproduce the failure by running ONLY these failed stage "
+            "command(s) — never the full suite:"
+        )
+        lines.extend(f"- `{cmd}`" for cmd in failed_stage_commands)
+    lines.extend([
+        "",
+        "Fix it, then re-run those same command(s) until they are green. "
+        "Commit with the WHY in the commit message, and push to the "
+        "existing branch.",
+        "",
+        "You will NOT use `--dangerously-skip-permissions`, `gh`, "
+        "`--force-merge`, or `--override-human-required` — this leg runs at "
+        "ordinary worker tool-scope (edit/push/git) only, same as any other "
+        "fix round.",
+        "",
+        "Your own authority is bounded: once you push, your diff is graded "
+        "against a small line-count bound, no public-API surface, no "
+        "sealed path, and files confined to the triage's proposed scope or "
+        "this branch's already-touched file kinds. Only a diff that passes "
+        "records a scoped Test pass and lets Review run next. Anything "
+        "larger or more substantive falls back to an ordinary fix round — "
+        "you have no merge authority of your own beyond that bound, and "
+        "nothing you do here can reach `force_merge` or "
+        "`override_human_required`.",
+    ])
+    return "\n".join(lines)
+
+
+class MechanicLegDispatch(TypedDict):
+    """:func:`sweep_dispatch_mechanic_leg`'s return shape.
+
+    ``dispatched`` is the one answer to "did a new mechanic leg actually
+    start" — set from `_dispatch_fix`'s own confirmed return value, never
+    from the mere absence of an exception (#2096). ``detail`` explains a
+    ``False`` result so a caller can tell a budget-exhausted no-op from a
+    no-capable-machine no-op from an in-flight no-op without inspecting
+    exceptions.
+    """
+
+    dispatched: bool
+    assignment_id: str | None
+    machine: str | None
+    detail: str
+
+
+def sweep_dispatch_mechanic_leg(
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    cause: str,
+    verdict: "TriageVerdict",
+    branch_sha: str,
+    failed_stage_commands: tuple[str, ...] = (),
+    evidence: tuple[str, ...] = (),
+    http_client: Any | None = None,
+) -> MechanicLegDispatch:
+    """Daemon-internal "dispatch one autonomous mechanic leg", authorized
+    for the sweep context (#4094).
+
+    Unlike :func:`sweep_dispatch_fixit_leg`/:func:`sweep_dispatch_finisher_
+    leg`, this does NOT advance the fix-round counter (`coord.auto_loop.
+    next_fix_iteration`): it dispatches at *work*'s OWN current
+    ``review_iteration`` rather than the next one, so the next ORDINARY fix
+    round (should one still be needed after a mechanic-leg fallback) gets
+    exactly the iteration number it would have gotten had this mechanic leg
+    never run — #4094's "the fix-round counter is unchanged after a
+    successful mechanic leg".
+
+    Routes to a capable machine via :func:`_select_mechanic_machine` — the
+    triage verdict's ``repro_capability`` when it names one, pinned via
+    `_dispatch_fix`'s own ``override_machine`` (the same pin `coord fix
+    --machine` uses), never guessed.
+
+    Budget: refuses, WITHOUT dispatching, when a mechanic leg has already
+    been attempted for this issue at THIS *branch_sha*
+    (:func:`_mechanic_leg_already_attempted_at_sha`) — one mechanic leg per
+    SHA, durable across sweep runs via the audit log.
+
+    Returns a :class:`MechanicLegDispatch` with ``dispatched=False`` —
+    never raises — for: no originating work-like assignment found for this
+    issue, a leg already in flight (`_in_flight_work_detail`), the per-SHA
+    budget already spent, no machine declaring the triage's
+    ``repro_capability``, or an underlying `_dispatch_fix` call that
+    declined. Only an observed, confirmed `Assignment` back from
+    `_dispatch_fix` is reported as ``dispatched=True``.
+    """
+    authorize_sweep_action("dispatch_mechanic_leg")
+
+    from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    work_like = [
+        a
+        for a in assignments_for_issue(board, repo_name, issue_number)
+        if a.type in WORK_LIKE_TYPES
+    ]
+    if not work_like:
+        return MechanicLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} has no originating work "
+                "assignment on the board — nothing to dispatch a mechanic "
+                "leg against"
+            ),
+        )
+
+    in_flight = _in_flight_work_detail(
+        repo_name, issue_number, board, verb="a mechanic leg",
+    )
+    if in_flight is not None:
+        return MechanicLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=in_flight,
+        )
+
+    if _mechanic_leg_already_attempted_at_sha(repo_name, issue_number, branch_sha):
+        return MechanicLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} already had a mechanic leg "
+                f"dispatched at sha={branch_sha!r} — one mechanic leg per "
+                "SHA (#4094); a second attempt at the same SHA falls back "
+                "to an ordinary fix round instead"
+            ),
+        )
+
+    work = _select_winning_work_assignment(work_like)
+
+    machine = _select_mechanic_machine(verdict.repro_capability, work, config)
+    if machine is None:
+        return MechanicLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} mechanic leg declined — no "
+                f"configured machine declares the capability "
+                f"{verdict.repro_capability!r} the triage verdict named as "
+                "able to reproduce this failure"
+            ),
+        )
+
+    from coord.auto_loop import _dispatch_fix  # noqa: PLC0415
+
+    briefing = _mechanic_leg_briefing(
+        cause=cause,
+        verdict=verdict,
+        failed_stage_commands=failed_stage_commands,
+        evidence=evidence,
+    )
+    # #4094: NOT `next_fix_iteration` — see this function's own docstring.
+    iteration = work.review_iteration or 0
+
+    fix = _dispatch_fix(
+        work, briefing, board, config, iteration,
+        http_client=http_client, override_machine=machine.name,
+    )
+    if fix is None:
+        return MechanicLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} mechanic leg dispatch could "
+                "not be confirmed started — the capable machine was "
+                "unreachable, or the dispatch was declined"
+            ),
+        )
+
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="board_doctor",
+        event_type=MECHANIC_LEG_DISPATCHED_EVENT,
+        actor="daemon",
+        summary=(
+            f"board-doctor dispatched a mechanic leg for {repo_name}#"
+            f"{issue_number} (cause={cause}) -> {fix.machine_name}"
+        ),
+        repo=repo_name,
+        issue=issue_number,
+        assignment_id=fix.assignment_id,
+        machine=fix.machine_name,
+        details={
+            "cause": cause,
+            "evidence": list(evidence),
+            "sha": branch_sha,
+            "repro_capability": verdict.repro_capability,
+            "failed_stage_commands": list(failed_stage_commands),
+        },
+    )
+
+    return MechanicLegDispatch(
+        dispatched=True,
+        assignment_id=fix.assignment_id,
+        machine=fix.machine_name,
+        detail=(
+            f"{repo_name}#{issue_number} mechanic leg dispatched to "
+            f"{fix.machine_name} for sha={branch_sha!r}"
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class MechanicLegBoundResult:
+    """:func:`mechanic_leg_within_bound`'s verdict.
+
+    ``within_bound`` is the one answer to "may this mechanic leg's diff
+    self-bless a scoped Test pass" — ``reasons`` is never empty when it is
+    ``False``, so a caller reporting a decline always has something
+    concrete to show rather than a bare boolean.
+    """
+
+    within_bound: bool
+    reasons: tuple[str, ...]
+    changed_lines: int
+    changed_files: tuple[str, ...]
+
+
+def mechanic_leg_within_bound(
+    *,
+    diff_text: str,
+    touches_public_api: bool,
+    proposed_scope_files: tuple[str, ...],
+    branch_known_files: tuple[str, ...],
+    sealed_paths: list[str],
+    max_changed_lines: int = MECHANIC_LEG_MAX_CHANGED_LINES_DEFAULT,
+) -> MechanicLegBoundResult:
+    """#4094's bound envelope for a mechanic leg's own diff — the finisher's
+    envelope (#3834), re-applied to a pre-review diff rather than an
+    already-reviewed one.
+
+    Deliberately a SEPARATE check from `coord.review.classify_finding_nit_
+    class` rather than a call to it: that function always consults
+    `coord.review.classify_blocking_evidence` over a REVIEW body first (and
+    refuses outright when that body can't be parsed), which does not exist
+    yet at Test-stage — there is no review to read. This reuses that
+    function's underlying mechanical primitives directly instead of
+    re-deriving them (#2096, one question one answer): `coord.github_ops.
+    diff_file_paths` for which files changed, and `coord.review.
+    _diff_touched_sealed_paths` / `coord.review._diff_changed_line_count`
+    for the sealed-path and line-count checks, so none of the three
+    mechanical facts this shares with the finisher's own bound can ever
+    silently drift between the two.
+
+    ALL of the following must hold for ``within_bound=True``:
+
+    1. ``not touches_public_api`` — caller-attested, not inferred, exactly
+       like `coord.review.ProposedFix.touches_public_api`.
+    2. No sealed path touched, per *sealed_paths*.
+    3. A bounded, nonempty diff: ``0 < changed_lines <= max_changed_lines``.
+    4. Every changed file is either named in *proposed_scope_files* (the
+       triage verdict's own guess at scope) or shares a file extension with
+       something in *branch_known_files* (the branch's own diff, or the
+       issue's declared ``## Files``) — #4094's "only files the triage
+       verdict proposed, or files of the same kind the branch already
+       touches". A changed file matching neither is named explicitly in
+       ``reasons`` rather than silently failing the whole check unexplained.
+
+    *reasons* is empty exactly when ``within_bound`` is ``True`` — a gate
+    that can report a concrete reason for every refusal, never a bare
+    boolean a caller has to take on faith.
+    """
+    from coord.github_ops import diff_file_paths  # noqa: PLC0415
+    from coord.review import _diff_changed_line_count, _diff_touched_sealed_paths  # noqa: PLC0415
+
+    changed_files = tuple(diff_file_paths(diff_text))
+    changed_lines = _diff_changed_line_count(diff_text)
+    reasons: list[str] = []
+
+    if touches_public_api:
+        reasons.append("the diff touches a public-API surface")
+
+    sealed_hits = _diff_touched_sealed_paths(diff_text, list(sealed_paths)) if sealed_paths else []
+    if sealed_hits:
+        reasons.append(f"the diff touches sealed path(s): {', '.join(sealed_hits)}")
+
+    if not (0 < changed_lines <= max_changed_lines):
+        reasons.append(
+            f"the diff changes {changed_lines} line(s), outside the "
+            f"1..{max_changed_lines} bound"
+        )
+
+    known_kinds = {
+        f.rsplit(".", 1)[-1].lower() for f in branch_known_files if "." in f
+    }
+    proposed = set(proposed_scope_files)
+    out_of_scope = [
+        f for f in changed_files
+        if f not in proposed
+        and not (known_kinds and "." in f and f.rsplit(".", 1)[-1].lower() in known_kinds)
+    ]
+    if out_of_scope:
+        reasons.append(
+            "the diff touches file(s) outside the triage's proposed scope "
+            f"and the branch's already-touched file kinds: "
+            f"{', '.join(out_of_scope)}"
+        )
+
+    return MechanicLegBoundResult(
+        within_bound=not reasons,
+        reasons=tuple(reasons),
+        changed_lines=changed_lines,
+        changed_files=changed_files,
+    )
+
+
+class MechanicLegVerdictResult(TypedDict):
+    """:func:`mechanic_leg_verdict`'s return shape.
+
+    ``scoped_pass`` is the one answer to "did this mechanic leg's diff earn
+    a scoped Test pass on its own authority" — ``True`` means `coord.state.
+    record_test_verdict` was actually called with ``test_state="passed"``
+    (never from the mere absence of an exception). ``False`` means the
+    fallback fix round ran instead (`actions` carries its
+    :class:`FixitLegDispatch`-shaped detail wrapped as a single-item list
+    for symmetry with :class:`FinisherSelfBlessResult`); ``detail`` explains
+    which of the two branches ran and why.
+    """
+
+    scoped_pass: bool
+    actions: list[Any]
+    detail: str
+
+
+def mechanic_leg_verdict(
+    work: "Assignment",
+    board: "Board",
+    config: "Config",
+    *,
+    cause: str,
+    verdict: "TriageVerdict",
+    repro_succeeded: bool,
+    stages_green: bool,
+    diff_text: str,
+    touches_public_api: bool,
+    new_head_sha: str,
+    branch_known_files: tuple[str, ...] = (),
+    mechanic_notes: tuple[str, ...] = (),
+    evidence: tuple[str, ...] = (),
+    max_changed_lines: int = MECHANIC_LEG_MAX_CHANGED_LINES_DEFAULT,
+    http_client: Any | None = None,
+) -> MechanicLegVerdictResult:
+    """Decide whether a mechanic leg's own diff earns a scoped Test PASS —
+    the bounded-authority core of a mechanic leg (#4094).
+
+    *repro_succeeded*/*stages_green* are the leg's own attestation (and, for
+    a caller that has it, a re-run's observation) of whether it could even
+    reproduce the failure and get the failed stage commands green again —
+    mirroring how `coord.review.ProposedFix.behavioral`/
+    ``touches_public_api`` are caller-attested rather than inferred. When
+    either is ``False``, this NEVER self-blesses: it falls back WHOLESALE
+    to :func:`sweep_dispatch_fixit_leg` — the same full fix-round path an
+    ordinary stuck Test failure already takes — carrying *mechanic_notes*
+    (what the mechanic leg tried and why it couldn't close it) as evidence.
+
+    Otherwise, grades *diff_text* against :func:`mechanic_leg_within_bound`.
+    A diff within bound: records ``test_state="passed"`` via `coord.state.
+    record_test_verdict`, prefixed with :data:`MECHANIC_SCOPED_TEST_REASON_
+    PREFIX` (#4094's "passed-scoped" verdict — see that constant's own
+    docstring for why this is recorded as plain ``"passed"`` rather than a
+    new `test_state` value), and reports ``scoped_pass=True`` — every
+    EXISTING Test-gate consumer (`coord.auto_loop`'s review-dispatch gate
+    foremost) already treats a ``"passed"`` write as a green Test stage, so
+    this is what makes Review run next without touching a single one of
+    those call sites. A diff OUTSIDE the bound falls back to a fix round
+    exactly like a reproduction failure does, carrying the bound check's own
+    *reasons* as evidence too.
+
+    This function never merges, never force-merges, and never overrides
+    `human_required` — its only two possible actions are "record a Test
+    PASS" and "dispatch an ordinary fix round", neither of which is a merge
+    primitive.
+    """
+    authorize_sweep_action("dispatch_mechanic_leg")
+
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    if work.type not in WORK_LIKE_TYPES:
+        raise ValueError(
+            f"mechanic_leg_verdict requires a work-like assignment, got "
+            f"assignment_id={work.assignment_id!r} with type={work.type!r}"
+        )
+
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    if not repro_succeeded or not stages_green:
+        record_audit(
+            tier="business",
+            category="test",
+            event_type="mechanic_leg_repro_failed",
+            actor="daemon",
+            summary=(
+                f"mechanic leg for {work.repo_name}#{work.issue_number} "
+                "could not reproduce the failure or get the failed stages "
+                "green — falling back to an ordinary fix round"
+            ),
+            repo=work.repo_name,
+            issue=work.issue_number,
+            assignment_id=work.assignment_id,
+            machine=work.machine_name,
+            details={
+                "repro_succeeded": repro_succeeded,
+                "stages_green": stages_green,
+            },
+        )
+        actions = _mechanic_fallback_fix_round(
+            work, board, config, cause=cause,
+            evidence=evidence, mechanic_notes=mechanic_notes,
+            http_client=http_client,
+        )
+        return MechanicLegVerdictResult(
+            scoped_pass=False,
+            actions=actions,
+            detail=(
+                f"{work.repo_name}#{work.issue_number}: mechanic leg could "
+                "not reproduce the failure/get the failed stages green — "
+                "fell back to an ordinary fix round"
+            ),
+        )
+
+    bound = mechanic_leg_within_bound(
+        diff_text=diff_text,
+        touches_public_api=touches_public_api,
+        proposed_scope_files=verdict.proposed_scope.files,
+        branch_known_files=branch_known_files,
+        sealed_paths=config.acceptance.sealed_paths(work.repo_name),
+        max_changed_lines=max_changed_lines,
+    )
+    if not bound.within_bound:
+        record_audit(
+            tier="business",
+            category="test",
+            event_type="mechanic_leg_bound_exceeded",
+            actor="daemon",
+            summary=(
+                f"mechanic leg diff for {work.repo_name}#{work.issue_number} "
+                f"exceeded #4094's bound — falling back to an ordinary fix "
+                f"round ({'; '.join(bound.reasons)})"
+            ),
+            repo=work.repo_name,
+            issue=work.issue_number,
+            assignment_id=work.assignment_id,
+            machine=work.machine_name,
+            details={
+                "reasons": list(bound.reasons),
+                "changed_lines": bound.changed_lines,
+                "changed_files": list(bound.changed_files),
+            },
+        )
+        actions = _mechanic_fallback_fix_round(
+            work, board, config, cause=cause,
+            evidence=tuple(evidence) + bound.reasons,
+            mechanic_notes=mechanic_notes,
+            http_client=http_client,
+        )
+        return MechanicLegVerdictResult(
+            scoped_pass=False,
+            actions=actions,
+            detail=(
+                f"{work.repo_name}#{work.issue_number}: mechanic leg diff "
+                f"exceeded #4094's bound ({'; '.join(bound.reasons)}) — fell "
+                "back to an ordinary fix round"
+            ),
+        )
+
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    test_reason = (
+        f"{MECHANIC_SCOPED_TEST_REASON_PREFIX}: {verdict.diagnosis} "
+        f"({bound.changed_lines} changed line(s) in "
+        f"{', '.join(bound.changed_files) or 'no files'})"
+    )
+    record_test_verdict(
+        assignment_id=work.assignment_id or "",
+        test_state="passed",
+        test_reason=test_reason,
+    )
+    record_audit(
+        tier="business",
+        category="test",
+        event_type="mechanic_leg_scoped_pass",
+        actor="daemon",
+        summary=(
+            f"mechanic leg for {work.repo_name}#{work.issue_number} self-"
+            "blessed a scoped Test pass within #4094's bound — proceeding "
+            "to Review"
+        ),
+        repo=work.repo_name,
+        issue=work.issue_number,
+        assignment_id=work.assignment_id,
+        machine=work.machine_name,
+        details={
+            "new_head_sha": new_head_sha,
+            "changed_lines": bound.changed_lines,
+            "changed_files": list(bound.changed_files),
+        },
+    )
+    return MechanicLegVerdictResult(
+        scoped_pass=True,
+        actions=[],
+        detail=(
+            f"{work.repo_name}#{work.issue_number}: mechanic leg diff is "
+            f"within #4094's bound ({bound.changed_lines} changed line(s)) "
+            "— recorded a scoped Test pass; Review runs next"
+        ),
+    )
+
+
+def _mechanic_fallback_fix_round(
+    work: "Assignment",
+    board: "Board",
+    config: "Config",
+    *,
+    cause: str,
+    evidence: tuple[str, ...],
+    mechanic_notes: tuple[str, ...],
+    http_client: Any | None,
+) -> list[Any]:
+    """The one fallback path out of :func:`mechanic_leg_verdict` — an
+    ordinary fix round via :func:`sweep_dispatch_fixit_leg`, carrying the
+    mechanic leg's own notes alongside the sweep's *evidence*. #4094:
+    "discard nothing" — whatever the mechanic leg already tried is handed
+    to the fix round as context rather than thrown away.
+
+    Returns a one-item list carrying the :class:`FixitLegDispatch` result,
+    matching :class:`MechanicLegVerdictResult.actions`'s documented shape.
+    """
+    fallback_evidence = tuple(evidence) + tuple(
+        f"mechanic leg note: {note}" for note in mechanic_notes
+    )
+    result = sweep_dispatch_fixit_leg(
+        work.repo_name, work.issue_number, board, config,
+        cause=cause, evidence=fallback_evidence, http_client=http_client,
+    )
+    return [result]
+
+
 class SmokeRequeue(TypedDict):
     """:func:`sweep_smoke_requeue`'s return shape.
 
@@ -2751,6 +3462,7 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "drive_queue_requeue": sweep_drive_queue_requeue,
     "dispatch_fixit_leg": sweep_dispatch_fixit_leg,
     "dispatch_finisher_leg": sweep_dispatch_finisher_leg,
+    "dispatch_mechanic_leg": sweep_dispatch_mechanic_leg,
     "smoke_requeue": sweep_smoke_requeue,
     "raise_budget": sweep_raise_fixit_budget,
     "bounce": sweep_bounce,

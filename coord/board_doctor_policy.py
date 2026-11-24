@@ -278,6 +278,15 @@ _INVESTIGATE_ACTION = "dispatch_fixit_leg"
 #: handler would still need to wire up.
 _FINISHER_ACTION = "dispatch_finisher_leg"
 
+#: The `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` action name
+#: :func:`dispatch_mechanic_leg_for_triage` dispatches (#4094) — mirrors
+#: :data:`_FINISHER_ACTION` exactly: a synchronous call from a future
+#: Test-stage caller (the place `coord.drive` decides a Test leg failed and
+#: hands the failure to `coord.failure_triage.triage_failure`), never the
+#: periodic sweep, so it registers nothing into `ALLOWLIST`/
+#: `AUTO_DISPATCHERS`/`INVESTIGATE_CAUSES`/`policy_tier_of` either.
+_MECHANIC_ACTION = "dispatch_mechanic_leg"
+
 #: cause -> auto-action name. Populated only via :func:`_register_auto_action`
 #: — never by assigning into this dict directly, so every entry is also
 #: checked against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the
@@ -1922,6 +1931,125 @@ def dispatch_nit_only_finisher(
         cause=CAUSE_NIT_ONLY_REQUEST_CHANGES,
         evidence=evidence,
         nits=nits,
+        http_client=http_client,
+    )
+    return bool(result.get("dispatched"))
+
+
+NO_MECHANIC_ENV_VAR = "COORD_BOARD_DOCTOR_NO_MECHANIC"
+"""Process-wide kill switch read by :func:`_mechanic_tier_enabled` (#4094)
+— mirrors :data:`NO_FINISHER_ENV_VAR` and friends: set (to any truthy
+string) to disarm the mechanic leg fleet-wide without touching
+``coordinator.yml``."""
+
+#: #4094's own cause string, passed through to `coord.board_doctor_
+#: permissions.sweep_dispatch_mechanic_leg` as ``cause=``. Not a
+#: `coord.board_doctor` `StuckRow.cause` — like `CAUSE_NIT_ONLY_REQUEST_
+#: CHANGES` this fires synchronously from a future Test-stage caller
+#: (wiring that caller in is explicitly out of scope here, same posture as
+#: `coord.failure_triage` itself), never from the periodic sweep.
+CAUSE_TEST_TRIAGE_MECHANICAL = "test_triage_mechanical"
+
+
+def _mechanic_tier_enabled(repo_name: str, config: "Config") -> bool:
+    """Decide whether a Test-stage failure's #4093 triage verdict may route
+    here (#4094).
+
+    Two gates, mirroring :func:`_finisher_tier_enabled`'s shape with the
+    fleet-wide YAML switch omitted on purpose: unlike `finish`/`investigate`,
+    nothing in this repo dispatches `coord.failure_triage.triage_failure`'s
+    output yet (see that module's own "no production caller yet" posture),
+    so there is no live call site for a `coordinator.yml` switch to arm or
+    disarm — adding one now would be an unreachable knob (#2096: a gate
+    that can never actually be exercised one way is worse than no gate).
+    The env-var kill switch alone already covers "pause this fleet-wide
+    without an operator edit", the same emergency-brake role every sibling
+    env var plays; a `Config.board_doctor.mechanic` fleet switch can be
+    added alongside the real call site once one exists.
+
+    1. :data:`NO_MECHANIC_ENV_VAR` — the process-wide kill switch.
+    2. ``board_doctor.mechanic`` — the per-repo opt-in
+       (`coord.models.BoardDoctorRepoConfig.mechanic`, default `False`). A
+       repo that has not opted in gets today's behaviour unchanged: a
+       Test-stage failure (mechanical or not) goes through the ordinary
+       fix-round path regardless of what the triage classifier says.
+    """
+    if os.environ.get(NO_MECHANIC_ENV_VAR):
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.mechanic)
+
+
+def dispatch_mechanic_leg_for_triage(
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    verdict: Any,
+    branch_sha: str,
+    failed_stage_commands: tuple[str, ...] = (),
+    evidence: tuple[str, ...] = (),
+    http_client: object | None = None,
+) -> bool:
+    """#4094: route a Test-stage failure `coord.failure_triage.
+    triage_failure` classified ``BUCKET_MECHANICAL`` to a mechanic leg
+    instead of spending a full fix round + review + test fan-out on it.
+
+    Called directly from wherever `coord.drive` decides a Test leg failed
+    and triages it (that call site does not exist yet — building it is
+    explicitly out of scope for #4094, same posture as `coord.failure_
+    triage` itself having no production caller). This is a plain,
+    synchronously-called function, NOT a `coord.board_doctor.sweep` auto-
+    dispatcher — mirrors :func:`dispatch_nit_only_finisher`'s own shape and
+    rationale exactly.
+
+    *verdict* is a `coord.failure_triage.TriageVerdict` (typed as `Any`
+    here to avoid importing that module at this function's call surface
+    before a real caller needs it — every attribute this function reads
+    off it, ``bucket``/``repro_capability``/``proposed_scope``/
+    ``diagnosis``, is part of that dataclass's stable public shape).
+
+    Returns ``True`` only when `coord.board_doctor_permissions.
+    sweep_dispatch_mechanic_leg` (via :data:`_MECHANIC_ACTION`) actually
+    confirms ``dispatched=True`` — never from the mere absence of an
+    exception (#2096). The caller must fall through to its own existing
+    behaviour on ``False``, for any reason: the tier is off, the repo
+    hasn't opted in, *verdict* isn't ``BUCKET_MECHANICAL``, the repo is
+    already at its per-repo capacity cap (:func:`_at_repo_capacity`,
+    shared with the finisher tier), a mechanic/fix-it/finisher leg or
+    drive-session is already in flight, the #4094 one-per-SHA budget is
+    already spent at *branch_sha*, no machine declares the verdict's
+    ``repro_capability``, or the dispatch itself declined.
+    """
+    from coord.failure_triage import BUCKET_MECHANICAL  # noqa: PLC0415
+
+    if getattr(verdict, "bucket", None) != BUCKET_MECHANICAL:
+        return False
+    if not _mechanic_tier_enabled(repo_name, config):
+        return False
+    if _at_repo_capacity(repo_name, config, board):
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor NOT dispatching a mechanic leg for "
+            f"{repo_name}#{issue_number} — the repo is already at its "
+            "per-repo capacity cap (_at_repo_capacity, #3837); falling back "
+            "to an ordinary fix round instead",
+            err=True,
+        )
+        return False
+    result = dispatch_sweep_action(
+        _MECHANIC_ACTION,
+        repo_name,
+        issue_number,
+        board,
+        config,
+        cause=CAUSE_TEST_TRIAGE_MECHANICAL,
+        verdict=verdict,
+        branch_sha=branch_sha,
+        failed_stage_commands=failed_stage_commands,
+        evidence=evidence,
         http_client=http_client,
     )
     return bool(result.get("dispatched"))
