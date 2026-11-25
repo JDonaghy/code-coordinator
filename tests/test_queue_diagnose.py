@@ -752,3 +752,55 @@ def test_a_done_row_whose_branch_no_longer_resolves_falls_back_to_the_pr_number(
 
     assert pr_state == "MERGED"
     assert any("gh pr view:" in err for err in errors)
+
+
+def test_a_done_row_read_open_by_number_never_resolves_an_arbitrary_pr_by_branch(
+    monkeypatch,
+):
+    """When the board-side, branch-independent lookup is the ONLY thing
+    that produced `pr_state == "OPEN"` (no branch was ever resolved),
+    `_github` must bind the SAME PR number to this entry rather than
+    calling `find_pr_for_branch` with an empty `--head`, which `gh` reads
+    as "no head filter" and would return an arbitrary open PR in the
+    repo — binding another entry's `mergeable`/checks to this one."""
+    work = _work(issue=66, branch="", pr_url="https://github.com/acme/api/pull/888")
+    board = Board(completed=[work])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    e = entry(66, state=STATE_DONE)
+    errors: list[str] = []
+
+    def fake_get_pr_state(repo: str, branch: str) -> str:
+        assert branch == "888"
+        return "OPEN"
+
+    def fake_find_pr_for_branch(repo: str, branch: str) -> dict:
+        raise AssertionError(
+            "find_pr_for_branch must not be called with an empty branch"
+        )
+
+    def fake_check_pr_mergeable(repo: str, number: int) -> bool:
+        assert number == 888
+        return True
+
+    def fake_list_checks_for_pr(self, repo: str, number: int) -> list:
+        assert number == 888
+        return []
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_pr_state_for_branch", fake_get_pr_state,
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.find_pr_for_branch", fake_find_pr_for_branch,
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.check_pr_mergeable", fake_check_pr_mergeable,
+    )
+    monkeypatch.setattr(
+        "coord.ci_github.GitHubCi.list_checks_for_pr", fake_list_checks_for_pr,
+    )
+
+    pr_number, pr_state, mergeable, _checks = probe._github(e, "", errors)  # noqa: SLF001
+
+    assert pr_state == "OPEN"
+    assert pr_number == 888
+    assert mergeable is True
