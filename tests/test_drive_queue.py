@@ -1990,9 +1990,9 @@ def test_a_review_fix_budget_stop_is_exempt_from_the_ceiling_and_retries():
 
 
 def test_a_plain_fix_round_ceiling_exit_still_blocks_despite_the_4117_exemption():
-    """Same work-leg count, but `own_reason` names the ORDINARY #2972
-    give-up wording, not the #4117 review-fix-budget-stop shape — the new
-    exemption must not accidentally widen to every ceiling exit."""
+    """Same work-leg count, but `own_reason` names an unrecognized death
+    with no marker at all, not the #4117 review-fix-budget-stop shape —
+    the new exemption must not accidentally widen to every ceiling exit."""
     key = entry_key(REPO, 1650)
     own_reason = "some other death with no recognised marker at all"
     facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
@@ -11016,7 +11016,7 @@ def test_an_unconfirmed_test_state_reset_reason_keeps_the_dead_end_markers():
 
 
 def _assignment(
-    *, type: str, dispatched_at: float, assignment_id: str,
+    *, assignment_type: str, dispatched_at: float, assignment_id: str,
     review_verdict: str | None = None, review_target: str | None = None,
 ):
     from coord.models import Assignment
@@ -11027,7 +11027,7 @@ def _assignment(
         issue_number=1650,
         issue_title="t",
         assignment_id=assignment_id,
-        type=type,
+        type=assignment_type,
         status="done",
         dispatched_at=dispatched_at,
         review_verdict=review_verdict,
@@ -11042,9 +11042,9 @@ def test_review_fix_remedy_target_fires_when_newest_review_requests_changes():
     from coord.board_doctor_policy import review_fix_remedy_target
     from coord.models import Board
 
-    work = _assignment(type="work", dispatched_at=NOW - 100, assignment_id="work1")
+    work = _assignment(assignment_type="work", dispatched_at=NOW - 100, assignment_id="work1")
     review = _assignment(
-        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        assignment_type="review", dispatched_at=NOW - 50, assignment_id="rev1",
         review_verdict="request-changes",
     )
     board = Board(completed=[work, review])
@@ -11058,10 +11058,10 @@ def test_review_fix_remedy_target_is_none_once_a_newer_work_leg_exists():
     from coord.models import Board
 
     review = _assignment(
-        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        assignment_type="review", dispatched_at=NOW - 50, assignment_id="rev1",
         review_verdict="request-changes",
     )
-    fix = _assignment(type="work", dispatched_at=NOW - 10, assignment_id="fix1")
+    fix = _assignment(assignment_type="work", dispatched_at=NOW - 10, assignment_id="fix1")
     board = Board(completed=[review, fix])
     assert review_fix_remedy_target(board, REPO, 1650) is None
 
@@ -11072,7 +11072,7 @@ def test_review_fix_remedy_target_is_none_when_the_newest_review_approved():
     from coord.models import Board
 
     review = _assignment(
-        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        assignment_type="review", dispatched_at=NOW - 50, assignment_id="rev1",
         review_verdict="approve",
     )
     board = Board(completed=[review])
@@ -11083,7 +11083,7 @@ def test_review_fix_remedy_target_is_none_with_no_review_at_all():
     from coord.board_doctor_policy import review_fix_remedy_target
     from coord.models import Board
 
-    work = _assignment(type="work", dispatched_at=NOW - 100, assignment_id="work1")
+    work = _assignment(assignment_type="work", dispatched_at=NOW - 100, assignment_id="work1")
     board = Board(completed=[work])
     assert review_fix_remedy_target(board, REPO, 1650) is None
 
@@ -11100,11 +11100,11 @@ def test_review_fix_remedy_target_is_none_when_a_newer_review_has_no_verdict_yet
     from coord.models import Board
 
     stale_review = _assignment(
-        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        assignment_type="review", dispatched_at=NOW - 50, assignment_id="rev1",
         review_verdict="request-changes",
     )
     in_flight_review = _assignment(
-        type="review", dispatched_at=NOW - 10, assignment_id="rev2",
+        assignment_type="review", dispatched_at=NOW - 10, assignment_id="rev2",
         review_verdict=None,
     )
     board = Board(completed=[stale_review, in_flight_review])
@@ -11172,7 +11172,7 @@ def test_perform_next_action_unperformed_dispatches_a_bounce_off_a_request_chang
     from coord.models import Board
 
     review = _assignment(
-        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        assignment_type="review", dispatched_at=NOW - 50, assignment_id="rev1",
         review_verdict="request-changes",
     )
     board = Board(completed=[review])
@@ -11215,7 +11215,7 @@ def test_perform_next_action_unperformed_refuses_to_bounce_onto_a_live_drive_ses
     from coord.models import Board
 
     review = _assignment(
-        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        assignment_type="review", dispatched_at=NOW - 50, assignment_id="rev1",
         review_verdict="request-changes",
     )
     board = Board(completed=[review])
