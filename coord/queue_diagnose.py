@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from coord.drive_queue import (
+    STATE_DONE_LIKE,
     QueueEntry,
     is_fix_round_ceiling_blocked,
     is_unreachable_wait_shape,
@@ -163,6 +164,18 @@ CAUSE_PREMISE_REFUSAL = "premise-refusal"
 CAUSE_UPSTREAM_GAP_PARK = "upstream-gap-park"
 CAUSE_PR_MERGED = "pr-merged"
 CAUSE_PR_CLOSED = "pr-closed"
+#: #4137: the entry's own drive-queue row already reads `done`/`merged-
+#: partial` (`coord.drive_queue.STATE_DONE_LIKE`) — independent, board-side
+#: proof nothing here is still blocking — but `GhLiveProbe._github` could
+#: not confirm what finished it (no branch recorded, no PR number on the
+#: winning assignment either, or the one `gh` call it tried raised). See
+#: :data:`PR_STATE_DONE_UNCONFIRMED`'s own docstring for the live-state
+#: sentinel this reads, and :func:`_rule_queue_confirmed_done` for the rule.
+#: Never `CAUSE_PR_MERGED`: that cause asserts a CONFIRMED live `MERGED`
+#: read, and a `done` row can also mean the issue closed with no PR at all
+#: — conflating the two would misreport the "fix" as `mark_done`
+#: reconciling a merge that may never have happened.
+CAUSE_QUEUE_ALREADY_DONE = "queue-already-done"
 CAUSE_MERGE_CONFLICT = "merge-conflict"
 CAUSE_DEAD_LEG = "dead-leg"
 CAUSE_NO_PR = "no-pr"
@@ -246,6 +259,7 @@ CAUSE_PROSE: dict[str, str] = {
     CAUSE_UPSTREAM_GAP_PARK: "the row is parked on a confirmed upstream gap (#3977) — not fixable by any fix-it leg or relaunch; clear the row by hand once the release lands or the gap is confirmed",
     CAUSE_PR_MERGED: "the PR merged while the entry sat stalled, so whatever the queue said had outlived its subject",
     CAUSE_PR_CLOSED: "the PR was closed while the entry sat stalled, so the queue is waiting on work that no longer exists",
+    CAUSE_QUEUE_ALREADY_DONE: "the drive-queue row's own state already reads done/merged-partial — nothing live can still be blocking it, even though gh could not confirm how it finished (no branch recorded, no PR number on the winning assignment, or the one gh call available raised); never dispatch a fix-it leg against a row this already settled",
     CAUSE_MERGE_CONFLICT: "GitHub reports the PR as conflicting; the branch needs a rebase before anything else can be true",
     CAUSE_DEAD_LEG: "the entry names a session the machine that launched it no longer has — the leg is dead, not slow",
     CAUSE_NO_PR: "no PR exists for this entry, so no CI-shaped or merge-shaped reason can be the real blocker",
@@ -293,6 +307,19 @@ MAX_DIAGNOSES_PER_PASS = 4
 
 # ── live readings ────────────────────────────────────────────────────────────
 
+#: #4137: the one explicit, non-ambiguous :attr:`LiveState.pr_state` value
+#: :meth:`GhLiveProbe._github` writes when it could not resolve a live PR
+#: state AT ALL (no branch recorded, no PR number on the winning
+#: assignment, or the one `gh` call it had raised) for an entry whose own
+#: drive-queue row already reads `done`/`merged-partial`
+#: (`coord.drive_queue.STATE_DONE_LIKE`). Distinct from the bare `""`
+#: default — which means "we never got a usable reading and the row's own
+#: state says nothing either" — precisely so :func:`_rule_queue_confirmed_
+#: done` can name it, instead of leaving a value that satisfies neither
+#: `_rule_pr_merged` nor `_rule_no_pr` to fall through to a stale pre-merge
+#: cause like `CAUSE_INTEGRATION_RED` (quadraui#2825's incident).
+PR_STATE_DONE_UNCONFIRMED = "done-unconfirmed"
+
 
 @dataclass(frozen=True)
 class CheckReading:
@@ -320,7 +347,9 @@ class LiveState:
     """
 
     pr_number: int | None = None
-    #: ``OPEN`` / ``MERGED`` / ``CLOSED``, or ``""`` when unread.
+    #: ``OPEN`` / ``MERGED`` / ``CLOSED``, :data:`PR_STATE_DONE_UNCONFIRMED`
+    #: (#4137 — a `done`-like queue row with nothing live to confirm it),
+    #: or ``""`` when unread.
     pr_state: str = ""
     #: GitHub's own ``mergeable`` verdict.  ``None`` = still computing, or the
     #: read failed.
@@ -628,8 +657,10 @@ def _stated_still_supported(family: str, live: LiveState) -> bool | None:
     cause would make the two mutually reinforcing, which is how a
     diagnostician talks itself into confidence it has not earned.
     """
-    if live.pr_state in ("MERGED", "CLOSED"):
-        # Nothing about a finished PR can still be blocking the queue.
+    if live.pr_state in ("MERGED", "CLOSED", PR_STATE_DONE_UNCONFIRMED):
+        # Nothing about a finished (or queue-confirmed-done) PR can still
+        # be blocking the queue — #4137 extends this to the sentinel the
+        # same way a confirmed live MERGED/CLOSED already was.
         return False if family else None
     if family == FAMILY_CI:
         if live.pr_state == "none":
@@ -711,6 +742,28 @@ def _rule_pr_merged(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] 
 def _rule_pr_closed(entry: QueueEntry, live: LiveState) -> tuple[str, str, str] | None:
     if live.pr_state == "CLOSED":
         return CAUSE_PR_CLOSED, CONFIDENCE_HIGH, _pr_line(live)
+    return None
+
+
+def _rule_queue_confirmed_done(
+    entry: QueueEntry, live: LiveState
+) -> tuple[str, str, str] | None:
+    """#4137: :data:`PR_STATE_DONE_UNCONFIRMED` is the one explicit value
+    :meth:`GhLiveProbe._github` writes for a `done`/`merged-partial` queue
+    row it could not confirm anything live about — see that constant's own
+    docstring. Checked immediately after :func:`_rule_pr_merged`/
+    :func:`_rule_pr_closed`: a row that DID get a confirmed live reading is
+    named by those, more precisely, first; this only ever fires on the
+    sentinel neither of them matches, closing the exact #2825 gap where
+    that left a row to fall through to a stale pre-merge cause like
+    `CAUSE_INTEGRATION_RED` instead.
+
+    `CONFIDENCE_MEDIUM`, not `CONFIDENCE_HIGH`: unlike `_rule_pr_merged`,
+    nothing live actually confirmed this — only the drive-queue row's own
+    recorded state did.
+    """
+    if live.pr_state == PR_STATE_DONE_UNCONFIRMED:
+        return CAUSE_QUEUE_ALREADY_DONE, CONFIDENCE_MEDIUM, _pr_line(live)
     return None
 
 
@@ -881,6 +934,9 @@ _RULES = (
     _rule_terminal_park,
     _rule_pr_merged,
     _rule_pr_closed,
+    # #4137: only ever fires on the explicit `PR_STATE_DONE_UNCONFIRMED`
+    # sentinel neither rule above matches — see its own docstring.
+    _rule_queue_confirmed_done,
     _rule_conflict,
     _rule_dead_leg,
     _rule_no_pr,
@@ -1524,20 +1580,49 @@ class GhLiveProbe:
         self, entry: QueueEntry, branch: str, errors: list[str]
     ) -> tuple[int | None, str, bool | None, tuple[CheckReading, ...] | None]:
         slug = self._github_slug(entry.repo)
-        if not slug or not branch:
-            if not slug:
-                errors.append(f"gh: no github slug configured for repo {entry.repo!r}")
-            else:
-                errors.append(f"gh: no branch known for {entry.key}")
+        if not slug:
+            errors.append(f"gh: no github slug configured for repo {entry.repo!r}")
             return None, "", None, None
 
         from coord import github_ops  # noqa: PLC0415
 
         pr_state = ""
-        try:
-            pr_state = github_ops.get_pr_state_for_branch(slug, branch) or "none"
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"gh pr view: {type(exc).__name__}: {exc}")
+        if branch:
+            try:
+                pr_state = github_ops.get_pr_state_for_branch(slug, branch) or "none"
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"gh pr view: {type(exc).__name__}: {exc}")
+        else:
+            errors.append(f"gh: no branch known for {entry.key}")
+
+        if not pr_state and entry.state in STATE_DONE_LIKE:
+            # #4137 (quadraui#2825): the branch-based read above came back
+            # empty — either there was no branch to resolve at all, or the
+            # one `gh pr view` call it tried raised — but the entry's own
+            # drive-queue row already reads `done`/`merged-partial`,
+            # independent, board-side proof this issue is finished. The
+            # winning assignment's `pr_url` resolves `gh pr view` exactly
+            # like a branch name does (`gh` accepts a number OR a branch
+            # as the same positional selector), entirely independently of
+            # `branch`.
+            number = self._pr_number_from_board(entry)
+            if number is not None:
+                try:
+                    pr_state = (
+                        github_ops.get_pr_state_for_branch(slug, str(number)) or "none"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"gh pr view (by number): {type(exc).__name__}: {exc}")
+            if not pr_state:
+                # Still nothing live to go on. Leaving `pr_state` at the
+                # ambiguous `""` here satisfies neither `_rule_pr_merged`
+                # ("MERGED") nor `_rule_no_pr` (a CONFIRMED "none") and lets
+                # a stale pre-merge cause recorded before this row finished
+                # (e.g. `CAUSE_INTEGRATION_RED`) win by default instead.
+                # `PR_STATE_DONE_UNCONFIRMED` is the explicit "we could not
+                # confirm anything live, but the queue's own state already
+                # settled this" reading `_rule_queue_confirmed_done` names.
+                pr_state = PR_STATE_DONE_UNCONFIRMED
 
         pr_number: int | None = None
         mergeable: bool | None = None
@@ -1557,6 +1642,47 @@ class GhLiveProbe:
         if pr_number is not None:
             checks = self._checks(slug, pr_number, errors)
         return pr_number, pr_state, mergeable, checks
+
+    def _pr_number_from_board(self, entry: QueueEntry) -> int | None:
+        """#4137: the winning work assignment's PR number, read straight
+        off ``Assignment.pr_url`` — independent of ``branch``, which
+        ``_gates`` may have resolved empty (no work-like assignment at
+        all, or one that simply never recorded a branch) even though the
+        PR itself finished long ago.
+
+        Reuses :func:`coord.gates.assignments_for_issue`/
+        :func:`coord.gates._select_winning_work_assignment` — the SAME
+        winner-selection :func:`coord.gates.build_gate_report` already
+        applies (#2096: one question, one answer), never a second,
+        independently-drifting "which assignment counts" rule.
+
+        ``None`` whenever there is no board/config, no work-like
+        assignment for this issue, or no ``pr_url`` recorded on the
+        winner — never guessed from any other field.
+        """
+        if self.board is None or self.config is None:
+            return None
+        try:
+            from coord.gates import (  # noqa: PLC0415
+                _select_winning_work_assignment,
+                assignments_for_issue,
+            )
+            from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+            work_like = [
+                a
+                for a in assignments_for_issue(self.board, entry.repo, entry.issue)
+                if a.type in WORK_LIKE_TYPES
+            ]
+            if not work_like:
+                return None
+            winner = _select_winning_work_assignment(work_like)
+            pr_url = winner.pr_url
+            if not pr_url:
+                return None
+            return int(pr_url.rsplit("/", 1)[-1])
+        except Exception:  # noqa: BLE001 — a probe, never a decision
+            return None
 
     @staticmethod
     def _checks(
