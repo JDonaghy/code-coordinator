@@ -415,7 +415,16 @@ def is_review_fix_budget_stop_reason(reason: str | None) -> bool:
     the review's own budget, not this one drive session's narrower
     ``--max-fix-rounds``, is the bound that should actually govern whether
     a fix can still be dispatched, so a relaunch here must get a fresh
-    per-drive budget rather than being told it has none left.
+    per-drive budget rather than being told it has none left. That ceiling
+    check is only half of what decides the relaunch's ACTUAL budget, though
+    — ``coord.commands.drive_queue._launch_argv`` is the function that
+    resolves the real ``--max-fix-rounds`` the subprocess gets, and it
+    narrows that figure via :func:`remaining_fix_rounds` independently of
+    this ceiling exemption. Its caller threads this same *own_reason*
+    through to it for exactly that reason: without it, the ceiling check
+    above would wave the relaunch through while `_launch_argv` still handed
+    it the narrowed (here, zero) figure — a relaunch that dispatches,
+    spends an attempt, and dies immediately with nothing fixed.
     """
     if not reason:
         return False
@@ -7117,10 +7126,16 @@ def _reconcile_running(
     # instead goes straight to a PERMANENT `(#2972)` block — exactly the
     # claude-coordinator#4117 incident (quadraui#2870): 5h13m idle with the
     # review's own budget nowhere near exhausted. Exempting it here means
-    # this death falls through to the ordinary `retry` logic below, giving
-    # the next relaunch its own fresh `--max-fix-rounds` — still bounded,
-    # in total, by `max_review_iterations` (`_decide_review`'s own
-    # unconditional check, never bypassed by this exemption).
+    # this death falls through to the ordinary `retry` logic below. The
+    # fresh `--max-fix-rounds` itself is resolved elsewhere — this check
+    # only decides `retry` vs `exhausted`, not the number — by
+    # `coord.commands.drive_queue._launch_argv`, which its caller hands the
+    # SAME *own_reason* this function received so it can widen back to
+    # `effective_max_fix_rounds` for this one shape too, instead of
+    # narrowing via `remaining_fix_rounds` the way every other relaunch
+    # does. Still bounded, in total, by `max_review_iterations`
+    # (`_decide_review`'s own unconditional check, never bypassed by this
+    # exemption).
     ceiling_exempt_review_budget_stop = is_review_fix_budget_stop_reason(own_reason)
     if (
         not ceiling_exempt_merge_stage_exit
