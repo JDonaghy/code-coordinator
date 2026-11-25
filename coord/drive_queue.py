@@ -392,6 +392,39 @@ def is_fix_round_ceiling_reason(reason: str | None) -> bool:
     return "(#2972)" in reason
 
 
+def is_review_fix_budget_stop_reason(reason: str | None) -> bool:
+    """#4117: does *reason* name ``coord.drive``'s "review requested
+    changes after N fix round(s) this drive — stopping" give-up — the
+    ``_decide_review`` branch that dies once ``counters.fix_rounds``
+    (THIS drive session's own, narrower budget) reaches
+    ``opts.max_fix_rounds``, while the message's own "(review iteration
+    X/Y is NOT exhausted; this drive's own --max-fix-rounds is.)" line
+    says plainly that the *issue's* lifetime review-iteration budget
+    (``pipeline.max_review_iterations``) still has room?
+
+    Marker-based, the same convention :func:`is_fix_round_ceiling_reason`
+    uses: ``coord.drive``'s exact wording is stamped verbatim by the one
+    branch that produces it, so a substring check is exact, not a guess.
+    Matches on both halves of the message (the "stopping" sentence AND
+    the "is NOT exhausted" clause) so this can never misfire against the
+    unrelated #2972 fix-round-ceiling give-up below, whose own wording
+    shares neither phrase.
+
+    :func:`_reconcile_running` consults this to EXEMPT the #2972 lifetime
+    ceiling check for exactly this shape (#4117's own "Expected" rule):
+    the review's own budget, not this one drive session's narrower
+    ``--max-fix-rounds``, is the bound that should actually govern whether
+    a fix can still be dispatched, so a relaunch here must get a fresh
+    per-drive budget rather than being told it has none left.
+    """
+    if not reason:
+        return False
+    return (
+        "fix round(s) this drive — stopping" in reason
+        and "is NOT exhausted; this drive's own --max-fix-rounds is" in reason
+    )
+
+
 def is_fix_round_ceiling_blocked(state: str | None, last_reason: str | None) -> bool:
     """#3454 review: the ONE predicate every auto-dispatcher must consult
     before firing against a (repo, issue) — "has this row's drive-queue
@@ -7070,8 +7103,28 @@ def _reconcile_running(
     ) and _running_merge_gate_reading(
         entry, facts, live_running_merge_gate
     ) is False
+    # #4117: a SECOND, unrelated exemption — `coord.drive`'s own "review
+    # requested changes after N fix round(s) this drive — stopping" give-up
+    # (:func:`is_review_fix_budget_stop_reason`) is THIS drive session's
+    # narrower ``--max-fix-rounds`` running out, not the issue's own
+    # ``pipeline.max_review_iterations`` budget — the death message says so
+    # itself ("is NOT exhausted"). Without this, the very session that
+    # legitimately spent its per-drive allowance fixing an EARLIER Test
+    # failure then reads here as having ALSO spent the row's lifetime #2972
+    # ceiling (both are resolved from the same `effective_max_fix_rounds`
+    # figure), so a relaunch that would otherwise get a fresh per-drive
+    # budget and dispatch the still-unanswered review fix immediately
+    # instead goes straight to a PERMANENT `(#2972)` block — exactly the
+    # claude-coordinator#4117 incident (quadraui#2870): 5h13m idle with the
+    # review's own budget nowhere near exhausted. Exempting it here means
+    # this death falls through to the ordinary `retry` logic below, giving
+    # the next relaunch its own fresh `--max-fix-rounds` — still bounded,
+    # in total, by `max_review_iterations` (`_decide_review`'s own
+    # unconditional check, never bypassed by this exemption).
+    ceiling_exempt_review_budget_stop = is_review_fix_budget_stop_reason(own_reason)
     if (
         not ceiling_exempt_merge_stage_exit
+        and not ceiling_exempt_review_budget_stop
         and remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0
     ):
         # #3454: this block now DOES mean "stop" — see
@@ -7185,13 +7238,22 @@ def _reconcile_running(
         )
         return Reconcile(entry.key, "merge_only", reason, occupies=False), None
 
+    review_budget_note = (
+        " — review-fix-budget stop (#4117): this drive's own "
+        "--max-fix-rounds ran out, not the issue's max_review_iterations "
+        "budget, so the relaunch below gets a fresh per-drive allowance "
+        "and the still-unanswered fix can dispatch immediately"
+        if ceiling_exempt_review_budget_stop
+        else ""
+    )
+
     attempts = entry.attempts + 1
     if attempts < effective_max_attempts:
         if own_reason:
             reason = (
                 f"{own_reason} (attempt {attempts}/{effective_max_attempts}) — "
                 f"requeued at position {entry.position}"
-                f"{dispatch_note}{empty_branch_note}"
+                f"{dispatch_note}{empty_branch_note}{review_budget_note}"
             )
         else:
             reason = (

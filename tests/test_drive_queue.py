@@ -1946,6 +1946,92 @@ def test_a_merge_stage_exit_still_blocks_the_ceiling_without_a_clear_gate():
     assert len(plan.blocked) == 1
 
 
+def test_a_review_fix_budget_stop_is_exempt_from_the_ceiling_and_retries():
+    """#4117: a drive died on `_decide_review`'s "review requested changes
+    after N fix round(s) this drive — stopping" give-up — THIS drive
+    session's own narrower `--max-fix-rounds` ran out while fixing an
+    earlier Test failure, not the issue's `max_review_iterations` budget
+    (the message says so itself). Work legs already run against this row
+    sit exactly AT the #2972 lifetime ceiling too (both budgets are
+    resolved from the same `effective_max_fix_rounds` figure), so without
+    the #4117 exemption this would wrongly go `exhausted`/`blocked` — the
+    claude-coordinator#4117 incident (quadraui#2870): 5h13m idle with the
+    review's own budget nowhere near exhausted. It must instead fall
+    through to the ordinary `retry`, giving the next relaunch a fresh
+    per-drive budget so the still-unanswered review fix can dispatch."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): review requested changes "
+        "after 2 fix round(s) this drive — stopping.\n"
+        "   (review iteration 1/5 is NOT exhausted; this drive's own "
+        "--max-fix-rounds is.)\n"
+        "   Findings: coord log rev1\n"
+        "   Continue by hand: coord assign --interactive --fix-of rev1"
+    )
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 1
+    assert own_reason in reconcile.reason
+    assert "fix-round ceiling" not in reconcile.reason
+    assert "(#2972)" not in reconcile.reason
+    assert len(plan.blocked) == 0
+
+
+def test_a_plain_fix_round_ceiling_exit_still_blocks_despite_the_4117_exemption():
+    """Same work-leg count, but `own_reason` names the ORDINARY #2972
+    give-up wording, not the #4117 review-fix-budget-stop shape — the new
+    exemption must not accidentally widen to every ceiling exit."""
+    key = entry_key(REPO, 1650)
+    own_reason = "some other death with no recognised marker at all"
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert "fix-round ceiling" in reconcile.reason
+    assert "(#2972)" in reconcile.reason
+    assert len(plan.blocked) == 1
+
+
+def test_is_review_fix_budget_stop_reason_matches_only_that_shape():
+    from coord.drive_queue import is_review_fix_budget_stop_reason
+
+    assert is_review_fix_budget_stop_reason(
+        "review requested changes after 2 fix round(s) this drive — "
+        "stopping.\n   (review iteration 1/5 is NOT exhausted; this "
+        "drive's own --max-fix-rounds is.)"
+    )
+    # The unrelated #2972 lifetime ceiling wording must never match.
+    assert not is_review_fix_budget_stop_reason(
+        "fix-round ceiling reached across relaunches (#2972): 3 work "
+        "leg(s) already run against this row's own budget of 3"
+    )
+    assert not is_review_fix_budget_stop_reason(
+        "review requested changes after 2 fix round(s) this drive — "
+        "stopping."
+    )
+    assert not is_review_fix_budget_stop_reason("")
+    assert not is_review_fix_budget_stop_reason(None)
+
+
 def test_the_daemon_host_shape_never_exempts_the_ceiling_without_a_live_override():
     """Review finding (fix round 1): on the daemon host `facts.
     merge_gate_status` is ALWAYS `""` — `BoardFetcher._fetch_local()` never
@@ -10764,3 +10850,99 @@ def test_an_unconfirmed_test_state_reset_reason_keeps_the_dead_end_markers():
     # With no original cause to layer onto, the note stands alone rather
     # than emitting a dangling separator.
     assert not test_routing_recovery_unconfirmed_reason("", observed).startswith(" —")
+
+
+# ── #4117: board-doctor remedy for "newest review is request-changes, no
+# newer work leg" ────────────────────────────────────────────────────────
+
+
+def _assignment(
+    *, type: str, dispatched_at: float, assignment_id: str,
+    review_verdict: str | None = None, review_target: str | None = None,
+):
+    from coord.models import Assignment
+
+    return Assignment(
+        machine_name="m1",
+        repo_name=REPO,
+        issue_number=1650,
+        issue_title="t",
+        assignment_id=assignment_id,
+        type=type,
+        status="done",
+        dispatched_at=dispatched_at,
+        review_verdict=review_verdict,
+        review_target=review_target,
+    )
+
+
+def test_review_fix_remedy_target_fires_when_newest_review_requests_changes():
+    """#4117: the newest review for this issue recorded request-changes and
+    no work-like leg has been dispatched since — the remedy is a fix off
+    THAT review, named by its assignment id."""
+    from coord.board_doctor_policy import review_fix_remedy_target
+    from coord.models import Board
+
+    work = _assignment(type="work", dispatched_at=NOW - 100, assignment_id="work1")
+    review = _assignment(
+        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        review_verdict="request-changes",
+    )
+    board = Board(completed=[work, review])
+    assert review_fix_remedy_target(board, REPO, 1650) == "rev1"
+
+
+def test_review_fix_remedy_target_is_none_once_a_newer_work_leg_exists():
+    """A fix (or any other work-like leg) already followed the review — its
+    OWN eventual review is the open question now, not this stale one."""
+    from coord.board_doctor_policy import review_fix_remedy_target
+    from coord.models import Board
+
+    review = _assignment(
+        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        review_verdict="request-changes",
+    )
+    fix = _assignment(type="work", dispatched_at=NOW - 10, assignment_id="fix1")
+    board = Board(completed=[review, fix])
+    assert review_fix_remedy_target(board, REPO, 1650) is None
+
+
+def test_review_fix_remedy_target_is_none_when_the_newest_review_approved():
+    """An ordinary approved review names no fix target at all."""
+    from coord.board_doctor_policy import review_fix_remedy_target
+    from coord.models import Board
+
+    review = _assignment(
+        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        review_verdict="approve",
+    )
+    board = Board(completed=[review])
+    assert review_fix_remedy_target(board, REPO, 1650) is None
+
+
+def test_review_fix_remedy_target_is_none_with_no_review_at_all():
+    from coord.board_doctor_policy import review_fix_remedy_target
+    from coord.models import Board
+
+    work = _assignment(type="work", dispatched_at=NOW - 100, assignment_id="work1")
+    board = Board(completed=[work])
+    assert review_fix_remedy_target(board, REPO, 1650) is None
+
+
+def test_next_action_unperformed_is_the_mechanical_route_not_the_capacity_gated_one():
+    """#4117 acceptance: the `CAUSE_NEXT_ACTION_UNPERFORMED` remedy
+    (`_perform_next_action_unperformed`, which now picks `fix-from-review`
+    over `restage(review)` when `review_fix_remedy_target` fires) is
+    registered on the #3760 MECHANICAL route — never the #3769 investigate
+    route `InvestigateCapacityGate` paces — so this remedy is never
+    deferred by that gate."""
+    from coord.board_doctor import CAUSE_NEXT_ACTION_UNPERFORMED, TIER_AUTO
+    from coord.board_doctor_policy import (
+        INVESTIGATE_CAUSES,
+        _is_mechanical_route,
+        policy_tier_of,
+    )
+
+    assert CAUSE_NEXT_ACTION_UNPERFORMED not in INVESTIGATE_CAUSES
+    assert _is_mechanical_route(CAUSE_NEXT_ACTION_UNPERFORMED)
+    assert policy_tier_of(CAUSE_NEXT_ACTION_UNPERFORMED) == TIER_AUTO

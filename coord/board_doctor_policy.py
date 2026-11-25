@@ -835,6 +835,58 @@ def _restage_test_stale_row(row: StuckRow) -> bool:
     return _restage_stale_gate_row(row, stage="test")
 
 
+def review_fix_remedy_target(
+    board: "Board", repo_name: str, issue_number: int,
+) -> str | None:
+    """#4117: the review assignment id whose own recorded ``request-
+    changes`` verdict IS this issue's remedy — dispatch a fix FROM that
+    review (:func:`coord.board_doctor_permissions.sweep_bounce`, the same
+    primitive ``coord bounce`` runs), never another review. Returns
+    ``None`` when the shape does not hold, which covers both "nothing to
+    fix" (no review at all, or the newest one approved/is still pending)
+    and "already handled" (a work-like leg has already been dispatched
+    since that review — ITS own eventual review is the one still open,
+    not this stale one).
+
+    Reads *board* directly rather than consulting
+    :func:`coord.entry_truth.reconcile_entry`'s ``next_action``: that
+    derivation folds every "review required but not ok" cause into the
+    SAME ``dispatch_review`` verdict — an ordinary review that simply
+    hasn't run yet and one that ran and explicitly said no read
+    identically — which is exactly the #4117 defect for a board-doctor
+    remedy: the row's own review already ran and rejected the diff, so
+    dispatching ANOTHER review just re-derives a conclusion the log
+    already has, the same "not the fix" reasoning #1956 established for
+    an unparseable verdict.
+    """
+    from coord.decomposition_chat import is_size_triage_review_target  # noqa: PLC0415
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    rows = assignments_for_issue(board, repo_name, issue_number)
+    reviews = [
+        a
+        for a in rows
+        if a.type == "review"
+        and a.review_verdict is not None
+        and not is_size_triage_review_target(getattr(a, "review_target", None))
+    ]
+    if not reviews:
+        return None
+    # `assignments_for_issue` sorts oldest dispatch first.
+    newest_review = reviews[-1]
+    if newest_review.review_verdict != "request-changes":
+        return None
+    newest_review_at = newest_review.dispatched_at or 0.0
+    newer_work_exists = any(
+        a.type in WORK_LIKE_TYPES and (a.dispatched_at or 0.0) > newest_review_at
+        for a in rows
+    )
+    if newer_work_exists:
+        return None
+    return newest_review.assignment_id
+
+
 def _perform_next_action_unperformed(row: StuckRow) -> bool:
     """#4045: re-derive *row*'s live :class:`~coord.entry_truth.EntryTruth`
     right before acting — never trusting :func:`coord.board_doctor.
@@ -893,6 +945,27 @@ def _perform_next_action_unperformed(row: StuckRow) -> bool:
         truth = reconcile_entry(board, config, repo_name, issue_number, gh_ops=gh_ops)
 
         if truth.next_action == NEXT_ACTION_DISPATCH_REVIEW:
+            # #4117: `reconcile_entry` folds "no review has run yet" and "a
+            # review ran and said request-changes" into the SAME
+            # `dispatch_review` verdict — but when it's the latter, with
+            # nothing dispatched since, the right remedy is a fix off that
+            # review (`coord bounce`), never another review. Checked BEFORE
+            # the generic `restage(review)` fallback below, which is now
+            # reached only when `review_fix_remedy_target` finds no such
+            # review to bounce.
+            fix_target = review_fix_remedy_target(board, repo_name, issue_number)
+            if fix_target is not None:
+                action_name = "fix-from-review"
+                bounce_result = dispatch_sweep_action(
+                    "bounce", repo_name, issue_number, fix_target, board, config,
+                )
+                acted = bool(bounce_result.get("bounced"))
+                if not acted:
+                    return _warn_noop(
+                        action_name, repo_name, issue_number,
+                        str(bounce_result.get("detail", "")),
+                    )
+                return True
             action_name = "restage(review)"
             result = dispatch_investigator_action(
                 "restage", repo_name, issue_number, board, config,
