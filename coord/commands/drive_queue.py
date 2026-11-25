@@ -103,6 +103,7 @@ from coord.drive_queue import (
     is_policy_refusal_reason,
     is_pre_dispatch_block_reason,
     is_premise_refusal_reason,
+    is_review_fix_budget_stop_reason,
     is_test_stage_routing_dead_end_reason,
     is_unsatisfiable_prereq_reason,
     merge_gate_remedy_command,
@@ -7448,7 +7449,10 @@ def _pipeline_max_fix_rounds_default(config_path: Path | None) -> int | None:
 
 
 def _launch_argv(
-    entry: QueueEntry, config_path: Path | None, facts: IssueFacts | None = None
+    entry: QueueEntry,
+    config_path: Path | None,
+    facts: IssueFacts | None = None,
+    own_reason: str | None = None,
 ) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
@@ -7496,15 +7500,35 @@ def _launch_argv(
     (every caller predating this parameter, and any call site with no board
     read on hand) falls back to the plain per-drive figure — the exact
     pre-#2972 behaviour.
+
+    #4117: *own_reason* — the exact death text `_reconcile_running` read for
+    this SAME entry this SAME tick (`exit_reasons.get(entry.key)`, the one
+    source :func:`is_review_fix_budget_stop_reason` is defined against).
+    When it names a review-fix-budget stop, the #2972 narrowing above is
+    skipped in favour of the plain per-drive `effective_max_fix_rounds`
+    figure instead — the "fresh per-drive allowance"
+    `_reconcile_running`'s own #4117 ceiling exemption already promises
+    this exact shape. Without this, that exemption only widens the
+    `_reconcile_running` CEILING CHECK; this function would still narrow
+    the relaunch's own ``--max-fix-rounds`` down to
+    `remaining_fix_rounds`, which is arithmetically always ``0`` for the
+    shape the exemption targets (the fix rounds this drive already spent
+    on an earlier Test failure are the same lifetime figure
+    `remaining_fix_rounds` subtracts) — so the relaunch would die on
+    `coord drive`'s own ``fix_rounds >= max_fix_rounds`` check with the
+    identical message, spending a tmux launch and an `attempts` slot while
+    dispatching zero fix legs. ``None`` (every caller predating this
+    parameter) reproduces the pre-#4117 narrowing exactly.
     """
     from coord.drive import coord_argv  # noqa: PLC0415
 
     config_default = _pipeline_max_fix_rounds_default(config_path)
-    fix_rounds = (
-        remaining_fix_rounds(entry, facts, config_default)
-        if facts is not None
-        else effective_max_fix_rounds(entry, config_default)
-    )
+    if facts is None:
+        fix_rounds = effective_max_fix_rounds(entry, config_default)
+    elif is_review_fix_budget_stop_reason(own_reason):
+        fix_rounds = effective_max_fix_rounds(entry, config_default)
+    else:
+        fix_rounds = remaining_fix_rounds(entry, facts, config_default)
     argv = coord_argv() + ["drive", entry.repo, str(entry.issue), "--tmux"]
     if entry.machine:
         argv += ["--machine", entry.machine]
@@ -9970,7 +9994,21 @@ def drive_queue_tick(
         # `--max-fix-rounds` is narrowed to what's actually left (see
         # `_launch_argv`'s docstring) — `board` is this SAME tick's read, the
         # one `plan_tick` above already reconciled against.
-        argv = _launch_argv(target, config_path, board.facts(target.key))
+        #
+        # #4117: *own_reason* for the SAME narrowing decision — prefer
+        # *exit_reasons*, this tick's own fresh `drive_exited` read, for an
+        # entry relaunching in the SAME tick it just died in (the ceiling
+        # exemption's own common case); fall back to `target.last_reason`,
+        # the row's persisted reason as of the START of this tick, for an
+        # entry whose relaunch was deferred to a LATER tick by capacity —
+        # `target` is no longer `STATE_RUNNING` by the time *that* tick's
+        # `_fetch_exit_reasons` runs, so `exit_reasons` has nothing for it,
+        # but the retry write that moved it to `waiting` already stamped its
+        # own death text (the #4117 `review_budget_note` wording included)
+        # into `last_reason`, and `entries`/`target` were freshly re-read off
+        # the DB at the top of THIS tick — so it is current, not stale.
+        own_reason = exit_reasons.get(target.key) or target.last_reason
+        argv = _launch_argv(target, config_path, board.facts(target.key), own_reason)
         try:
             result = subprocess.run(  # noqa: S603 — argv built from coord_argv + typed row
                 argv,

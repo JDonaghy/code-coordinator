@@ -2032,6 +2032,57 @@ def test_is_review_fix_budget_stop_reason_matches_only_that_shape():
     assert not is_review_fix_budget_stop_reason(None)
 
 
+def test_launch_argv_widens_back_to_the_per_drive_figure_for_a_review_fix_budget_stop():
+    """#4117: the #2972 ceiling CHECK is only half of what blocked the
+    quadraui#2870 incident — `_reconcile_running`'s exemption above makes
+    the row fall through to `retry` rather than `exhausted`, but the
+    relaunch's own `coord drive --tmux --max-fix-rounds` argv is built by
+    `coord.commands.drive_queue._launch_argv`, a SEPARATE function that
+    narrows the figure via `remaining_fix_rounds` — the exact same lifetime
+    budget the ceiling check just exempted. Walking the issue's own numbers
+    (`max_fix_rounds=2`, `work_leg_count=3`, `legs_at_enqueue=0`):
+    `remaining_fix_rounds` = `2 - (3-0-1)` = 0, so without `own_reason`
+    threaded through too, this relaunch would still be launched with
+    `--max-fix-rounds 0` and die immediately on `coord drive`'s own ceiling
+    check — zero fix legs dispatched, despite the #4117 exemption firing.
+    Passing the review-fix-budget-stop `own_reason` through must instead
+    widen the figure back to `effective_max_fix_rounds`'s plain per-drive
+    allowance (2), the "fresh per-drive allowance" the exemption's own
+    reason text promises."""
+    from coord.commands.drive_queue import _launch_argv
+
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): review requested changes "
+        "after 2 fix round(s) this drive — stopping.\n"
+        "   (review iteration 1/5 is NOT exhausted; this drive's own "
+        "--max-fix-rounds is.)"
+    )
+    row = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+
+    argv = _launch_argv(row, None, facts, own_reason)
+    assert "--max-fix-rounds" in argv
+    assert argv[argv.index("--max-fix-rounds") + 1] == "2"
+
+
+def test_launch_argv_still_narrows_for_an_ordinary_death_at_the_same_leg_count():
+    """Same entry/facts as above, but `own_reason` names an UNRELATED death
+    (or is absent) — the #4117 widening must not leak into the ordinary
+    #2972 narrowing path, which `remaining_fix_rounds` still computes as 0
+    for this leg count."""
+    from coord.commands.drive_queue import _launch_argv
+
+    row = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+
+    argv = _launch_argv(row, None, facts, "some other death, no marker at all")
+    assert argv[argv.index("--max-fix-rounds") + 1] == "0"
+
+    argv_no_reason = _launch_argv(row, None, facts, None)
+    assert argv_no_reason[argv_no_reason.index("--max-fix-rounds") + 1] == "0"
+
+
 def test_the_daemon_host_shape_never_exempts_the_ceiling_without_a_live_override():
     """Review finding (fix round 1): on the daemon host `facts.
     merge_gate_status` is ALWAYS `""` — `BoardFetcher._fetch_local()` never
