@@ -1595,6 +1595,7 @@ class GhLiveProbe:
         else:
             errors.append(f"gh: no branch known for {entry.key}")
 
+        number_from_board: int | None = None
         if not pr_state and entry.state in STATE_DONE_LIKE:
             # #4137 (quadraui#2825): the branch-based read above came back
             # empty — either there was no branch to resolve at all, or the
@@ -1605,11 +1606,12 @@ class GhLiveProbe:
             # like a branch name does (`gh` accepts a number OR a branch
             # as the same positional selector), entirely independently of
             # `branch`.
-            number = self._pr_number_from_board(entry)
-            if number is not None:
+            number_from_board = self._pr_number_from_board(entry)
+            if number_from_board is not None:
                 try:
                     pr_state = (
-                        github_ops.get_pr_state_for_branch(slug, str(number)) or "none"
+                        github_ops.get_pr_state_for_branch(slug, str(number_from_board))
+                        or "none"
                     )
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"gh pr view (by number): {type(exc).__name__}: {exc}")
@@ -1627,11 +1629,20 @@ class GhLiveProbe:
         pr_number: int | None = None
         mergeable: bool | None = None
         if pr_state == "OPEN":
-            try:
-                found = github_ops.find_pr_for_branch(slug, branch) or {}
-                pr_number = int(found.get("number")) if found.get("number") else None
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"gh pr list: {type(exc).__name__}: {exc}")
+            if branch:
+                try:
+                    found = github_ops.find_pr_for_branch(slug, branch) or {}
+                    pr_number = int(found.get("number")) if found.get("number") else None
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"gh pr list: {type(exc).__name__}: {exc}")
+            elif number_from_board is not None:
+                # No branch to resolve from (the board-side lookup above is
+                # what produced "OPEN" in the first place) — reuse that
+                # same number instead of calling `find_pr_for_branch` with
+                # an empty `--head`, which `gh` reads as "no head filter"
+                # and would bind an ARBITRARY open PR in the repo to this
+                # entry.
+                pr_number = number_from_board
             if pr_number is not None:
                 try:
                     mergeable = github_ops.check_pr_mergeable(slug, pr_number)
