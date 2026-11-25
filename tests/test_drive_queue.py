@@ -16,6 +16,7 @@ most attention here are the ones that caused real incidents:
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11087,6 +11088,29 @@ def test_review_fix_remedy_target_is_none_with_no_review_at_all():
     assert review_fix_remedy_target(board, REPO, 1650) is None
 
 
+def test_review_fix_remedy_target_is_none_when_a_newer_review_has_no_verdict_yet():
+    """#4117 review: an older review recorded request-changes, but a NEWER
+    review for the same row has not posted a verdict at all yet — still
+    running/pending, or a crashed leg whose verdict never propagated
+    (quadraui#2873). The older request-changes verdict is not this row's
+    newest word, so bouncing off it would race the in-flight review —
+    `review_fix_remedy_target` must refuse rather than pick the stale
+    verdicted review just because it is the newest VERDICTED one."""
+    from coord.board_doctor_policy import review_fix_remedy_target
+    from coord.models import Board
+
+    stale_review = _assignment(
+        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        review_verdict="request-changes",
+    )
+    in_flight_review = _assignment(
+        type="review", dispatched_at=NOW - 10, assignment_id="rev2",
+        review_verdict=None,
+    )
+    board = Board(completed=[stale_review, in_flight_review])
+    assert review_fix_remedy_target(board, REPO, 1650) is None
+
+
 def test_next_action_unperformed_is_the_mechanical_route_not_the_capacity_gated_one():
     """#4117 acceptance: the `CAUSE_NEXT_ACTION_UNPERFORMED` remedy
     (`_perform_next_action_unperformed`, which now picks `fix-from-review`
@@ -11104,3 +11128,115 @@ def test_next_action_unperformed_is_the_mechanical_route_not_the_capacity_gated_
     assert CAUSE_NEXT_ACTION_UNPERFORMED not in INVESTIGATE_CAUSES
     assert _is_mechanical_route(CAUSE_NEXT_ACTION_UNPERFORMED)
     assert policy_tier_of(CAUSE_NEXT_ACTION_UNPERFORMED) == TIER_AUTO
+
+
+def _next_action_unperformed_row():
+    from coord.board_doctor import CAUSE_NEXT_ACTION_UNPERFORMED, StuckRow
+
+    return StuckRow(
+        queue="drive-queue",
+        key=f"{REPO}#1650",
+        state="stuck",
+        cause=CAUSE_NEXT_ACTION_UNPERFORMED,
+        confidence="high",
+        evidence=(f"cause={CAUSE_NEXT_ACTION_UNPERFORMED}",),
+    )
+
+
+def _wire_next_action_unperformed(monkeypatch, board, config, *, next_action) -> None:
+    import coord.board_doctor_policy as policy
+
+    monkeypatch.setattr(
+        policy, "_resolve_board_and_config_for_mechanical_action",
+        lambda *a, **k: (board, config),
+    )
+    monkeypatch.setattr(
+        "coord.entry_truth.reconcile_entry",
+        lambda *a, **k: SimpleNamespace(
+            next_action=next_action, next_action_reason="review required but not approved",
+        ),
+    )
+
+
+def test_perform_next_action_unperformed_dispatches_a_bounce_off_a_request_changes_review(
+    monkeypatch,
+):
+    """#4117 acceptance: with a `request-changes` review as the newest
+    review for this row and nothing else in flight,
+    `_perform_next_action_unperformed` reaches `dispatch_sweep_action(
+    "bounce", ...)` — the real production wiring, not just
+    `review_fix_remedy_target` in isolation."""
+    from coord.board_doctor_policy import AUTO_DISPATCHERS
+    from coord.config import Config
+    from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
+    from coord.models import Board
+
+    review = _assignment(
+        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        review_verdict="request-changes",
+    )
+    board = Board(completed=[review])
+    config = Config(repos=[], machines=[])
+    _wire_next_action_unperformed(
+        monkeypatch, board, config, next_action=NEXT_ACTION_DISPATCH_REVIEW,
+    )
+    monkeypatch.setattr("coord.drive.list_drive_sessions", list)
+
+    bounce_calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coord.board_doctor_policy.dispatch_sweep_action",
+        lambda *a, **k: bounce_calls.append(a) or {"bounced": True},
+    )
+
+    from coord.board_doctor_policy import CAUSE_NEXT_ACTION_UNPERFORMED
+
+    performed = AUTO_DISPATCHERS[CAUSE_NEXT_ACTION_UNPERFORMED](
+        _next_action_unperformed_row(),
+    )
+
+    assert performed is True
+    assert bounce_calls == [("bounce", REPO, 1650, "rev1", board, config)]
+
+
+def test_perform_next_action_unperformed_refuses_to_bounce_onto_a_live_drive_session(
+    monkeypatch,
+):
+    """#4117 review: a live `coord drive` session is already running
+    against this row (the live-drive half `_in_flight_work_detail` checks
+    that the predecessor `restage(review)` remedy was safe against, and
+    this `fix-from-review` remedy was not) — the bounce must be refused,
+    never dispatched out from under it."""
+    from coord.board_doctor_policy import (
+        AUTO_DISPATCHERS,
+        CAUSE_NEXT_ACTION_UNPERFORMED,
+    )
+    from coord.config import Config
+    from coord.entry_truth import NEXT_ACTION_DISPATCH_REVIEW
+    from coord.models import Board
+
+    review = _assignment(
+        type="review", dispatched_at=NOW - 50, assignment_id="rev1",
+        review_verdict="request-changes",
+    )
+    board = Board(completed=[review])
+    config = Config(repos=[], machines=[])
+    _wire_next_action_unperformed(
+        monkeypatch, board, config, next_action=NEXT_ACTION_DISPATCH_REVIEW,
+    )
+    monkeypatch.setattr(
+        "coord.drive.list_drive_sessions",
+        lambda: [{"repo": REPO, "issue": 1650, "session_name": "drive-1650"}],
+    )
+
+    bounce_calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coord.board_doctor_policy.dispatch_sweep_action",
+        lambda *a, **k: bounce_calls.append(a) or {"bounced": True},
+    )
+
+    performed = AUTO_DISPATCHERS[CAUSE_NEXT_ACTION_UNPERFORMED](
+        _next_action_unperformed_row(),
+    )
+
+    assert performed is False
+    assert bounce_calls == []

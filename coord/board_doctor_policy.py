@@ -842,11 +842,20 @@ def review_fix_remedy_target(
     changes`` verdict IS this issue's remedy — dispatch a fix FROM that
     review (:func:`coord.board_doctor_permissions.sweep_bounce`, the same
     primitive ``coord bounce`` runs), never another review. Returns
-    ``None`` when the shape does not hold, which covers both "nothing to
-    fix" (no review at all, or the newest one approved/is still pending)
-    and "already handled" (a work-like leg has already been dispatched
-    since that review — ITS own eventual review is the one still open,
-    not this stale one).
+    ``None`` when the shape does not hold, which covers "nothing to fix"
+    (no review at all, or the newest one approved/is still pending),
+    "already handled" (a work-like leg has already been dispatched since
+    that review — ITS own eventual review is the one still open, not this
+    stale one), and "a review is already in flight for this row" (the
+    newest review OVERALL — not just the newest *verdicted* one — has no
+    verdict yet). That last case matters even though a pending review's
+    own eventual next action is a mechanical no-op here: an older
+    request-changes verdict must not look like the newest word on this
+    row just because the review that superseded it hasn't posted yet, or
+    never will (quadraui#2873's "verdict not propagated after an agent
+    restart") — bouncing off it would dispatch a fix worker onto a branch
+    a review leg is still actively reading, the same double-dispatch
+    shape #476/#477 guard everywhere else.
 
     Reads *board* directly rather than consulting
     :func:`coord.entry_truth.reconcile_entry`'s ``next_action``: that
@@ -868,13 +877,19 @@ def review_fix_remedy_target(
         a
         for a in rows
         if a.type == "review"
-        and a.review_verdict is not None
-        and not is_size_triage_review_target(getattr(a, "review_target", None))
+        and not is_size_triage_review_target(a.review_target)
     ]
     if not reviews:
         return None
     # `assignments_for_issue` sorts oldest dispatch first.
     newest_review = reviews[-1]
+    if newest_review.review_verdict is None:
+        # The newest review for this row hasn't posted a verdict yet
+        # (still running/pending, or a crashed leg whose verdict never
+        # propagated) — an older request-changes verdict underneath it is
+        # not this row's newest word, and bouncing off it would race the
+        # in-flight review.
+        return None
     if newest_review.review_verdict != "request-changes":
         return None
     newest_review_at = newest_review.dispatched_at or 0.0
@@ -956,6 +971,23 @@ def _perform_next_action_unperformed(row: StuckRow) -> bool:
             fix_target = review_fix_remedy_target(board, repo_name, issue_number)
             if fix_target is not None:
                 action_name = "fix-from-review"
+                from coord.board_doctor_permissions import (  # noqa: PLC0415
+                    _in_flight_work_detail,
+                )
+
+                # #4117: `review_fix_remedy_target` already refuses when
+                # the newest review itself is still unverdicted, but that
+                # leaves the live-`coord drive` half uncovered — the one
+                # question every OTHER sweep primitive that takes a row
+                # down and dispatches a worker against it
+                # (`sweep_dispatch_fixit_leg`, `investigator_requeue`) asks
+                # before acting.
+                in_flight = _in_flight_work_detail(
+                    repo_name, issue_number, board, verb="a fix-from-review bounce",
+                )
+                if in_flight is not None:
+                    return _warn_noop(action_name, repo_name, issue_number, in_flight)
+
                 bounce_result = dispatch_sweep_action(
                     "bounce", repo_name, issue_number, fix_target, board, config,
                 )
