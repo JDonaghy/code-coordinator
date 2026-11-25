@@ -405,10 +405,23 @@ def is_review_fix_budget_stop_reason(reason: str | None) -> bool:
     Marker-based, the same convention :func:`is_fix_round_ceiling_reason`
     uses: ``coord.drive``'s exact wording is stamped verbatim by the one
     branch that produces it, so a substring check is exact, not a guess.
-    Matches on both halves of the message (the "stopping" sentence AND
-    the "is NOT exhausted" clause) so this can never misfire against the
-    unrelated #2972 fix-round-ceiling give-up below, whose own wording
-    shares neither phrase.
+
+    Matched on the message's FIRST LINE alone, and deliberately not on the
+    "is NOT exhausted" clause that follows it. The clause would be a
+    tighter match, but it is on line two — and a reason this predicate has
+    to recognise does not always still have a line two. A relaunch is
+    paced by #2273's post-death backoff, so it usually happens on a LATER
+    tick than the death, where the only text on hand is the row's
+    persisted ``last_reason`` — which :func:`_augment_backoff_reason` has
+    by then rewritten down to "first line of the original cause + the
+    fresh backoff sentence". Requiring both halves made this predicate
+    blind on exactly the tick that launches the relaunch. The first-line
+    sentence is unique to the one ``_decide_review`` branch that emits it,
+    so it is no weaker as a marker: the #2972 fix-round-ceiling give-up
+    below shares none of it, and ``coord.drive``'s neighbouring
+    review-stage give-ups ("review requested changes and the fix loop is
+    exhausted", "...but pipeline.auto_loop is OFF") are worded differently
+    throughout.
 
     :func:`_reconcile_running` consults this to EXEMPT the #2972 lifetime
     ceiling check for exactly this shape (#4117's own "Expected" rule):
@@ -428,10 +441,7 @@ def is_review_fix_budget_stop_reason(reason: str | None) -> bool:
     """
     if not reason:
         return False
-    return (
-        "fix round(s) this drive — stopping" in reason
-        and "is NOT exhausted; this drive's own --max-fix-rounds is" in reason
-    )
+    return "fix round(s) this drive — stopping" in reason
 
 
 def is_fix_round_ceiling_blocked(state: str | None, last_reason: str | None) -> bool:
@@ -7256,8 +7266,9 @@ def _reconcile_running(
     review_budget_note = (
         " — review-fix-budget stop (#4117): this drive's own "
         "--max-fix-rounds ran out, not the issue's max_review_iterations "
-        "budget, so the relaunch below gets a fresh per-drive allowance "
-        "and the still-unanswered fix can dispatch immediately"
+        "budget, so the #2972 lifetime ceiling is exempted here and the "
+        "relaunch is budgeted from this row's own per-drive allowance "
+        "rather than the lifetime remainder"
         if ceiling_exempt_review_budget_stop
         else ""
     )
