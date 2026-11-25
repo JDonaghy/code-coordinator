@@ -2014,25 +2014,97 @@ def test_a_plain_fix_round_ceiling_exit_still_blocks_despite_the_4117_exemption(
 def test_is_review_fix_budget_stop_reason_matches_only_that_shape():
     from coord.drive_queue import is_review_fix_budget_stop_reason
 
-    assert is_review_fix_budget_stop_reason(
+    full = (
         "review requested changes after 2 fix round(s) this drive — "
         "stopping.\n   (review iteration 1/5 is NOT exhausted; this "
         "drive's own --max-fix-rounds is.)"
     )
+    assert is_review_fix_budget_stop_reason(full)
     # The unrelated #2972 lifetime ceiling wording must never match.
     assert not is_review_fix_budget_stop_reason(
         "fix-round ceiling reached across relaunches (#2972): 3 work "
         "leg(s) already run against this row's own budget of 3"
     )
+    # `coord.drive`'s neighbouring review-stage give-ups are different
+    # decisions (the issue's own review loop IS exhausted; auto_loop is
+    # off) and must not borrow this exemption.
     assert not is_review_fix_budget_stop_reason(
-        "review requested changes after 2 fix round(s) this drive — "
-        "stopping."
+        "review requested changes and the fix loop is exhausted\n"
+        "   (5 rounds, cap 5)."
+    )
+    assert not is_review_fix_budget_stop_reason(
+        "review requested changes but pipeline.auto_loop is OFF — the "
+        "review→fix path is switched off in coordinator.yml"
     )
     assert not is_review_fix_budget_stop_reason("")
     assert not is_review_fix_budget_stop_reason(None)
 
 
-def test_launch_argv_widens_back_to_the_per_drive_figure_for_a_review_fix_budget_stop():
+def test_is_review_fix_budget_stop_reason_survives_the_backoff_rewrite():
+    """The tick that actually relaunches is a LATER one than the death
+    (#2273 paces every relaunch behind a post-death backoff), so the text
+    this predicate is asked about there is the row's persisted
+    `last_reason` — which `_augment_backoff_reason` has reduced to the
+    first line of the original cause plus a fresh backoff sentence. A
+    predicate that needed the message's second-line "is NOT exhausted"
+    clause read False on exactly that tick, so the relaunch was budgeted
+    with the lifetime remainder (0) and died without dispatching
+    anything. Built through the real `_augment_backoff_reason` rather
+    than a hand-written approximation of its output, so the two cannot
+    drift apart.
+    """
+    from coord.drive_queue import (
+        _augment_backoff_reason,
+        is_review_fix_budget_stop_reason,
+    )
+
+    death = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): review "
+        "requested changes after 2 fix round(s) this drive — stopping.\n"
+        "   (review iteration 1/5 is NOT exhausted; this drive's own "
+        "--max-fix-rounds is.)\n"
+        "   Findings: coord log rev1"
+    )
+    stored = _augment_backoff_reason(
+        f"{death} (attempt 1/2) — requeued at position 0",
+        "retry backoff: the previous attempt failed 0s ago, next attempt "
+        "permitted in 60s",
+    )
+    # The clause the predicate used to require really is gone by then.
+    assert "is NOT exhausted" not in stored
+    assert is_review_fix_budget_stop_reason(stored)
+
+
+def _launch_argv_config(tmp_path: Path) -> Path:
+    """A minimal real `coordinator.yml` for the `_launch_argv` tests below.
+
+    They must hand `_launch_argv` an EXPLICIT config path: `None` resolves
+    to ``$HOME/.coord/coordinator.yml``, so a unit test passing `None`
+    reads (or fails to read) whatever the machine it runs on happens to
+    have — green on a coordinator host, red in a thin-client ``$HOME``
+    with no `coordinator.yml` at all, which is what
+    `scripts/run_tests_in_populated_home.sh` synthesizes and what every
+    fleet client really looks like. This file names no `pipeline:` block,
+    so `pipeline.max_fix_rounds` is the built-in default and the entry's
+    own `max_fix_rounds` override is what decides the figure under test.
+    """
+    path = tmp_path / "coordinator.yml"
+    path.write_text(
+        "repos:\n"
+        f"  - name: {REPO}\n"
+        f"    github: john/{REPO}\n"
+        "    default_branch: main\n"
+        "machines:\n"
+        "  - name: dellserver\n"
+        "    host: dellserver\n"
+        f"    repos: [{REPO}]\n"
+    )
+    return path
+
+
+def test_launch_argv_widens_back_to_the_per_drive_figure_for_a_review_fix_budget_stop(
+    tmp_path: Path,
+):
     """#4117: the #2972 ceiling CHECK is only half of what blocked the
     quadraui#2870 incident — `_reconcile_running`'s exemption above makes
     the row fall through to `retry` rather than `exhausted`, but the
@@ -2061,12 +2133,14 @@ def test_launch_argv_widens_back_to_the_per_drive_figure_for_a_review_fix_budget
     row = entry(1650, max_fix_rounds=2)
     facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
 
-    argv = _launch_argv(row, None, facts, own_reason)
+    argv = _launch_argv(row, _launch_argv_config(tmp_path), facts, own_reason)
     assert "--max-fix-rounds" in argv
     assert argv[argv.index("--max-fix-rounds") + 1] == "2"
 
 
-def test_launch_argv_still_narrows_for_an_ordinary_death_at_the_same_leg_count():
+def test_launch_argv_still_narrows_for_an_ordinary_death_at_the_same_leg_count(
+    tmp_path: Path,
+):
     """Same entry/facts as above, but `own_reason` names an UNRELATED death
     (or is absent) — the #4117 widening must not leak into the ordinary
     #2972 narrowing path, which `remaining_fix_rounds` still computes as 0
@@ -2075,12 +2149,45 @@ def test_launch_argv_still_narrows_for_an_ordinary_death_at_the_same_leg_count()
 
     row = entry(1650, max_fix_rounds=2)
     facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+    config_path = _launch_argv_config(tmp_path)
 
-    argv = _launch_argv(row, None, facts, "some other death, no marker at all")
+    argv = _launch_argv(row, config_path, facts, "some other death, no marker at all")
     assert argv[argv.index("--max-fix-rounds") + 1] == "0"
 
-    argv_no_reason = _launch_argv(row, None, facts, None)
+    argv_no_reason = _launch_argv(row, config_path, facts, None)
     assert argv_no_reason[argv_no_reason.index("--max-fix-rounds") + 1] == "0"
+
+
+def test_the_fix_round_config_peek_fails_soft_on_an_unresolvable_config(
+    tmp_path: Path,
+):
+    """The `--max-fix-rounds` figure both `_launch_argv` and the tick's
+    `plan_tick` call read their config default from is an ADVISORY peek:
+    it must degrade to `None` (built-in default) when the config cannot be
+    resolved at all, never take the tick down with it.
+
+    `_load_config` reports an unresolvable config as `click.echo` +
+    `sys.exit(2)`, and `SystemExit` is a `BaseException` — it escapes an
+    `except Exception`. So a peek routed through that wrapper killed the
+    launch path outright on any machine whose config does not resolve: a
+    thin client with no `~/.coord/coordinator.yml`, exactly the shape
+    `scripts/run_tests_in_populated_home.sh` synthesizes. Pinned on both
+    halves: the peek returning `None`, and `_launch_argv` still producing
+    a launchable argv (with the entry's own per-drive figure) over the
+    same unresolvable path.
+    """
+    from coord.commands.drive_queue import (
+        _launch_argv,
+        _pipeline_max_fix_rounds_default,
+    )
+
+    missing = tmp_path / "definitely-absent" / "coordinator.yml"
+    assert _pipeline_max_fix_rounds_default(missing) is None
+
+    row = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=1)
+    argv = _launch_argv(row, missing, facts, None)
+    assert argv[argv.index("--max-fix-rounds") + 1] == "2"
 
 
 def test_the_daemon_host_shape_never_exempts_the_ceiling_without_a_live_override():

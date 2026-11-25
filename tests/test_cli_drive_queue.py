@@ -3813,6 +3813,82 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(
     assert state._get_drive_escalation_local(REPO, 1762) is not None
 
 
+def test_a_review_fix_budget_stop_relaunches_with_a_budget_that_can_dispatch(
+    cli, seed, launches, coord_db
+):
+    """#4117 end-to-end: a drive that died on `_decide_review`'s "review
+    requested changes after N fix round(s) this drive — stopping" give-up
+    must come back with a `--max-fix-rounds` the relaunched drive can
+    actually SPEND, not just a `waiting` row.
+
+    The row sits exactly at the #2972 lifetime ceiling (3 work legs
+    against `--max-fix-rounds 2`), because the fix rounds this drive
+    already spent on an earlier Test failure are the same lifetime figure
+    the ceiling counts. Two separate decisions have to go the right way
+    for the still-unanswered review fix to reach a worker, and they are
+    made by different functions reading the same death text:
+    `_reconcile_running`'s ceiling check (retry, not a permanent
+    `(#2972)` block) and `_launch_argv`'s `--max-fix-rounds` resolution.
+    Exempting only the first one yields a relaunch launched with
+    `--max-fix-rounds 0`, which dies on `coord drive`'s own identical
+    check having dispatched nothing — an idle row that burns a tmux
+    launch per tick, which is the quadraui#2870 incident this closes. So
+    the assertion is on the relaunch ARGV, the one observation that shows
+    the remedy can reach a dispatch.
+    """
+    from coord.audit import record_audit
+    from coord.drive_queue import entry_key
+
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--machine", "dellserver",
+               "--max-fix-rounds", "2").exit_code == 0
+    assert cli("tick").exit_code == 0
+    assert queued(1650)["state"] == "running"
+
+    # This drive's own history: the initial work leg plus the 2 fix rounds
+    # it spent on an earlier Test failure — `legs_at_enqueue` was stamped
+    # at 0 by the `add` above, so all 3 count against this row's budget.
+    seed(assignments=[
+        {"issue_number": 1650, "type": "work", "status": "done"}
+        for _ in range(3)
+    ])
+
+    own_reason = (
+        f"drive exited for {entry_key(REPO, 1650)} (exit_code=1): review "
+        "requested changes after 2 fix round(s) this drive — stopping.\n"
+        "   (review iteration 1/5 is NOT exhausted; this drive's own "
+        "--max-fix-rounds is.)"
+    )
+    launched_at = queued(1650)["launched_at"]
+    _backdate(1650, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=own_reason, repo=REPO, issue=1650,
+        ts=launched_at + 5,
+    )
+
+    retry = cli("tick")
+    assert retry.exit_code == 0, retry.output
+    row = queued(1650)
+    assert row["state"] == "waiting"
+    assert row["attempts"] == 1
+    assert "(#2972)" not in row["last_reason"]
+    assert len(launches) == 1, launches  # paced by #2273's backoff, not yet
+
+    _backdate_reason(coord_db, 1650, PAST_BOTH_RETRY_GATES_SECONDS)
+    relaunch = cli("tick")
+    assert relaunch.exit_code == 0, relaunch.output
+    assert queued(1650)["state"] == "running"
+    assert len(launches) == 2, launches
+
+    argv = launches[1]
+    assert "--max-fix-rounds" in argv, argv
+    # The row's own per-drive figure, not the lifetime remainder of 0 —
+    # `coord drive` dies on `fix_rounds >= max_fix_rounds` before
+    # dispatching anything at 0.
+    assert argv[argv.index("--max-fix-rounds") + 1] == "2", argv
+
+
 def test_a_premise_refusal_park_escalates_exactly_once(
     cli, seed, launches, coord_db, monkeypatch,
 ):
