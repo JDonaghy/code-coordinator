@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from coord import queue_diagnose as qd
 from coord.config import Config, Machine, Repo
-from coord.drive_queue import STATE_BLOCKED, QueueEntry
+from coord.drive_queue import STATE_BLOCKED, STATE_DONE, QueueEntry
 from coord.models import Assignment, Board
 
 REPO = "api"
@@ -604,3 +604,151 @@ def test_live_entry_truth_reads_the_same_reconcile_entry_fact_as_staleness(monke
     assert got is not None
     assert got.next_action == want.next_action
     assert got.review_stale == want.review_stale
+
+
+# ── #4137 (quadraui#2825): a `done`/merged row with an unresolved branch ────
+# ── must never read the ambiguous `""` and fall through to a stale cause ────
+
+
+def test_the_done_unconfirmed_sentinel_outranks_a_stale_integration_red_reading():
+    """The pure `diagnose()` rule: even a live-failing check with a clean
+    branch Test verdict (`_rule_integration_red`'s own trigger shape) must
+    never win over a `done` row's explicit, queue-confirmed sentinel."""
+    got = qd.diagnose(
+        entry(50, state=STATE_DONE),
+        live(
+            pr_state=qd.PR_STATE_DONE_UNCONFIRMED,
+            pr_number=None,
+            checks=(qd.CheckReading("build", "failure"),),
+            branch_test_state="passed",
+        ),
+    )
+    assert got.cause == qd.CAUSE_QUEUE_ALREADY_DONE
+    assert got.cause != qd.CAUSE_INTEGRATION_RED
+
+
+def test_a_non_done_row_with_no_branch_keeps_the_plain_ambiguous_empty_state():
+    """#4137's fix is scoped to `STATE_DONE_LIKE` rows only — a genuinely
+    stalled, not-yet-finished row with no branch must keep reading the
+    plain `""`, never the sentinel, so the existing, more specific
+    `CAUSE_NEVER_DISPATCHED`/abstention handling of that shape
+    (`tests/test_block_log.py`) is unaffected."""
+    board = Board()
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    e = entry(64)  # default state=STATE_BLOCKED
+    errors: list[str] = []
+
+    _pr_number, pr_state, _mergeable, _checks = probe._github(e, "", errors)  # noqa: SLF001
+
+    assert pr_state == ""
+
+
+def test_a_done_row_with_no_branch_and_no_assignment_at_all_reads_the_sentinel():
+    """#4137 (quadraui#2825)'s exact shape: the drive-queue row already
+    reads `done`, but `build_gate_report` found no work-like assignment
+    behind it at all (e.g. housekeeping aged it off `board.active`/
+    `board.completed`) — `_github` has nothing live to resolve, and must
+    say so explicitly rather than leaving the ambiguous `""`."""
+    board = Board()
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    e = entry(60, state=STATE_DONE)
+    errors: list[str] = []
+
+    pr_number, pr_state, mergeable, checks = probe._github(e, "", errors)  # noqa: SLF001
+
+    assert pr_state == qd.PR_STATE_DONE_UNCONFIRMED
+    assert pr_number is None
+    assert mergeable is None
+    assert checks is None
+    assert any("no branch known" in err for err in errors)
+
+    state = probe.probe(e)
+    got = qd.diagnose(e, state)
+    assert got.cause == qd.CAUSE_QUEUE_ALREADY_DONE
+
+
+def test_a_done_row_whose_branch_raises_and_has_no_pr_url_reads_the_sentinel(
+    monkeypatch,
+):
+    """The branch IS recorded, but the one live `gh pr view <branch>` call
+    raises (e.g. the branch ref was deleted after merge) and the winning
+    assignment has no `pr_url` for a second, branch-independent attempt —
+    still an explicit sentinel, never the ambiguous `""`."""
+    work = _work(issue=63, branch="issue-63-fix", pr_url=None)
+    board = Board(completed=[work])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    e = entry(63, state=STATE_DONE)
+    errors: list[str] = []
+
+    def fake_get_pr_state(repo: str, branch: str) -> str:
+        raise RuntimeError('gh: no pull requests found for branch "issue-63-fix"')
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_pr_state_for_branch", fake_get_pr_state,
+    )
+
+    _pr_number, pr_state, _mergeable, _checks = probe._github(  # noqa: SLF001
+        e, "issue-63-fix", errors,
+    )
+
+    assert pr_state == qd.PR_STATE_DONE_UNCONFIRMED
+    assert any("gh pr view:" in err for err in errors)
+
+
+def test_a_done_row_with_no_resolvable_branch_but_a_recorded_pr_url_confirms_merged(
+    monkeypatch,
+):
+    """A REAL live confirmation must always be preferred over the
+    sentinel whenever one is available: the winning assignment's
+    `pr_url` — recorded independently of `branch` — resolves `gh pr view`
+    exactly the same way a branch name does."""
+    work = _work(issue=61, branch="", pr_url="https://github.com/acme/api/pull/501")
+    board = Board(completed=[work])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    e = entry(61, state=STATE_DONE)
+    errors: list[str] = []
+
+    def fake_get_pr_state(repo: str, branch: str) -> str:
+        assert branch == "501"
+        return "MERGED"
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_pr_state_for_branch", fake_get_pr_state,
+    )
+
+    _pr_number, pr_state, _mergeable, _checks = probe._github(e, "", errors)  # noqa: SLF001
+
+    assert pr_state == "MERGED"
+
+    got = qd.diagnose(e, qd.LiveState(pr_state=pr_state))
+    assert got.cause == qd.CAUSE_PR_MERGED
+
+
+def test_a_done_row_whose_branch_no_longer_resolves_falls_back_to_the_pr_number(
+    monkeypatch,
+):
+    """The branch string IS recorded but no longer resolves live (deleted
+    post-merge); the PR number recorded on the winning assignment is a
+    second, branch-independent way to confirm the real state."""
+    work = _work(issue=62, branch="issue-62-fix", pr_url="https://github.com/acme/api/pull/777")
+    board = Board(completed=[work])
+    probe = qd.GhLiveProbe(board=board, config=_config())
+    e = entry(62, state=STATE_DONE)
+    errors: list[str] = []
+
+    def fake_get_pr_state(repo: str, branch: str) -> str:
+        if branch == "issue-62-fix":
+            raise RuntimeError('gh: no pull requests found for branch "issue-62-fix"')
+        assert branch == "777"
+        return "MERGED"
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_pr_state_for_branch", fake_get_pr_state,
+    )
+
+    _pr_number, pr_state, _mergeable, _checks = probe._github(  # noqa: SLF001
+        e, "issue-62-fix", errors,
+    )
+
+    assert pr_state == "MERGED"
+    assert any("gh pr view:" in err for err in errors)
