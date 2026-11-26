@@ -860,6 +860,11 @@ def _fix_from_review(
         "terminal_skip": (
             "the reviewed work is already merged/closed on GitHub (#522)"
         ),
+        "rework_refused": (
+            "the live PR/branch/drive-queue state says there is nothing left "
+            "to rework (#4121) — see the detail line below for which fact "
+            "refused"
+        ),
         "no_work_found": "fix dispatch failed",
     }
     reason = next(

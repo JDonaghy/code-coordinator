@@ -50,7 +50,10 @@ def _assignment(**overrides) -> Assignment:
 
 
 def _board(*assignments: Assignment) -> Board:
-    return Board(active=[], completed=list(assignments))
+    return Board(
+        repos=list(_config().repos), machines=[], active=[],
+        completed=list(assignments),
+    )
 
 
 def _config() -> Config:
@@ -421,42 +424,37 @@ def test_accepts_a_caller_supplied_board_instead_of_building_its_own():
 
 
 def _work_row(**overrides) -> Assignment:
-    defaults = dict(
-        machine_name="laptop",
-        repo_name=REPO,
-        issue_number=ISSUE,
-        issue_title="Fix the thing",
-        briefing="Original briefing text.",
-        assignment_id="work-2825",
-        status="done",
-        branch="issue-2825-fix",
-        pr_url="https://github.com/org/quadraui/pull/999",
-        dispatched_at=100.0,
-        finished_at=101.0,
-        type="work",
-        review_state="dispatched",
-        review_iteration=0,
-    )
-    defaults.update(overrides)
-    return Assignment(**defaults)
+    """The reviewed WORK row — ``_assignment()`` plus the fields the fix
+    dispatchers actually read: a briefing to re-send, a ``review_state`` for
+    the verdict to propagate onto, and a PR for the guard to refuse against.
+    """
+    return _assignment(**{
+        "assignment_id": "work-2825",
+        "issue_title": "Fix the thing",
+        "briefing": "Original briefing text.",
+        "pr_url": "https://github.com/org/quadraui/pull/999",
+        "finished_at": 101.0,
+        "review_state": "dispatched",
+        **overrides,
+    })
 
 
 def _review_row(**overrides) -> Assignment:
-    defaults = dict(
-        machine_name="laptop",
-        repo_name=REPO,
-        issue_number=ISSUE,
-        issue_title="[review] Fix the thing",
-        assignment_id="review-2825",
-        status="done",
-        branch="issue-2825-fix",
-        dispatched_at=102.0,
-        finished_at=103.0,
-        type="review",
-        review_of_assignment_id="work-2825",
-    )
-    defaults.update(overrides)
-    return Assignment(**defaults)
+    """The completed REVIEW row pointing at :func:`_work_row`'s work."""
+    return _assignment(**{
+        "assignment_id": "review-2825",
+        "issue_title": "[review] Fix the thing",
+        "type": "review",
+        "dispatched_at": 102.0,
+        "finished_at": 103.0,
+        "review_of_assignment_id": "work-2825",
+        **overrides,
+    })
+
+
+def _done_row_entry() -> dict:
+    """The drive-queue row from the incident: already ``done``."""
+    return {"repo_name": REPO, "issue_number": ISSUE, "state": STATE_DONE}
 
 
 def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
@@ -472,16 +470,8 @@ def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
 
     work = _work_row()
     review = _review_row()
-    board = Board(
-        repos=[Repo(name=REPO, github="org/quadraui", default_branch="main")],
-        machines=[],
-        active=[],
-        completed=[work, review],
-    )
-    config = Config(
-        repos=[Repo(name=REPO, github="org/quadraui", default_branch="main")],
-        machines=[],
-    )
+    board = _board(work, review)
+    config = _config()
     mock_http = MagicMock()
 
     # `config.machines=[]` alone already makes `select_fix_machine` return
@@ -492,8 +482,7 @@ def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
     # assert it is never even reached: that is the fact that can only hold
     # with the `may_dispatch_rework` guard in place.
     with patch(
-        "coord.state.get_drive_queue_entry",
-        return_value={"repo_name": REPO, "issue_number": ISSUE, "state": STATE_DONE},
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
     ), patch("coord.github_ops.work_is_terminal", return_value=True), patch(
         "coord.dispatch.select_fix_machine"
     ) as mock_select_fix_machine:
@@ -516,20 +505,167 @@ def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
     mock_http.post.assert_not_called()
 
 
+def test_rework_refusal_persists_the_propagated_verdict_to_the_db(tmp_path):
+    """A refusal is reached only AFTER `propagate_review_verdict` has
+    already written `review.review_verdict` and `work.review_state` onto
+    the in-memory board, and `process_review_completion` leaves persistence
+    to its caller. So `rework_refused` has to be one of the kinds that
+    caller writes the board back for (`PERSIST_ACTION_KINDS`) — otherwise
+    the mutation is silently dropped, the review row's `review_verdict`
+    stays NULL in the DB, and every later `coord notify` pass re-detects
+    the row as "review done, no verdict ever captured" and can escalate to
+    deleting and re-dispatching the review: a fresh metered review leg
+    against an already-merged PR, the very symptom this guard exists to
+    stop."""
+    from coord.auto_loop import run_for_review_transition
+    from coord.state import load_board, save_board
+
+    review_log = tmp_path / "review.log"
+    review_log.write_text(
+        "REVIEW_VERDICT: request-changes\n"
+        "REVIEW_BODY:\n"
+        "## Blocking findings\n"
+        "- A real problem, from this reviewer's own vantage.\n"
+        "END_REVIEW\n"
+    )
+    save_board(_board(_work_row(), _review_row()))
+
+    record = {"type": "review", "review_of_assignment_id": "work-2825"}
+    entry = {"log_path": str(review_log)}
+
+    with patch(
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
+    ), patch("coord.github_ops.work_is_terminal", return_value=True):
+        actions = run_for_review_transition(
+            "review-2825", record, entry, _config(),
+        )
+
+    assert [a.kind for a in actions] == ["rework_refused"]
+
+    loaded = load_board()
+    assert loaded is not None
+    review_loaded = loaded.find_by_id("review-2825")
+    assert review_loaded is not None
+    assert review_loaded.review_verdict == "request-changes", (
+        "the verdict must be durably recorded, not dropped — a later stall "
+        "sweep must never read this row as 'no verdict ever captured'"
+    )
+    work_loaded = loaded.find_by_id("work-2825")
+    assert work_loaded is not None
+    assert work_loaded.review_state == "done"
+
+
+def test_notify_classifies_a_rework_refusal_as_a_board_mutation():
+    """The stalled-pipeline sweep reaches the same dispatcher through
+    `coord.notify.dispatch_stalled_pipeline_action`, which decides whether
+    the sweep's `board_dirty` gets set from the action kind alone. A kind
+    that mutates the board but dispatches nothing has to classify as
+    `review_transition_applied` there, not `no_action`: `no_action` drops
+    the write while the one-shot `notified` ledger still marks the row
+    handled, so the transition is lost for good."""
+    from coord import notify as notify_mod
+    from coord.auto_loop import LoopAction
+
+    assert (
+        "rework_refused" in notify_mod._MUTATING_REVIEW_COMPLETION_KINDS
+    ), "rework_refused mutates the board — notify must persist it"
+
+    work = _work_row(review_state=None, test_state="passed")
+    review = _review_row(review_verdict="request-changes", review_posted_at=104.0)
+    board = _board(work, review)
+    config = _config()
+    config.pipeline.auto_dispatch_stalled = True
+
+    detections = notify_mod.detect_stalled_pipeline(
+        config, board=board, merge_queue_items=[],
+    )
+    assert detections, "fixture must produce the review_request_changes_no_fix shape"
+    detection, detected_work = detections[0]
+    assert detection.reason == "review_request_changes_no_fix"
+
+    with patch(
+        "coord.auto_loop.process_review_completion",
+        return_value=[LoopAction(
+            kind="rework_refused", assignment_id="review-2825",
+            detail="drive-queue row is already 'done' — refusing fix dispatch",
+        )],
+    ):
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, detected_work, board, config,
+        )
+
+    assert action.kind == "review_transition_applied"
+    assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+
+
+def test_a_fix_round_asks_the_live_rework_question_exactly_once():
+    """`_dispatch_fix_for_review` consults the guard and then calls
+    `_dispatch_fix`, which guards itself for every other caller. Each
+    evaluation makes live GitHub reads (PR state per candidate branch, a
+    base/head compare, a remote branch listing), so one fix round must ask
+    once — the allow it already has cannot have changed in between."""
+    from coord.auto_loop import _dispatch_fix_for_review
+
+    work = _work_row()
+    review = _review_row()
+    board = _board(work, review)
+    findings = ReviewFindings(
+        verdict="request-changes", body="## Blocking\n- 1. fix it\n"
+    )
+
+    guard = MagicMock(return_value=(True, "no refusal condition matched"))
+    with patch("coord.drive_queue.may_dispatch_rework", guard), patch(
+        "coord.auto_loop._work_is_terminal", return_value=False,
+    ), patch(
+        "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+        return_value=False,
+    ), patch("coord.dispatch.select_fix_machine") as select_machine:
+        select_machine.return_value = MagicMock(machine=None)
+        actions = _dispatch_fix_for_review(
+            review, findings, board, _config(), http_client=MagicMock(),
+        )
+
+    # The dispatch itself fails (no capable machine) — what this pins is the
+    # guard call count on the way there.
+    assert [a.kind for a in actions] == ["no_work_found"]
+    assert guard.call_count == 1, (
+        f"expected one live rework check per fix round, got "
+        f"{guard.call_count}"
+    )
+
+
 def test_every_auto_loop_fix_dispatch_site_calls_may_dispatch_rework():
     """Grep-based: every function in `coord/auto_loop.py` that dispatches a
-    rework leg must call `may_dispatch_rework` before it dispatches.
-    Covers the two sites #4134 wires (`_dispatch_fix`,
-    `_dispatch_fix_for_review`); the sibling slices extend this same shape
-    of assertion for their own dispatch sites rather than inventing a
-    second way to ask the same question (#2096/#2085)."""
+    rework leg must call `may_dispatch_rework` BEFORE it dispatches — both
+    that the call exists and that it precedes the dispatch it guards, so a
+    guard moved below the POST fails here. Covers the two sites #4134 wires
+    (`_dispatch_fix`, `_dispatch_fix_for_review`); the sibling slices extend
+    this same shape of assertion for their own dispatch sites rather than
+    inventing a second way to ask the same question (#2096/#2085)."""
     import inspect
 
     from coord import auto_loop
 
-    for name in ("_dispatch_fix", "_dispatch_fix_for_review"):
+    # Each site paired with the text of the dispatch it must guard: the
+    # `/assign` POST for the function that fires it, and the call to that
+    # function for the one that delegates.
+    sites = {
+        "_dispatch_fix": "/assign",
+        "_dispatch_fix_for_review": "_dispatch_fix(",
+    }
+    for name, dispatch_marker in sites.items():
         source = inspect.getsource(getattr(auto_loop, name))
-        assert "may_dispatch_rework(" in source, (
+        guard_at = source.find("may_dispatch_rework(")
+        assert guard_at != -1, (
             f"coord.auto_loop.{name} must call may_dispatch_rework() before "
             "dispatching a rework leg (#4134)"
+        )
+        dispatch_at = source.find(dispatch_marker)
+        assert dispatch_at != -1, (
+            f"coord.auto_loop.{name} no longer dispatches via "
+            f"{dispatch_marker!r} — update this test's site table"
+        )
+        assert guard_at < dispatch_at, (
+            f"coord.auto_loop.{name} calls may_dispatch_rework() only AFTER "
+            f"{dispatch_marker!r} — a guard below the dispatch guards nothing"
         )

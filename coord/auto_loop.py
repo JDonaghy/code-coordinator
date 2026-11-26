@@ -1682,6 +1682,10 @@ def _dispatch_fix_for_review(
         work, briefing, board, config, next_iteration,
         model=model, http_client=http_client,
         override_machine=override_machine, failure_detail=fix_failure,
+        # The guard above already asked `may_dispatch_rework` about this
+        # exact (repo, issue) and got an allow; every question it asks is a
+        # live GitHub read, so one fix round asks once.
+        rework_guard_checked=True,
     )
 
     if fix is None:
@@ -1988,6 +1992,7 @@ def _dispatch_fix(
     override_machine: str | None = None,
     status_fetcher=None,
     failure_detail: list[str] | None = None,
+    rework_guard_checked: bool = False,
 ) -> Assignment | None:
     """POST a fix assignment to the agent server.
 
@@ -2006,6 +2011,15 @@ def _dispatch_fix(
     timed out" with no named cause), or, when ``may_dispatch_rework``
     refuses before machine selection is ever attempted, that refusal's own
     reason.
+
+    *rework_guard_checked* is for a caller that just asked
+    :func:`coord.drive_queue.may_dispatch_rework` about this same
+    ``(repo, issue)`` and got an allow — :func:`_dispatch_fix_for_review`
+    is that caller. Every refusal the guard can reach is a LIVE GitHub read
+    (a PR state per candidate branch, a base/head compare, a remote branch
+    listing), so asking twice inside one fix round doubles that cost for an
+    answer that cannot have changed in between. Default ``False`` keeps the
+    guard mandatory for every other caller.
 
     #1176/#2302: the dispatched type mirrors ``work.type`` for any
     :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` member (``"test-author"``,
@@ -2030,17 +2044,18 @@ def _dispatch_fix(
     # every rework dispatch site answers it the same way (#2096/#2085).
     from coord.drive_queue import may_dispatch_rework  # noqa: PLC0415
 
-    allowed, reason = may_dispatch_rework(
-        work.repo_name, work.issue_number, "fix", board=board,
-    )
-    if not allowed:
-        log.warning(
-            "auto_loop: NOT dispatching fix for %s — %s",
-            work.assignment_id, reason,
+    if not rework_guard_checked:
+        allowed, reason = may_dispatch_rework(
+            work.repo_name, work.issue_number, "fix", board=board,
         )
-        if failure_detail is not None:
-            failure_detail.append(reason)
-        return None
+        if not allowed:
+            log.warning(
+                "auto_loop: NOT dispatching fix for %s — %s",
+                work.assignment_id, reason,
+            )
+            if failure_detail is not None:
+                failure_detail.append(reason)
+            return None
 
     from coord.dispatch import describe_fix_machine_failure, select_fix_machine
 
