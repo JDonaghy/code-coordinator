@@ -243,6 +243,48 @@ def test_pytest_failed_tally_names_pytest_even_without_failed_line() -> None:
     assert evidence.failed_stages == ("pytest",)
 
 
+# ── Echo-trap defense ───────────────────────────────────────────────────────
+
+
+def test_echoed_test_command_does_not_shadow_the_real_failed_stage() -> None:
+    """A multi-stage runner's own `test_command` is routinely echoed into the
+    log before it ever runs (a `set -x` trace, a script-source dump for a
+    verbose failure report) — and that echo can itself contain the literal
+    `FAILED STAGES (stage order, first is likely root): ...` phrasing as
+    unexpanded template text, with no real failure behind it yet. The FIRST
+    occurrence here is exactly that echo; only the LAST — trailed by the
+    runner's own closing `SMOKE:` marker — is the real verdict.
+    """
+    log = (
+        "+ grep -A1 FAILED_STAGES ci-check.sh\n"
+        "FAILED STAGES (stage order, first is likely root): $failed_list\n"
+        "running stage 1/2: cargo fmt --check\n"
+        "stage 1/2 OK\n"
+        "running stage 2/2: cargo test --workspace --lib\n"
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "test result: FAILED. 0 passed; 1 failed\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+        "SMOKE: fail exit=1\n"
+    )
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ("cargo test --workspace --lib",)
+
+
+def test_single_failed_stages_line_is_still_trusted_with_no_marker() -> None:
+    """Backward compat: today's only exercised shape — exactly one `FAILED
+    STAGES` line and no `SMOKE:` marker anywhere in the (bounded) log — must
+    still be trusted on its own, with no corroborating marker required.
+    """
+    log = (
+        "running stage 1/1: cargo test --workspace --lib\n"
+        "test result: FAILED. 0 passed; 1 failed\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ("cargo test --workspace --lib",)
+
+
 # ── Round-trip (dict) serialisation — this is what gets persisted ──────────
 
 

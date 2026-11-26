@@ -6362,6 +6362,81 @@ def test_finalize_smoke_fanout_passes_when_every_leg_passes(coord_db) -> None:
     assert load_assignment_test_state("w-fanout") == "passed"
 
 
+def test_finalize_smoke_fanout_writes_per_leg_failure_evidence_to_parent_test_output(
+    coord_db, tmp_path, monkeypatch,
+) -> None:
+    """Guards against a fix briefing that holds only a bare one-line reason
+    (e.g. `headless smoke: exit=1`), the echoed `test_command`, and the
+    `[[smoke-fanout:...]]` base64 blob — zero compiler errors, test names,
+    or `FAILED STAGES` lines.
+
+    Each failing leg's own stored test output (what a plain-runner leg
+    writes via `coord.confirm_test.write_test_output_file`, keyed by the
+    LEG's id) folds into the PARENT's own test-output file — the file
+    `coord fix` reads ahead of the bare `test_reason` summary.
+    """
+    from coord.confirm_test import write_test_output_file  # noqa: PLC0415
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+    from coord.state import load_assignment_test_reason, record_test_verdict  # noqa: PLC0415
+
+    coord_state_dir = tmp_path / "coord-state"
+    monkeypatch.setattr("coord.state.COORD_DIR", coord_state_dir)
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="failed", reason="headless smoke")
+    _seed_leg(leg_id="leg-b", state="failed", reason="headless smoke")
+    write_test_output_file(
+        "leg-a",
+        "running stage 1/1: cargo test --workspace --lib\n"
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "test result: FAILED. 0 passed; 1 failed\n"
+        "FAILED STAGES (stage order, first is likely root): "
+        "cargo test --workspace --lib\n"
+        "SMOKE: fail exit=1\n",
+    )
+    write_test_output_file(
+        "leg-b",
+        "collected 2 items\n"
+        "FAILED tests/test_widgets.py::test_widget_resize\n"
+        "E       assert 80 == 100\n"
+        "========================= 1 failed, 1 passed in 0.05s =====================\n"
+        "SMOKE: fail exit=1\n",
+    )
+    manifest = _encode_fanout_manifest([
+        ("leg-a", ("gtk",), "cargo test --workspace --lib"),
+        ("leg-b", ("windows",), "pytest quadraui/tests"),
+    ])
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            f"{manifest}\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    stored = coord_state_dir / "test_output" / "w-fanout.txt"
+    assert stored.exists()
+    briefing_evidence = stored.read_text()
+
+    assert "cargo test --workspace --lib" in briefing_evidence
+    assert "error[E0308]: mismatched types" in briefing_evidence
+    assert "FAILED tests/test_widgets.py::test_widget_resize" in briefing_evidence
+    assert "E       assert 80 == 100" in briefing_evidence
+
+    # Never the base64 fan-out manifest — that belongs on `test_reason` for
+    # machine parsing, never quoted at a fix worker as evidence.
+    assert "[[smoke-fanout:" not in briefing_evidence
+
+    # The aggregate `test_reason` is untouched by this — still short, still
+    # carries the manifest for `_parse_fanout_manifest`'s own readers.
+    reason = load_assignment_test_reason("w-fanout") or ""
+    assert "[[smoke-fanout:" in reason
+
+
 @pytest.mark.parametrize(
     "infra_reason",
     [
