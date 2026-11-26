@@ -63,6 +63,7 @@ from coord.board_doctor import (
     drop_stale_predicted_after_edges,
     idle_fleet_root_rows,
     merge_queue_rows,
+    merged_partial_dependent_holds,
     merged_partial_rows,
     next_action_unperformed_rows,
     no_progress_rows,
@@ -77,6 +78,7 @@ from coord.board_doctor import (
     stranded_prereq_guard,
     stranded_prereq_rows,
     sweep,
+    sweep_merged_partial_dependent_holds,
     sweep_predicted_after_edges,
 )
 from coord.config import (
@@ -7988,6 +7990,362 @@ class TestSweepPredictedAfterEdgesIntegration:
         assert notes == []
         [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2539]
         assert entry.after == ("quadraui#9999",)
+
+
+class TestMergedPartialDependentHolds:
+    """#4177: a dependent's own ``after=`` edge is satisfied the instant its
+    prerequisite's PR merges, whatever ``ISSUE_RESOLUTION:`` it carried —
+    these are the shapes that hold it anyway until the remainder lands."""
+
+    def test_a_waiting_dependent_of_an_open_merged_partial_prereq_is_held(
+        self,
+    ) -> None:
+        prereq = QueueEntry(
+            repo="quadraui", issue=2984, state=STATE_MERGED_PARTIAL,
+        )
+        dependent = QueueEntry(
+            repo="quadraui", issue=2986, state=STATE_WAITING,
+            after=(prereq.key,),
+        )
+        held: list[tuple[str, str]] = []
+        recorded: list[tuple[str, str, tuple[str, ...]]] = []
+
+        notes = merged_partial_dependent_holds(
+            [prereq, dependent],
+            issue_open=lambda repo, issue: True,
+            hold=lambda e, reason: held.append((e.key, reason)),
+            record=lambda e, action, deps: recorded.append((e.key, action, deps)),
+        )
+
+        assert notes == [f"{dependent.key}: held: waiting on {prereq.key}"]
+        [(key, reason)] = held
+        assert key == dependent.key
+        assert queue_diagnose.is_partial_remainder_hold_reason(reason)
+        assert prereq.key in reason
+        assert recorded == [(dependent.key, "held", (prereq.key,))]
+
+    def test_a_dependent_of_a_merged_partial_prereq_whose_issue_already_closed_is_not_held(
+        self,
+    ) -> None:
+        """The remainder was filed (or the issue otherwise resolved) and
+        closed — the row's own `state` column has not caught up yet (#3945
+        never dequeues a `merged-partial` row), but the live issue state
+        already says there is nothing left to wait for."""
+        prereq = QueueEntry(
+            repo="quadraui", issue=2984, state=STATE_MERGED_PARTIAL,
+        )
+        dependent = QueueEntry(
+            repo="quadraui", issue=2986, state=STATE_WAITING,
+            after=(prereq.key,),
+        )
+        held: list[tuple[str, str]] = []
+
+        notes = merged_partial_dependent_holds(
+            [prereq, dependent],
+            issue_open=lambda repo, issue: False,
+            hold=lambda e, reason: held.append((e.key, reason)),
+        )
+
+        assert notes == []
+        assert held == []
+
+    def test_a_running_or_already_blocked_entry_is_never_newly_held(self) -> None:
+        """Only a dispatchable `waiting` row is a hold candidate — a row
+        already `running` (launched before the prereq went partial) or
+        `blocked` for an unrelated reason is left exactly as it is."""
+        prereq = QueueEntry(
+            repo="quadraui", issue=2984, state=STATE_MERGED_PARTIAL,
+        )
+        running = QueueEntry(
+            repo="quadraui", issue=2985, state=STATE_RUNNING,
+            attempts=1, launched_at=1.0, after=(prereq.key,),
+        )
+        blocked_other = QueueEntry(
+            repo="quadraui", issue=2987, state=STATE_BLOCKED,
+            last_reason="(#1844) guard refusal", after=(prereq.key,),
+        )
+        held: list[str] = []
+
+        notes = merged_partial_dependent_holds(
+            [prereq, running, blocked_other],
+            issue_open=lambda repo, issue: True,
+            hold=lambda e, reason: held.append(e.key),
+        )
+
+        assert notes == []
+        assert held == []
+
+    def test_a_held_entry_is_released_once_the_remainder_is_filed(self) -> None:
+        """The prereq's issue closed (the remainder was filed): the
+        dependent, previously held by THIS module's own marker, resumes."""
+        prereq = QueueEntry(
+            repo="quadraui", issue=2984, state=STATE_MERGED_PARTIAL,
+        )
+        held_reason = queue_diagnose.partial_remainder_hold_reason((prereq.key,))
+        dependent = QueueEntry(
+            repo="quadraui", issue=2986, state=STATE_BLOCKED,
+            last_reason=held_reason, after=(prereq.key,),
+        )
+        released: list[str] = []
+        recorded: list[tuple[str, str, tuple[str, ...]]] = []
+
+        notes = merged_partial_dependent_holds(
+            [prereq, dependent],
+            issue_open=lambda repo, issue: False,
+            release=lambda e: released.append(e.key),
+            record=lambda e, action, deps: recorded.append((e.key, action, deps)),
+        )
+
+        assert notes == [f"{dependent.key}: released: merged-partial remainder resolved"]
+        assert released == [dependent.key]
+        assert recorded == [(dependent.key, "released", ())]
+
+    def test_a_blocked_entry_for_an_unrelated_reason_is_never_released(self) -> None:
+        """A `blocked` row this module never held (no marker in
+        `last_reason`) must never be resumed just because its `after=`
+        prereq happens to no longer be an unresolved merged-partial one —
+        that is a different reconciler's row to manage."""
+        dependent = QueueEntry(
+            repo="quadraui", issue=2987, state=STATE_BLOCKED,
+            last_reason="(#1844) guard refusal",
+        )
+        released: list[str] = []
+
+        notes = merged_partial_dependent_holds(
+            [dependent], issue_open=lambda repo, issue: False,
+            release=lambda e: released.append(e.key),
+        )
+
+        assert notes == []
+        assert released == []
+
+    def test_a_dep_dequeued_entirely_is_treated_as_resolved_not_held_forever(self) -> None:
+        """A prereq row absent from the live queue (an operator `remove`,
+        or any other sweep that dequeued it) is not a candidate for
+        holding forever — only a row THIS cause still names counts."""
+        dependent = QueueEntry(
+            repo="quadraui", issue=2986, state=STATE_WAITING,
+            after=("quadraui#2984",),
+        )
+        held: list[str] = []
+
+        notes = merged_partial_dependent_holds(
+            [dependent], issue_open=lambda repo, issue: True,
+            hold=lambda e, reason: held.append(e.key),
+        )
+
+        assert notes == []
+        assert held == []
+
+    def test_multiple_unresolved_prereqs_are_all_named_in_the_hold_reason(self) -> None:
+        first = QueueEntry(repo="quadraui", issue=2984, state=STATE_MERGED_PARTIAL)
+        second = QueueEntry(repo="quadraui", issue=2985, state=STATE_MERGED_PARTIAL)
+        dependent = QueueEntry(
+            repo="quadraui", issue=2986, state=STATE_WAITING,
+            after=(first.key, second.key),
+        )
+        recorded: list[tuple[str, str, tuple[str, ...]]] = []
+
+        notes = merged_partial_dependent_holds(
+            [first, second, dependent],
+            issue_open=lambda repo, issue: True,
+            record=lambda e, action, deps: recorded.append((e.key, action, deps)),
+        )
+
+        assert notes == [f"{dependent.key}: held: waiting on {first.key}, {second.key}"]
+        assert recorded == [(dependent.key, "held", (first.key, second.key))]
+
+    def test_the_hold_marker_is_recognised_as_a_permanent_block_by_drive_queue(
+        self,
+    ) -> None:
+        """(#4177) must be one of `coord.drive_queue._PERMANENT_BLOCK_
+        MARKERS`, or the tick's own unreachable-wait/after= reconcilers
+        would silently resume a held row out from under this sweep — see
+        `coord.drive_queue._PERMANENT_BLOCK_MARKERS`'s own `(#4177)` entry."""
+        from coord.drive_queue import is_permanent_block_reason
+
+        reason = queue_diagnose.partial_remainder_hold_reason(("quadraui#2984",))
+
+        assert is_permanent_block_reason(reason)
+
+
+class TestSweepMergedPartialDependentHoldsIntegration:
+    """#4177: the production wiring, end-to-end through the real audit log
+    and drive-queue DB."""
+
+    def test_real_held_entry_is_persisted_blocked_with_the_marker_reason(self) -> None:
+        from coord.drive_queue import entries_from_rows
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2984)
+        state.update_drive_queue_entry(
+            "quadraui", 2984, state=STATE_MERGED_PARTIAL,
+        )
+        enqueue_drive_queue("quadraui", 2986, after=["quadraui#2984"])
+
+        with patch("coord.board_doctor._issue_open", lambda repo, issue: True):
+            notes = sweep_merged_partial_dependent_holds()
+
+        assert notes == ["quadraui#2986: held: waiting on quadraui#2984"]
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2986]
+        assert entry.state == STATE_BLOCKED
+        assert queue_diagnose.is_partial_remainder_hold_reason(entry.last_reason)
+
+    def test_real_hold_is_recorded_in_the_audit_log(self) -> None:
+        from coord.audit import query_audit_log
+        from coord.board_doctor import (
+            AUDIT_CATEGORY_PARTIAL_REMAINDER_HOLD,
+            EVENT_PARTIAL_REMAINDER_HELD,
+        )
+        from coord.state import enqueue_drive_queue
+
+        enqueue_drive_queue("quadraui", 2984)
+        state.update_drive_queue_entry(
+            "quadraui", 2984, state=STATE_MERGED_PARTIAL,
+        )
+        enqueue_drive_queue("quadraui", 2990, after=["quadraui#2984"])
+
+        with patch("coord.board_doctor._issue_open", lambda repo, issue: True):
+            sweep_merged_partial_dependent_holds()
+
+        events = query_audit_log(
+            event_type=EVENT_PARTIAL_REMAINDER_HELD,
+            category=AUDIT_CATEGORY_PARTIAL_REMAINDER_HOLD,
+            repo="quadraui", issue=2990,
+        )
+        assert len(events["entries"]) == 1
+
+    def test_real_held_entry_is_released_once_the_prereq_issue_closes(self) -> None:
+        from coord.drive_queue import entries_from_rows
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2984)
+        state.update_drive_queue_entry(
+            "quadraui", 2984, state=STATE_MERGED_PARTIAL,
+        )
+        enqueue_drive_queue("quadraui", 2991, after=["quadraui#2984"])
+        held_reason = queue_diagnose.partial_remainder_hold_reason(
+            ("quadraui#2984",),
+        )
+        state.update_drive_queue_entry(
+            "quadraui", 2991, state=STATE_BLOCKED, last_reason=held_reason,
+        )
+
+        with patch("coord.board_doctor._issue_open", lambda repo, issue: False):
+            notes = sweep_merged_partial_dependent_holds()
+
+        assert notes == [
+            "quadraui#2991: released: merged-partial remainder resolved"
+        ]
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2991]
+        assert entry.state == STATE_WAITING
+
+    def test_dry_run_computes_but_never_writes(self) -> None:
+        from coord.drive_queue import entries_from_rows
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2984)
+        state.update_drive_queue_entry(
+            "quadraui", 2984, state=STATE_MERGED_PARTIAL,
+        )
+        enqueue_drive_queue("quadraui", 2992, after=["quadraui#2984"])
+
+        with patch("coord.board_doctor._issue_open", lambda repo, issue: True):
+            notes = sweep_merged_partial_dependent_holds(dry_run=True)
+
+        assert notes == ["quadraui#2992: held: waiting on quadraui#2984"]
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2992]
+        assert entry.state == STATE_WAITING
+
+
+class TestRunSweepHoldsMergedPartialDependents:
+    """#4177: :func:`run_sweep` wires the hold sweep in the same advisory,
+    kill-switched way it already wires :func:`sweep_predicted_after_edges`
+    (#4037)."""
+
+    def test_run_sweep_reports_held_dependents(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([], Board()),
+        )
+        config = Config(repos=[], machines=[])
+
+        def fake_hold_sweep(*, dry_run, config):
+            return ["quadraui#2986: held: waiting on quadraui#2984"]
+
+        report = board_doctor_mod.run_sweep(
+            config=config,
+            followthrough=False,
+            drop_predicted_after_edges=False,
+            auto_refile=False,
+            conflict_fix_ceiling_requeue=False,
+            config_drift_autofix_apply=False,
+            base_sync_fix_ceiling_dispatch=False,
+            merged_partial_dependent_hold_sweep=fake_hold_sweep,
+        )
+
+        assert report.held_merged_partial_dependents == [
+            "quadraui#2986: held: waiting on quadraui#2984"
+        ]
+
+    def test_hold_merged_partial_dependents_false_disables_the_pass(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([], Board()),
+        )
+        config = Config(repos=[], machines=[])
+        calls: list[Any] = []
+
+        def fake_hold_sweep(*, dry_run, config):
+            calls.append(1)
+            return []
+
+        board_doctor_mod.run_sweep(
+            config=config,
+            followthrough=False,
+            drop_predicted_after_edges=False,
+            auto_refile=False,
+            conflict_fix_ceiling_requeue=False,
+            config_drift_autofix_apply=False,
+            base_sync_fix_ceiling_dispatch=False,
+            hold_merged_partial_dependents=False,
+            merged_partial_dependent_hold_sweep=fake_hold_sweep,
+        )
+
+        assert calls == []
+
+    def test_a_failed_hold_sweep_is_advisory_and_never_sinks_the_report(
+        self, monkeypatch,
+    ) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda *, config, **_: ([], Board()),
+        )
+        config = Config(repos=[], machines=[])
+
+        def failing_hold_sweep(*, dry_run, config):
+            raise RuntimeError("boom")
+
+        report = board_doctor_mod.run_sweep(
+            config=config,
+            followthrough=False,
+            drop_predicted_after_edges=False,
+            auto_refile=False,
+            conflict_fix_ceiling_requeue=False,
+            config_drift_autofix_apply=False,
+            base_sync_fix_ceiling_dispatch=False,
+            merged_partial_dependent_hold_sweep=failing_hold_sweep,
+        )
+
+        assert report.held_merged_partial_dependents == []
 
 
 class TestSelfCorrectionAfterDropIsExistingBehaviour:
