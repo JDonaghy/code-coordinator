@@ -11532,16 +11532,50 @@ class AgentServer:
         while True:
             exit_code, output = self._run_precheck_command(assignment, worktree)
             if exit_code == 0:
-                self._set_precheck_result(assignment, "passed", None, attempts)
+                self._finish_precheck(assignment, worktree, "passed", None, attempts)
                 return
             if attempts >= max(0, int(self.precheck_max_resume_attempts)):
-                self._set_precheck_result(assignment, "failed", output, attempts)
+                self._finish_precheck(assignment, worktree, "failed", output, attempts)
                 return
             resumed = self._spawn_precheck_resume(assignment, worktree, output)
             if not resumed:
-                self._set_precheck_result(assignment, "failed", output, attempts)
+                self._finish_precheck(assignment, worktree, "failed", output, attempts)
                 return
             attempts += 1
+
+    def _finish_precheck(
+        self,
+        assignment: AgentAssignment,
+        worktree: Path,
+        status: str,
+        reason: str | None,
+        attempts: int,
+    ) -> None:
+        """Record the outcome and, when a remediation session ran, make sure
+        whatever it committed actually reaches the branch (#4166).
+
+        `_reap`'s own safety-net push runs BEFORE this whole precheck step,
+        so a remediation turn that committed but did not push would
+        otherwise leave its fix only in a worktree that is torn down a few
+        lines later. The resumed session is told to push itself; this is the
+        same belt-and-braces push `_reap` already performs for the primary
+        session, and is a no-op ("Everything up-to-date") when the session
+        did push — or when the repo has no ``origin`` at all, exactly like
+        that one.
+        """
+        self._set_precheck_result(assignment, status, reason, attempts)
+        if attempts <= 0:
+            return
+        try:
+            _git(worktree, "push", "-u", "origin", "HEAD", timeout=60.0)
+            self._log_line(
+                assignment, "# precheck (#4166): pushed the remediation commits",
+            )
+        except (_GitError, subprocess.TimeoutExpired) as exc:
+            self._log_line(
+                assignment,
+                f"# precheck (#4166): post-remediation push did not run ({exc})",
+            )
 
     def _run_precheck_command(
         self, assignment: AgentAssignment, worktree: Path,
@@ -11594,6 +11628,12 @@ class AgentServer:
         bounded by :data:`PRECHECK_RESUME_TIMEOUT_S`: this runs on the
         leg's own reap thread, and the next precheck run must observe the
         remediation, not race it.
+
+        The resumed turn's own stream-json output appends to the leg's SAME
+        log, so anything that parses that log (`coord log`, a later
+        `parse_log`) counts its tokens and cost. The cost/usage fields
+        `_reap` already computed for this assignment are not recomputed —
+        they describe the primary session, which is what they are read as.
         """
         session_id = assignment.claude_session_id
         if not session_id:

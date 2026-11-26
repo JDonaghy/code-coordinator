@@ -8805,3 +8805,37 @@ def test_status_payload_omits_precheck_diagnostics_a_leg_never_had(tmp_path: Pat
     reloaded = AgentAssignment(spec=spec, **{k: v for k, v in d.items() if k != "spec"})
     assert reloaded.precheck_status is None
     assert reloaded.precheck_resume_attempts == 0
+
+
+def test_post_session_precheck_pushes_what_the_remediation_committed(
+    tmp_path: Path,
+) -> None:
+    """`_reap`'s own push runs BEFORE the precheck step, so a remediation
+    turn that commits but does not push would leave its fix in a worktree
+    that is torn down moments later. The fix has to reach origin."""
+    wt = _init_repo_with_remote(tmp_path / "wt")
+    remote = tmp_path / "wt-remote.git"
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(
+        tmp_path,
+        resume_argv=[
+            sys.executable, "-c",
+            "import subprocess; open('fixed', 'w').close(); "
+            "subprocess.run(['git', 'add', '-A'], stdout=subprocess.DEVNULL); "
+            "subprocess.run(['git', 'commit', '-m', 'precheck fix'], "
+            "stdout=subprocess.DEVNULL)",
+        ],
+        seen=seen,
+    )
+    a = _precheck_assignment(server, tmp_path, precheck="test -f fixed", worktree=wt)
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "passed"
+    assert a.precheck_resume_attempts == 1
+    pushed = subprocess.run(
+        ["git", "log", "--oneline", "-1", "main"], cwd=str(remote),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "precheck fix" in pushed
+    assert "pushed the remediation commits" in Path(a.log_path).read_text()
