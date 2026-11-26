@@ -94,6 +94,10 @@ __all__ = [
     "CONFIDENCE_NONE",
     "MAX_DIAGNOSES_PER_EPISODE",
     "MAX_DIAGNOSES_PER_PASS",
+    # #4177: merged-partial dependent holds.
+    "PARTIAL_REMAINDER_HOLD_MARKER",
+    "is_partial_remainder_hold_reason",
+    "partial_remainder_hold_reason",
     "CheckReading",
     "Diagnosis",
     "GhLiveProbe",
@@ -303,6 +307,61 @@ MAX_DIAGNOSES_PER_EPISODE = 3
 #: the entries beyond the cap are simply diagnosed on the next tick, and
 #: :func:`run_pass` reports the deferral rather than truncating silently.
 MAX_DIAGNOSES_PER_PASS = 4
+
+
+# ── merged-partial dependent holds (#4177) ──────────────────────────────────
+#
+# When a prerequisite's PR merges `ISSUE_RESOLUTION: partial` (#3945's
+# `coord.drive_queue.STATE_MERGED_PARTIAL`), its own remainder issue has not
+# been filed yet — the dependency the issue's own `after=` edge named is
+# demonstrably incomplete even though the PR already landed. `coord.
+# board_doctor.merged_partial_dependent_holds` is what blocks a `waiting`
+# dependent from dispatch in that window; this marker is the vocabulary the
+# write side (that function) and the read side (this predicate, and
+# `coord.drive_queue._PERMANENT_BLOCK_MARKERS`, which embeds the identical
+# literal text) both key off, so the two can never silently drift apart
+# (#2096: one question, one answer).
+
+#: Embedded verbatim in a held entry's own `last_reason` by
+#: :func:`partial_remainder_hold_reason`, and the literal text
+#: `coord.drive_queue._PERMANENT_BLOCK_MARKERS` also carries — that is what
+#: keeps the tick's own `blocked`-row reconcilers (`_reconcile_blocked`,
+#: `_reconcile_blocked_unreachable`, `_reconcile_blocked_after`) from
+#: silently resuming a hold this module never asked them to manage: a held
+#: dependent's prerequisite has already `facts.landed` (the PR merged), so a
+#: fresh `after=` re-derivation would call the edge satisfied and resume it
+#: on the very next tick, and a held dependent with `attempts == 0` and no
+#: branch/PR/merge-queue row would otherwise also match
+#: `coord.drive_queue.is_unreachable_wait_shape`'s bare "never dispatched"
+#: shape. Only `coord.board_doctor`'s own sweep, which re-checks the live
+#: prerequisite's issue state, may release this hold.
+PARTIAL_REMAINDER_HOLD_MARKER = "(#4177)"
+
+
+def partial_remainder_hold_reason(dep_keys: Sequence[str]) -> str:
+    """The canonical `last_reason` text for a dependent held because every
+    key in *dep_keys* (``"repo#issue"``) merged `ISSUE_RESOLUTION: partial`
+    and its remainder issue has not been filed yet (#4177, #3862).
+
+    *dep_keys* is rendered verbatim, in the order given, so the reason names
+    every unresolved prerequisite at once rather than only the first —
+    useful when an entry declares more than one `after=` edge and more than
+    one of them is still an unresolved partial merge.
+    """
+    names = ", ".join(dep_keys)
+    return (
+        f"held {PARTIAL_REMAINDER_HOLD_MARKER}: prerequisite(s) {names} "
+        "merged ISSUE_RESOLUTION: partial and the remainder issue has not "
+        "been filed yet — dispatch paused until the remainder lands"
+    )
+
+
+def is_partial_remainder_hold_reason(text: str | None) -> bool:
+    """Whether *text* is :func:`partial_remainder_hold_reason`'s own marker —
+    the one recognition point both :mod:`coord.board_doctor` (to avoid
+    re-holding an already-held entry, and to know when it may release one)
+    and a human reading `coord drive-queue list` share."""
+    return bool(text) and PARTIAL_REMAINDER_HOLD_MARKER in text
 
 
 # ── live readings ────────────────────────────────────────────────────────────

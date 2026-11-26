@@ -374,8 +374,21 @@ PARK_STALE_SECONDS = 45 * 60.0
 #: embedded verbatim in the reason it returns (see
 #: `NON_CONVERGENCE_LATCH_MARKER`) so this sweep never auto-resumes it,
 #: exactly like its three siblings above.
+#:
+#: #4177's own entry, same shape as #3522's: the real remedy — releasing a
+#: dependent held on a merged-partial prerequisite whose remainder has not
+#: been filed yet — runs entirely OUTSIDE this relaunch loop, in
+#: `coord.board_doctor.merged_partial_dependent_holds`'s own sweep, which
+#: re-checks the live prerequisite issue. Without this marker a held entry
+#: (`attempts == 0`, no branch/PR/merge-queue row) would match
+#: `is_unreachable_wait_shape`'s bare "never dispatched" shape, and its
+#: prerequisite's PR has, by construction, already `facts.landed` — so a
+#: fresh `after=` re-derivation would call the edge satisfied too — either
+#: of which would silently resume the entry out from under the hold on the
+#: very next tick. See `coord.queue_diagnose.PARTIAL_REMAINDER_HOLD_MARKER`,
+#: the literal text this entry mirrors.
 _PERMANENT_BLOCK_MARKERS: tuple[str, ...] = (
-    "(#1844)", "(#2019)", "(#2972)", "(#3522)", "(#4133)",
+    "(#1844)", "(#2019)", "(#2972)", "(#3522)", "(#4133)", "(#4177)",
 )
 
 
