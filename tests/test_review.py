@@ -4657,6 +4657,47 @@ def test_line_is_numeric_lowering_only_rejects_no_numbers_at_all() -> None:
     assert not _line_is_numeric_lowering_only('foo', 'bar')
 
 
+def test_line_is_numeric_lowering_only_rejects_digit_run_inside_identifier() -> None:
+    """A digit run embedded in a renamed quoted symbol — e.g. a
+    `KNOWN_LEGACY_PRIMITIVE_BACKEND_METHODS`-style entry — is a reviewable
+    content change, not a ratchet value tracking a regen, even though the
+    embedded digits happen to go down."""
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert not _line_is_numeric_lowering_only(
+        '    "table_row_2",', '    "table_row_1",',
+    )
+    assert not _line_is_numeric_lowering_only(
+        '    "draw_box_9" => Backend::V2,', '    "draw_box_8" => Backend::V2,',
+    )
+
+
+def test_line_is_numeric_lowering_only_rejects_multi_dot_version_string() -> None:
+    """A dotted version string isn't a single numeric literal — splitting on
+    one dot only (`1.2` then a bare `3`) used to let a version downgrade
+    through; the delimiter-aware token must see no match at all here."""
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert not _line_is_numeric_lowering_only('ver = "1.2.3"', 'ver = "1.2.2"')
+
+
+def test_line_is_numeric_lowering_only_rejects_sign_flip_that_raises_magnitude() -> None:
+    """`-10` -> `-5` is a RAISE (closer to zero, i.e. larger), not a
+    lowering — the token must carry its sign into the float comparison
+    rather than comparing `10` and `5` as unsigned magnitudes."""
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert not _line_is_numeric_lowering_only('x = -10', 'x = -5')
+
+
+def test_line_is_numeric_lowering_only_accepts_a_genuine_negative_lowering() -> None:
+    """The sign-aware token still accepts an actual lowering of a negative
+    value (`-5` -> `-10` is lower, not higher)."""
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert _line_is_numeric_lowering_only('x = -5', 'x = -10')
+
+
 def test_file_is_surface_numeric_lowering_only_accepts_single_line_lowering() -> None:
     from coord.review import _file_is_surface_numeric_lowering_only
 
@@ -5815,6 +5856,105 @@ def _surface_compare_diff_fetcher(repo: str, base: str, head: str) -> str:
     return f"diff --git a/ratchet.json b/ratchet.json\n@@ -1 +1 @@\n-x\n+{marker}\n"
 
 
+def test_maybe_auto_reaffirm_surface_only_lowering_never_touches_a_request_changes_row(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """A `request-changes` prior review must never be auto-reaffirmed, even
+    when the delta is otherwise a textbook surface-only ratchet lowering —
+    `record_review_reaffirm` only re-points an APPROVED review's staleness
+    anchors (its own docstring), and reaffirming a `request-changes` row
+    would report the branch unblocked while the merge gate (which still
+    requires `review_verdict == "approve"`) keeps refusing it."""
+    from unittest.mock import patch
+
+    from coord import merge_queue as mq
+    from coord.models import IntegrationSurface
+    from coord.review import maybe_auto_reaffirm_surface_only_lowering
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(
+            two_machine_config.repos[0],
+            integration_surfaces=[
+                IntegrationSurface(paths=["ratchet.json"], regen="regen", check="check"),
+            ],
+        )],
+    )
+    monkeypatch.setattr("coord.github_ops.get_compare_diff", _surface_compare_diff_fetcher)
+    monkeypatch.setattr(
+        "coord.github_ops.get_repo_file",
+        lambda repo, path, sha: {"oldsha": '{"count": 100}', "newsha": '{"count": 90}'}[sha],
+    )
+
+    prior = _scoped_prior_review(review_verdict="request-changes")
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    with patch("coord.state.record_review_reaffirm") as rec:
+        result = maybe_auto_reaffirm_surface_only_lowering(entry, prior, cfg)
+
+    assert result is False
+    rec.assert_not_called()
+    assert prior.review_head_sha == "oldsha"  # untouched
+
+
+def test_dispatch_scoped_reviews_for_queue_falls_through_for_request_changes_prior(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """Same surface-only ratchet-lowering delta as the approve-verdict case
+    below, but the prior review is `request-changes` — must fall through to
+    the ordinary attributable-leg scoped-review path instead of being
+    auto-reaffirmed, with a conflict-fix leg present so
+    `only_bounded_fix_since_review` actually dispatches rather than this
+    assertion being vacuously true for an unrelated reason."""
+    from unittest.mock import patch
+
+    from coord import merge_queue as mq
+    from coord.models import IntegrationSurface
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(
+            two_machine_config.repos[0],
+            integration_surfaces=[
+                IntegrationSurface(paths=["ratchet.json"], regen="regen", check="check"),
+            ],
+        )],
+    )
+    monkeypatch.setattr("coord.github_ops.get_compare_diff", _surface_compare_diff_fetcher)
+    monkeypatch.setattr(
+        "coord.github_ops.get_repo_file",
+        lambda repo, path, sha: {"oldsha": '{"count": 100}', "newsha": '{"count": 90}'}[sha],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review(review_verdict="request-changes")
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    with patch("coord.state.record_review_reaffirm") as rec:
+        dispatched = dispatch_scoped_reviews_for_queue(
+            board, cfg,
+            queue_items=[entry],
+            http_client=_FakeHTTPClient({"id": "scoped-request-changes"}),
+            diff_fetcher=_scoped_diff_fetcher,
+        )
+    rec.assert_not_called()
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+
+
 def test_dispatch_scoped_reviews_for_queue_auto_reaffirms_surface_only_ratchet_lowering(
     two_machine_config: Config, monkeypatch,
 ) -> None:
@@ -5847,7 +5987,16 @@ def test_dispatch_scoped_reviews_for_queue_auto_reaffirms_surface_only_ratchet_l
         assignment_id="w1", type="work", status="done", branch="issue-1-fix",
     )
     prior = _scoped_prior_review()
-    board = Board(completed=[work, prior])
+    # A conflict-fix leg is present so `only_bounded_fix_since_review` would
+    # have dispatched a scoped review on its own — proving the auto-reaffirm
+    # short-circuit (not the absence of an attributable leg) is what
+    # suppresses it, symmetric with the "raises value" sibling test below.
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
     entry = _scoped_entry(state=mq.PENDING)
     entry.branch_head_sha = "newsha"
     entry.branch_patch_id = "patchid-new"

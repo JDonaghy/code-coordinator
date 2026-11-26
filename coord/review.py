@@ -6168,7 +6168,7 @@ def _live_review_stale(
 # A surface path is NOT trusted that broadly — only a value *lowering* is
 # safe, so this reads the actual diff content, not just the touched paths.
 
-_NUMERIC_LITERAL_RE = re.compile(r"\d+(?:\.\d+)?")
+_NUMERIC_LITERAL_RE = re.compile(r"(?<![\w.-])-?\d+(?:\.\d+)?(?![\w.])")
 
 
 def _line_is_numeric_lowering_only(old_line: str, new_line: str) -> bool:
@@ -6182,6 +6182,16 @@ def _line_is_numeric_lowering_only(old_line: str, new_line: str) -> bool:
     fails this, even if every number present happens to be lower. A token
     that isn't a valid number after the split (shouldn't happen, since both
     sides are matched by the same regex) also fails closed.
+
+    The token itself requires a non-word, non-dot, non-``-`` delimiter on
+    either side (and tolerates a leading ``-`` as part of the token, so sign
+    flips are compared correctly): a bare ``\\d+`` would also match a digit
+    run embedded in an identifier (``"table_row_2"`` renamed to
+    ``"table_row_1"``) or a multi-dot version string (``"1.2.3"`` lowered to
+    ``"1.2.2"``), both of which are a reviewable content change, not a
+    ratchet value tracking a regen. When a changed line has no delimited
+    numeric token at all, ``_NUMERIC_LITERAL_RE.split`` returns the line
+    unsplit, so the equality check below already fails closed on it.
     """
     if old_line == new_line:
         return True
@@ -6268,12 +6278,13 @@ def _review_delta_is_surface_only_ratchet_lowering(
 
     Once the changed-path set is confirmed surface-only, the actual CONTENT
     comparison fetches each path's full text at *review_sha* and
-    *current_sha* directly (*file_fetcher*, defaulting to
-    :func:`coord.github_ops.get_repo_file`, called as
-    ``file_fetcher(repo_github, path, sha)``) rather than reusing either
-    base-relative diff — #4152's own mechanical resolution pushes a merge
-    commit (keeping *review_sha* an ancestor), but a hand or worker rebase
-    might not, and fetching each side's content directly by its own SHA
+    *current_sha* directly (*file_fetcher*, defaulting to *gh_ops*'s own
+    ``get_repo_file`` when it has one, else :func:`coord.github_ops
+    .get_repo_file`, called as ``file_fetcher(repo_github, path, sha)``)
+    rather than reusing either base-relative diff — #4152's own mechanical
+    resolution pushes a merge commit (keeping *review_sha* an ancestor), but
+    a hand or worker rebase might not, and fetching each side's content
+    directly by its own SHA
     sidesteps that ambiguity entirely rather than trying to reconstruct it
     from two base-relative diffs.
 
@@ -6310,7 +6321,7 @@ def _review_delta_is_surface_only_ratchet_lowering(
     if not all(path in declared_paths for path in changed_paths):
         return False  # touches a non-surface path — needs a real review
 
-    _fetch = file_fetcher or github_ops.get_repo_file
+    _fetch = file_fetcher or getattr(gh_ops, "get_repo_file", None) or github_ops.get_repo_file
     for path in sorted(changed_paths):
         try:
             old_text = _fetch(repo_github, path, review_sha)
@@ -6342,18 +6353,32 @@ def maybe_auto_reaffirm_surface_only_lowering(
     current branch head, exactly like :func:`coord.board_doctor_permissions
     .finisher_self_bless` does for its own re-point, so a caller that keeps
     using *prior_review* afterward sees the reaffirmed anchors too) — only
-    when the repo declares ``integration_surfaces`` (#4151) and
+    when *prior_review*'s recorded verdict is ``"approve"``, the repo
+    declares ``integration_surfaces`` (#4151), and
     :func:`_review_delta_is_surface_only_ratchet_lowering` confirms the delta
     since *prior_review* is confined to those paths and every changed line
     only lowers a numeric literal. ``False`` otherwise — the repo declares no
-    surfaces, or the delta doesn't qualify — leaving *entry*/*prior_review*
-    completely untouched for the caller's existing scoped/full-review path.
+    surfaces, the prior verdict wasn't an approval, or the delta doesn't
+    qualify — leaving *entry*/*prior_review* completely untouched for the
+    caller's existing scoped/full-review path.
+
+    The verdict gate matters because both call sites pass
+    ``verdicts=("approve", "request-changes")`` to
+    :func:`coord.merge_queue.find_scoped_review_candidate` (so a
+    ``request-changes`` row can still be routed into an ordinary scoped
+    re-review). ``record_review_reaffirm`` only ever re-points an
+    **approved** review's staleness anchors (its own docstring); reaffirming
+    a ``request-changes`` row would stamp it as covering the current head
+    while the merge gate still refuses it for lacking an approval — a
+    permanent stall this function must never cause.
 
     *gh_ops* (defaults to :mod:`coord.github_ops`) is the backend
     :func:`_review_delta_is_surface_only_ratchet_lowering`'s base-relative
     diff compare reads through; *file_fetcher* is the per-path content
     fetch — both injectable so tests never hit the network.
     """
+    if getattr(prior_review, "review_verdict", None) != "approve":
+        return False
     repo_cfg = config.repo(entry.repo_name)
     surfaces = list(getattr(repo_cfg, "integration_surfaces", None) or [])
     if not surfaces:
@@ -6374,18 +6399,27 @@ def maybe_auto_reaffirm_surface_only_lowering(
     new_patch_id = getattr(entry, "branch_patch_id", None)
     from coord.state import record_review_reaffirm  # noqa: PLC0415
 
-    record_review_reaffirm(
-        review_assignment_id=prior_review.assignment_id,
-        new_head_sha=current_sha,
-        new_patch_id=new_patch_id,
-        reason=(
-            "#4153: delta since approval is confined to declared "
-            "integration_surfaces paths and only lowers numeric literals "
-            "— auto-reaffirmed without a re-review"
-        ),
-        actor="daemon",
-        conflict_fix_only=None,
-    )
+    try:
+        record_review_reaffirm(
+            review_assignment_id=prior_review.assignment_id,
+            new_head_sha=current_sha,
+            new_patch_id=new_patch_id,
+            reason=(
+                "#4153: delta since approval is confined to declared "
+                "integration_surfaces paths and only lowers numeric literals "
+                "— auto-reaffirmed without a re-review"
+            ),
+            actor="daemon",
+            conflict_fix_only=None,
+        )
+    except Exception:  # noqa: BLE001 — fail-safe: fall through to a real review
+        log.warning(
+            "[review] auto-reaffirm write failed for %s (%s #%s) — "
+            "falling back to the ordinary scoped/full-review path",
+            prior_review.assignment_id, entry.repo_name, entry.issue_number,
+            exc_info=True,
+        )
+        return False
     prior_review.review_head_sha = current_sha
     prior_review.review_patch_id = new_patch_id
     log.info(
