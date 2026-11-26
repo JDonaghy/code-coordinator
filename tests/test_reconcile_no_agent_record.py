@@ -630,6 +630,75 @@ def test_2208_smoke_row_clears_without_a_human(monkeypatch) -> None:
     assert "no record of this assignment" in verdicts[0]["test_reason"]
 
 
+def test_fanout_leg_with_no_agent_record_self_records_and_folds(monkeypatch) -> None:
+    """#4143: a #3182 capability-partition fan-out leg the agent has no
+    record of at all must still self-record onto ITS OWN row (never
+    straight onto the shared parent — the #1797 racing-sibling-writes
+    shape) and have `finalize_smoke_fanout` called against the shared
+    parent immediately afterward, exactly like the ordinary `terminal ==
+    "failed"` path does."""
+    from coord.smoke import smoke_leg_issue_title  # noqa: PLC0415
+
+    verdicts: list[dict] = []
+    monkeypatch.setattr(
+        "coord.state.record_test_verdict",
+        lambda **kw: verdicts.append(kw),
+    )
+    monkeypatch.setattr("coord.state.load_assignment_test_reason", lambda aid: None)
+    monkeypatch.setattr("coord.state.load_assignment_test_state", lambda aid: None)
+    finalize_calls: list[str] = []
+    monkeypatch.setattr(
+        "coord.smoke.finalize_smoke_fanout",
+        lambda work_parent_id: finalize_calls.append(work_parent_id),
+    )
+
+    work = Assignment(
+        machine_name="dellserver", repo_name="cc",
+        issue_number=2208, issue_title="green branch",
+        status="done", assignment_id="work-1", type="work",
+        branch="issue-2208-x", test_state="running",
+        dispatched_at=time.time() - 43200.0,
+    )
+    leg = Assignment(
+        machine_name="dellserver", repo_name="cc",
+        issue_number=2208, issue_title=smoke_leg_issue_title("t", ("macos",)),
+        status="running", assignment_id="leg-macos", type="smoke",
+        branch="issue-2208-x", review_of_assignment_id="work-1",
+        dispatched_at=time.time() - 39600.0,
+    )
+
+    rec = _Recorder()
+    out = reconcile_completed_assignments(
+        _config(),
+        board=Board(
+            repos=[Repo(name="cc", github="acme/cc")], machines=[],
+            active=[leg], completed=[work],
+        ),
+        agent_status_fn=lambda host: _status(
+            completed=[{"id": f"other-{i}", "status": "done"} for i in range(25)],
+        ),
+        update_state_fn=rec,
+        capture_plan=False,
+    )
+
+    assert [c["assignment_id"] for c in rec.calls] == ["leg-macos"]
+    assert out[0]["to_status"] == "failed"
+
+    # The #3315 budget tracking write lands on the persistent parent; the
+    # leg's OWN verdict is a separate write, never a direct overwrite of the
+    # shared parent's test_state with this leg's result.
+    leg_verdicts = [v for v in verdicts if v["assignment_id"] == "leg-macos"]
+    assert len(leg_verdicts) == 1, (
+        "the leg's own verdict must land on its own row, never straight "
+        f"onto the shared parent — got {verdicts!r}"
+    )
+    assert leg_verdicts[0]["test_state"] is None
+    assert finalize_calls == ["work-1"], (
+        "finalize_smoke_fanout must be called against the shared parent "
+        f"right after the leg's own verdict is recorded — got {finalize_calls!r}"
+    )
+
+
 # ── history eviction, driven through a real AgentServer ────────────────────
 
 
