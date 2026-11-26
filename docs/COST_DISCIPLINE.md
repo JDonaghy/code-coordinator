@@ -15,8 +15,20 @@ Minimize direct code work in the coordinator — instead, write a good briefing 
 
 - **Dispatch, don't do.** If a task can be described in a briefing, send it to a worker.
   Reserve the coordinator session for triage, review, and decisions.
-- **Workers are cheap.** Sonnet workers typically cost $0.30–0.90 per task. An hour of Opus
-  coordinator time costs $40+.
+- **Workers are not cheap — dispatch is still right, but it costs dollars, not cents.** Measured
+  2026-08-08→11 (394 legs, $907 total): a **work** leg averages **$4.64** on sonnet (median
+  $3.61, ~23 min), **$7.30** on opus, **$7.89** on fable; a **review** leg averages **$1.61**, a
+  **smoke** leg **$0.44**. The figure this line carried for a year — "$0.30–0.90 per task" — was
+  stale by 5–15x, and every triage call was being made against it. An hour of Opus coordinator
+  time still costs $40+, so "dispatch, don't do" holds; what changes is that a dispatched task is
+  no longer free at the margin, so a *second* leg on the same issue is a real decision (see the
+  rework note below).
+- **Rework, not model choice, is the dominant cost.** In the same window 32 of 78 issues needed
+  more than one work leg — 48 extra legs, **$187 (21% of all spend)** — and there were more
+  review legs (133) than work legs (127), with 54 of those re-reviews (**$77**). Together the
+  request-changes→fix loop is ~29% of spend, far outweighing the sonnet-vs-opus gap. Prefer one
+  well-briefed leg over two cheap ones: the `--briefing` you skip is paid back at ~$4.64 plus a
+  $1.61 re-review.
 - **Compact aggressively.** Long coordinator sessions balloon cache reads. Use `/compact` when
   switching topics or after completing a batch of work.
 - **Parallel workers, serial coordinator.** Dispatch multiple workers in parallel, then review
