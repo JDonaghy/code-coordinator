@@ -1088,6 +1088,99 @@ def _find_leg_for_partition(
     return best
 
 
+#: Bound (characters) on the command snippet shown in a failure-evidence
+#: header. A partition's resolved Test-stage command is an arbitrary shell
+#: command (commas, brackets, newlines — anything #4166 forbids echoing
+#: into a fix briefing wholesale); this is a label, not the command itself.
+_COMMAND_LABEL_BUDGET = 80
+
+
+def _bounded_command_label(command: str) -> str:
+    """Collapse *command* to one line and cap it to `_COMMAND_LABEL_BUDGET`
+    characters, so a 3KB+ multi-stage CI command never lands in a header
+    verbatim — only enough to say which command this partition ran.
+    """
+    label = " ".join(command.split())
+    if len(label) > _COMMAND_LABEL_BUDGET:
+        label = label[:_COMMAND_LABEL_BUDGET].rstrip() + "…"
+    return label
+
+
+#: How many pre-existing-failure notes one leg may contribute. A leg writes
+#: at most one, so >1 means something appended repeatedly; cap it rather
+#: than let a pathological log pad the briefing.
+_MAX_PRE_EXISTING_NOTES = 2
+
+
+def _pre_existing_notes(leg_output: str) -> list[str]:
+    """Every `coord.base_failure_cache` note line in *leg_output*, capped."""
+    from coord.base_failure_cache import PRE_EXISTING_NOTE_PREFIX  # noqa: PLC0415
+
+    notes = [
+        line.strip()
+        for line in leg_output.splitlines()
+        if line.strip().startswith(PRE_EXISTING_NOTE_PREFIX)
+    ]
+    return notes[:_MAX_PRE_EXISTING_NOTES]
+
+
+def _write_fanout_failure_evidence(
+    work_parent_id: str,
+    leg_states: list[tuple[str, tuple[str, ...], str | None, str | None, str | None]],
+) -> None:
+    """Compose a richer fix-briefing evidence body for *work_parent_id* out
+    of each FAILING leg's own stored test output, and persist it where
+    `coord fix` already looks first.
+
+    Best-effort and silent on any read/write failure — this only enriches
+    what the fix worker is briefed with; it must never block or alter the
+    verdict :func:`finalize_smoke_fanout` is folding.
+    """
+    from coord.confirm_test import write_test_output_file  # noqa: PLC0415
+    from coord.failure_evidence import (  # noqa: PLC0415
+        extract_failure_evidence,
+        format_evidence_block,
+    )
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    sections: list[str] = []
+    for leg_id, caps, state, reason, command in leg_states:
+        if state != "failed":
+            continue
+        header = f"capability set [{'+'.join(caps)}] failed"
+        if command:
+            header += f" (ran `{_bounded_command_label(command)}`)"
+        leg_output = ""
+        try:
+            leg_output = (COORD_DIR / "test_output" / f"{leg_id}.txt").read_text()
+        except OSError:
+            leg_output = ""
+        block = format_evidence_block(extract_failure_evidence(leg_output)) if leg_output else ""
+        # #4166: the extractor keeps compiler/test lines and drops
+        # everything else, including the agent's own pre-existing-failure
+        # note (`coord.base_failure_cache`) — the one line that tells a fix
+        # worker this failure was already red on the base it branched from.
+        # Carry it through explicitly; it is bounded by construction (see
+        # `note_line`), so this cannot reintroduce unbounded log text.
+        notes = _pre_existing_notes(leg_output)
+        body = "\n".join([part for part in (block, *notes) if part])
+        if body:
+            sections.append(f"{header}\n{body}")
+        elif reason:
+            sections.append(f"{header} — {reason}")
+        else:
+            sections.append(header)
+    if not sections:
+        return
+    try:
+        write_test_output_file(work_parent_id, "\n\n".join(sections))
+    except Exception:  # noqa: BLE001 — never break the caller's own fold
+        logger.exception(
+            "_write_fanout_failure_evidence: failed to persist evidence for %s",
+            work_parent_id,
+        )
+
+
 def finalize_smoke_fanout(work_parent_id: str) -> None:
     """#3182: fold every fan-out leg's own terminal verdict into ONE
     aggregate verdict on the parent work row, once enough of them are in.
@@ -1162,22 +1255,22 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
         # failure report, so two failing legs that ran DIFFERENT commands
         # (possible now that command resolution is scoped per partition) read
         # as distinguishable instead of two identically-shaped failures.
-        leg_states: list[tuple[tuple[str, ...], str | None, str | None, str | None]] = []
+        leg_states: list[tuple[str, tuple[str, ...], str | None, str | None, str | None]] = []
         for leg_id, caps, command in legs:
             state = load_assignment_test_state(leg_id)
             reason = load_assignment_test_reason(leg_id)
-            leg_states.append((caps, state, reason, command))
-        if any(state in (None, "running") for _, state, _, _ in leg_states):
+            leg_states.append((leg_id, caps, state, reason, command))
+        if any(state in (None, "running") for _, _, state, _, _ in leg_states):
             return  # not everyone has reported in yet
 
         severity = {"failed": 3, TEST_STATE_BLOCKED: 2, "skipped": 1, "passed": 0}
         worst = max(
-            (state for _, state, _, _ in leg_states if state in severity),
+            (state for _, _, state, _, _ in leg_states if state in severity),
             key=lambda s: severity[s],
             default="passed",
         )
         summary = "; ".join(
-            f"[{'+'.join(caps)}]={state}" for caps, state, _, _ in leg_states
+            f"[{'+'.join(caps)}]={state}" for _, caps, state, _, _ in leg_states
         )
         manifest_line = _encode_fanout_manifest(
             [(lid, caps, command) for lid, caps, command in legs]
@@ -1186,12 +1279,27 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
         if worst == "failed":
             named = "; ".join(
                 f"capability set [{'+'.join(caps)}] failed"
-                + (f" (ran `{command}`)" if command else "")
+                + (f" (ran `{_bounded_command_label(command)}`)" if command else "")
                 + (f" — {reason}" if reason else "")
-                for caps, state, reason, command in leg_states
+                for _, caps, state, reason, command in leg_states
                 if state == "failed"
             )
             final_state, headline = "failed", f"Test stage failed (#3182): {named}."
+            # `test_reason` above (echoed verbatim in a `coord fix` briefing
+            # when no richer evidence exists) carries only each leg's own
+            # one-line reason — a plain-runner leg's is routinely as bare as
+            # "headless smoke" — plus the `[[smoke-fanout:...]]` manifest
+            # blob, neither of which names a single compiler error, test
+            # name, or `FAILED STAGES` line. Fold each FAILING leg's own
+            # stored test output (`write_test_output_file`, keyed by the
+            # LEG's id — see `coord.notify._record_smoke_verdict`'s
+            # retargeting) through `coord.failure_evidence.
+            # extract_failure_evidence` and persist the result on the
+            # PARENT's own test-output file, which `coord fix`
+            # (`coord.commands.plan_followup.fix`) already prefers over
+            # `test_reason` whenever it exists — no reader-side change
+            # needed for the fix briefing to pick this up.
+            _write_fanout_failure_evidence(work_parent_id, leg_states)
         elif worst == TEST_STATE_BLOCKED:
             final_state, headline = TEST_STATE_BLOCKED, (
                 "Test stage blocked (#3182): at least one capability-"

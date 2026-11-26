@@ -8415,3 +8415,427 @@ class TestReapPushSkippedForZeroCommitRefusal:
             assert "# reap: push starting" in log_text
         finally:
             server.shutdown()
+
+
+# ── #4166: post-session precheck (bounded `--resume`) ─────────────────────
+
+
+def _precheck_server(
+    tmp_path: Path,
+    *,
+    resume_argv: list[str],
+    seen: list[AssignmentSpec],
+) -> AgentServer:
+    rp = _init_repo(tmp_path / "repo")
+
+    def builder(spec: AssignmentSpec) -> list[str]:
+        seen.append(spec)
+        return resume_argv
+
+    return AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["api"],
+        state_dir=tmp_path / "state",
+        worker_command=builder,
+        repo_paths={"api": str(rp)},
+    )
+
+
+def _precheck_assignment(
+    server: AgentServer,
+    tmp_path: Path,
+    *,
+    precheck: str,
+    spec_type: str = "work",
+    session_id: str | None = "sess-1",
+    status: str = DONE,
+    worktree: Path | None = None,
+) -> AgentAssignment:
+    wt = worktree if worktree is not None else tmp_path / "wt"
+    wt.mkdir(parents=True, exist_ok=True)
+    spec = _spec(tmp_path / "repo", type=spec_type, precheck=precheck)
+    a = AgentAssignment(id="pc1", spec=spec, status=status)
+    a.log_path = str(tmp_path / "pc1.log")
+    a.worktree_path = str(wt)
+    a.claude_session_id = session_id
+    server._assignments[a.id] = a
+    return a
+
+
+def test_post_session_precheck_passing_needs_no_resume(tmp_path: Path) -> None:
+    """The common case: the worker did run the repo's compliance set before
+    pushing, so the agent's own run of it passes and nothing is resumed."""
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+    a = _precheck_assignment(server, tmp_path, precheck="true")
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "passed"
+    assert a.precheck_reason is None
+    assert a.precheck_resume_attempts == 0
+    assert seen == []  # no session was resumed
+
+
+def test_post_session_precheck_resumes_the_worker_and_rechecks(tmp_path: Path) -> None:
+    """A precheck that fails is handed back to the worker's OWN session via
+    `--resume`, and the precheck is re-run against what that session did —
+    the leg only reports `failed` if it is still failing afterwards."""
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(
+        tmp_path,
+        resume_argv=[sys.executable, "-c", "open('fixed', 'w').close()"],
+        seen=seen,
+    )
+    a = _precheck_assignment(server, tmp_path, precheck="test -f fixed")
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "passed"
+    assert a.precheck_resume_attempts == 1
+    # The remediation turn ran in the leg's own worktree...
+    assert (tmp_path / "wt" / "fixed").exists()
+    # ...as a resume of the worker's own session, carrying the failing
+    # precheck as its next user turn rather than a fresh briefing.
+    assert len(seen) == 1
+    assert seen[0].resume_session_id == "sess-1"
+    assert "test -f fixed" in seen[0].briefing
+    log = Path(a.log_path).read_text()
+    assert "resuming session sess-1" in log
+
+
+def test_post_session_precheck_reports_failed_once_the_resume_budget_is_spent(
+    tmp_path: Path,
+) -> None:
+    """The failing verdict is reachable (#2096): a remediation session that
+    does not fix the precheck is not retried forever — one attempt, then the
+    failure is recorded as-is."""
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(
+        tmp_path,
+        resume_argv=[sys.executable, "-c", "print('I changed nothing')"],
+        seen=seen,
+    )
+    a = _precheck_assignment(
+        server, tmp_path, precheck="echo 'clippy: 3 warnings denied' >&2; exit 1",
+    )
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "failed"
+    assert a.precheck_resume_attempts == 1
+    assert a.precheck_reason is not None
+    assert "clippy: 3 warnings denied" in a.precheck_reason
+    assert len(seen) == 1  # bounded — exactly one resume, not a loop
+    # Diagnostic only: a precheck verdict never re-grades pushed work.
+    assert a.status == DONE
+
+
+def test_post_session_precheck_honours_a_zero_resume_budget(tmp_path: Path) -> None:
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+    server.precheck_max_resume_attempts = 0
+    a = _precheck_assignment(server, tmp_path, precheck="exit 1")
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "failed"
+    assert a.precheck_resume_attempts == 0
+    assert seen == []
+
+
+def test_post_session_precheck_cannot_resume_without_a_session_id(tmp_path: Path) -> None:
+    """No captured session id means there is no conversation to re-enter —
+    report the failure rather than spawn a context-free session."""
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+    a = _precheck_assignment(server, tmp_path, precheck="exit 1", session_id=None)
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "failed"
+    assert a.precheck_resume_attempts == 0
+    assert seen == []
+    assert "no claude session id captured" in Path(a.log_path).read_text()
+
+
+def test_post_session_precheck_skips_when_the_worktree_is_gone(tmp_path: Path) -> None:
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+    a = _precheck_assignment(
+        server, tmp_path, precheck="exit 1", worktree=tmp_path / "wt",
+    )
+    shutil.rmtree(tmp_path / "wt")
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "skipped"
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("spec_type", "precheck", "status"),
+    [
+        ("smoke", "exit 1", DONE),       # never carries a precheck on the wire
+        ("review", "exit 1", DONE),
+        ("work", "", DONE),              # repo declared none
+        ("work", "exit 1", FAILED),      # nothing landed to check
+    ],
+)
+def test_post_session_precheck_is_a_no_op_outside_its_gate(
+    tmp_path: Path, spec_type: str, precheck: str, status: str,
+) -> None:
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+    a = _precheck_assignment(
+        server, tmp_path, precheck=precheck, spec_type=spec_type, status=status,
+    )
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status is None
+    assert a.precheck_reason is None
+    assert seen == []
+
+
+# ── #4166: per-base-SHA pre-existing-failure cache ───────────────────────
+
+
+def _failing_evidence(line_no: int) -> object:
+    from coord.failure_evidence import extract_failure_evidence
+
+    return extract_failure_evidence(
+        "running stage 1/1: cargo test --workspace --lib\n"
+        f"thread 'tests::resize' panicked at src/widget.rs:{line_no}:9:\n"
+        "assertion `left == right` failed\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+
+
+def test_a_sibling_branch_failing_the_same_way_is_called_out_as_pre_existing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Two branches off the same base failing identically is evidence the
+    failure belongs to the base — the second leg's own log says so, ahead of
+    its `SMOKE:` marker, which is what reaches the fix briefing."""
+    monkeypatch.delenv("COORD_BASE_FAILURE_CACHE", raising=False)
+    clone, _origin = _init_repo_with_origin(tmp_path)
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+
+    first = AgentAssignment(
+        id="leg-a", spec=_spec(clone, type="smoke", target_branch="issue-1"), status=DONE,
+    )
+    first.log_path = str(tmp_path / "leg-a.log")
+    Path(first.log_path).write_text("# existing log\n")
+    second = AgentAssignment(
+        id="leg-b", spec=_spec(clone, type="smoke", target_branch="issue-2"), status=DONE,
+    )
+    second.log_path = str(tmp_path / "leg-b.log")
+    server._assignments[first.id] = first
+    server._assignments[second.id] = second
+
+    server._note_pre_existing_failure(first, clone, _failing_evidence(120))
+    server._note_pre_existing_failure(second, clone, _failing_evidence(131))
+
+    # The first branch to hit it has nothing to compare against.
+    assert first.pre_existing_failure_reason is None
+    assert "pre-existing failure:" not in Path(first.log_path).read_text()
+
+    assert second.pre_existing_failure_reason is not None
+    assert "issue-1" in second.pre_existing_failure_reason
+    assert "pre-existing failure:" in Path(second.log_path).read_text()
+
+
+def test_the_same_branch_failing_twice_is_not_called_pre_existing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A retry of one leg is not two independent branches — it says nothing
+    about the base and must not be reported as if it did."""
+    monkeypatch.delenv("COORD_BASE_FAILURE_CACHE", raising=False)
+    clone, _origin = _init_repo_with_origin(tmp_path)
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+
+    spec = _spec(clone, type="smoke", target_branch="issue-1")
+    for leg_id in ("leg-a", "leg-b"):
+        a = AgentAssignment(id=leg_id, spec=spec, status=DONE)
+        a.log_path = str(tmp_path / f"{leg_id}.log")
+        server._assignments[leg_id] = a
+        server._note_pre_existing_failure(a, clone, _failing_evidence(120))
+        assert a.pre_existing_failure_reason is None
+
+
+def test_a_repo_with_no_resolvable_base_records_nothing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """No `origin` remote means no base SHA to key on — the cache stays
+    empty rather than keying every repo's failures under one bogus base."""
+    from coord.base_failure_cache import read_records
+
+    monkeypatch.delenv("COORD_BASE_FAILURE_CACHE", raising=False)
+    local_only = _init_repo(tmp_path / "local")
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+
+    assert server._resolve_base_sha(local_only, "main") == ""
+
+    a = AgentAssignment(
+        id="leg-a", spec=_spec(local_only, type="smoke", target_branch="issue-1"),
+        status=DONE,
+    )
+    a.log_path = str(tmp_path / "leg-a.log")
+    server._note_pre_existing_failure(a, local_only, _failing_evidence(120))
+
+    assert a.pre_existing_failure_reason is None
+    assert read_records(state_dir=tmp_path / "state") == []
+
+
+def test_reap_runs_the_post_session_precheck_for_a_real_work_leg(tmp_path: Path) -> None:
+    """The hook is reachable from production, not just callable in a unit
+    test: drive the real `_reap` path via `assign()`/`wait_for()` and assert
+    the precheck verdict landed on the assignment the coordinator polls."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=[
+            sys.executable, "-c",
+            "import subprocess; open('fixed', 'w').close(); "
+            "subprocess.run(['git', 'add', '-A'], stdout=subprocess.DEVNULL); "
+            "subprocess.run(['git', 'commit', '-m', 'onward'], stdout=subprocess.DEVNULL)",
+        ],
+        repo_path=repo,
+    )
+
+    a = server.assign(_spec(repo, precheck="test -f fixed"))
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE
+    assert final.precheck_status == "passed"
+    assert final.precheck_resume_attempts == 0
+    assert "# precheck (#4166): passed" in Path(final.log_path).read_text()
+    server.shutdown()
+
+
+def test_reap_records_a_failing_precheck_without_re_grading_the_leg(
+    tmp_path: Path,
+) -> None:
+    """A precheck the worker left failing is reported as a diagnostic — the
+    leg's commits are already pushed, so its status is never re-graded off
+    the back of it (#1357's posture)."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=[
+            sys.executable, "-c",
+            "import subprocess; subprocess.run("
+            "['git', 'commit', '--allow-empty', '-m', 'onward'], "
+            "stdout=subprocess.DEVNULL)",
+        ],
+        repo_path=repo,
+    )
+    server.precheck_max_resume_attempts = 0
+
+    a = server.assign(
+        _spec(repo, precheck="echo 'rustfmt: 2 files need formatting' >&2; exit 1"),
+    )
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE
+    assert final.precheck_status == "failed"
+    assert final.precheck_reason is not None
+    assert "rustfmt: 2 files need formatting" in final.precheck_reason
+    assert final.zero_commit_reason is None
+    server.shutdown()
+
+
+def test_precheck_reason_on_the_row_is_a_bounded_headline(tmp_path: Path) -> None:
+    """#715 caps the whole `/status` payload, so the precheck's own output
+    must not ride on the row in full — the row gets a headline, the leg's
+    log gets the detail."""
+    from coord.agent import PRECHECK_REASON_CHARS
+
+    noisy = "; ".join(f"warning {i}: something is off" for i in range(400))
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(tmp_path, resume_argv=[sys.executable, "-c", ""], seen=seen)
+    server.precheck_max_resume_attempts = 0
+    a = _precheck_assignment(
+        server, tmp_path,
+        precheck=f"{sys.executable} -c \"print({noisy!r}); print('error: aborting due to 400 previous errors')\"; exit 1",
+    )
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "failed"
+    assert a.precheck_reason is not None
+    assert len(a.precheck_reason) <= PRECHECK_REASON_CHARS + 1
+    assert "aborting due to 400 previous errors" in a.precheck_reason
+    # The detail is still recoverable — from the log, which costs no poll
+    # latency.
+    assert "warning 399: something is off" in Path(a.log_path).read_text()
+
+
+def test_status_payload_omits_precheck_diagnostics_a_leg_never_had(tmp_path: Path) -> None:
+    """Almost no leg has a precheck verdict (only a repo that declares
+    `repos[].precheck` ever gets one), so the fields must cost nothing on
+    every other entry — and must round-trip when they ARE set."""
+    repo = _init_repo(tmp_path / "repo")
+    spec = _spec(repo)
+
+    plain = AgentAssignment(id="plain", spec=spec, status=DONE, finished_at=1.0)
+    d = plain.to_status_dict()
+    for key in (
+        "precheck_status",
+        "precheck_reason",
+        "precheck_resume_attempts",
+        "pre_existing_failure_reason",
+    ):
+        assert key not in d
+
+    graded = AgentAssignment(id="graded", spec=spec, status=DONE, finished_at=1.0)
+    graded.precheck_status = "failed"
+    graded.precheck_reason = "rustfmt: 2 files would be reformatted"
+    graded.precheck_resume_attempts = 1
+    d2 = graded.to_status_dict()
+    assert d2["precheck_status"] == "failed"
+    assert d2["precheck_resume_attempts"] == 1
+
+    # A slimmed entry still reloads (missing key -> dataclass default).
+    reloaded = AgentAssignment(spec=spec, **{k: v for k, v in d.items() if k != "spec"})
+    assert reloaded.precheck_status is None
+    assert reloaded.precheck_resume_attempts == 0
+
+
+def test_post_session_precheck_pushes_what_the_remediation_committed(
+    tmp_path: Path,
+) -> None:
+    """`_reap`'s own push runs BEFORE the precheck step, so a remediation
+    turn that commits but does not push would leave its fix in a worktree
+    that is torn down moments later. The fix has to reach origin."""
+    wt = _init_repo_with_remote(tmp_path / "wt")
+    remote = tmp_path / "wt-remote.git"
+    seen: list[AssignmentSpec] = []
+    server = _precheck_server(
+        tmp_path,
+        resume_argv=[
+            sys.executable, "-c",
+            "import subprocess; open('fixed', 'w').close(); "
+            "subprocess.run(['git', 'add', '-A'], stdout=subprocess.DEVNULL); "
+            "subprocess.run(['git', 'commit', '-m', 'precheck fix'], "
+            "stdout=subprocess.DEVNULL)",
+        ],
+        seen=seen,
+    )
+    a = _precheck_assignment(server, tmp_path, precheck="test -f fixed", worktree=wt)
+
+    server._run_post_session_precheck(a)
+
+    assert a.precheck_status == "passed"
+    assert a.precheck_resume_attempts == 1
+    pushed = subprocess.run(
+        ["git", "log", "--oneline", "-1", "main"], cwd=str(remote),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "precheck fix" in pushed
+    assert "pushed the remediation commits" in Path(a.log_path).read_text()

@@ -29,6 +29,7 @@ from coord.failure_evidence import (
     FailureEvidence,
     FailureSignals,
     extract_failure_evidence,
+    failure_signature,
     format_evidence_block,
 )
 
@@ -243,6 +244,50 @@ def test_pytest_failed_tally_names_pytest_even_without_failed_line() -> None:
     assert evidence.failed_stages == ("pytest",)
 
 
+# ── Echo-trap defense ───────────────────────────────────────────────────────
+
+
+def test_echoed_test_command_does_not_shadow_the_real_failed_stage() -> None:
+    """A multi-stage runner's own `test_command` is routinely echoed into the
+    log before it ever runs (a `set -x` trace, a script-source dump for a
+    verbose failure report) — and that echo can itself contain the literal
+    `FAILED STAGES (stage order, first is likely root): ...` phrasing as
+    unexpanded template text, with no real failure behind it yet. This is
+    the real production shape (#4092's extractor runs over the stored leg
+    output exactly as `coord.notify._record_smoke_verdict` persists it,
+    which never carries a trailing `SMOKE:` line of its own — that marker
+    is a worker-transport detail stripped before storage). The FIRST
+    occurrence here is exactly that echo; only the LAST is the real verdict,
+    and it must win even with no further corroboration.
+    """
+    log = (
+        "+ grep -A1 FAILED_STAGES ci-check.sh\n"
+        "FAILED STAGES (stage order, first is likely root): $failed_list\n"
+        "running stage 1/2: cargo fmt --check\n"
+        "stage 1/2 OK\n"
+        "running stage 2/2: cargo test --workspace --lib\n"
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "test result: FAILED. 0 passed; 1 failed\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ("cargo test --workspace --lib",)
+
+
+def test_single_failed_stages_line_is_still_trusted() -> None:
+    """The common case: exactly one `FAILED STAGES` line in the log is
+    trusted on its own.
+    """
+    log = (
+        "running stage 1/1: cargo test --workspace --lib\n"
+        "test result: FAILED. 0 passed; 1 failed\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+    evidence = extract_failure_evidence(log)
+    assert evidence.failed_stages == ("cargo test --workspace --lib",)
+
+
 # ── Round-trip (dict) serialisation — this is what gets persisted ──────────
 
 
@@ -285,3 +330,58 @@ def test_run_plain_runner_command_pass_has_empty_evidence() -> None:
     verdict = run_plain_runner_command("whatever", "/tmp", timeout=5.0, run=fake_run)
     assert verdict.failure_evidence is not None
     assert verdict.failure_evidence.is_empty
+
+
+# ── #4166: failure fingerprinting (the per-base-SHA cache's key) ───────────
+
+
+def test_the_same_defect_on_two_machines_fingerprints_identically() -> None:
+    """Two runs of ONE defect differ in everything that isn't the defect:
+    temp dirs, elapsed times, pids, surrounding line numbers. The cache key
+    must not move because of any of it."""
+    run_a = (
+        "running stage 1/2: cargo test --workspace --lib\n"
+        "thread 'tests::resize' panicked at /tmp/build-1234/src/widget.rs:120:9:\n"
+        "assertion `left == right` failed\n"
+        "test result: FAILED. 0 passed; 1 failed; finished in 12.84s\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+    run_b = (
+        "running stage 1/2: cargo test --workspace --lib\n"
+        "thread 'tests::resize' panicked at /var/folders/zz/build-98765/src/widget.rs:131:9:\n"
+        "assertion `left == right` failed\n"
+        "test result: FAILED. 0 passed; 1 failed; finished in 41.02s\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+
+    sig_a = failure_signature(extract_failure_evidence(run_a))
+    sig_b = failure_signature(extract_failure_evidence(run_b))
+
+    assert sig_a
+    assert sig_a == sig_b
+
+
+def test_two_different_defects_fingerprint_differently() -> None:
+    compile_failure = extract_failure_evidence(
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "error: could not compile `quadraui`\n"
+    )
+    test_failure = extract_failure_evidence(_read("pytest_failure.log"))
+
+    assert failure_signature(compile_failure) != failure_signature(test_failure)
+
+
+def test_an_empty_evidence_record_has_no_fingerprint() -> None:
+    """Nothing may ever be keyed off "no evidence at all" — a clean pass and
+    an unparseable log must not collide on one cache key."""
+    assert failure_signature(FailureEvidence()) == ""
+    assert failure_signature(extract_failure_evidence(_read("clean_pass.log"))) == ""
+
+
+def test_a_fingerprint_is_short_and_stable_across_calls() -> None:
+    evidence = extract_failure_evidence(_read("pytest_failure.log"))
+
+    first = failure_signature(evidence)
+    assert first == failure_signature(evidence)
+    assert len(first) == 16

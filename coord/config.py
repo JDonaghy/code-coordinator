@@ -3975,6 +3975,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "requires",
         "max_parallel",
         "board_doctor",
+        "precheck",
     }
 )
 
@@ -4190,6 +4191,17 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
         if run_cmd is not None and not isinstance(run_cmd, str):
             raise ConfigError(f"repos[{i}].run_cmd must be a string")
 
+        # #4166: precheck — the repo's declared fast compliance set, run by
+        # a work/fix leg before its final push.
+        precheck = entry.get("precheck")
+        if precheck is not None and not isinstance(precheck, str):
+            raise ConfigError(f"repos[{i}].precheck must be a string")
+        if isinstance(precheck, str) and not precheck.strip():
+            raise ConfigError(
+                f"repos[{i}].precheck must be a non-empty string (omit the "
+                "key entirely to declare no precheck)"
+            )
+
         worker_permissions = _parse_worker_permissions(entry.get("worker_permissions"), i)
 
         housekeeping = entry.get("housekeeping", []) or []
@@ -4330,6 +4342,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 test_command=test_command,
                 ci_command=ci_command,
                 run_cmd=run_cmd,
+                precheck=precheck,
                 worker_permissions=worker_permissions,
                 housekeeping=housekeeping,
                 coordinator_only_files=coordinator_only_files,

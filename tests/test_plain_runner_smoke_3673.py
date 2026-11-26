@@ -584,3 +584,87 @@ def test_check_plain_runner_target_branch_detects_head_mismatch(tmp_path: Path) 
     assert error is not None
     assert "does not match" in error
     server.shutdown()
+
+
+# ── #4166: two branches off one base, failing identically ─────────────────
+
+
+def test_two_branches_off_one_base_report_the_second_failure_as_pre_existing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """End-to-end through the real plain-runner path: when a second branch
+    cut from the same base fails with the same fingerprint as a first one,
+    the second leg's log says the failure predates the branch — written
+    ahead of the closing ``SMOKE:`` marker, which is the only part of the
+    log that survives into the stored leg output a fix briefing is built
+    from (`coord.progress.parse_smoke_verdict_from_log`).
+    """
+    monkeypatch.delenv("COORD_BASE_FAILURE_CACHE", raising=False)
+    repo = _init_repo_with_remote(tmp_path / "repo")
+    for branch in ("issue-1-first", "issue-2-second"):
+        subprocess.run(
+            ["git", "checkout", "-b", branch, "main"], cwd=str(repo),
+            check=True, capture_output=True,
+        )
+        (repo / f"{branch}.txt").write_text("work\n")
+        subprocess.run(["git", "add", "-A"], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"work on {branch}"], cwd=str(repo),
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch], cwd=str(repo),
+            check=True, capture_output=True,
+        )
+    subprocess.run(["git", "checkout", "main"], cwd=str(repo), check=True, capture_output=True)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        # The failure summariser is the only `claude` call on this path;
+        # stub it so the test never shells out to a real binary.
+        if isinstance(cmd, list) and cmd and cmd[0] == agent_mod.DEFAULT_WORKER_BINARY:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(agent_mod.subprocess, "run", fake_run)
+
+    server = _server(
+        tmp_path, repo_path=repo,
+        argv=[sys.executable, "-c", "raise SystemExit('claude must never run for this leg')"],
+    )
+    # Same failure on both branches — a ratchet that tripped on the base,
+    # not something either branch introduced.
+    failing = (
+        f"{sys.executable} -c \"print('error[E0308]: mismatched types'); "
+        "print(' --> src/widget.rs:120:9'); "
+        "print('FAILED STAGES (stage order, first is likely root): cargo test'); "
+        'import sys; sys.exit(1)"'
+    )
+    logs: dict[str, str] = {}
+    try:
+        for issue, branch in ((1, "issue-1-first"), (2, "issue-2-second")):
+            spec = _spec(
+                repo, type="smoke", plain_runner=True, issue_number=issue,
+                target_branch=branch, smoke_command=failing, smoke_timeout_s=60,
+            )
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=30)
+            assert final.status == DONE, final.error
+            assert final.exit_code == 1
+            logs[branch] = Path(final.log_path).read_text()
+            if branch == "issue-1-first":
+                assert final.pre_existing_failure_reason is None
+            else:
+                assert final.pre_existing_failure_reason is not None
+                assert "issue-1-first" in final.pre_existing_failure_reason
+    finally:
+        server.shutdown()
+
+    assert "pre-existing failure:" not in logs["issue-1-first"]
+
+    second = logs["issue-2-second"]
+    assert "pre-existing failure:" in second
+    assert "issue-1-first" in second
+    # Ahead of the marker, or no reader would ever see it.
+    assert second.index("pre-existing failure:") < second.index("SMOKE: fail")

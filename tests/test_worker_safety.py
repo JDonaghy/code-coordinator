@@ -487,6 +487,50 @@ class TestNewIssueGuidanceSystemPrompt:
         assert "gh issue create" in system_prompt
 
 
+# ── precheck in system prompt ────────────────────────────────────────────
+
+
+class TestPrecheckSystemPrompt:
+    """#4166: a repo's declared `precheck` is included in a work/fix leg's
+    system prompt — the briefing contract that tells the worker to run its
+    fast compliance set before the final push."""
+
+    def test_work_system_prompt_includes_precheck_when_provided(self) -> None:
+        precheck = "cargo clippy --all-targets -- -D warnings"
+        spec = _spec(type="work", precheck=precheck)
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+        assert precheck in system_prompt
+        assert "Before your final push" in system_prompt
+
+    def test_fix_system_prompt_includes_precheck_when_provided(self) -> None:
+        precheck = "cargo clippy --all-targets -- -D warnings"
+        spec = _spec(type="fix", precheck=precheck)
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+        assert precheck in system_prompt
+
+    def test_work_system_prompt_omits_precheck_when_empty(self) -> None:
+        spec = _spec(type="work", precheck="")
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+        assert "Before your final push" not in system_prompt
+
+    def test_smoke_system_prompt_never_sees_precheck(self) -> None:
+        """A smoke leg runs the Test stage's own command, not a precheck —
+        `spec.precheck` is only ever sent for type="work"/"fix" (see
+        `coord.dispatch.dispatch`'s own gating), but the prompt-building
+        branch for `smoke` must stay inert even if it were somehow set."""
+        spec = _spec(type="smoke", precheck="make precheck")
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+        assert "make precheck" not in system_prompt
+
+
 # ── #2314: flag-position-insensitive deny matching ──────────────────────────
 #
 # `Bash(pip install -e *)` only matched `-e` IMMEDIATELY after `install` — a
