@@ -1017,6 +1017,28 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
     return str(repo_cfg.github or ""), str(getattr(repo_cfg, "default_branch", "") or "main")
 
 
+def _repo_surface_paths(config_path: Path, repo: str) -> tuple[str, ...]:
+    """Flattened ``Repo.integration_surfaces`` (#4151) paths for *repo*.
+
+    Same fail-open posture as `_repo_coordinates`: an unresolvable repo or
+    a config that won't load yields no surfaces rather than raising —
+    `predict_overlap`'s `surface_paths=()` default already degrades to
+    the pre-#4154 behaviour, so a config problem here must not also break
+    the overlap prediction it would otherwise still be able to make.
+    """
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        repo_cfg = _load_config(config_path).repo(repo)
+    except (Exception, SystemExit):  # noqa: BLE001 — see `_repo_coordinates`
+        return ()
+    surfaces = list(getattr(repo_cfg, "integration_surfaces", None) or [])
+    paths: list[str] = []
+    for surface in surfaces:
+        paths.extend(str(p) for p in (getattr(surface, "paths", None) or ()))
+    return tuple(paths)
+
+
 def _candidate_body_only(config_path: Path, repo: str, issue: int) -> str:
     """This candidate issue's own body, for a caller that needs its declared
     files text but not #2247's overlap prediction (#4008).
@@ -1255,6 +1277,13 @@ def _predict_overlap(
     checked first (ground truth); a queued entry with no branch yet is
     compared declaration-to-declaration, and only when it has one.
 
+    Passes the repo's declared ``integration_surfaces`` (#4151) paths
+    through to `predict_overlap` as `surface_paths` (#4154, via
+    `_repo_surface_paths`), so an overlap confined entirely to a
+    mechanically-derived file (a ratchet-test fixture, a generated
+    baseline) never chains a `--after` edge on its own — milestone.py
+    reuses this same function, so that caller is covered too.
+
     Returns ``(prediction, staleness_note, malformed_warning, candidate_body)``
     — see `_candidate_body` for when the staleness note is non-empty, and
     :func:`coord.overlap_predict.malformed_files_warning` (#3258) for the
@@ -1315,8 +1344,11 @@ def _predict_overlap(
             synced_at_fetcher=_issue_body_synced_at,
         )
     )
+    surface_paths = _repo_surface_paths(config_path, repo)
     return (
-        predict_overlap(candidate, footprints, exclude_keys={key}),
+        predict_overlap(
+            candidate, footprints, exclude_keys={key}, surface_paths=surface_paths,
+        ),
         staleness_note,
         malformed_warning,
         candidate_body,

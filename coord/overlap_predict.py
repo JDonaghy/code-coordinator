@@ -127,12 +127,12 @@ that one file is still real, uncovered work. :func:`predict_overlap` threads
 the same ``surface_paths`` through to every footprint it compares against —
 dropping the resulting empty-hit overlap via the existing ``if hits:`` guard,
 not a new code path — so a candidate whose ONLY overlap with an in-flight
-branch is a surface file now yields `Prediction()` (rule 3: no prediction,
-not a refusal) for that footprint, exactly as if the two branches had never
-touched the same file at all. :func:`classify_outcome` does not take this
-parameter: scoring a PAST prediction against the real diffs is a different
-question ("was the recorded claim true") from ordering a NEW one, and
-widening that signature was not asked for here.
+branch is a surface file now yields a falsy prediction with no overlaps for
+that footprint (rule 3: no prediction, not a refusal), exactly as if the two
+branches had never touched the same file at all. :func:`classify_outcome`
+does not take this parameter: scoring a PAST prediction against the real
+diffs is a different question ("was the recorded claim true") from
+ordering a NEW one, and widening that signature was not asked for here.
 """
 
 from __future__ import annotations
@@ -646,6 +646,25 @@ def overlap_would_run_before(
     return int(new_position) <= int(other_position)
 
 
+def _surface_covers(path: str, surface: str) -> bool:
+    """Whether a declared ``integration_surfaces`` path covers *path*.
+
+    Directed, unlike :func:`paths_overlap`: a surface covers a path only
+    when they are identical, or *surface* is a directory declaration
+    (trailing slash) that *path* sits under. The reverse — *path* being a
+    directory that happens to contain *surface* — does NOT count, because
+    that shape is a coarse ``## Files`` declaration (``scripts/``) that
+    also covers real, non-surface work (``scripts/deploy.py``) the surface
+    itself says nothing about; only the narrower side of the relationship
+    is evidence that the matched path is purely the mechanical artifact.
+    """
+    if not path or not surface:
+        return False
+    if path == surface:
+        return True
+    return bool(surface.endswith("/") and path.startswith(surface))
+
+
 def _intersect(
     candidate: Sequence[str],
     other: Sequence[str],
@@ -654,23 +673,33 @@ def _intersect(
 ) -> tuple[str, ...]:
     """The candidate paths that also appear in *other*, via :func:`paths_overlap`.
 
-    #4154: when *surface_paths* is given and every hit is covered by one of
-    them, the whole match is dropped (``()``) — a collision that is entirely
-    on a declared ``integration_surfaces`` path (#4151) is not a real
-    collision between the two branches' own work; see the module docstring.
-    A single non-surface hit keeps the ENTIRE result, surface hits included:
-    this only decides whether the match counts as a collision at all, it
-    does not selectively hide files from an edge that is real for another
-    reason.
+    #4154: when *surface_paths* is given, the whole match is dropped
+    (``()``) only when EVERY candidate hit AND every ``other`` path it
+    matched against is covered by a declared surface (:func:`_surface_covers`,
+    directed — see its docstring for why the direction matters). Checking
+    only the candidate-side hits is not enough: a coarse directory
+    declaration on the ``other`` side (``scripts/``) can match a candidate's
+    exact surface file while itself standing in for real, non-surface work
+    that this function never sees directly — requiring the matched ``other``
+    paths to also be covered closes that gap. A single uncovered path on
+    either side keeps the ENTIRE result, surface hits included: this only
+    decides whether the match counts as a collision at all, it does not
+    selectively hide files from an edge that is real for another reason.
     """
     hits: list[str] = []
+    matched_other: set[str] = set()
     for path in candidate:
-        if any(paths_overlap(path, o) for o in other) and path not in hits:
-            hits.append(path)
-    if hits and surface_paths and all(
-        any(paths_overlap(hit, surface) for surface in surface_paths) for hit in hits
-    ):
-        return ()
+        matches = [o for o in other if paths_overlap(path, o)]
+        if matches:
+            if path not in hits:
+                hits.append(path)
+            matched_other.update(matches)
+    if hits and surface_paths:
+        def covered(p: str) -> bool:
+            return any(_surface_covers(p, surface) for surface in surface_paths)
+
+        if all(covered(h) for h in hits) and all(covered(o) for o in matched_other):
+            return ()
     return tuple(hits)
 
 
