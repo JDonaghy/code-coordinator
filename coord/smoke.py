@@ -1106,6 +1106,24 @@ def _bounded_command_label(command: str) -> str:
     return label
 
 
+#: How many pre-existing-failure notes one leg may contribute. A leg writes
+#: at most one, so >1 means something appended repeatedly; cap it rather
+#: than let a pathological log pad the briefing.
+_MAX_PRE_EXISTING_NOTES = 2
+
+
+def _pre_existing_notes(leg_output: str) -> list[str]:
+    """Every `coord.base_failure_cache` note line in *leg_output*, capped."""
+    from coord.base_failure_cache import PRE_EXISTING_NOTE_PREFIX  # noqa: PLC0415
+
+    notes = [
+        line.strip()
+        for line in leg_output.splitlines()
+        if line.strip().startswith(PRE_EXISTING_NOTE_PREFIX)
+    ]
+    return notes[:_MAX_PRE_EXISTING_NOTES]
+
+
 def _write_fanout_failure_evidence(
     work_parent_id: str,
     leg_states: list[tuple[str, tuple[str, ...], str | None, str | None, str | None]],
@@ -1138,8 +1156,16 @@ def _write_fanout_failure_evidence(
         except OSError:
             leg_output = ""
         block = format_evidence_block(extract_failure_evidence(leg_output)) if leg_output else ""
-        if block:
-            sections.append(f"{header}\n{block}")
+        # #4166: the extractor keeps compiler/test lines and drops
+        # everything else, including the agent's own pre-existing-failure
+        # note (`coord.base_failure_cache`) — the one line that tells a fix
+        # worker this failure was already red on the base it branched from.
+        # Carry it through explicitly; it is bounded by construction (see
+        # `note_line`), so this cannot reintroduce unbounded log text.
+        notes = _pre_existing_notes(leg_output)
+        body = "\n".join([part for part in (block, *notes) if part])
+        if body:
+            sections.append(f"{header}\n{body}")
         elif reason:
             sections.append(f"{header} — {reason}")
         else:
@@ -1253,7 +1279,7 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
         if worst == "failed":
             named = "; ".join(
                 f"capability set [{'+'.join(caps)}] failed"
-                + (f" (ran `{command}`)" if command else "")
+                + (f" (ran `{_bounded_command_label(command)}`)" if command else "")
                 + (f" — {reason}" if reason else "")
                 for _, caps, state, reason, command in leg_states
                 if state == "failed"

@@ -6489,6 +6489,83 @@ def test_finalize_smoke_fanout_bounds_the_echoed_command_label(
     header_line = briefing_evidence.splitlines()[0]
     assert len(header_line) < 200
 
+    # The aggregate `test_reason` is read as a briefing fallback when no
+    # richer evidence file exists, so its own per-leg headline is bounded
+    # the same way.
+    from coord.state import load_assignment_test_reason  # noqa: PLC0415
+
+    reason = load_assignment_test_reason("w-fanout") or ""
+    assert huge_command not in reason
+    assert "(ran `set -x echo stage 0" in reason
+
+
+def test_finalize_smoke_fanout_carries_a_pre_existing_failure_note(
+    coord_db, tmp_path, monkeypatch,
+) -> None:
+    """#4166: the agent writes a one-line pre-existing-failure note into a
+    failing leg's own output when a sibling branch off the same base already
+    failed the same way (`coord.base_failure_cache`). The evidence extractor
+    keeps compiler/test lines only, so the note has to be carried through
+    explicitly — otherwise the fix worker never learns the failure predates
+    its branch.
+    """
+    from coord.base_failure_cache import PRE_EXISTING_NOTE_PREFIX  # noqa: PLC0415
+    from coord.confirm_test import write_test_output_file  # noqa: PLC0415
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    coord_state_dir = tmp_path / "coord-state"
+    monkeypatch.setattr("coord.state.COORD_DIR", coord_state_dir)
+
+    note = (
+        f"{PRE_EXISTING_NOTE_PREFIX} this same failure was already recorded "
+        "for quadraui at base 0123456789ab on branch issue-1 (2026-11-20) — "
+        "it predates this branch."
+    )
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="failed", reason="headless smoke")
+    write_test_output_file(
+        "leg-a",
+        "running stage 1/1: cargo test --workspace --lib\n"
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "FAILED STAGES (stage order, first is likely root): "
+        "cargo test --workspace --lib\n"
+        f"{note}\n",
+    )
+    manifest = _encode_fanout_manifest([("leg-a", ("gtk",), "cargo test --workspace --lib")])
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            f"{manifest}\n"
+            "Test stage running across 1 capability-partition leg(s) (#3182): [gtk]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    briefing_evidence = (coord_state_dir / "test_output" / "w-fanout.txt").read_text()
+
+    assert note in briefing_evidence
+    assert "error[E0308]: mismatched types" in briefing_evidence
+
+
+def test_pre_existing_notes_are_capped_and_everything_else_is_ignored() -> None:
+    """A leg writes one note; a pathological log carrying many must not pad
+    the briefing with all of them, and ordinary log lines never masquerade
+    as notes."""
+    from coord.base_failure_cache import PRE_EXISTING_NOTE_PREFIX  # noqa: PLC0415
+    from coord.smoke import _MAX_PRE_EXISTING_NOTES, _pre_existing_notes  # noqa: PLC0415
+
+    assert _pre_existing_notes("error[E0308]: mismatched types\nSMOKE: fail\n") == []
+
+    many = "".join(f"{PRE_EXISTING_NOTE_PREFIX} note {i}\n" for i in range(20))
+    notes = _pre_existing_notes("some log\n" + many)
+
+    assert len(notes) == _MAX_PRE_EXISTING_NOTES
+    assert notes[0] == f"{PRE_EXISTING_NOTE_PREFIX} note 0"
+
 
 @pytest.mark.parametrize(
     "infra_reason",

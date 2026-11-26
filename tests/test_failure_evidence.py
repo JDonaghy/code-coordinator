@@ -29,6 +29,7 @@ from coord.failure_evidence import (
     FailureEvidence,
     FailureSignals,
     extract_failure_evidence,
+    failure_signature,
     format_evidence_block,
 )
 
@@ -329,3 +330,58 @@ def test_run_plain_runner_command_pass_has_empty_evidence() -> None:
     verdict = run_plain_runner_command("whatever", "/tmp", timeout=5.0, run=fake_run)
     assert verdict.failure_evidence is not None
     assert verdict.failure_evidence.is_empty
+
+
+# ── #4166: failure fingerprinting (the per-base-SHA cache's key) ───────────
+
+
+def test_the_same_defect_on_two_machines_fingerprints_identically() -> None:
+    """Two runs of ONE defect differ in everything that isn't the defect:
+    temp dirs, elapsed times, pids, surrounding line numbers. The cache key
+    must not move because of any of it."""
+    run_a = (
+        "running stage 1/2: cargo test --workspace --lib\n"
+        "thread 'tests::resize' panicked at /tmp/build-1234/src/widget.rs:120:9:\n"
+        "assertion `left == right` failed\n"
+        "test result: FAILED. 0 passed; 1 failed; finished in 12.84s\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+    run_b = (
+        "running stage 1/2: cargo test --workspace --lib\n"
+        "thread 'tests::resize' panicked at /var/folders/zz/build-98765/src/widget.rs:131:9:\n"
+        "assertion `left == right` failed\n"
+        "test result: FAILED. 0 passed; 1 failed; finished in 41.02s\n"
+        "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
+    )
+
+    sig_a = failure_signature(extract_failure_evidence(run_a))
+    sig_b = failure_signature(extract_failure_evidence(run_b))
+
+    assert sig_a
+    assert sig_a == sig_b
+
+
+def test_two_different_defects_fingerprint_differently() -> None:
+    compile_failure = extract_failure_evidence(
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "error: could not compile `quadraui`\n"
+    )
+    test_failure = extract_failure_evidence(_read("pytest_failure.log"))
+
+    assert failure_signature(compile_failure) != failure_signature(test_failure)
+
+
+def test_an_empty_evidence_record_has_no_fingerprint() -> None:
+    """Nothing may ever be keyed off "no evidence at all" — a clean pass and
+    an unparseable log must not collide on one cache key."""
+    assert failure_signature(FailureEvidence()) == ""
+    assert failure_signature(extract_failure_evidence(_read("clean_pass.log"))) == ""
+
+
+def test_a_fingerprint_is_short_and_stable_across_calls() -> None:
+    evidence = extract_failure_evidence(_read("pytest_failure.log"))
+
+    first = failure_signature(evidence)
+    assert first == failure_signature(evidence)
+    assert len(first) == 16

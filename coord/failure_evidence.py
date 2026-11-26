@@ -19,6 +19,7 @@ and the sibling triage pass) to read back without ever re-opening the log.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -368,3 +369,56 @@ def format_evidence_block(evidence: FailureEvidence) -> str:
         "--- end extracted failure evidence ---",
     ]
     return "\n".join(lines)
+
+
+# ── Failure fingerprinting ───────────────────────────────────────────────
+
+#: How many extracted error lines feed the fingerprint. Enough to separate
+#: two genuinely different failures in the same stage, few enough that a
+#: long cascade of follow-on errors (whose tail varies run to run) does not
+#: make the same root failure fingerprint differently each time.
+SIGNATURE_ERROR_LINES = 6
+
+#: Volatile fragments that say nothing about WHICH failure this is — line/
+#: column numbers, elapsed times, per-run temp dirs, hashes, pids.
+_SIG_TMP_PATH_RE = re.compile(r"(?:/private)?/(?:tmp|var/folders)/\S+")
+_SIG_HEX_RE = re.compile(r"\b[0-9a-f]{7,}\b")
+_SIG_DIGITS_RE = re.compile(r"\d+")
+
+
+def _normalize_signature_line(line: str) -> str:
+    text = _SIG_TMP_PATH_RE.sub("<tmp>", line.strip())
+    text = _SIG_HEX_RE.sub("<hex>", text)
+    text = _SIG_DIGITS_RE.sub("N", text)
+    return " ".join(text.split())
+
+
+def failure_signature(evidence: FailureEvidence) -> str:
+    """A stable, bounded fingerprint of *which* failure this is.
+
+    Two runs of the same underlying defect — on different machines, at
+    different clock times, in different temp dirs, with different line
+    numbers in the surrounding noise — fingerprint identically; two
+    different defects do not. Returns ``""`` for an empty record, so a
+    caller can never key anything off "no evidence at all".
+
+    Deliberately derived from the already-extracted
+    :class:`FailureEvidence` rather than the raw log: the extractor has
+    already thrown away the parts of a log that vary per run (timestamps,
+    progress bars, machine names), which is exactly what a fingerprint must
+    not depend on.
+    """
+    if evidence.is_empty:
+        return ""
+    parts = ["stages:" + "|".join(evidence.failed_stages)]
+    lines = [
+        norm
+        for norm in (
+            _normalize_signature_line(raw)
+            for raw in evidence.errors.splitlines()
+        )
+        if norm
+    ]
+    parts.extend(lines[:SIGNATURE_ERROR_LINES])
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()
+    return digest[:16]

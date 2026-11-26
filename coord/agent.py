@@ -31,7 +31,12 @@ from coord import cargo_cache
 from coord.claude_setup_token import inject_setup_token
 from coord.config_reload import reload_config_if_stale
 from coord.decomposition_chat import is_size_triage_review_target
-from coord.failure_evidence import FailureEvidence, extract_failure_evidence, format_evidence_block
+from coord.failure_evidence import (
+    FailureEvidence,
+    extract_failure_evidence,
+    failure_signature,
+    format_evidence_block,
+)
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
 from coord.smoke_tags import smoke_leg_capabilities
@@ -4400,6 +4405,28 @@ class AgentAssignment:
     # `coord log`'s summary, and the sibling triage pass — can read the
     # cause of a failure without re-opening (or re-parsing) the raw log.
     failure_evidence: dict | None = None
+    # #4166: outcome of the post-session precheck — `"passed"`, `"failed"`,
+    # `"skipped"` (a precheck that could not be run at all: no worktree
+    # left, the command itself unlaunchable), or `None` for every leg that
+    # never had one (any repo with no `repos[].precheck`, and every spec
+    # type outside `PRECHECK_SPEC_TYPES`). Diagnostic only — setting these
+    # three fields NEVER changes `status`, exactly like
+    # `stash_unmatched_globs` above.
+    precheck_status: str | None = None
+    # The precheck's own output tail on a failure (bounded to
+    # `PRECHECK_REASON_CHARS`), or the reason it was skipped. `None` on a
+    # pass.
+    precheck_reason: str | None = None
+    # How many `--resume` remediation sessions this leg actually spent
+    # (0 when the precheck passed first time, or when none could be run);
+    # never more than `AgentServer.precheck_max_resume_attempts`.
+    precheck_resume_attempts: int = 0
+    # #4166: advisory note set on a plain-runner smoke leg whose failure
+    # fingerprint was already recorded for this repo at the SAME base SHA on
+    # a DIFFERENT branch (`coord.base_failure_cache`) — i.e. evidence the
+    # failure predates this branch. Diagnostic only: it never changes the
+    # leg's verdict, only what the fix briefing gets told.
+    pre_existing_failure_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -4421,6 +4448,16 @@ class AgentAssignment:
         Active (pending/running) assignments are returned unchanged — some
         callers (`coord status`) still read `spec.type`/`spec.review_target`
         off in-flight entries to label what's currently running.
+
+        #4166: the four precheck/pre-existing-failure diagnostics are
+        omitted entirely when they hold their defaults. Almost every leg has
+        no precheck verdict at all (only a repo that declares
+        `repos[].precheck` ever gets one), and a key per field per entry
+        across `_COMPLETED_HISTORY_CAP` terminal entries is a measurable
+        slice of the same payload budget this method exists to defend —
+        paid by every leg for a field only a few carry. `_load_state`
+        reconstructs an absent key from the dataclass default, so a slimmed
+        entry round-trips unchanged.
         """
         d = asdict(self)
         if self.status not in (PENDING, RUNNING):
@@ -4428,6 +4465,14 @@ class AgentAssignment:
             if spec is not None:
                 spec["briefing"] = ""
                 spec["system_prompt"] = None
+        for key, default in (
+            ("precheck_status", None),
+            ("precheck_reason", None),
+            ("precheck_resume_attempts", 0),
+            ("pre_existing_failure_reason", None),
+        ):
+            if d.get(key) == default:
+                d.pop(key, None)
         return d
 
 
@@ -7133,6 +7178,82 @@ WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
 })
 
 
+# ── #4166: post-session precheck ────────────────────────────────────────
+#
+# A repo's declared `precheck` (`repos[].precheck` in coordinator.yml) is a
+# fast compliance set — clippy, a ratchet, a formatter, a codegen `--check`.
+# `default_worker_command` already tells a work/fix worker to run it before
+# its final push, but "told to" is not "did": the common failure is a leg
+# that pushes, exits, and only the Test stage (minutes later, on another
+# machine, costing a whole fix round) discovers the formatter was never run.
+#
+# So the agent runs it ITSELF once the worker's session has exited, while
+# the leg's worktree is still on disk, and — bounded — hands a failure back
+# to the worker's OWN session via `--resume` so the worker that wrote the
+# code is the one that fixes it, with all of its context still loaded.
+#
+# Fail-soft by construction: no repo without a configured `precheck` runs
+# any of this, a precheck that cannot be run at all is recorded as skipped,
+# and the outcome NEVER changes `status` (same diagnostic-only posture as
+# `stash_unmatched_globs`, #1357). The leg already pushed; a precheck
+# verdict is information for the Test stage and the human, not a retroactive
+# re-grade of work that is already on the branch.
+
+#: Wall-clock bound on ONE precheck run. A precheck is by definition the
+#: *fast* set — a repo whose compliance set needs longer than this has
+#: declared the wrong command, and reporting a timeout as a precheck
+#: failure is the honest answer.
+POST_SESSION_PRECHECK_TIMEOUT_S = 900.0
+
+#: Wall-clock bound on ONE `--resume` remediation session. Smaller than a
+#: full leg's budget on purpose: this is "fix what the precheck just
+#: printed", not open-ended work.
+PRECHECK_RESUME_TIMEOUT_S = 1800.0
+
+#: How many remediation sessions one leg may spend. Bounded hard — a leg
+#: that cannot satisfy its repo's own fast compliance set in this many
+#: tries gets reported, never retried forever. Overridable per-server
+#: (`AgentServer.precheck_max_resume_attempts`) for tests.
+PRECHECK_MAX_RESUME_ATTEMPTS = 1
+
+#: Bound on the precheck headline carried on the assignment row (and thus
+#: into `/status`). Deliberately a HEADLINE, not a failure block: #715 caps
+#: the whole `/status` payload, and a multi-KB reason on every terminal
+#: entry is exactly what that cap exists to prevent. The full output goes
+#: to the leg's own log instead, where reading it costs no poll latency.
+PRECHECK_REASON_CHARS = 240
+
+#: How much of a failing precheck's output reaches the leg log and the
+#: remediation prompt. Generous enough for a real clippy/rustfmt/ratchet
+#: block; neither copy is persisted on the assignment row.
+PRECHECK_LOG_TAIL_CHARS = 4000
+
+#: Types whose session the post-session precheck applies to — exactly the
+#: ones `coord.dispatch.dispatch` ever sends a non-empty `spec.precheck`
+#: for, and the only ones that push code of their own.
+PRECHECK_SPEC_TYPES: frozenset[str] = frozenset({"work", "fix"})
+
+
+def _precheck_reason_headline(output: str) -> str:
+    """A failing precheck's last meaningful line, bounded (#4166).
+
+    A compliance tool says what is wrong at the END of its output — the
+    `error: aborting due to 3 previous errors` / `2 files would be
+    reformatted` summary — so the last line is the headline. Deliberately
+    ONE line and one truncation rule, not a "last few lines" join: a single
+    runaway line (a tool that prints 400 warnings separated by semicolons)
+    would otherwise fill the whole budget with the start of the noise and
+    push the summary out. The full output stays in the leg's log.
+    """
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    headline = lines[-1]
+    if len(headline) > PRECHECK_REASON_CHARS:
+        headline = headline[:PRECHECK_REASON_CHARS].rstrip() + "…"
+    return headline
+
+
 def _config_mtime_of(config: "Any | None") -> float | None:
     """mtime of *config*'s backing ``coordinator.yml``, or None (#2299).
 
@@ -7246,6 +7367,11 @@ class AgentServer:
         self.bash_wrap_spawn = bash_wrap_spawn
         self.first_output_timeout = first_output_timeout
         self.runtime_ceiling_s = runtime_ceiling_s
+        # #4166: how many `--resume` remediation sessions one leg's
+        # post-session precheck may spend. An attribute rather than a bare
+        # read of the module constant so a test can pin it (including to 0,
+        # "report the failure, never resume") without monkeypatching.
+        self.precheck_max_resume_attempts = PRECHECK_MAX_RESUME_ATTEMPTS
         # #425: optional provider registry (see constructor docstring).
         # Typed as ``dict[str, object]`` to avoid an import cycle with
         # :mod:`coord.providers` at module load time — concrete instances
@@ -11181,6 +11307,24 @@ class AgentServer:
             self._fail(assignment, f"plain-runner smoke crashed: {exc}")
             return
 
+        # #4166: a graded product failure — not a baseline-red run (already
+        # a statement about the base) and not a harness crash (no failure to
+        # fingerprint) — goes in the per-base-SHA cache, and says so in this
+        # log when a sibling branch off the same base already failed the same
+        # way. Must run BEFORE the marker lines below: everything after the
+        # `SMOKE:` marker is dropped from the stored leg output a fix
+        # briefing is built from.
+        if not verdict.passed and not verdict.baseline_red and not verdict.harness_crash:
+            try:
+                self._note_pre_existing_failure(
+                    assignment, Path(repo_path), verdict.failure_evidence,
+                )
+            except Exception:  # noqa: BLE001 — advisory only, never grade on it
+                _log.exception(
+                    "plain-runner smoke %s: pre-existing-failure note failed",
+                    assignment.id,
+                )
+
         try:
             with open(assignment.log_path, "a", encoding="utf-8") as fh:
                 fh.write(
@@ -11282,6 +11426,301 @@ class AgentServer:
                 "plain-runner smoke %s: failed to append failure summary to log",
                 assignment.id,
             )
+
+    # ── #4166: per-base-SHA pre-existing-failure cache ──────────────────
+
+    def _resolve_base_sha(self, worktree: Path, base_branch: str) -> str:
+        """The commit this worktree's branch was cut from, or ``""``.
+
+        ``merge-base HEAD origin/<base_branch>`` first — that is the base
+        the branch actually diverged at, which is what two branches must
+        share for one's failure to say anything about the other's. Falls
+        back to ``origin/<base_branch>``'s own tip (a worktree sitting
+        directly on the base, no divergence to compute), then gives up:
+        a repo with no ``origin`` remote has no base SHA worth keying on.
+        """
+        for args in (
+            ("merge-base", "HEAD", f"origin/{base_branch}"),
+            ("rev-parse", f"origin/{base_branch}"),
+        ):
+            try:
+                sha = _git(worktree, *args).strip()
+            except _GitError:
+                continue
+            if sha:
+                return sha
+        return ""
+
+    def _note_pre_existing_failure(
+        self,
+        assignment: AgentAssignment,
+        worktree: Path,
+        evidence: FailureEvidence | None,
+    ) -> None:
+        """Record this graded failure in the per-base-SHA cache and, on a
+        hit from a different branch at the same base, say so in the leg's
+        own log (#4166).
+
+        The note is written BEFORE the closing ``SMOKE:`` marker on purpose:
+        `coord.progress.parse_smoke_verdict_from_log` keeps everything ahead
+        of that marker as the verdict's ``context``, which
+        `coord.notify._record_smoke_verdict` stores as the leg's test output
+        — the text a fix briefing is built from. A note written after the
+        marker would be invisible to every reader that matters.
+
+        Never changes the verdict: by the time this runs the exit code has
+        already decided pass/fail (see :func:`execute_plain_runner_smoke`).
+        """
+        from coord.base_failure_cache import note_line, record_failure  # noqa: PLC0415
+
+        spec = assignment.spec
+        signature = failure_signature(evidence) if evidence is not None else ""
+        if not signature:
+            return
+        base_sha = self._resolve_base_sha(worktree, spec.branch or "main")
+        if not base_sha:
+            return
+        branch = spec.target_branch or assignment.branch or ""
+        prior = record_failure(
+            spec.repo_name,
+            base_sha,
+            signature,
+            branch=branch,
+            state_dir=self.state_dir,
+        )
+        if prior is None:
+            return
+        line = note_line(prior)
+        self._log_line(assignment, "\n" + line)
+        with self._lock:
+            assignment.pre_existing_failure_reason = line
+
+    # ── #4166: post-session precheck ────────────────────────────────────
+
+    def _run_post_session_precheck(self, assignment: AgentAssignment) -> None:
+        """Run the repo's declared `precheck` now that the worker's session
+        has exited, and hand any failure back to that same session via
+        ``--resume`` — bounded by
+        :attr:`precheck_max_resume_attempts` (#4166).
+
+        A no-op unless the leg is one of :data:`PRECHECK_SPEC_TYPES`, its
+        spec carries a non-empty ``precheck`` (only ever true when the repo
+        declared one — see `coord.dispatch.dispatch`), it finished ``DONE``,
+        and its worktree is still on disk. Records the outcome on the
+        assignment and NEVER touches ``status``.
+
+        Called from :meth:`_reap` before `_stash_artifacts`/
+        `_cleanup_worktree`, which is the only window where the worker's
+        session id is known AND its worktree still exists.
+        """
+        spec = assignment.spec
+        if spec.type not in PRECHECK_SPEC_TYPES or not spec.precheck:
+            return
+        if assignment.status != DONE:
+            # A failed/cancelled/advisory leg has nothing to check: either
+            # no code landed, or the leg's own terminal reason is already
+            # the thing a human needs to read.
+            return
+        worktree = Path(assignment.worktree_path) if assignment.worktree_path else None
+        if worktree is None or not worktree.is_dir():
+            self._set_precheck_result(
+                assignment, "skipped", "worktree is gone — nothing to check", 0,
+            )
+            return
+
+        attempts = 0
+        while True:
+            exit_code, output = self._run_precheck_command(assignment, worktree)
+            if exit_code == 0:
+                self._set_precheck_result(assignment, "passed", None, attempts)
+                return
+            if attempts >= max(0, int(self.precheck_max_resume_attempts)):
+                self._set_precheck_result(assignment, "failed", output, attempts)
+                return
+            resumed = self._spawn_precheck_resume(assignment, worktree, output)
+            if not resumed:
+                self._set_precheck_result(assignment, "failed", output, attempts)
+                return
+            attempts += 1
+
+    def _run_precheck_command(
+        self, assignment: AgentAssignment, worktree: Path,
+    ) -> tuple[int, str]:
+        """Run ``spec.precheck`` in *worktree*; return (exit code, output).
+
+        Reuses :func:`run_plain_runner_command` — the same bounded
+        shell-exec the plain runner already uses for an operator-authored
+        command from ``coordinator.yml`` — rather than a second
+        implementation of "run a configured command and keep a bounded
+        tail". Only its exit code and output are consulted here; the
+        smoke-specific `baseline_red`/`harness_crash` mapping is not
+        meaningful for a precheck and is ignored.
+        """
+        spec = assignment.spec
+        env = {
+            **os.environ,
+            **cargo_cache.cargo_env(spec.repo_name, self.state_dir),
+        }
+        verdict = run_plain_runner_command(
+            spec.precheck,
+            str(worktree),
+            timeout=POST_SESSION_PRECHECK_TIMEOUT_S,
+            env=env,
+        )
+        output = _tail_text(verdict.log_tail, PRECHECK_LOG_TAIL_CHARS)
+        self._log_line(
+            assignment,
+            f"# precheck (#4166): exit={verdict.exit_code}"
+            + (f"\n{output}" if verdict.exit_code != 0 and output else ""),
+        )
+        return verdict.exit_code, output
+
+    def _spawn_precheck_resume(
+        self, assignment: AgentAssignment, worktree: Path, output: str,
+    ) -> bool:
+        """Re-enter the worker's own session with the precheck failure as
+        the next user turn. Returns whether a session actually ran.
+
+        ``False`` — with the reason logged — whenever resuming is not
+        possible: no session id was captured from the log, or the leg's
+        provider reports ``capabilities().resume=False``. The caller then
+        reports the precheck failure as-is; it never retries blind.
+
+        The spawn mirrors :meth:`_spawn`'s own argv/env construction (the
+        injectable :attr:`worker_command` seam or the provider's
+        ``build_command``, `_worker_subprocess_env`, the #2569 venv strip)
+        so a resumed turn runs under exactly the same confinement as the
+        turn that produced the code. It is deliberately BLOCKING and
+        bounded by :data:`PRECHECK_RESUME_TIMEOUT_S`: this runs on the
+        leg's own reap thread, and the next precheck run must observe the
+        remediation, not race it.
+        """
+        session_id = assignment.claude_session_id
+        if not session_id:
+            self._log_line(
+                assignment,
+                "# precheck (#4166): no claude session id captured — "
+                "cannot resume, reporting the precheck failure as-is",
+            )
+            return False
+
+        spec = assignment.spec
+        provider_obj = self._resolve_provider_best_effort(spec)
+        if provider_obj is not None:
+            try:
+                if not provider_obj.capabilities().resume:  # type: ignore[attr-defined]
+                    self._log_line(
+                        assignment,
+                        f"# precheck (#4166): provider {spec.provider!r} reports "
+                        "capabilities().resume=False — cannot resume, reporting "
+                        "the precheck failure as-is",
+                    )
+                    return False
+            except Exception:  # noqa: BLE001 — a misbehaving provider must not break the reap
+                return False
+
+        prompt = (
+            "Your session has ended, but this repo's declared precheck (the "
+            "fast compliance set you were told to run before your final "
+            "push) FAILED against the branch you pushed:\n\n"
+            f"    {spec.precheck}\n\n"
+            f"{output}\n\n"
+            "Fix exactly what it reports — nothing else, no new features, no "
+            "refactors — then commit and `git push origin HEAD`. If the "
+            "precheck's complaint is not something this branch can fix, say "
+            "so in one line and stop."
+        )
+        resume_spec = replace(spec, briefing=prompt, resume_session_id=session_id)
+        try:
+            if provider_obj is not None:
+                argv = provider_obj.build_command(  # type: ignore[attr-defined]
+                    resume_spec, resolved_model=spec.model
+                )
+                initial_input = provider_obj.initial_input(resume_spec)  # type: ignore[attr-defined]
+            else:
+                argv = self.worker_command(resume_spec)
+                initial_input = _user_message_line(prompt)
+        except Exception:  # noqa: BLE001 — argv construction must not break the reap
+            _log.exception(
+                "precheck resume %s: could not build the resume command", assignment.id,
+            )
+            return False
+
+        env = _worker_subprocess_env(cwd=worktree, assignment_id=assignment.id)
+        env.update(cargo_cache.cargo_env(spec.repo_name, self.state_dir, env))
+        if provider_obj is not None:
+            env.update(provider_obj.env())  # type: ignore[attr-defined]
+        _strip_venv_bins_from_path(env, _pinned_venv_bin_dirs(env))
+
+        self._log_line(
+            assignment,
+            f"# precheck (#4166): resuming session {session_id} to fix it "
+            f"(bounded to {PRECHECK_RESUME_TIMEOUT_S:.0f}s)",
+        )
+        try:
+            with open(assignment.log_path, "a", encoding="utf-8") as log_fh:
+                proc = subprocess.Popen(
+                    _maybe_bash_wrap(argv, self.bash_wrap_spawn),
+                    cwd=str(worktree),
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
+                    start_new_session=True,
+                    env=env,
+                )
+        except (OSError, AttributeError, TypeError) as exc:
+            self._log_line(assignment, f"# precheck (#4166): resume spawn failed: {exc}")
+            return False
+
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(initial_input)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, AssertionError):
+            pass  # the session may have exited already — `wait` below tells us
+
+        try:
+            proc.wait(timeout=PRECHECK_RESUME_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            _killpg_safe(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _killpg_safe(proc.pid, signal.SIGKILL)
+            self._log_line(
+                assignment,
+                "# precheck (#4166): resumed session exceeded "
+                f"{PRECHECK_RESUME_TIMEOUT_S:.0f}s and was killed",
+            )
+        # A session that ran at all counts as an attempt, timeout included:
+        # the precheck is re-run either way, and the attempt budget is what
+        # makes this terminate.
+        return True
+
+    def _set_precheck_result(
+        self,
+        assignment: AgentAssignment,
+        status: str,
+        reason: str | None,
+        attempts: int,
+    ) -> None:
+        """Persist the precheck outcome. Never touches ``status`` (#1357's
+        diagnostic-only posture — the leg's commits are already pushed)."""
+        bounded = _precheck_reason_headline(reason) if reason else None
+        with self._lock:
+            live = self._assignments.get(assignment.id)
+            for target in {id(assignment): assignment, id(live): live}.values():
+                if target is None:
+                    continue
+                target.precheck_status = status
+                target.precheck_reason = bounded
+                target.precheck_resume_attempts = attempts
+        self._persist()
+        self._log_line(
+            assignment,
+            f"# precheck (#4166): {status} after {attempts} resume attempt(s); "
+            "status left unchanged",
+        )
 
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
         # #324/#425/#1796: provider-layer routing.
@@ -12939,6 +13378,21 @@ class AgentServer:
                 )
         except (OSError, AttributeError):
             pass
+
+        # #4166: run the repo's declared `precheck` against what the worker
+        # actually pushed, and bounce a failure back into its own session —
+        # here, because this is the only point where the session id has been
+        # captured (just above) and the worktree still exists (`_cleanup_
+        # worktree` runs below). Wrapped: a precheck is a diagnostic, and
+        # must never be able to abort a reap mid-way and leak the worktree.
+        if assignment is not None:
+            try:
+                self._run_post_session_precheck(assignment)
+            except Exception:  # noqa: BLE001 — never break the reap
+                _log.exception(
+                    "post-session precheck %s: raised; continuing teardown",
+                    assignment_id,
+                )
 
         # #305: stash artifacts BEFORE removing the worktree so the compiled
         # outputs survive cleanup.  Only runs for DONE assignments (workers
