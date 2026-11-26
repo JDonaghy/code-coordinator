@@ -1084,13 +1084,15 @@ class TestUsageCommandByIssueAndDrillFlags:
         assert "invalid 'since' spec" in result.output
         assert "--since" in result.output
 
-    def test_issue_drill_defaults_to_bounded_window_without_since(
+    def test_issue_drill_without_since_narrows_fetch_by_issue_not_by_window(
         self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
     ) -> None:
         """#4139: a bare ``--issue N`` (no --today/--week/--month/--since)
-        must not fetch unbounded all-history — that is exactly what timed
-        out on a live fleet. It should resolve to a bounded recent window
-        and pass both ``since`` and ``issue`` down to the fetch."""
+        must stay unbounded in time — an issue's first leg can be arbitrarily
+        old, so a default window would answer ``No usage data`` for it. The
+        fetch is made cheap by pushing ``issue`` down (so the daemon filters
+        before serializing) and by the longer default timeout, not by
+        silently clipping history."""
         import coord.usage as usage_mod
 
         calls: list[dict] = []
@@ -1106,9 +1108,37 @@ class TestUsageCommandByIssueAndDrillFlags:
         result = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--issue", "5"])
         assert result.exit_code == 0, result.output
         assert len(calls) == 1
-        assert calls[0]["since"] is not None, "unbounded fetch — the #4139 regression"
-        assert calls[0]["issue"] == 5
+        assert calls[0]["since"] is None, "a default window would hide older legs"
+        assert calls[0]["until"] is None
+        assert calls[0]["issue"] == 5, "unfiltered fetch — the #4139 regression"
         assert calls[0]["timeout"] == usage_mod.USAGE_ROWS_DEFAULT_TIMEOUT
+
+    def test_issue_drill_without_since_still_renders_a_leg_older_than_any_window(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """The user-visible half of the rule above: a leg dispatched a year
+        ago is still rendered by a bare ``--issue N``. Drives the real
+        ``_usage_issue_drill`` window/filter logic over a row the fetch
+        returns; only the transport is faked."""
+        import coord.usage as usage_mod
+
+        old = time.time() - 365 * 86400
+        row = {
+            "assignment_id": "old-leg", "issue_number": 5, "issue_title": "x",
+            "repo_name": "demo", "type": "work", "model": "sonnet",
+            "status": "done", "cost_usd": 0.25,
+            "input_tokens": 10, "output_tokens": 20, "cache_read_tokens": 30,
+            "cache_creation_tokens": 0,
+            "dispatched_at": old, "finished_at": old + 60,
+        }
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: [dict(row)])
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--issue", "5"])
+        assert result.exit_code == 0, result.output
+        assert "No usage data" not in result.output
+        assert "work" in result.output
 
     def test_issue_drill_usage_timeout_flag_overrides_default(
         self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
