@@ -43,6 +43,7 @@ declaration".
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -57,6 +58,8 @@ from coord.milestone_order import (
 from coord.models import SplitChunk, SplitProposal
 from coord.overlap_predict import Footprint, parse_declared_files, predict_overlap
 
+_log = logging.getLogger(__name__)
+
 __all__ = [
     "SizeThresholds",
     "SizeSignal",
@@ -65,6 +68,8 @@ __all__ = [
     "score_issue_size",
     "SplitVerification",
     "verify_split_proposal",
+    "AUDIT_CATEGORY",
+    "EVENT_SPLIT_REJECTED",
     "NO_BACKEND_SPLIT_MARKER",
     "detect_cross_backend_scope",
     "build_cross_backend_split_proposal",
@@ -72,6 +77,14 @@ __all__ = [
     "build_slice_child_body",
     "substitute_slice_tokens",
 ]
+
+#: #4175: `coord.audit.record_audit`'s `category=`/`event_type=` for every
+#: `verify_split_proposal` rejection — one vocabulary entry so `coord audit`
+#: / `query_audit_log(category=AUDIT_CATEGORY)` can find every rejection
+#: regardless of which check tripped or which call site (`coord.dispatch`,
+#: `coord.decomposition_chat`) invoked the gate.
+AUDIT_CATEGORY = "decomposition"
+EVENT_SPLIT_REJECTED = "split_proposal_rejected"
 
 
 @dataclass(frozen=True)
@@ -416,6 +429,46 @@ class SplitVerification:
     work_order: WorkOrder | None = None
 
 
+def _reject(proposal: SplitProposal, reason: str) -> SplitVerification:
+    """Build the ``ok=False`` verdict for *reason* — the ONE place every
+    :func:`verify_split_proposal` rejection funnels through (#4175),
+    regardless of which check tripped or which of this module's several
+    call sites (`coord.dispatch`, `coord.decomposition_chat`) invoked the
+    gate: logs it at WARNING and records a durable
+    :func:`coord.audit.record_audit` event under :data:`AUDIT_CATEGORY` /
+    :data:`EVENT_SPLIT_REJECTED`, so an operator can find every rejection
+    this gate ever produced (``coord audit`` / ``query_audit_log``) without
+    re-deriving "was this proposal rejected, and why" from scratch per call
+    site.
+
+    The audit write is best-effort, same as every other `record_audit`
+    caller in this repo (see that module's own docstring) — a rejection
+    verdict is still returned to the caller even if the durable write
+    itself fails.
+    """
+    _log.warning(
+        "verify_split_proposal: rejected %s#%s: %s",
+        proposal.repo_name,
+        proposal.issue_number,
+        reason,
+    )
+    try:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_SPLIT_REJECTED,
+            actor="verify_split_proposal",
+            summary=reason,
+            repo=proposal.repo_name,
+            issue=proposal.issue_number,
+        )
+    except Exception:  # noqa: BLE001 — audit logging must never break the gate
+        pass
+    return SplitVerification(ok=False, reason=reason)
+
+
 def verify_split_proposal(
     proposal: SplitProposal, *, epic_body: str | None = None
 ) -> SplitVerification:
@@ -444,12 +497,20 @@ def verify_split_proposal(
        sibling could launch beside it). A prose-only dependency is rejected
        here, before any epic body is even built — same posture as check 4
        below rejecting a declared edge to a nonexistent/later child.
-    4. *epic_body* — the `## Sub-issues` block that would actually be
+    4. No chunk ``consumes`` a symbol an EARLIER chunk ``introduces``
+       without ALSO declaring an `After:` edge to that earlier chunk
+       (#4175) — a symbol dependency ("Consumes: Foo.bar" matching an
+       earlier "Introduces: Foo.bar") is exactly the kind of seam-level
+       coupling file overlap can never see, the same posture check 3
+       above already takes for a prose dependency; declaring the symbols
+       but skipping the edge lets the consuming child be dispatched
+       before the introducing one has landed.
+    5. *epic_body* — the `## Sub-issues` block that would actually be
        written to the real epic issue — parses under the create-epic
        grammar (:func:`coord.milestone_order.parse_sub_issues`) and
        produces exactly one node per proposed chunk (so every child will
        actually be visible once filed).
-    5. When the caller has no real epic body yet (the common case: the
+    6. When the caller has no real epic body yet (the common case: the
        real issue numbers don't exist until the epic and its children are
        filed), one is COMPUTED here — sequential placeholder numbers in
        proposal order, with each child's ``after`` edges the UNION (#4031)
@@ -468,7 +529,7 @@ def verify_split_proposal(
 
        This construction is a DAG by built-in (every edge, declared or
        predicted, only ever points strictly backward), so it can never
-       itself trip check 4's cycle/undeclared-target failure; those
+       itself trip check 5's cycle/undeclared-target failure; those
        failure modes are reachable through the *epic_body* override
        instead — see the test suite.
 
@@ -480,27 +541,22 @@ def verify_split_proposal(
     over a real epic body has already decided what it says.
     """
     if not proposal.chunks:
-        return SplitVerification(
-            ok=False, reason="proposal has no chunks to split into"
-        )
+        return _reject(proposal, "proposal has no chunks to split into")
 
+    introduced_by: dict[str, int] = {}
     for i, chunk in enumerate(proposal.chunks, start=1):
         files = [f for f in (chunk.files_likely or []) if str(f).strip()]
         if not files:
-            return SplitVerification(
-                ok=False,
-                reason=(
-                    f"child {i} ({chunk.title!r}) declares no '## Files' scope"
-                ),
+            return _reject(
+                proposal,
+                f"child {i} ({chunk.title!r}) declares no '## Files' scope",
             )
         placeholders = [f for f in files if "<" in f or ">" in f]
         if placeholders:
-            return SplitVerification(
-                ok=False,
-                reason=(
-                    f"child {i} ({chunk.title!r}) declares unfilled template "
-                    f"placeholder(s) in '## Files': {placeholders!r}"
-                ),
+            return _reject(
+                proposal,
+                f"child {i} ({chunk.title!r}) declares unfilled template "
+                f"placeholder(s) in '## Files': {placeholders!r}",
             )
         declared_after = {int(p) for p in (chunk.after or ())}
         prose_only = sorted(
@@ -509,19 +565,52 @@ def verify_split_proposal(
             if p not in declared_after and 1 <= p < i
         )
         if prose_only:
-            return SplitVerification(
-                ok=False,
-                reason=(
-                    f"child {i} ({chunk.title!r}) names a dependency on "
-                    f"{'child' if len(prose_only) == 1 else 'children'} "
-                    f"{', '.join(str(p) for p in prose_only)} in its own "
-                    "scope prose, but declares no matching 'After: Child "
-                    f"{prose_only[0]}' line — a prose-only dependency is a "
-                    "verification failure; declare the 'After:' line (or "
-                    "drop the prose reference if there is in fact no such "
-                    "dependency)"
-                ),
+            return _reject(
+                proposal,
+                f"child {i} ({chunk.title!r}) names a dependency on "
+                f"{'child' if len(prose_only) == 1 else 'children'} "
+                f"{', '.join(str(p) for p in prose_only)} in its own "
+                "scope prose, but declares no matching 'After: Child "
+                f"{prose_only[0]}' line — a prose-only dependency is a "
+                "verification failure; declare the 'After:' line (or "
+                "drop the prose reference if there is in fact no such "
+                "dependency)",
             )
+
+        # #4175: a `Consumes:` symbol matching an earlier chunk's
+        # `Introduces:` is the same kind of seam-level coupling file
+        # overlap can never see that the prose-dependency check above
+        # guards — `introduced_by` maps each symbol to the FIRST (lowest-
+        # numbered) chunk that introduced it, built up strictly forward as
+        # this loop advances, so a chunk can never be flagged against its
+        # own `introduces` or a LATER chunk's.
+        unedged = sorted(
+            {
+                (symbol, introduced_by[symbol])
+                for symbol in (chunk.consumes or ())
+                if symbol in introduced_by
+                and introduced_by[symbol] not in declared_after
+            },
+            key=lambda pair: (pair[1], pair[0]),
+        )
+        if unedged:
+            missing_targets = sorted({target for _, target in unedged})
+            described = ", ".join(
+                f"{symbol!r} (introduced by child {target})"
+                for symbol, target in unedged
+            )
+            return _reject(
+                proposal,
+                f"child {i} ({chunk.title!r}) consumes symbol(s) {described} "
+                "that an earlier child introduces, but declares no "
+                f"matching 'After: Child {missing_targets[0]}' line — a "
+                "consumed symbol with no matching 'After:' edge is a "
+                "verification failure; declare the 'After:' line (or drop "
+                "the 'Consumes:' declaration if there is in fact no such "
+                "dependency)",
+            )
+        for symbol in chunk.introduces or ():
+            introduced_by.setdefault(symbol, i)
 
     if epic_body is None:
         nodes: list[WorkOrderNode] = []
@@ -530,17 +619,15 @@ def verify_split_proposal(
             declared_after = sorted({int(p) for p in (chunk.after or ())})
             for target in declared_after:
                 if not (1 <= target < i):
-                    return SplitVerification(
-                        ok=False,
-                        reason=(
-                            f"child {i} ({chunk.title!r}) declares "
-                            f"'After: Child {target}', but child {target} is "
-                            "not an earlier child of this proposal (it has "
-                            f"{len(proposal.chunks)} chunk(s)) — a declared "
-                            "dependency must never name a nonexistent or "
-                            "later child, since nothing later can have "
-                            "landed yet"
-                        ),
+                    return _reject(
+                        proposal,
+                        f"child {i} ({chunk.title!r}) declares "
+                        f"'After: Child {target}', but child {target} is "
+                        "not an earlier child of this proposal (it has "
+                        f"{len(proposal.chunks)} chunk(s)) — a declared "
+                        "dependency must never name a nonexistent or "
+                        "later child, since nothing later can have "
+                        "landed yet",
                     )
             files = tuple(f for f in chunk.files_likely if str(f).strip())
             prediction = predict_overlap(files, footprints_so_far)
@@ -555,19 +642,17 @@ def verify_split_proposal(
     try:
         parsed = parse_sub_issues(epic_body)
     except WorkOrderError as exc:
-        return SplitVerification(
-            ok=False,
-            reason=f"proposed epic body failed the create-epic grammar: {exc}",
+        return _reject(
+            proposal,
+            f"proposed epic body failed the create-epic grammar: {exc}",
         )
 
     if len(parsed.nodes) != len(proposal.chunks):
-        return SplitVerification(
-            ok=False,
-            reason=(
-                f"proposed epic body declares {len(parsed.nodes)} sub-issue(s), "
-                f"but the proposal has {len(proposal.chunks)} chunk(s) — not "
-                "every child would be visible once filed"
-            ),
+        return _reject(
+            proposal,
+            f"proposed epic body declares {len(parsed.nodes)} sub-issue(s), "
+            f"but the proposal has {len(proposal.chunks)} chunk(s) — not "
+            "every child would be visible once filed",
         )
 
     return SplitVerification(ok=True, reason=None, epic_body=epic_body, work_order=parsed)

@@ -558,6 +558,303 @@ class TestVerifySplitProposalRejectsProseOnlyDependency:
         assert verification.ok is True
 
 
+class TestVerifySplitProposalRejectsUnedgedSymbolConsumption:
+    """#4175: a child whose `consumes` names a symbol an EARLIER child's
+    `introduces` already declared, with no matching `after:` edge, is
+    rejected — the same "a semantic dependency file-overlap can never see
+    must be declared" posture #4064's prose-dependency check already
+    enforces, applied to the `Removes:`/`Introduces:`/`Consumes:` wire
+    declarations instead of free-text prose."""
+
+    def test_consumed_symbol_with_no_after_edge_is_rejected(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    introduces=("Foo.bar",),
+                ),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/unrelated.py"],
+                    consumes=("Foo.bar",),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "child 2" in verification.reason
+        assert "Foo.bar" in verification.reason
+        assert "verification failure" in verification.reason
+
+    def test_consumed_symbol_with_matching_after_edge_is_accepted(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    introduces=("Foo.bar",),
+                ),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/unrelated.py"],
+                    consumes=("Foo.bar",),
+                    after=(1,),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_consuming_a_symbol_nobody_introduces_is_not_flagged(self) -> None:
+        # No chunk declares `Introduces: Foo.bar` — nothing to chain
+        # against, so this must behave exactly as if `consumes` were empty.
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/unrelated.py"],
+                    consumes=("Foo.bar",),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_introducing_and_consuming_the_same_symbol_in_one_chunk_is_not_a_false_positive(
+        self,
+    ) -> None:
+        # A chunk that both introduces and consumes the same symbol (e.g.
+        # it defines a helper and also calls it) must never be read as
+        # depending on itself.
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    introduces=("Foo.bar",),
+                    consumes=("Foo.bar",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_a_later_chunks_introduces_does_not_retroactively_flag_an_earlier_consumer(
+        self,
+    ) -> None:
+        # Only an EARLIER chunk's `introduces` can trigger the check — a
+        # later chunk re-declaring the same symbol name must not be read
+        # as if child 1 depended on child 2.
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    consumes=("Foo.bar",),
+                ),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/b.py"],
+                    introduces=("Foo.bar",),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_no_symbol_declarations_behaves_exactly_as_before(self) -> None:
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+
+class TestVerifySplitProposalLogsEveryRejection:
+    """#4175: every rejection — any check, not just the new symbol one —
+    logs at WARNING and records a durable audit event, so an operator can
+    find why a proposal was refused without re-running the gate."""
+
+    def test_rejection_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level("WARNING", logger="coord.preflight_size")
+        verification = verify_split_proposal(_proposal([]))
+        assert verification.ok is False
+        assert any(
+            "proposal has no chunks to split into" in record.message
+            for record in caplog.records
+        )
+        assert all(record.levelname == "WARNING" for record in caplog.records)
+
+    def test_rejection_records_an_audit_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from coord.preflight_size import AUDIT_CATEGORY, EVENT_SPLIT_REJECTED
+
+        recorded: list[dict] = []
+
+        def _fake_record_audit(**kwargs):
+            recorded.append(kwargs)
+
+        monkeypatch.setattr(
+            "coord.audit.record_audit", _fake_record_audit
+        )
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    introduces=("Foo.bar",),
+                ),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/unrelated.py"],
+                    consumes=("Foo.bar",),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert len(recorded) == 1
+        call = recorded[0]
+        assert call["category"] == AUDIT_CATEGORY
+        assert call["event_type"] == EVENT_SPLIT_REJECTED
+        assert call["repo"] == proposal.repo_name
+        assert call["issue"] == proposal.issue_number
+        assert verification.reason in call["summary"]
+
+    def test_a_successful_verification_records_no_audit_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded: list[dict] = []
+
+        def _fake_record_audit(**kwargs):
+            recorded.append(kwargs)
+
+        monkeypatch.setattr(
+            "coord.audit.record_audit", _fake_record_audit
+        )
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+        assert recorded == []
+
+
+class TestSizeTriageResponseParsesSymbolDeclarations:
+    """#4175: `Removes:`/`Introduces:`/`Consumes:` lines in the size-triage
+    wire format land on the parsed `SplitChunk`, the same way #4031's
+    `After:` line already does — and a consumed/introduced pair with no
+    `After:` edge is caught end-to-end by `verify_split_proposal`."""
+
+    def test_removes_introduces_consumes_are_parsed_onto_the_chunk(self) -> None:
+        from coord.decomposition_chat import parse_size_triage_response
+
+        text = """\
+SIZE_TRIAGE_VERDICT: split
+## Child 1: Add the new helper
+Adds a replacement helper.
+Removes: Old.helper
+Introduces: New.helper
+
+## Files
+- coord/a.py
+
+## Child 2: Migrate callers
+Switches every caller over.
+After: Child 1
+Consumes: New.helper
+
+## Files
+- coord/b.py
+
+END_SIZE_TRIAGE
+"""
+        proposal = parse_size_triage_response(
+            text, repo_name="acme/widgets", issue_number=7, issue_title="t"
+        )
+        assert proposal is not None
+        assert proposal.chunks[0].removes == ("Old.helper",)
+        assert proposal.chunks[0].introduces == ("New.helper",)
+        assert proposal.chunks[0].consumes == ()
+        assert proposal.chunks[1].consumes == ("New.helper",)
+        assert proposal.chunks[1].after == (1,)
+        # The declaration lines themselves must not leak into the scope
+        # prose a later briefing/body would echo back.
+        assert "Removes:" not in proposal.chunks[0].scope
+        assert "Introduces:" not in proposal.chunks[0].scope
+        assert "Consumes:" not in proposal.chunks[1].scope
+
+    def test_no_symbol_lines_defaults_to_empty_tuples(self) -> None:
+        from coord.decomposition_chat import parse_size_triage_response
+
+        text = """\
+SIZE_TRIAGE_VERDICT: split
+## Child 1: a
+scope a
+
+## Files
+- coord/a.py
+
+END_SIZE_TRIAGE
+"""
+        proposal = parse_size_triage_response(
+            text, repo_name="acme/widgets", issue_number=7, issue_title="t"
+        )
+        assert proposal is not None
+        assert proposal.chunks[0].removes == ()
+        assert proposal.chunks[0].introduces == ()
+        assert proposal.chunks[0].consumes == ()
+
+    def test_consumed_symbol_with_no_after_line_is_rejected_end_to_end(self) -> None:
+        from coord.decomposition_chat import parse_size_triage_response
+
+        text = """\
+SIZE_TRIAGE_VERDICT: split
+## Child 1: Add the new helper
+Adds a replacement helper.
+Introduces: New.helper
+
+## Files
+- coord/a.py
+
+## Child 2: Migrate callers
+Switches every caller over.
+Consumes: New.helper
+
+## Files
+- coord/b.py
+
+END_SIZE_TRIAGE
+"""
+        proposal = parse_size_triage_response(
+            text, repo_name="acme/widgets", issue_number=7, issue_title="t"
+        )
+        assert proposal is not None
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is False
+        assert verification.reason is not None
+        assert "New.helper" in verification.reason
+
+
 class TestVerifySplitProposalRejectsNoChunks:
     def test_no_chunks_is_rejected_with_a_reason(self) -> None:
         verification = verify_split_proposal(_proposal([]))
