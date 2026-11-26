@@ -142,6 +142,7 @@ from coord.failure_triage import (
     BUCKET_INFRA,
     BUCKET_MECHANICAL,
     BUCKET_SUBSTANTIVE,
+    DiffStat,
     is_degraded_verdict,
 )
 from coord import machine_fault
@@ -2341,10 +2342,16 @@ class GitMergeVerifier:
         Evidence is built from ``state.work_test_reason`` alone — the one
         failure text `coord drive` already has on hand for this issue,
         without a second log fetch. ``diff_stat``/``declared_files``/
-        ``machine_capabilities`` are left at their empty defaults, same as
-        every other optional :func:`triage_failure` input this verifier has
-        no cheap way to produce; the deterministic infra/mechanical tiers
-        and the model tier all degrade gracefully without them.
+        ``machine_capabilities`` (#4124) are each a best-effort fetch —
+        :meth:`_diff_stat_for_test_state`/:meth:`_declared_files_for_test_state`/
+        :meth:`_machine_capabilities_for_state` — mirroring the SAME inputs
+        the CI-red edge (`coord.ci_fix.triage_ci_failure`) already feeds the
+        identical classifier (#2096: one classifier, fed consistently
+        across edges, never a Test-edge call that quietly runs the
+        mechanical-confinement check blind). Any of the three failing soft
+        degrades that one input to its empty default — the deterministic
+        infra/mechanical tiers and the model tier all degrade gracefully
+        without them, exactly as before #4124.
 
         #4100: gated by `coord.board_doctor_policy._triage_tier_enabled`
         on `self.config` — read fresh every call, so the SAME mid-run
@@ -2368,12 +2375,91 @@ class GitMergeVerifier:
             return None
         try:
             evidence = extract_failure_evidence(reason)
-            verdict = triage_failure(evidence=evidence)
+            verdict = triage_failure(
+                evidence=evidence,
+                diff_stat=self._diff_stat_for_test_state(state),
+                declared_files=self._declared_files_for_test_state(state),
+                machine_capabilities=self._machine_capabilities_for_state(state),
+            )
         except Exception:  # noqa: BLE001 — classifier trouble must never block drive
             return None
         if is_degraded_verdict(verdict):
             return None
         return verdict
+
+    def _diff_stat_for_test_state(self, state: IssueState) -> DiffStat:
+        """Best-effort :class:`~coord.failure_triage.DiffStat` for *state*'s
+        work branch (#4124) — the Test-edge counterpart of
+        `coord.ci_fix._diff_stat_for_entry`, feeding the SAME
+        mechanical-confinement check that function already feeds for the
+        CI-red and merge-failure edges (#2096). Compares *state*'s work
+        branch against the repo's default branch — the same base
+        `coord.ci_fix._diff_stat_for_entry` uses (`entry.target_branch`),
+        close enough for a mechanical-confinement check that only cares
+        WHICH files moved, not the exact merge-base for an epic's custom
+        target branch.
+
+        Fails soft to an empty ``DiffStat`` on any read failure (no
+        ``repo_github``/``work_branch`` yet, a throttled/malformed
+        compare, ...) — classification input, never a dispatch
+        precondition, same posture as every other best-effort fetch in
+        this class.
+        """
+        if not state.repo_github or not state.work_branch:
+            return DiffStat()
+        try:
+            from coord import github_ops  # noqa: PLC0415
+
+            diff_text = github_ops.get_compare_diff(
+                state.repo_github, state.repo_default_branch, state.work_branch,
+            )
+            if not diff_text:
+                return DiffStat()
+            return DiffStat(files=tuple(github_ops.diff_file_paths(diff_text)))
+        except Exception:  # noqa: BLE001 — see docstring
+            return DiffStat()
+
+    def _declared_files_for_test_state(self, state: IssueState) -> tuple[str, ...]:
+        """Best-effort ``## Files`` declaration for *state*'s issue
+        (#4124) — read straight off the live issue body via
+        :func:`coord.overlap_predict.parse_declared_files`, the same
+        source `coord.ci_fix._fetch_issue_body`/``parse_declared_files``
+        use to feed the identical check on the CI-red edge (#2096).
+
+        Fails soft to ``()`` on any read failure (``gh`` missing,
+        rate-limited, a network blip, no recognised ``## Files`` block) —
+        classification input, never a dispatch precondition.
+        """
+        if not state.repo_github:
+            return ()
+        try:
+            from coord import github_ops  # noqa: PLC0415
+            from coord.overlap_predict import parse_declared_files  # noqa: PLC0415
+
+            issue_data = github_ops.get_issue(state.repo_github, state.issue)
+            body = str(issue_data.get("body") or "")
+            return tuple(parse_declared_files(body))
+        except Exception:  # noqa: BLE001 — see docstring
+            return ()
+
+    def _machine_capabilities_for_state(self, state: IssueState) -> tuple[str, ...]:
+        """The capabilities the machine that ran *state*'s Test leg
+        advertises (#4124) — feeds `triage_failure`'s repro-capability
+        inference, so a mechanical verdict can say whether the SAME
+        machine class can reproduce the failure instead of guessing from
+        the issue text alone.
+
+        ``()`` — never raises — for a machine that no longer resolves (no
+        ``work_machine`` recorded yet, removed from config, unknown name,
+        or no config at all): classification input, never a dispatch
+        precondition.
+        """
+        if not state.work_machine or self.config is None:
+            return ()
+        machine = next(
+            (m for m in self.config.machines if m.name == state.work_machine), None,
+        )
+        return tuple(machine.capabilities) if machine is not None else ()
 
     def has_scoped_review_candidate(self, state: IssueState) -> bool:
         """#4114: True when a prior APPROVED review for *state*'s work row
