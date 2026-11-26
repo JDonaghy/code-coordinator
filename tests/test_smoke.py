@@ -6437,6 +6437,59 @@ def test_finalize_smoke_fanout_writes_per_leg_failure_evidence_to_parent_test_ou
     assert "[[smoke-fanout:" in reason
 
 
+def test_finalize_smoke_fanout_bounds_the_echoed_command_label(
+    coord_db, tmp_path, monkeypatch,
+) -> None:
+    """A partition's resolved Test-stage command can be a multi-KB,
+    CI-shaped multi-stage shell script (#4166) — the one payload the issue
+    explicitly forbids echoing into a fix briefing. The header built from
+    it must stay a short, single-line label, never the command verbatim.
+    """
+    from coord.confirm_test import write_test_output_file  # noqa: PLC0415
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    coord_state_dir = tmp_path / "coord-state"
+    monkeypatch.setattr("coord.state.COORD_DIR", coord_state_dir)
+
+    huge_command = "set -x\n" + "\n".join(
+        f"echo stage {i}; cargo test --features f{i} -p quadraui" for i in range(200)
+    )
+    assert len(huge_command) > 4000
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="failed", reason="headless smoke")
+    write_test_output_file(
+        "leg-a",
+        "running stage 1/1: cargo test --workspace --lib\n"
+        "error[E0308]: mismatched types\n"
+        " --> src/widget.rs:120:9\n"
+        "test result: FAILED. 0 passed; 1 failed\n"
+        "FAILED STAGES (stage order, first is likely root): "
+        "cargo test --workspace --lib\n",
+    )
+    manifest = _encode_fanout_manifest([("leg-a", ("gtk",), huge_command)])
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            f"{manifest}\n"
+            "Test stage running across 1 capability-partition leg(s) (#3182): [gtk]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    stored = coord_state_dir / "test_output" / "w-fanout.txt"
+    briefing_evidence = stored.read_text()
+
+    assert huge_command not in briefing_evidence
+    assert "error[E0308]: mismatched types" in briefing_evidence
+    # The header carries only a short, bounded label of the command — never
+    # the full multi-stage text.
+    header_line = briefing_evidence.splitlines()[0]
+    assert len(header_line) < 200
+
+
 @pytest.mark.parametrize(
     "infra_reason",
     [

@@ -167,6 +167,46 @@ class TestCiCommandConfigParsing:
             load_config(self._write(tmp_path, '    ci_command: ""\n'))
 
 
+class TestPrecheckConfigParsing:
+    """#4166: `repos[].precheck` — the declared fast compliance set a
+    work/fix leg's briefing instructs the worker to run before its final
+    push."""
+
+    def _write(self, tmp_path: Path, repo_block: str) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: portal\n"
+            "    github: acme/portal\n"
+            f"{repo_block}"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tailnet\n"
+            "    repos: [portal]\n"
+            "    repo_paths:\n"
+            "      portal: /tmp/portal\n"
+        )
+        return p
+
+    def test_precheck_round_trips(self, tmp_path: Path) -> None:
+        cfg = load_config(
+            self._write(tmp_path, '    precheck: "cargo clippy -- -D warnings"\n')
+        )
+        assert cfg.repo("portal").precheck == "cargo clippy -- -D warnings"
+
+    def test_absent_precheck_is_none(self, tmp_path: Path) -> None:
+        cfg = load_config(self._write(tmp_path, '    test_command: "npm test"\n'))
+        assert cfg.repo("portal").precheck is None
+
+    def test_non_string_precheck_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="precheck must be a string"):
+            load_config(self._write(tmp_path, "    precheck: 42\n"))
+
+    def test_empty_precheck_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="non-empty string"):
+            load_config(self._write(tmp_path, '    precheck: ""\n'))
+
+
 # ── Part 2: the live-CI read distinguishes "green" from "never looked" ───────
 
 

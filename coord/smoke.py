@@ -1088,6 +1088,24 @@ def _find_leg_for_partition(
     return best
 
 
+#: Bound (characters) on the command snippet shown in a failure-evidence
+#: header. A partition's resolved Test-stage command is an arbitrary shell
+#: command (commas, brackets, newlines — anything #4166 forbids echoing
+#: into a fix briefing wholesale); this is a label, not the command itself.
+_COMMAND_LABEL_BUDGET = 80
+
+
+def _bounded_command_label(command: str) -> str:
+    """Collapse *command* to one line and cap it to `_COMMAND_LABEL_BUDGET`
+    characters, so a 3KB+ multi-stage CI command never lands in a header
+    verbatim — only enough to say which command this partition ran.
+    """
+    label = " ".join(command.split())
+    if len(label) > _COMMAND_LABEL_BUDGET:
+        label = label[:_COMMAND_LABEL_BUDGET].rstrip() + "…"
+    return label
+
+
 def _write_fanout_failure_evidence(
     work_parent_id: str,
     leg_states: list[tuple[str, tuple[str, ...], str | None, str | None, str | None]],
@@ -1113,7 +1131,7 @@ def _write_fanout_failure_evidence(
             continue
         header = f"capability set [{'+'.join(caps)}] failed"
         if command:
-            header += f" (ran `{command}`)"
+            header += f" (ran `{_bounded_command_label(command)}`)"
         leg_output = ""
         try:
             leg_output = (COORD_DIR / "test_output" / f"{leg_id}.txt").read_text()

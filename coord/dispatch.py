@@ -1556,6 +1556,14 @@ def dispatch(
         from pathlib import Path
         new_issue_guidance = repo.resolve_new_issue_guidance(Path(repo_path).expanduser())
 
+    # #4166: precheck briefing contract — a work or fix leg's briefing
+    # names the repo's declared fast compliance set, so the worker runs it
+    # (and fixes anything it reports) before its final push, instead of
+    # only ever finding out at the Test stage.
+    precheck: str = ""
+    if proposal.type in ("work", "fix") and repo is not None and repo.precheck:
+        precheck = repo.precheck
+
     # #603: prepend the per-issue context digest to the TOP of a -p WORK
     # briefing (cross-repo deps / prior-attempt findings) so the worker reads
     # them first.  Only `work` (chat/refinement/conflict-fix carry no issue
@@ -1770,6 +1778,10 @@ def dispatch(
     # have this field and will reject the payload with a 400.
     if new_issue_guidance:
         payload["new_issue_guidance"] = new_issue_guidance
+    # #4166: only send precheck when non-empty — older agents don't have
+    # this field and will reject the payload with a 400.
+    if precheck:
+        payload["precheck"] = precheck
     # Only send fresh_branch when True — older agents don't have this field
     # and will reject the payload with a 400.
     if fresh_branch:

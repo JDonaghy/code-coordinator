@@ -2956,6 +2956,104 @@ class TestNewIssueGuidance:
         assert "new_issue_guidance" not in payload
 
 
+class TestPrecheckBriefingContract:
+    """#4166: a repo's declared `precheck` flows from repo config through
+    the dispatch payload for a work/fix proposal."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_precheck_for_work(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        precheck = "cargo clippy --all-targets -- -D warnings && cargo fmt --check"
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", precheck=precheck)],
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix bug",
+            rationale="fix",
+            type="fix",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["precheck"] == precheck
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_omits_precheck_when_not_configured(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],  # no precheck
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix bug",
+            rationale="work",
+            type="work",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "precheck" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_excludes_precheck_for_review_assignment(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """A declared precheck is a work/fix-leg instruction only — a
+        review leg reads the diff, it doesn't push anything."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", precheck="make precheck")],
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix bug",
+            rationale="review",
+            type="review",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "precheck" not in payload
+
+
 class TestProviderDispatch:
     """#324: dispatch() resolves provider name and threads it through the payload and DB."""
 

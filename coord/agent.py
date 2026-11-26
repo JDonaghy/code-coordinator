@@ -1145,6 +1145,10 @@ class AssignmentSpec:
     artifact_paths: list[str] = field(default_factory=list)
     # #352: per-repo new-issue guidance (only for type="new-issue-chat").
     new_issue_guidance: str = ""
+    # #4166: the repo's declared fast compliance set (only for type="work"/
+    # "fix") — appended to the system prompt so the worker runs it before
+    # its final push. Empty means the repo declared no `precheck`.
+    precheck: str = ""
     # "work" (default) or "review". The agent treats both the same — what
     # differs is the briefing and (for reviewers) the system prompt.
     type: str = "work"
@@ -6660,6 +6664,18 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # this text).
         if spec.workflow:
             system_prompt += _workflow_leg_system_prompt_suffix()
+        # #4166: the repo's declared fast compliance set, when configured —
+        # tell the worker to run it (and fix anything it reports) before
+        # its final push, instead of only ever finding out at the Test
+        # stage. Only `spec.type in ("work", "fix")` ever carries a
+        # non-empty `spec.precheck` — see `coord.dispatch.dispatch`'s own
+        # gating of the wire field.
+        if spec.precheck:
+            system_prompt += (
+                "\n\nBefore your final push, run this repo's declared fast "
+                "compliance set and fix anything it reports:\n\n"
+                f"    {spec.precheck}\n"
+            )
         # #2169: `Monitor` is the sanctioned way to poll a backgrounded
         # long-running command in bounded steps (see the ONE-SHOT section of
         # WORKER_SYSTEM_PROMPT) instead of a foreground loop that blocks

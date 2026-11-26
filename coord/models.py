@@ -266,6 +266,14 @@ class Repo:
     # behaviour, but `dispatch_smoke` logs that the verdict it is about to
     # produce is narrower than CI (see `resolve_smoke_command`).
     ci_command: str | None = None
+    # #4166: the repo's declared fast compliance set — e.g. for quadraui,
+    # CI-shaped clippy, both ratchets, fmt, `gen_wire_types --check`, and
+    # the binding checks when binding-core is touched. A work/fix leg's
+    # briefing (`coord.agent`'s catch-all system-prompt branch) tells the
+    # worker to run this before its final push. `None` (the default) means
+    # no precheck is declared for this repo — a leg sees no such
+    # instruction, byte-for-byte the pre-#4166 behaviour.
+    precheck: str | None = None
     # #296: optional shell command to interactively run the app for manual
     # smoke testing.  Surfaced in the TUI Test stage detail panel so the
     # tester knows exactly what to launch.

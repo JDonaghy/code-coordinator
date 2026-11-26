@@ -40,20 +40,6 @@ _FAILED_STAGES_LINE_RE = re.compile(
     re.MULTILINE,
 )
 
-#: The runner's own closing verdict marker (`SMOKE_SYSTEM_PROMPT`'s
-#: vocabulary, byte-identical for a plain-runner leg —
-#: `coord.agent.plain_runner_smoke_marker_lines`). A self-contained mirror
-#: of `coord.progress._SMOKE_VERDICT_RE`, not an import of it: that module
-#: pulls in board/agent-transport concerns this one must stay free of, and
-#: the two sides never need to share a Python import to agree on the same
-#: four-word marker vocabulary (see `coord.smoke.PlainRunnerVerdict`'s own
-#: docstring for the same reasoning — two independent mirrors of the same
-#: vocabulary, not two independent definitions of it).
-_SMOKE_MARKER_LINE_RE = re.compile(
-    r"^SMOKE:[ \t]*(?:baseline-red|harness-crash|pass(?:ed)?|fail(?:ed|ure|ing)?)\b",
-    re.MULTILINE | re.IGNORECASE,
-)
-
 #: Cargo's own per-stage failure markers — used when the runner printed no
 #: `FAILED STAGES` summary (e.g. a bare `cargo test` with no wrapping
 #: script). Matched in document order, which IS stage order: cargo stages
@@ -75,36 +61,23 @@ _PYTEST_FAILED_TALLY_RE = re.compile(r"\b[1-9]\d* failed\b")
 
 
 def _parse_failed_stages(log: str) -> list[str]:
-    # A multi-stage runner's own `test_command` is routinely echoed
-    # into the log BEFORE it ever executes (a header line, a verbose `set
-    # -x`, a `--help`/usage banner embedded in the script) — and that
-    # echoed source text can itself contain the literal phrase "FAILED
-    # STAGES (stage order, first is likely root): ..." as sample/template
-    # output, with no real failure behind it. `.search()` (first match)
-    # would trust that echo over the runner's REAL closing summary, which
-    # always comes later, after every stage has actually run. Collect every
-    # candidate and, when there's more than one, prefer the latest one that
-    # is followed somewhere later in the log by the runner's own closing
-    # `SMOKE: pass|fail|...` marker — the real summary is always printed
-    # once, right before that marker; an echoed header has nothing of the
-    # runner's own trailing after it. A single candidate (today's only
-    # exercised shape, before any corroborating marker exists in the log)
-    # is trusted exactly as before.
+    # A multi-stage runner's own `test_command` is routinely echoed into the
+    # log BEFORE it ever executes (a header line, a verbose `set -x`, a
+    # `--help`/usage banner embedded in the script) — and that echoed
+    # source text can itself contain the literal phrase "FAILED STAGES
+    # (stage order, first is likely root): ..." as sample/template output,
+    # with no real failure behind it. `.search()` (first match) would trust
+    # that echo over the runner's REAL closing summary, which is always
+    # printed last, after every stage has actually run. Collecting every
+    # candidate and keeping the latest one handles both: a single real
+    # summary (today's only exercised shape) is unaffected, and an echoed
+    # header followed later by the real summary resolves to the real one.
     candidates: list[tuple[int, list[str]]] = []
     for mm in _FAILED_STAGES_LINE_RE.finditer(log):
         stages = [s.strip() for s in mm.group("stages").split(",") if s.strip()]
         if stages:
             candidates.append((mm.start(), stages))
     if candidates:
-        if len(candidates) == 1:
-            return candidates[0][1]
-        marker_positions = [mm.start() for mm in _SMOKE_MARKER_LINE_RE.finditer(log)]
-        for start, stages in reversed(candidates):
-            if any(pos > start for pos in marker_positions):
-                return stages
-        # No candidate is corroborated by a trailing marker — fall back to
-        # the latest one rather than the first, since a real summary (when
-        # one exists at all) is always the LAST occurrence of this phrase.
         return candidates[-1][1]
 
     matches = list(_CARGO_COULD_NOT_COMPILE_RE.finditer(log)) + list(

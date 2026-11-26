@@ -251,9 +251,13 @@ def test_echoed_test_command_does_not_shadow_the_real_failed_stage() -> None:
     log before it ever runs (a `set -x` trace, a script-source dump for a
     verbose failure report) — and that echo can itself contain the literal
     `FAILED STAGES (stage order, first is likely root): ...` phrasing as
-    unexpanded template text, with no real failure behind it yet. The FIRST
-    occurrence here is exactly that echo; only the LAST — trailed by the
-    runner's own closing `SMOKE:` marker — is the real verdict.
+    unexpanded template text, with no real failure behind it yet. This is
+    the real production shape (#4092's extractor runs over the stored leg
+    output exactly as `coord.notify._record_smoke_verdict` persists it,
+    which never carries a trailing `SMOKE:` line of its own — that marker
+    is a worker-transport detail stripped before storage). The FIRST
+    occurrence here is exactly that echo; only the LAST is the real verdict,
+    and it must win even with no further corroboration.
     """
     log = (
         "+ grep -A1 FAILED_STAGES ci-check.sh\n"
@@ -265,16 +269,14 @@ def test_echoed_test_command_does_not_shadow_the_real_failed_stage() -> None:
         " --> src/widget.rs:120:9\n"
         "test result: FAILED. 0 passed; 1 failed\n"
         "FAILED STAGES (stage order, first is likely root): cargo test --workspace --lib\n"
-        "SMOKE: fail exit=1\n"
     )
     evidence = extract_failure_evidence(log)
     assert evidence.failed_stages == ("cargo test --workspace --lib",)
 
 
-def test_single_failed_stages_line_is_still_trusted_with_no_marker() -> None:
-    """Backward compat: today's only exercised shape — exactly one `FAILED
-    STAGES` line and no `SMOKE:` marker anywhere in the (bounded) log — must
-    still be trusted on its own, with no corroborating marker required.
+def test_single_failed_stages_line_is_still_trusted() -> None:
+    """The common case: exactly one `FAILED STAGES` line in the log is
+    trusted on its own.
     """
     log = (
         "running stage 1/1: cargo test --workspace --lib\n"
