@@ -108,7 +108,10 @@ FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work"}) | SEALED_PATH_AUTHOR_TY
 # request-changes verdict was propagated onto the parent row without a fix
 # dispatch, or (#4002) a request-changes verdict against an already-approved
 # head was recorded on the review row (non-blocking, no fix round) rather
-# than discarded.
+# than discarded. ``rework_refused`` (#4134) belongs here too: by the time
+# ``may_dispatch_rework`` refuses, ``propagate_review_verdict`` has already
+# written ``review.review_verdict``/``work.review_state`` onto the board —
+# same "mutates, no dispatch" shape as ``terminal_skip``.
 #
 # #1622: module-level rather than a local in ``_run_for_review_transition``
 # because ``coord fix`` is now a second caller of
@@ -117,6 +120,7 @@ FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work"}) | SEALED_PATH_AUTHOR_TY
 PERSIST_ACTION_KINDS: tuple[str, ...] = (
     "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
     "verdict_propagated", "finisher_dispatched", "superseded_by_approval",
+    "rework_refused",
 )
 
 
@@ -1996,10 +2000,12 @@ def _dispatch_fix(
     *override_machine* — from ``coord fix --machine`` — pins the dispatch to
     exactly that machine (no fallback). *status_fetcher* is forwarded to
     :func:`coord.dispatch.select_fix_machine` for test injection. When the
-    caller passes a *failure_detail* list, a human-readable reason (naming
-    the machine(s) tried and why) is appended to it whenever this returns
-    ``None`` for lack of a usable machine — the #3208 fix for a bare
-    "dispatch failed: timed out" with no named cause.
+    caller passes a *failure_detail* list, a human-readable reason is
+    appended to it whenever this returns ``None`` — either naming the
+    machine(s) tried and why (the #3208 fix for a bare "dispatch failed:
+    timed out" with no named cause), or, when ``may_dispatch_rework``
+    refuses before machine selection is ever attempted, that refusal's own
+    reason.
 
     #1176/#2302: the dispatched type mirrors ``work.type`` for any
     :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` member (``"test-author"``,
