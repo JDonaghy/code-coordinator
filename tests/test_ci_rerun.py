@@ -76,6 +76,20 @@ class TestGhRerunResult:
         assert result.in_progress is True
         assert "still in progress" in result.reason
 
+    def test_in_progress_refusal_classified_against_repos_own_fixture_wording(self) -> None:
+        """This repo's pre-#4165 fixtures for this exact `gh` refusal
+        (`tests/test_github_ops.py`, `tests/test_ci_store.py`) use "run
+        already in progress" — `_is_run_in_progress_stderr`'s marker list
+        must recognize that wording too, not only the synthetic "is still
+        in progress" phrasing used elsewhere in this file."""
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_gh_result("", returncode=1, stderr="run already in progress"),
+        ):
+            result = github_ops.rerun_workflow_run_failed_detail("acme/api", "12345")
+        assert result.ok is False
+        assert result.in_progress is True
+
     def test_gh_missing_is_not_in_progress(self) -> None:
         with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError("no gh")):
             result = github_ops.rerun_workflow_run_job_detail("acme/api", "123", "99")
