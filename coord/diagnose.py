@@ -41,6 +41,7 @@ orchestration in :func:`diagnose_stage` is unit-testable by monkeypatching them.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import time
@@ -408,6 +409,59 @@ def _agent_liveness(assignment: "Assignment", machine: "Machine | None") -> str:
     if any(isinstance(e, dict) and e.get("id") == assignment.assignment_id for e in active):
         return "live"
     return "dead"
+
+
+def _confirm_dead_via_assignment_endpoint(
+    assignment: "Assignment", machine: "Machine | None",
+) -> str:
+    """``"dead"`` | ``"live"`` | ``"unknown"`` — the ``sweep_dead_running_rows``
+    heal's own cross-check against the owning agent's ``GET
+    /assignments/<id>`` (#4141), asked right before a heal rather than
+    trusted from :func:`_session_state`'s own ``/status``-based read alone.
+
+    ``_agent_liveness`` above only ever consults ``/status``'s ``active``
+    list — a snapshot of RUNNING/PENDING entries. An assignment that
+    reaches a terminal state on the agent RIGHT AS this sweep runs (a real
+    completion racing the heal — the #2870/#2985/#2986/#2991/#3007
+    incidents) has already left that list by the time ``/status`` answers,
+    so a bare match-in-active check reads it exactly like a row the agent
+    has no memory of at all: "dead". ``/assignments/<id>`` answers the
+    narrower question directly — this agent's own record for ONE id,
+    whatever its status — so a completion the board hasn't reconciled yet
+    shows up here as a live record (never "dead"), and only an id this
+    agent genuinely has no memory of reads "dead".
+
+    ``machine`` is ``None`` when the assignment has no ``machine_name`` at
+    all — treated as dead, same as ``_agent_liveness``, since there is
+    nothing to ask. Any network failure, non-200/404 response, or
+    unparsable body reads "unknown" — never "dead" on a probe that didn't
+    actually answer, matching this module's never-finalize-on-a-probe-
+    failure contract.
+    """
+    if machine is None:
+        return "dead"
+    import httpx  # noqa: PLC0415
+
+    from coord.network import AGENT_PORT, DEFAULT_TIMEOUT  # noqa: PLC0415
+
+    try:
+        resp = httpx.get(
+            f"http://{machine.host}:{AGENT_PORT}/assignments/{assignment.assignment_id}",
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001 — unreachable/timeout: unknown, never dead
+        return "unknown"
+    if resp.status_code == 404:
+        return "dead"
+    if resp.status_code != 200:
+        return "unknown"
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — unparsable body: unknown, never dead
+        return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    return "live"
 
 
 def _ssh_target_for(assignment: "Assignment", config: "Config") -> str | None:
@@ -2483,6 +2537,65 @@ def _is_stale(
 # reads "live" or "unknown".
 PHANTOM_HEAL_BUFFER_SECONDS = 600.0
 
+# #4141: how many CONSECUTIVE sweep passes must agree a row is dead
+# (`_session_state` AND `_confirm_dead_via_assignment_endpoint` both reading
+# "dead") before it is safe to heal. One confirmed-dead read is never
+# enough on its own — the exact window `PHANTOM_HEAL_BUFFER_SECONDS` can't
+# close is a real completion landing in the few seconds between this
+# sweep's liveness probe and its own heal write, which reads identically to
+# "dead" on a single pass (#2870/#2985/#2986/#2991/#3007, all around
+# 56-69m). A row that reads anything other than dead on any pass — "live",
+# "unknown", or not swept at all that cycle — resets its streak to zero
+# (the pruning pass at the end of `sweep_dead_running_rows`), so this is
+# never "two dead reads ever", only two IN A ROW.
+PHANTOM_DEAD_CONFIRM_PASSES = 2
+
+
+def _phantom_miss_state_path() -> Path:
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    return COORD_DIR / "phantom_dead_misses.json"
+
+
+def _load_phantom_miss_counts() -> dict[str, int]:
+    """Durable cross-process, cross-call miss counter for #4141's
+    two-consecutive-passes gate.
+
+    `sweep_dead_running_rows` deliberately never mutates `board`/the
+    `assignments` table on anything short of an actual heal (see that
+    function's own docstring) — writing a per-row counter through the same
+    seam would reintroduce exactly the "is this a reconcile-safe mutation"
+    question that design avoids. A small JSON file under `~/.coord/` is its
+    own narrow, self-contained store instead — the same shape
+    `coord.agent_app._write_last_update`/`_read_last_update` already use for
+    comparable small operational state — and both of this sweep's callers
+    (`coord notify`'s periodic one-shot CLI invocation and
+    `coord.serve_app`'s long-lived daemon tick) run on the one machine that
+    hosts the canonical board, so a local file is visible to both.
+    """
+    try:
+        data = json.loads(_phantom_miss_state_path().read_text())
+    except Exception:  # noqa: BLE001 — missing/corrupt file: start from empty
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, (int, float)):
+            out[k] = int(v)
+    return out
+
+
+def _save_phantom_miss_counts(counts: dict[str, int]) -> None:
+    path = _phantom_miss_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(counts))
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001 — best-effort; losing this just re-arms the gate
+        pass
+
 
 @dataclass
 class PhantomRowHeal:
@@ -2511,8 +2624,8 @@ def sweep_dead_running_rows(
 
     Scans every ``running``/``pending`` row on *board* (fleet-wide, not
     scoped to one issue — unlike :func:`_cleanup_issue`) and, for each,
-    applies the same two guards a careful human would before touching a
-    row that merely *looks* wedged:
+    applies the same guards a careful human would before touching a row
+    that merely *looks* wedged:
 
     1. **Confirmed dead, never ambiguous** — liveness is read via
        :func:`_session_state` (tmux first, local or remote, falling back to
@@ -2523,14 +2636,26 @@ def sweep_dead_running_rows(
        ``coord/drive_queue.py`` documents ("liveness cannot be verified from
        here, so this is UNKNOWN, not dead") applies here too: only the
        assignment's own recorded machine can make this call.
-    2. **Aged out, not merely between turns** — the row must be running
+    2. **Cross-checked against the agent's own per-id record** (#4141) —
+       :func:`_confirm_dead_via_assignment_endpoint` asks ``GET
+       /assignments/<id>`` directly, which (unlike ``/status``'s ``active``
+       snapshot) still answers for an assignment that reached a terminal
+       state on the agent moments ago. Only a ``"dead"`` read here too is
+       actionable.
+    3. **Two consecutive sweep passes must agree** (#4141) — a single
+       confirmed-dead pair of reads is never enough on its own; see
+       :data:`PHANTOM_DEAD_CONFIRM_PASSES`'s docstring for why. The streak
+       is a small JSON file (:func:`_load_phantom_miss_counts`), not a board
+       mutation, so a row that reads anything else on an intervening pass
+       resets to zero.
+    4. **Aged out, not merely between turns** — the row must be running
        longer than its own ``config.pipeline.attention_threshold_for(...)``
        (the same wall-clock threshold
        :func:`coord.notify.detect_needs_attention` uses) PLUS
        :data:`PHANTOM_HEAL_BUFFER_SECONDS` of margin, so a session that is
        merely idle between turns or briefly disconnected is never raced.
 
-    Recovery, once both guards pass, is byte-for-byte
+    Recovery, once every guard passes, is byte-for-byte
     :func:`_finalize_dead` — the exact non-destructive action ``coord
     diagnose --reset`` runs for a phantom row: branch and commits are always
     preserved, and the stage becomes re-dispatchable. Writes go through the
@@ -2541,6 +2666,11 @@ def sweep_dead_running_rows(
     caller has to do explicitly — the next board read simply no longer
     counts the row as ``running``.
 
+    *dry_run* previews against the miss-counter file exactly as read (so a
+    row already one pass into its streak from real sweeps shows accurately
+    as "would heal"), but never writes it back — a preview must not itself
+    arm or disarm the real gate.
+
     Returns one :class:`PhantomRowHeal` per row healed (or, when *dry_run*,
     per row that WOULD be healed), so the caller can post a GitHub comment
     recording it — mirroring the existing ``needs_attention`` comment's
@@ -2549,6 +2679,9 @@ def sweep_dead_running_rows(
     """
     if now is None:
         now = time.time()
+
+    miss_counts = _load_phantom_miss_counts()
+    dead_candidate_ids: set[str] = set()
 
     healed: list[PhantomRowHeal] = []
     seen_ids: set[str] = set()
@@ -2577,11 +2710,28 @@ def sweep_dead_running_rows(
             # never an ambiguous one (#1870/#2536).
             continue
 
+        machine = _resolve_machine(config, a.machine_name)
+        if _confirm_dead_via_assignment_endpoint(a, machine) != "dead":
+            # The owning agent still has SOME record of this id (active, or
+            # a completion that hasn't reconciled yet) — never heal on this
+            # pass; let the ordinary completion path land it instead (#4141).
+            continue
+
+        dead_candidate_ids.add(a.assignment_id)
+        miss_count = miss_counts.get(a.assignment_id, 0) + 1
+        if miss_count < PHANTOM_DEAD_CONFIRM_PASSES:
+            # First confirmed-dead pass — record the streak and wait for a
+            # second CONSECUTIVE pass to agree before touching anything.
+            if not dry_run:
+                miss_counts[a.assignment_id] = miss_count
+            continue
+
         detail = (
             f"{a.type or 'work'} row running {running_for / 60.0:.0f}m "
             f"(past its {threshold / 60.0:.0f}m needs-attention threshold + "
             f"{PHANTOM_HEAL_BUFFER_SECONDS / 60.0:.0f}m buffer) — session "
-            f"confirmed dead on machine {a.machine_name!r}"
+            f"confirmed dead on machine {a.machine_name!r} and by its own "
+            f"agent across {miss_count} consecutive sweep passes"
         )
         if dry_run:
             healed.append(PhantomRowHeal(
@@ -2594,6 +2744,8 @@ def sweep_dead_running_rows(
                 action="(dry-run) would finalize the phantom session",
             ))
             continue
+
+        miss_counts.pop(a.assignment_id, None)
 
         # #4140: capture whatever cost/token signal the log still carries
         # BEFORE finalizing — once the row goes terminal nothing else ever
@@ -2615,6 +2767,15 @@ def sweep_dead_running_rows(
             detail=detail,
             action=action,
         ))
+
+    if not dry_run:
+        # Reset the streak for any id this pass no longer confirms dead
+        # (healed-and-popped above, or simply not a dead candidate this
+        # time) — the gate is "two IN A ROW", never "two ever".
+        for aid in list(miss_counts):
+            if aid not in dead_candidate_ids:
+                del miss_counts[aid]
+        _save_phantom_miss_counts(miss_counts)
 
     return healed
 
