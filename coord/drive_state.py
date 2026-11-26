@@ -436,6 +436,33 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
             and a.get("review_of_assignment_id") == work_aid
         ]
     )
+    # #4171: coord.review.dispatch_scoped_review deliberately keeps the
+    # OLDER round's review_of_assignment_id on a scoped re-review (so the
+    # merge-queue's chain-based mq.has_approved_review still recognises it),
+    # which makes it invisible to the exact-match above. A request-changes
+    # scoped verdict then reads as "no review at all" and the drive loop
+    # waits forever instead of dispatching the next fix round. Fall back to
+    # the most recently dispatched review on the issue when it was clearly
+    # dispatched FOR this work row — strictly after this row finished — since
+    # a review dispatched later than this round's own finish cannot be the
+    # stale earlier-round verdict the comment above guards against.
+    if review is None:
+        _finished_at_raw = (work or {}).get("finished_at")
+        try:
+            _work_finished_at = (
+                float(_finished_at_raw) if _finished_at_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            _work_finished_at = None
+        if _work_finished_at is not None:
+            review = _latest(
+                [
+                    a
+                    for a in mine
+                    if a.get("type") == "review"
+                    and (a.get("dispatched_at") or 0.0) > _work_finished_at
+                ]
+            )
     smoke = _latest(
         [
             a

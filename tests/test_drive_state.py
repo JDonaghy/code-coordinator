@@ -486,6 +486,47 @@ def test_review_is_keyed_on_the_current_work_row_not_the_issue():
     assert state.review_verdict == ""
 
 
+def test_scoped_rereview_is_read_despite_carrying_the_root_review_of_assignment_id(): # noqa: E501
+    """#4171: ``coord.review.dispatch_scoped_review`` deliberately stamps a
+    scoped re-review's ``review_of_assignment_id`` with the OLDER round's
+    id (here ``w1``, not the fix round ``w2``) so the merge-queue's
+    chain-based match still recognises it. The exact-match lookup above
+    then sees no review at all for ``w2`` and a request-changes verdict
+    never reaches ``_decide_review`` — claude-coordinator#4166 stalled
+    ~1h45m this way. The scoped review (``r2``) is dispatched strictly
+    after ``w2`` finished, which is exactly what distinguishes it from the
+    stale ``r1`` the previous test must still ignore."""
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", dispatched_at=100.0, finished_at=105.0),
+            row(
+                assignment_id="r1",
+                type="review",
+                dispatched_at=110.0,
+                review_of_assignment_id="w1",
+                review_verdict="request-changes",
+            ),
+            row(
+                assignment_id="w2",
+                dispatched_at=200.0,
+                finished_at=250.0,
+                test_state="passed",
+            ),
+            row(
+                assignment_id="r2",
+                type="review",
+                dispatched_at=260.0,
+                review_of_assignment_id="w1",
+                review_verdict="request-changes",
+            ),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_aid == "w2"
+    assert state.review_aid == "r2"
+    assert state.review_verdict == "request-changes"
+
+
 def test_review_verdict_resolves_to_fix_round_approval_not_parent_null(): # noqa: E501
     """#1601 (the #1566 incident): the PARENT work row's own `review_state`
     can be stuck at "dispatched" with no verdict forever once a fix round's
