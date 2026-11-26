@@ -522,6 +522,51 @@ def _finalize_dead(assignment: "Assignment", config: "Config") -> str:
     return fr.terminal_status or "finalized"
 
 
+def _capture_cost_before_heal(assignment: "Assignment", config: "Config") -> None:
+    """Best-effort cost/token capture for a row :func:`sweep_dead_running_rows`
+    is about to finalize (#4140).
+
+    A phantom row's session died without ever reaching a terminal
+    ``claude -p`` ``result`` event — that silence is exactly why the row
+    looked phantom in the first place — so the ordinary completion-time
+    capture (``coord.notify.post_transition``'s ``_capture_cost``, reachable
+    only from the live ``detect_transitions`` poll) never ran for it either.
+    Left alone, :func:`_finalize_dead` would still mark the row terminal,
+    and that terminal status is exactly what excludes it from every future
+    ``coord backfill-cost`` candidate query too (``cost_capture_state``
+    stays NULL, but nothing ever looks again) — so this is the one chance
+    to recover whatever partial signal the log holds.
+
+    Routes through :func:`coord.notify.capture_cost_and_tokens_for_assignment`
+    — the same engine ``coord backfill-cost`` already uses, reached one call
+    earlier — so a log killed before any `result` event still has its
+    running per-turn token total (``coord.worker_events``' accumulation)
+    persisted, which is enough for the reporting layer to estimate a cost
+    instead of silently recording $0.
+
+    Called BEFORE the finalize write, not after: best-effort and silent on
+    any failure — a capture problem must never block the heal itself.
+    """
+    if not assignment.assignment_id:
+        return
+    from coord.notify import capture_cost_and_tokens_for_assignment  # noqa: PLC0415
+    from coord.usage import LOGS_DIR  # noqa: PLC0415
+
+    machine = _resolve_machine(config, assignment.machine_name)
+    host = machine.host if machine is not None else None
+    log_path = str(LOGS_DIR / f"{assignment.assignment_id}.log")
+    try:
+        capture_cost_and_tokens_for_assignment(
+            assignment.assignment_id, log_path=log_path, host=host,
+            provider_name=assignment.provider_name,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; must not block the heal
+        log.debug(
+            "sweep_dead_running_rows: cost capture failed for %s: %s",
+            assignment.assignment_id, exc,
+        )
+
+
 def _kill_session(assignment: "Assignment", config: "Config") -> bool:
     """Stop *assignment*'s live session, whichever shape it is, and confirm it
     actually stopped.  Used by reset to stop a live session before
@@ -2549,6 +2594,11 @@ def sweep_dead_running_rows(
                 action="(dry-run) would finalize the phantom session",
             ))
             continue
+
+        # #4140: capture whatever cost/token signal the log still carries
+        # BEFORE finalizing — once the row goes terminal nothing else ever
+        # revisits it for cost (see _capture_cost_before_heal's docstring).
+        _capture_cost_before_heal(a, config)
 
         try:
             action = f"finalized phantom session ({_finalize_dead(a, config)})"

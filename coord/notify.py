@@ -5406,6 +5406,69 @@ def post_orphaned_review_findings(
     return posted_ids
 
 
+def sweep_missing_review_cost(config: Config) -> list[str]:
+    """Automatic counterpart to ``coord backfill-review-cost`` (#4140).
+
+    A review leg can reach a terminal status with ``cost_usd`` still NULL/0
+    through paths neither :func:`post_transition`'s ``_capture_cost`` nor
+    :func:`post_orphaned_review_findings` ever revisit: the leg never
+    reached ``status='done'`` at all (it failed/was cancelled, so
+    ``post_orphaned_review_findings``'s ``status='done'`` filter never
+    picks it up), or it did post findings successfully but the log had no
+    cost to capture AT THAT MOMENT (a transient parse failure, or a log
+    killed before claude's terminal ``result`` event) and, once
+    ``review_posted_at`` is set, nothing else ever looks at the row again.
+    Before this, the only recovery was an operator running ``coord
+    backfill-review-cost`` by hand.
+
+    Walks :func:`coord.state.load_review_assignments_missing_cost` — the
+    exact same candidate population that command already uses — and routes
+    each through :func:`capture_cost_and_tokens_for_assignment`, the same
+    engine, so this is not a new capture mechanism, just the existing one
+    reached automatically on `coord notify`'s own cadence instead of only on
+    operator demand. A log with no terminal ``result`` event can still
+    carry a partial per-turn token signal (``coord.worker_events``'
+    running-total accumulation keeps that regardless of whether a
+    ``result`` event ever arrived); capturing those tokens is enough for
+    the reporting layer (``coord.usage_rollup.leg_cost``) to turn them into
+    a priced estimate instead of a silent, indistinguishable "zero cost"
+    once this sweep stamps ``cost_capture_state`` either way.
+
+    Best-effort per row: one row's capture failing must not block the rest.
+    Returns the list of assignment ids this pass actually wrote cost and/or
+    tokens for, for tests/logging — a row left in ``still_missing`` by
+    :func:`capture_cost_and_tokens_for_assignment` (log truly gone, agent
+    unreachable) simply stays a candidate for the next pass.
+    """
+    from coord.state import load_review_assignments_missing_cost  # noqa: PLC0415
+    from coord.usage import LOGS_DIR  # noqa: PLC0415
+
+    candidates = load_review_assignments_missing_cost()
+    if not candidates:
+        return []
+
+    machines_by_name = {m.name: m for m in config.machines}
+    captured: list[str] = []
+    for row in candidates:
+        aid = row.get("assignment_id")
+        if not aid:
+            continue
+        machine = machines_by_name.get(row.get("machine_name") or "")
+        host = machine.host if machine is not None else None
+        log_path = str(LOGS_DIR / f"{aid}.log")
+        try:
+            wrote = capture_cost_and_tokens_for_assignment(
+                aid, log_path=log_path, host=host,
+                provider_name=row.get("provider_name"),
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad row must not sink the rest
+            log.warning("sweep_missing_review_cost: failed for %s: %s", aid, exc)
+            continue
+        if wrote:
+            captured.append(aid)
+    return captured
+
+
 def _dispatch_board_pending_pr_opens(config: Config) -> None:
     """Load the board, open PRs for any work-leg completions still missing
     one, and save (#2844).
@@ -6447,6 +6510,17 @@ def run(
         post_orphaned_review_findings(config)
     except Exception:  # noqa: BLE001
         log.exception("post_orphaned_review_findings: unexpected error")
+
+    # #4140: automatic counterpart to `coord backfill-review-cost` — a
+    # review leg can go terminal with no cost ever captured through paths
+    # the sweep above doesn't revisit (never reached status='done', or did
+    # but the log had nothing to capture at that moment). Runs right after
+    # the orphaned-findings sweep since both walk terminal review rows;
+    # best-effort, non-fatal, like every other sweep in this function.
+    try:
+        sweep_missing_review_cost(config)
+    except Exception:  # noqa: BLE001
+        log.exception("sweep_missing_review_cost: unexpected error")
 
     # Auto-loop: for each completed review, optionally dispatch a fix worker.
     # Runs after notify posts the completion comment so GitHub has the full

@@ -1712,6 +1712,108 @@ class TestPostOrphanedReviewFindings:
         assert "All clear." in body_arg
 
 
+class TestSweepMissingReviewCost:
+    """#4140: ``sweep_missing_review_cost`` — the automatic counterpart to
+    ``coord backfill-review-cost``, so a terminal review row with no cost
+    ever captured (never reached status='done', so the orphaned-findings
+    sweep's filter never saw it; or did, but the log had nothing to capture
+    at that moment) gets recovered on `coord notify`'s own cadence, not only
+    on operator demand."""
+
+    def _record_review(self, assignment_id: str, *, status: str = "failed") -> None:
+        from coord.models import Assignment
+        from coord.state import get_connection, record_dispatched_assignment
+
+        assignment = Assignment(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[review] Fix the thing",
+            briefing="review briefing",
+            type="review",
+            review_target="99",
+            dispatched_at=1000.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/api")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status=?, finished_at=1234.0 WHERE assignment_id=?",
+            (status, assignment_id),
+        )
+        conn.commit()
+
+    def test_recovers_cost_for_a_review_that_never_reached_done(
+        self, coord_dir: Path, config: Config, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A review that failed/was cancelled (never status='done') is
+        outside `post_orphaned_review_findings`'s own candidate filter —
+        this sweep is the only thing that ever revisits its cost."""
+        import json
+
+        self._record_review("sw1", status="failed")
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        monkeypatch.setattr("coord.usage.LOGS_DIR", logs_dir)
+        (logs_dir / "sw1.log").write_text(
+            json.dumps({
+                "type": "result", "subtype": "success", "result": "done",
+                "total_cost_usd": 1.75, "num_turns": 2, "duration_ms": 4321,
+                "session_id": "s", "input_tokens": 5, "output_tokens": 7,
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        captured = notify_mod.sweep_missing_review_cost(config)
+
+        assert captured == ["sw1"]
+        from coord.state import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id='sw1'"
+        ).fetchone()
+        assert row["cost_usd"] == 1.75
+
+    def test_row_already_costed_is_not_a_candidate(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        self._record_review("sw2", status="done")
+        from coord.state import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET cost_usd=3.0 WHERE assignment_id='sw2'")
+        conn.commit()
+
+        captured = notify_mod.sweep_missing_review_cost(config)
+
+        assert captured == []
+
+    def test_log_unavailable_is_best_effort_and_non_fatal(
+        self, coord_dir: Path, config: Config, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A row whose log is gone (no local file, agent unreachable) stays
+        a candidate for the next pass rather than raising."""
+        self._record_review("sw3", status="failed")
+        monkeypatch.setattr("coord.usage.LOGS_DIR", tmp_path / "no-such-logs-dir")
+
+        captured = notify_mod.sweep_missing_review_cost(config)
+
+        assert captured == []
+
+    def test_run_invokes_the_sweep(
+        self, coord_dir: Path, config: Config, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """`notify.run()` calls the sweep automatically, not just on
+        operator demand."""
+        calls: list[Config] = []
+        monkeypatch.setattr(
+            notify_mod, "sweep_missing_review_cost",
+            lambda cfg: calls.append(cfg) or [],
+        )
+        with patch.object(notify_mod, "_agent_status", return_value={"active": [], "completed": []}):
+            notify_mod.run(config)
+
+        assert calls == [config]
+
+
 class TestReviewPostClaimRace:
     """#2468: the identical "Review Complete" comment posted twice, 4 seconds
     apart, on #2288's round-4 review. `_try_parse_and_post_review` (the live
