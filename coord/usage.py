@@ -404,14 +404,14 @@ def filter_assignments_in_window(assignments: list[Assignment], window) -> list[
 # silently rendering a partial read as if it were complete.
 USAGE_ROWS_MAX_ROWS = 50_000
 
-# #4139: the daemon round-trip for `/usage-rows` serializes every row in
-# `assignments` + `assignments_archive` as JSON before any issue/window
-# filtering narrows the payload — on a live fleet with real history that
-# routinely takes longer than a plain httpx default (5s), so an unbounded
-# `coord usage --issue N` (no --since) timed out every time. This is the
-# default for both `fetch_usage_rows` and `fetch_usage_rows_from_daemon`;
-# callers that know their fetch is cheap (a tightly windowed/issue-filtered
-# read) may still pass a smaller `timeout` explicitly.
+# #4139: an unbounded `/usage-rows` round-trip makes the daemon read, decode
+# and serialize every row in `assignments` + `assignments_archive`, which on a
+# live fleet with real history routinely takes longer than a plain httpx
+# default (5s) — short enough that `coord usage --issue N` with no window flag
+# fails with a read timeout instead of an answer. This is the default for both
+# `fetch_usage_rows` and `fetch_usage_rows_from_daemon`; callers that know
+# their fetch is cheap (a tightly windowed/issue-filtered read) may still pass
+# a smaller `timeout` explicitly.
 USAGE_ROWS_DEFAULT_TIMEOUT = 30.0
 
 

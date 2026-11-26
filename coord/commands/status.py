@@ -3380,14 +3380,6 @@ def _usage_by_issue(
     click.echo(format_usage_by_issue(result, window.label))
 
 
-# #4139: a bare `coord usage --issue N` (no --today/--week/--month/--since)
-# used to fetch truly unbounded all-history rows, which — combined with the
-# httpx default timeout — reliably timed out on any fleet with real history.
-# Default to a bounded recent window instead; an explicit window flag still
-# overrides this, and a genuinely older leg is reachable via --since.
-ISSUE_DRILL_DEFAULT_SINCE = "90d"
-
-
 def _usage_issue_drill(
     config_path: Path,
     issue_number: int,
@@ -3399,27 +3391,23 @@ def _usage_issue_drill(
     timeout: float | None = None,
 ) -> None:
     """``coord usage --issue N`` (contract Mock 2, #1115) — per-stage drill
-    for one issue's legs. Defaults to the last :data:`ISSUE_DRILL_DEFAULT_SINCE`
-    (#4139) unless --today/--week/--month/--since overrides it."""
+    for one issue's legs. Unbounded (all history) unless --today/--week/
+    --month/--since is also given: an issue's first leg can be arbitrarily
+    old, and a default window would render ``No usage data for issue #N``
+    for it — a wrong answer, not a slow one. The fetch is kept cheap by
+    narrowing it to this one issue server-side instead (#4139)."""
     from coord.usage import USAGE_ROWS_DEFAULT_TIMEOUT, fetch_usage_rows, format_usage_issue_drill
     from coord.usage_rollup import leg_in_window, row_issue_number
 
     cfg = _load_config(config_path)
     has_window_flag = today or week or month or since_spec
-    # #4139: only substitute the bounded default when the caller gave no
-    # window flag at all — `_usage_resolve_window` rejects more than one of
-    # --today/--week/--month/--since, so defaulting `since_spec` whenever it
-    # was merely unset (even with e.g. --today already given) would make a
-    # legitimate single-flag call look like two and raise spuriously.
-    window = _usage_resolve_window(
-        today, week, month, since_spec if has_window_flag else ISSUE_DRILL_DEFAULT_SINCE
-    )
-    # #3313: push the resolved window down into the fetch itself. #4139:
-    # unlike before, this is never (None, None) any more — see
-    # `ISSUE_DRILL_DEFAULT_SINCE` above. See `_usage_by_issue` for why the
-    # window can't be left to client-side filtering alone.
-    since = window.start
-    until = window.end
+    window = _usage_resolve_window(today, week, month, since_spec) if has_window_flag else None
+    # #3313: push the resolved window down into the fetch itself (None/None
+    # when no window flag was given, i.e. unbounded all-history). See
+    # `_usage_by_issue` above for why this can't be left to client-side
+    # filtering alone.
+    since = window.start if window is not None else None
+    until = window.end if window is not None else None
     resolved_timeout = timeout if timeout is not None else USAGE_ROWS_DEFAULT_TIMEOUT
     # #1553: select by the *attributed* issue, matching the `--by issue`
     # summary above. Selecting on the raw `issue_number` while the summary
@@ -3430,16 +3418,18 @@ def _usage_issue_drill(
     # #4139: `issue=issue_number` is pushed down into the fetch (both the
     # daemon query param and `_local_usage_rows`'s own filter use
     # `row_issue_number` equality, same as below) so a capable daemon
-    # filters server-side before serializing. The client-side
-    # `row_issue_number`/`leg_in_window` recheck stays regardless, since an
-    # older daemon simply ignores the unknown `issue` param and returns
-    # everything in-window.
+    # filters server-side before serializing — serializing every history row
+    # is what made an unwindowed drill exceed the client timeout. The
+    # client-side `row_issue_number`/`leg_in_window` recheck stays
+    # regardless, since an older daemon simply ignores the unknown `issue`
+    # param and returns everything in-window.
     rows = [
         row
         for row in fetch_usage_rows(
             since=since, until=until, issue=issue_number, timeout=resolved_timeout
         )
-        if row_issue_number(row) == issue_number and leg_in_window(row, window)
+        if row_issue_number(row) == issue_number
+        and (window is None or leg_in_window(row, window))
     ]
     click.echo(format_usage_issue_drill(rows, issue_number, cfg.pricing))
 
