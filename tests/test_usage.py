@@ -2344,6 +2344,29 @@ class TestFanoutFoldLatencies:
         assert result[0].issue_number == 42
         assert result[0].latency_secs == pytest.approx(50.0)  # 1250 - 1200
 
+    def test_blocked_fold_is_not_dropped(self) -> None:
+        """A round that folds to `test_blocked` (`TEST_STATE_BLOCKED`,
+        `coord/smoke.py:2258`) is the pathological, longest-wedged case
+        this metric exists to catch — it must count the same as
+        `test_passed`/`test_failed`/`test_skipped`, not vanish."""
+        from coord import usage as usage_mod
+        from coord.smoke_tags import _encode_fanout_manifest
+
+        manifest = _encode_fanout_manifest([("leg1", ("gtk",), None)])
+        rows = [{"assignment_id": "leg1", "finished_at": 1000.0}]
+        entries = [
+            _audit_entry(
+                "test_blocked", repo="quadraui", issue=7, ts=1100.0,
+                details={"test_reason": f"{manifest}\nTest stage blocked (#3182)."},
+            ),
+        ]
+
+        result = usage_mod.fanout_fold_latencies(rows, entries)
+        assert len(result) == 1
+        assert result[0].repo_name == "quadraui"
+        assert result[0].issue_number == 7
+        assert result[0].latency_secs == pytest.approx(100.0)  # 1100 - 1000
+
     def test_missing_leg_rows_contribute_nothing(self) -> None:
         """A fold round whose legs can't be found in assignment_rows at all
         (incomplete usage-row history) must be skipped, not guessed at."""

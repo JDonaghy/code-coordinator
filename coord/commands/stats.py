@@ -191,6 +191,7 @@ def waste(
     from coord.leg_waste import build_waste_report, waste_report_to_dict  # noqa: PLC0415
     from coord.state import list_audit_log  # noqa: PLC0415
     from coord.usage import (  # noqa: PLC0415
+        HealCounts,
         fanout_fold_latencies,
         fetch_usage_rows,
         heal_counts_from_audit,
@@ -259,14 +260,24 @@ def waste(
     # independently-filtered read. Best-effort, mirroring the board/audit
     # fetches above: a problem computing one of these three signals must
     # never take down the rest of `coord stats waste`.
-    heal_counts = heal_counts_from_audit(audit_entries)
     try:
-        threshold_repo_names = {repo} if repo else {i.repo_name for i in report.issues}
+        heal_counts = heal_counts_from_audit(audit_entries)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"warning: could not compute heal/stall counts: {e}", err=True)
+        heal_counts = HealCounts()
+    try:
+        threshold_repo_names = (
+            [repo] if repo else sorted({i.repo_name for i in report.issues})
+        )
         repo_thresholds = repo_attention_thresholds(threshold_repo_names, config=cfg)
     except Exception as e:  # noqa: BLE001
         click.echo(f"warning: could not compute repo attention thresholds: {e}", err=True)
         repo_thresholds = []
-    fold_latencies = fanout_fold_latencies(assignment_rows, audit_entries)
+    try:
+        fold_latencies = fanout_fold_latencies(assignment_rows, audit_entries)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"warning: could not compute fan-out fold latencies: {e}", err=True)
+        fold_latencies = []
 
     if output_json:
         body = waste_report_to_dict(report)

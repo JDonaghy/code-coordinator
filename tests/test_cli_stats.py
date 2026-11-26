@@ -20,6 +20,18 @@ from coord.cli import main
 from .conftest import VALID_CONFIG, output_and_stderr
 
 
+@pytest.fixture(autouse=True)
+def _reset_p90_attention_cache():
+    """Mirrors `tests/test_usage.py`'s `_reset_cache` fixture: the
+    module-level `_SUCCESSFUL_DURATIONS_CACHE` must not leak mocked rows
+    from one test into the next test in this session."""
+    import coord.usage as usage_mod
+
+    usage_mod.reset_p90_attention_cache()
+    yield
+    usage_mod.reset_p90_attention_cache()
+
+
 def _write_config(tmp_path):
     p = tmp_path / "coordinator.yml"
     p.write_text(VALID_CONFIG)
@@ -269,8 +281,6 @@ def test_stats_waste_surfaces_heal_stall_signals_json(tmp_path, monkeypatch) -> 
 
     import coord.usage as usage_mod
 
-    usage_mod.reset_p90_attention_cache()
-
     rows = [
         _row(assignment_id="r1", issue_number=1, status="merged"),
         # The two fan-out legs the fold-latency audit event below names.
@@ -348,7 +358,6 @@ def test_stats_waste_surfaces_heal_stall_signals_human(tmp_path, monkeypatch) ->
 
     import coord.usage as usage_mod
 
-    usage_mod.reset_p90_attention_cache()
     monkeypatch.setattr(
         usage_mod, "fetch_usage_rows",
         lambda *a, **k: [_row(assignment_id="r1", issue_number=1, status="merged")],
