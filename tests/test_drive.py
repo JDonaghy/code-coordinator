@@ -4118,13 +4118,20 @@ def test_git_merge_verifier_triage_test_failure_compile_error_guard_is_not_degra
 def test_git_merge_verifier_triage_test_failure_feeds_diff_stat_declared_files_and_capabilities(
     tmp_path, monkeypatch,
 ):
-    """#4124: the Test edge must feed `triage_failure`'s mechanical-
-    confinement check the SAME three inputs the CI-red edge
-    (`coord.ci_fix.triage_ci_failure`) already feeds it — a branch diff's
-    touched files, the issue's own `## Files` declaration, and the
-    capabilities of the machine that ran the Test leg — never leave them
-    at their empty defaults when they are cheaply available (#2096: one
-    classifier, fed consistently across edges)."""
+    """The Test edge must feed `triage_failure`'s mechanical-confinement
+    check a branch diff's touched files, the issue's own `## Files`
+    declaration, and the capabilities of the machine that actually ran
+    the Test leg — never leave them at their empty defaults when they are
+    cheaply available (#2096: one classifier, fed consistently across
+    edges).
+
+    The Test leg's host is `state.smoke_machine` (the Test stage's own
+    child row), NOT `state.work_machine` (the worker's host) — the two
+    are set to different machines here to prove the capabilities come
+    from the former. ``macos`` (a real `_PLATFORM_CAPABILITY_TOKENS`
+    entry) is used, not a made-up token, so this also proves the value
+    reaches `_infer_repro_capability` rather than just round-tripping
+    through an opaque tuple."""
     import coord.failure_triage as failure_triage
     import coord.github_ops as github_ops
 
@@ -4155,13 +4162,19 @@ def test_git_merge_verifier_triage_test_failure_feeds_diff_stat_declared_files_a
     )
 
     cfg = _config_with_triage_enabled()
-    cfg.machines.append(Machine(name="mac1", host="mac1.tail", capabilities=["mac", "rust"]))
+    cfg.machines.append(
+        Machine(name="linux1", host="linux1.tail", capabilities=["linux"])
+    )
+    cfg.machines.append(
+        Machine(name="mac1", host="mac1.tail", capabilities=["macos", "rust"])
+    )
     verifier = GitMergeVerifier(repo_path=str(tmp_path))
     verifier.set_config(cfg)
     s = state(
         work_test_reason="3 failed",
         work_branch="issue-4124-fix",
-        work_machine="mac1",
+        work_machine="linux1",
+        smoke_machine="mac1",
     )
 
     verdict = verifier.triage_test_failure(s)
@@ -4169,7 +4182,51 @@ def test_git_merge_verifier_triage_test_failure_feeds_diff_stat_declared_files_a
     assert verdict is not None and verdict.bucket == "substantive"
     assert captured["diff_stat"].files == ("src/foo.rs",)
     assert captured["declared_files"] == ("src/foo.rs",)
-    assert captured["machine_capabilities"] == ("mac", "rust")
+    assert captured["machine_capabilities"] == ("macos", "rust")
+
+
+def test_machine_capabilities_for_state_returns_empty_for_cross_machine_fanout(
+    tmp_path,
+):
+    """A #3182 capability-partition fan-out across more than one machine
+    has no single host to attribute a failure to — the helper must report
+    "can't attribute" (``()``) rather than guessing one leg's host for
+    all of them, even when `state.smoke_machine` itself resolves fine."""
+    cfg = _config_with_triage_enabled()
+    cfg.machines.append(
+        Machine(name="mac1", host="mac1.tail", capabilities=["macos"])
+    )
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(cfg)
+    s = state(
+        work_test_reason=(
+            "[[smoke-fanout:leg1=macos=,leg2=linux=]]\n"
+            "Test stage passed (#3182) across 2 capability-partition leg(s)."
+        ),
+        smoke_machine="mac1",
+    )
+
+    assert verifier._machine_capabilities_for_state(s) == ()
+
+
+def test_machine_capabilities_for_state_single_fanout_leg_still_resolves(
+    tmp_path,
+):
+    """A fan-out manifest with exactly ONE leg (every rule folded into a
+    single capability partition) is not a cross-machine ambiguity — the
+    smoke leg's own machine still resolves normally."""
+    cfg = _config_with_triage_enabled()
+    cfg.machines.append(
+        Machine(name="mac1", host="mac1.tail", capabilities=["macos"])
+    )
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(cfg)
+    s = state(
+        work_test_reason="[[smoke-fanout:leg1=macos=]]\nTest stage passed.",
+        smoke_machine="mac1",
+    )
+
+    assert verifier._machine_capabilities_for_state(s) == ("macos",)
 
 
 def test_git_merge_verifier_triage_test_failure_diff_declared_and_capabilities_fail_soft(
@@ -4205,6 +4262,40 @@ def test_git_merge_verifier_triage_test_failure_diff_declared_and_capabilities_f
     assert captured["diff_stat"].files == ()
     assert captured["declared_files"] == ()
     assert captured["machine_capabilities"] == ()
+
+
+def test_diff_stat_and_machine_capabilities_fail_soft_on_raise(
+    tmp_path, monkeypatch,
+):
+    """Unlike the "nothing recorded yet" fail-soft case above, this drives
+    the two helpers' `except Exception` arms specifically: a real
+    `work_branch`/`smoke_machine` IS on hand, but the read itself blows up
+    (a throttled/malformed `gh api compare`, a `coord.smoke_tags` import
+    or parse failure) — both must still degrade to their empty default
+    rather than propagating."""
+    import coord.github_ops as github_ops
+    import coord.smoke_tags as smoke_tags
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("gh api compare: rate limited")
+
+    monkeypatch.setattr(github_ops, "get_compare_diff", boom)
+    monkeypatch.setattr(smoke_tags, "_parse_fanout_manifest", boom)
+
+    cfg = _config_with_triage_enabled()
+    cfg.machines.append(
+        Machine(name="mac1", host="mac1.tail", capabilities=["macos"])
+    )
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(cfg)
+    s = state(
+        work_test_reason="3 failed",
+        work_branch="issue-4124-fix",
+        smoke_machine="mac1",
+    )
+
+    assert verifier._diff_stat_for_test_state(s).files == ()
+    assert verifier._machine_capabilities_for_state(s) == ()
 
 
 def test_empty_fix_round_does_not_spend_the_budget():

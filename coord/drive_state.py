@@ -203,6 +203,13 @@ class IssueState:
     # polling `test_state == "running"` forever against a child that has
     # already finished.
     smoke_failure_reason: str = ""
+    # The host that actually ran *this* Test leg — `coord.smoke.
+    # rank_smoke_machines` routes the Test stage independently of the work
+    # leg (and since #3182 can fan a diff out across several legs on
+    # several machines at once), so `work_machine` is NOT a safe proxy for
+    # "the machine that produced `work_test_reason`". Sourced the same way
+    # `review_machine` is, off the smoke child row's own `machine_name`.
+    smoke_machine: str = ""
 
     active_count: int = 0
     active_types: tuple[str, ...] = ()
@@ -580,6 +587,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         smoke_aid=g(smoke, "assignment_id"),
         smoke_status=g(smoke, "status"),
         smoke_failure_reason=g(smoke, "failure_reason"),
+        smoke_machine=g(smoke, "machine_name"),
         active_count=len(active),
         active_types=tuple(sorted({(a.get("type") or "?") for a in active})),
         merge_status=(merge_entry or {}).get("status") or "",
