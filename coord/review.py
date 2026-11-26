@@ -6147,6 +6147,256 @@ def _live_review_stale(
     return truth.review_stale, truth.review_stale_reason
 
 
+# ── #4153: auto-reaffirm on a surface-only ratchet-lowering delta ──────────
+#
+# #4151 lets a repo declare `integration_surfaces`: paths a `regen` command
+# rewrites mechanically (a ratchet-test fixture, a generated baseline JSON).
+# #4152 uses that to resolve a merge CONFLICT confined to those paths without
+# a `claude -p` leg — but its own push still voids any approval already on
+# the branch, exactly like a conflict-fix worker's rebase would. This block
+# is the other half (#4123's slice 3): when the delta since that approval is
+# confined to declared surface paths AND every changed line only lowers a
+# numeric literal (never raises one, never touches non-numeric content), the
+# delta is provably just a ratchet value tracking a sibling's regen — so
+# `coord.state.record_review_reaffirm` re-points the approval's staleness
+# anchors directly, instead of dispatching a scoped re-review for something
+# a human reviewer would only ever rubber-stamp.
+#
+# This is strictly narrower than #3707's `ancillary_files` allow-list: an
+# ancillary path may change in ANY way and still be skipped, because it's
+# config-trusted to never carry reviewable logic (CHANGELOG.md, README.md).
+# A surface path is NOT trusted that broadly — only a value *lowering* is
+# safe, so this reads the actual diff content, not just the touched paths.
+
+_NUMERIC_LITERAL_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _line_is_numeric_lowering_only(old_line: str, new_line: str) -> bool:
+    """True when *new_line* differs from *old_line* only in its numeric
+    literal tokens, and every token that changed is strictly lower in
+    *new_line* than the corresponding one in *old_line*.
+
+    Splits both lines on the same numeric-token regex and requires the
+    non-numeric remainder to match exactly — a line whose surrounding text
+    also changed (a renamed constant, a reordered field, a comment edit)
+    fails this, even if every number present happens to be lower. A token
+    that isn't a valid number after the split (shouldn't happen, since both
+    sides are matched by the same regex) also fails closed.
+    """
+    if old_line == new_line:
+        return True
+    if _NUMERIC_LITERAL_RE.split(old_line) != _NUMERIC_LITERAL_RE.split(new_line):
+        return False  # non-numeric content differs too
+    old_nums = _NUMERIC_LITERAL_RE.findall(old_line)
+    new_nums = _NUMERIC_LITERAL_RE.findall(new_line)
+    if len(old_nums) != len(new_nums) or not old_nums:
+        return False
+    lowered_any = False
+    for old_n, new_n in zip(old_nums, new_nums):
+        if old_n == new_n:
+            continue
+        try:
+            if float(new_n) >= float(old_n):
+                return False  # raised, not lowered
+        except ValueError:
+            return False
+        lowered_any = True
+    return lowered_any
+
+
+def _file_is_surface_numeric_lowering_only(old_text: str | None, new_text: str | None) -> bool:
+    """True when every line that differs between *old_text* and *new_text*
+    is a :func:`_line_is_numeric_lowering_only` change — i.e. the whole file
+    delta is accounted for by in-place numeric-literal lowering, never a
+    line inserted, removed, reordered, or changed in any other way.
+
+    Walks :func:`difflib.SequenceMatcher`'s opcodes rather than a raw
+    unified diff: an ``"equal"`` block is skipped outright, any
+    ``"insert"``/``"delete"`` fails closed immediately (a numeric-only edit
+    never adds or removes a whole line), and a ``"replace"`` block must pair
+    1:1 (equal line counts on both sides) for
+    :func:`_line_is_numeric_lowering_only` to even have a counterpart to
+    compare each old line against.
+
+    ``None`` on either side (an unreadable fetch) fails closed to ``False``.
+    """
+    if old_text is None or new_text is None:
+        return False
+    if old_text == new_text:
+        return True
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "replace":
+            return False  # a pure insert/delete can't be a numeric-literal edit
+        if (i2 - i1) != (j2 - j1):
+            return False  # unequal line counts — not a 1:1 value swap
+        for old_line, new_line in zip(old_lines[i1:i2], new_lines[j1:j2]):
+            if not _line_is_numeric_lowering_only(old_line, new_line):
+                return False
+    return True
+
+
+def _review_delta_is_surface_only_ratchet_lowering(
+    gh_ops,
+    repo_github: str | None,
+    surfaces: "list[object]",
+    base_branch: str | None,
+    review_sha: str | None,
+    current_sha: str | None,
+    diff_cache: dict[tuple[str, str, str], str | None] | None = None,
+    file_fetcher=None,
+) -> bool:
+    """True when every path that changed between *review_sha* (what an
+    existing ``approve``d review covered) and *current_sha* (the branch's
+    current head) is one of *surfaces*' declared paths (#4151), AND the
+    whole-file delta on each of those paths is confined to
+    :func:`_file_is_surface_numeric_lowering_only` edits.
+
+    Reuses :func:`coord.merge_queue._fetch_compare_diff` /
+    :func:`coord.merge_queue._diff_blocks_by_path`'s base-branch-relative
+    double-diff to isolate the changed-path set — the exact same technique
+    :func:`coord.merge_queue._review_delta_is_ancillary_only` uses and for
+    the same reason (#3707's docstring): after a conflict-fix rebase
+    *review_sha* is not necessarily an ancestor of *current_sha*, so a
+    direct ``review_sha...current_sha`` compare can't be trusted to mean
+    "what the rebase changed". One path-isolation implementation, not two
+    (#2096).
+
+    Once the changed-path set is confirmed surface-only, the actual CONTENT
+    comparison fetches each path's full text at *review_sha* and
+    *current_sha* directly (*file_fetcher*, defaulting to
+    :func:`coord.github_ops.get_repo_file`, called as
+    ``file_fetcher(repo_github, path, sha)``) rather than reusing either
+    base-relative diff — #4152's own mechanical resolution pushes a merge
+    commit (keeping *review_sha* an ancestor), but a hand or worker rebase
+    might not, and fetching each side's content directly by its own SHA
+    sidesteps that ambiguity entirely rather than trying to reconstruct it
+    from two base-relative diffs.
+
+    Fails closed to ``False`` whenever *surfaces*/*base_branch*/
+    *repo_github*/either SHA is missing, either base-relative compare call
+    raises or returns ``None``, the changed-path set is empty (nothing to
+    attribute — #1475's patch-id check upstream should already have caught
+    a genuine no-op), any changed path isn't declared, or any declared
+    path's content fetch raises or isn't numeric-lowering-only.
+    """
+    if not surfaces or not base_branch or not repo_github or not review_sha or not current_sha:
+        return False
+    declared_paths: set[str] = set()
+    for surface in surfaces:
+        declared_paths.update(getattr(surface, "paths", None) or [])
+    if not declared_paths:
+        return False
+
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    review_diff = mq._fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha, diff_cache)
+    current_diff = mq._fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha, diff_cache)
+    if review_diff is None or current_diff is None:
+        return False
+    review_blocks = mq._diff_blocks_by_path(review_diff)
+    current_blocks = mq._diff_blocks_by_path(current_diff)
+    changed_paths = {
+        path
+        for path in set(review_blocks) | set(current_blocks)
+        if review_blocks.get(path) != current_blocks.get(path)
+    }
+    if not changed_paths:
+        return False  # nothing actually changed — not this check's call to make
+    if not all(path in declared_paths for path in changed_paths):
+        return False  # touches a non-surface path — needs a real review
+
+    _fetch = file_fetcher or github_ops.get_repo_file
+    for path in sorted(changed_paths):
+        try:
+            old_text = _fetch(repo_github, path, review_sha)
+        except Exception:  # noqa: BLE001 — unreadable fetch: fail closed
+            return False
+        try:
+            new_text = _fetch(repo_github, path, current_sha)
+        except Exception:  # noqa: BLE001
+            return False
+        if not _file_is_surface_numeric_lowering_only(old_text, new_text):
+            return False
+    return True
+
+
+def maybe_auto_reaffirm_surface_only_lowering(
+    entry,
+    prior_review: Assignment,
+    config: Config,
+    *,
+    gh_ops=None,
+    file_fetcher=None,
+) -> bool:
+    """Try #4153's auto-reaffirm for *entry*'s voided approval *prior_review*
+    before a caller falls back to dispatching a scoped (or full) re-review.
+
+    True — and *prior_review* re-pointed both durably
+    (:func:`coord.state.record_review_reaffirm`) and in-memory
+    (``prior_review.review_head_sha``/``review_patch_id`` set to *entry*'s
+    current branch head, exactly like :func:`coord.board_doctor_permissions
+    .finisher_self_bless` does for its own re-point, so a caller that keeps
+    using *prior_review* afterward sees the reaffirmed anchors too) — only
+    when the repo declares ``integration_surfaces`` (#4151) and
+    :func:`_review_delta_is_surface_only_ratchet_lowering` confirms the delta
+    since *prior_review* is confined to those paths and every changed line
+    only lowers a numeric literal. ``False`` otherwise — the repo declares no
+    surfaces, or the delta doesn't qualify — leaving *entry*/*prior_review*
+    completely untouched for the caller's existing scoped/full-review path.
+
+    *gh_ops* (defaults to :mod:`coord.github_ops`) is the backend
+    :func:`_review_delta_is_surface_only_ratchet_lowering`'s base-relative
+    diff compare reads through; *file_fetcher* is the per-path content
+    fetch — both injectable so tests never hit the network.
+    """
+    repo_cfg = config.repo(entry.repo_name)
+    surfaces = list(getattr(repo_cfg, "integration_surfaces", None) or [])
+    if not surfaces:
+        return False
+    review_sha = getattr(prior_review, "review_head_sha", None)
+    current_sha = getattr(entry, "branch_head_sha", None)
+    if not _review_delta_is_surface_only_ratchet_lowering(
+        gh_ops if gh_ops is not None else github_ops,
+        entry.repo_github,
+        surfaces,
+        entry.target_branch,
+        review_sha,
+        current_sha,
+        file_fetcher=file_fetcher,
+    ):
+        return False
+
+    new_patch_id = getattr(entry, "branch_patch_id", None)
+    from coord.state import record_review_reaffirm  # noqa: PLC0415
+
+    record_review_reaffirm(
+        review_assignment_id=prior_review.assignment_id,
+        new_head_sha=current_sha,
+        new_patch_id=new_patch_id,
+        reason=(
+            "#4153: delta since approval is confined to declared "
+            "integration_surfaces paths and only lowers numeric literals "
+            "— auto-reaffirmed without a re-review"
+        ),
+        actor="daemon",
+        conflict_fix_only=None,
+    )
+    prior_review.review_head_sha = current_sha
+    prior_review.review_patch_id = new_patch_id
+    log.info(
+        "[review] auto-reaffirmed %s (%s #%s): surface-only ratchet-"
+        "lowering delta since %s -> %s",
+        prior_review.assignment_id, entry.repo_name, entry.issue_number,
+        review_sha, current_sha,
+    )
+    return True
+
+
 def compute_resolution_delta(old_diff_text: str | None, new_diff_text: str | None) -> str | None:
     """Return a unified diff *between* two full unified diffs (#1476).
 
@@ -7325,6 +7575,16 @@ def dispatch_scoped_reviews_for_queue(
             if prior_review is None:
                 continue  # no scoped candidate — needs a full review, not this path
 
+            # #4153: a delta confined to declared integration_surfaces paths
+            # and only lowering numeric literals is auto-reaffirmed straight
+            # away — it never needed `only_bounded_fix_since_review`'s
+            # attribution guardrail at all, since the content check itself
+            # is the safety proof.
+            if maybe_auto_reaffirm_surface_only_lowering(
+                entry, prior_review, config, gh_ops=github_ops,
+            ):
+                continue
+
             if not mq.only_bounded_fix_since_review(entry, board, prior_review):
                 continue  # guardrail: another commit intervened — full review required
 
@@ -7626,6 +7886,17 @@ def maybe_scoped_review_for_completed_fix(
         )
         if prior_review is None:
             return None
+
+        # #4153: same auto-reaffirm short-circuit as
+        # `dispatch_scoped_reviews_for_queue` — a surface-only ratchet-
+        # lowering delta is auto-reaffirmed instead of scoping a review
+        # around it, so this caller falls back to "nothing to dispatch"
+        # exactly as it would for an already-covered approval.
+        if maybe_auto_reaffirm_surface_only_lowering(
+            entry, prior_review, config, gh_ops=github_ops,
+        ):
+            return None
+
         if not mq.only_bounded_fix_since_review(entry, board, prior_review):
             return None
 
