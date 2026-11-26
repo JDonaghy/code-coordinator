@@ -1055,10 +1055,11 @@ def sweep_dispatch_fixit_leg(
 
     Returns a :class:`FixitLegDispatch` with ``dispatched=False`` — never
     raises — for: no originating work-like assignment found for this
-    issue, a leg already in flight, or an underlying `_dispatch_fix` call
-    that declined (no capable machine, unreachable agent, …). Only an
-    observed, confirmed `Assignment` back from `_dispatch_fix` is reported
-    as ``dispatched=True``.
+    issue, a leg already in flight, `coord.drive_queue.may_dispatch_rework`
+    refusing against the live ``(repo, issue)`` (#4135), or an underlying
+    `_dispatch_fix` call that declined (no capable machine, unreachable
+    agent, …). Only an observed, confirmed `Assignment` back from
+    `_dispatch_fix` is reported as ``dispatched=True``.
     """
     authorize_sweep_action("dispatch_fixit_leg")
 
@@ -1096,12 +1097,30 @@ def sweep_dispatch_fixit_leg(
     work = _select_winning_work_assignment(work_like)
 
     from coord.auto_loop import _dispatch_fix, next_fix_iteration  # noqa: PLC0415
+    from coord.drive_queue import may_dispatch_rework  # noqa: PLC0415
+
+    # #4135: the same live question every rework dispatcher must ask before
+    # firing (#2096/#2085) — asked explicitly here, ahead of the iteration
+    # lookup and briefing build below, so a refusal short-circuits before
+    # any of that work. `rework_guard_checked=True` on the `_dispatch_fix`
+    # call below keeps this a single live-GitHub-read ask per sweep.
+    rework_allowed, rework_reason = may_dispatch_rework(
+        repo_name, issue_number, "fixit_leg", board=board,
+    )
+    if not rework_allowed:
+        return FixitLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=rework_reason,
+        )
 
     iteration = next_fix_iteration(board, work)
     briefing = _fixit_leg_briefing(cause=cause, evidence=evidence)
 
     fix = _dispatch_fix(
         work, briefing, board, config, iteration, http_client=http_client,
+        rework_guard_checked=True,
     )
     if fix is None:
         return FixitLegDispatch(

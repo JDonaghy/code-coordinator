@@ -3291,7 +3291,9 @@ def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[Stuc
     ]
 
 
-def _episode_stuck_row(episode: dict) -> StuckRow | None:
+def _episode_stuck_row(
+    episode: dict, *, entries_by_key: Mapping[str, Any] | None = None,
+) -> StuckRow | None:
     """Reconstruct a :class:`StuckRow` from an already-diagnosed episode (#3758).
 
     :func:`coord.queue_diagnose.run_pass` only re-probes episodes
@@ -3309,11 +3311,23 @@ def _episode_stuck_row(episode: dict) -> StuckRow | None:
     yet (empty or still :data:`coord.queue_diagnose.CAUSE_UNKNOWN`) — same
     as today's effective behavior for those, just reached without a retry.
 
-    Leaves :attr:`StuckRow.fresh` at its default ``False`` (#3777): the
-    cause/confidence here are whatever `block_log` persisted from the
-    diagnosis event that concluded the episode, which can be arbitrarily
-    old — this never re-confirms them, so nothing downstream may treat
-    this row as this-sweep live evidence.
+    #4135: also returns ``None`` when *entries_by_key* names a LIVE
+    drive-queue row for this episode's key whose :attr:`QueueEntry.state`
+    already reads :data:`coord.drive_queue.STATE_DONE`. `block_log`'s
+    stored diagnosis is a point-in-time snapshot from whenever the episode
+    settled, which can predate the row finishing by any amount — rebuilding
+    a stuck row from it after the live row has moved to `done` reproduces
+    exactly the quadraui#2825 shape (a daemon acting on stale state instead
+    of asking the one thing that changed). The live row wins; the stored
+    episode never overrides it. ``None`` (the default) skips this check
+    entirely — a caller with no live rows on hand gets the pre-#4135
+    behavior, never a crash.
+
+    Leaves :attr:`StuckRow.fresh` at its default ``False`` (#3777) for
+    every other case: the cause/confidence here are whatever `block_log`
+    persisted from the diagnosis event that concluded the episode, which
+    can be arbitrarily old — this never re-confirms them, so nothing
+    downstream may treat this row as this-sweep live evidence.
     """
     cause = episode.get("diagnosed_cause") or ""
     if not cause or cause == queue_diagnose.CAUSE_UNKNOWN:
@@ -3321,6 +3335,12 @@ def _episode_stuck_row(episode: dict) -> StuckRow | None:
     key = episode.get("key")
     if not key:
         return None
+    if entries_by_key is not None:
+        from coord.drive_queue import STATE_DONE  # noqa: PLC0415
+
+        live_entry = entries_by_key.get(str(key))
+        if live_entry is not None and live_entry.state == STATE_DONE:
+            return None
     return StuckRow(
         queue="drive-queue",
         key=str(key),
@@ -5100,7 +5120,9 @@ def _collect_rows_with_board(
     rows = drive_queue_rows(diagnoses)
     rows.extend(refreshed_rows)
     rows.extend(
-        row for ep in live_settled_episodes if (row := _episode_stuck_row(ep)) is not None
+        row
+        for ep in live_settled_episodes
+        if (row := _episode_stuck_row(ep, entries_by_key=entries_by_key)) is not None
     )
     merge_entries = load_merge_queue()
     rows.extend(
@@ -6442,9 +6464,11 @@ def _dispatch_base_sync_fix(
     ``has_prior_conflict_fix`` — this function never re-derives that.
 
     Returns ``{"dispatched": bool, "detail": str}`` for every outcome this
-    function itself decides: no merge-queue entry, no capable machine, an
-    already-active conflict-fix, or a spent retry cap are all confirmed
-    no-ops reported as ``dispatched=False`` rather than raised. This does
+    function itself decides: no merge-queue entry,
+    :func:`coord.drive_queue.may_dispatch_rework` refusing against the
+    live ``(repo, issue)`` (#4135), no capable machine, an already-active
+    conflict-fix, or a spent retry cap are all confirmed no-ops reported
+    as ``dispatched=False`` rather than raised. This does
     NOT mean the function can never raise at all — ``authorize_sweep_
     action`` raises :class:`coord.board_doctor_permissions.
     SweepPermissionError` by design, and ``load_queue``/``build_board``/
@@ -6459,6 +6483,7 @@ def _dispatch_base_sync_fix(
     from coord.board_doctor_permissions import authorize_sweep_action  # noqa: PLC0415
     from coord.board_service import write_board  # noqa: PLC0415
     from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+    from coord.drive_queue import may_dispatch_rework  # noqa: PLC0415
     from coord.merge_queue import load_queue  # noqa: PLC0415
     from coord.network import fetch_status  # noqa: PLC0415
     from coord.state import build_board  # noqa: PLC0415
@@ -6479,6 +6504,18 @@ def _dispatch_base_sync_fix(
         }
 
     board = build_board()
+
+    # #4135: the same live question every rework dispatcher must ask before
+    # firing (#2096/#2085) — `coord.conflict_fix.dispatch_conflict_fix` does
+    # not yet guard itself (that's #4136's own slice), so this site asks
+    # explicitly rather than skip the check because a sibling hasn't landed
+    # it yet.
+    rework_allowed, rework_reason = may_dispatch_rework(
+        repo_name, issue_number, "base_sync_fix", board=board,
+    )
+    if not rework_allowed:
+        return {"dispatched": False, "detail": rework_reason}
+
     fix = dispatch_conflict_fix(
         entry, board, config, base_sync_fix=True, status_fetcher=fetch_status,
     )
