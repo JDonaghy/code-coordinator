@@ -1,6 +1,6 @@
 """Unit tests for ``coord.drive_queue.may_dispatch_rework`` (#4133) and its
-wiring into the auto-loop's own fix dispatchers (#4134), plus the
-board-doctor dispatch sites (#4135).
+wiring into the auto-loop's own fix dispatchers (#4134), the board-doctor
+dispatch sites (#4135), and conflict-fix/ci-fix/review dispatch (#4136).
 
 #4133 is slice 1 of 5 of #4121 (the quadraui#2825 incident: a merged PR
 re-dispatched a fix leg about 22 times because nothing checked the live
@@ -11,9 +11,12 @@ _dispatch_fix_for_review`` — the tests below that marker cover the wiring,
 not the predicate's own logic (already exhaustive above). #4135 is slice 3,
 wiring the same guard into ``coord.board_doctor._dispatch_base_sync_fix``
 and ``coord.board_doctor_permissions.sweep_dispatch_fixit_leg`` — the tests
-below the ``#4135`` marker cover those two sites. The remaining sibling
-slices (#4136-#4137) wire the same guard into conflict-fix, ci-fix and
-review dispatch, which stay out of scope here.
+below the ``#4135`` marker cover those two sites. #4136 is slice 4, wiring
+the same guard into ``coord.conflict_fix.dispatch_conflict_fix``,
+``coord.ci_fix.dispatch_ci_fix`` and ``coord.review.dispatch_review`` — the
+tests below the ``#4136`` marker cover those three sites, the last of the
+parent issue's seven declared call sites. #4137 (sibling, out of scope
+here) fixes an unrelated ``queue_diagnose`` binding.
 """
 
 from __future__ import annotations
@@ -763,3 +766,124 @@ def test_2825_shape_done_row_refuses_fixit_leg_dispatch():
     assert result["dispatched"] is False
     assert "done" in result["detail"]
     mock_http.post.assert_not_called()
+
+
+# ── #4136: wiring into conflict-fix, ci-fix and review dispatch ────────────
+#
+# The tests above pin `may_dispatch_rework` itself and #4134/#4135's wiring
+# into the auto-loop and board-doctor dispatchers; these pin that
+# `coord.conflict_fix.dispatch_conflict_fix`, `coord.ci_fix.dispatch_ci_fix`
+# and `coord.review.dispatch_review` — the last three of the parent issue's
+# seven declared call sites — actually CALL the guard and honor a refusal,
+# rather than re-deriving the predicate's own logic (already exhaustive
+# above).
+
+
+def _queued_merge_entry(**overrides):
+    from coord import merge_queue as mq
+
+    defaults = dict(
+        assignment_id="w2825", repo_name=REPO, repo_github="org/quadraui",
+        branch="issue-2825-fix", target_branch="main", issue_number=ISSUE,
+        issue_title="t", state=mq.PENDING,
+    )
+    defaults.update(overrides)
+    return mq.QueuedMerge(**defaults)
+
+
+def test_every_conflict_ci_review_rework_dispatch_site_calls_may_dispatch_rework():
+    """Grep-based, same shape as the #4134/#4135 site tests above: every
+    function in `coord.conflict_fix`, `coord.ci_fix` and `coord.review` that
+    dispatches a rework leg must call `may_dispatch_rework` BEFORE it
+    dispatches — both that the call exists and that it precedes the
+    dispatch it guards, so a guard moved below the POST/delegated call
+    fails here. With this, all 7 of #4121's declared call sites are
+    covered."""
+    import inspect
+
+    from coord import ci_fix, conflict_fix, review
+
+    # Each site paired with the text of the live dispatch action it must
+    # guard: the `/assign` POST itself for the two sites that build one
+    # directly, or the call to the delegating primitive for the one that
+    # doesn't.
+    sites = {
+        (conflict_fix, "dispatch_conflict_fix"): "client.post(url",
+        (ci_fix, "dispatch_ci_fix"): "_dispatch_fix(",
+        (review, "dispatch_review"): "client.post(url",
+    }
+    for (module, name), dispatch_marker in sites.items():
+        source = inspect.getsource(getattr(module, name))
+        guard_at = source.find("may_dispatch_rework(")
+        assert guard_at != -1, (
+            f"{module.__name__}.{name} must call may_dispatch_rework() "
+            "before dispatching a rework leg (#4136)"
+        )
+        dispatch_at = source.find(dispatch_marker)
+        assert dispatch_at != -1, (
+            f"{module.__name__}.{name} no longer dispatches via "
+            f"{dispatch_marker!r} — update this test's site table"
+        )
+        assert guard_at < dispatch_at, (
+            f"{module.__name__}.{name} calls may_dispatch_rework() only "
+            f"AFTER {dispatch_marker!r} — a guard below the dispatch "
+            "guards nothing"
+        )
+
+
+def test_2825_shape_done_row_refuses_conflict_fix_dispatch():
+    """The #2825 incident shape against `dispatch_conflict_fix`: a
+    drive-queue row already `done` must refuse the conflict-fix before
+    machine selection — and so the agent `/assign` POST it would make —
+    is ever reached."""
+    from coord.conflict_fix import dispatch_conflict_fix
+
+    entry = _queued_merge_entry()
+    board = _board()
+
+    with patch(
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
+    ), patch("coord.conflict_fix.select_conflict_fix_machine") as mock_select:
+        result = dispatch_conflict_fix(entry, board, _config())
+
+    mock_select.assert_not_called()
+    assert result is None
+
+
+def test_2825_shape_done_row_refuses_ci_fix_dispatch():
+    """The #2825 incident shape against `dispatch_ci_fix`: a drive-queue
+    row already `done` must refuse the ci-fix before the original work
+    assignment is even looked up — and so before any infra rerun, mechanic
+    leg, or ordinary worker dispatch is attempted."""
+    from coord.ci_fix import dispatch_ci_fix
+
+    entry = _queued_merge_entry()
+    board = _board()
+
+    with patch(
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
+    ), patch("coord.ci_fix.dispatch_precheck") as mock_precheck:
+        result = dispatch_ci_fix(entry, board, _config())
+
+    mock_precheck.assert_not_called()
+    assert result is None
+
+
+def test_2825_shape_done_row_refuses_review_dispatch():
+    """The #2825 incident shape against `dispatch_review`: a drive-queue
+    row already `done` must refuse a fresh review before the #3670
+    duplicate-review checks and the atomic dispatch claim — and so before
+    the agent `/assign` POST it would make — are ever reached."""
+    from coord.review import dispatch_review
+
+    work = _work_row()
+    board = _board(work)
+
+    with patch(
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
+    ), patch("coord.state.claim_review_dispatch") as mock_claim:
+        result = dispatch_review(work, board, _config())
+
+    mock_claim.assert_not_called()
+    assert result is None
+    assert "done" in (work.review_dispatch_reason or "")

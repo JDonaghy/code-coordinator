@@ -2507,7 +2507,27 @@ def dispatch_conflict_fix(
     the completion hook (``coord.reconcile.on_conflict_fix_done``) re-reads
     the branch's LIVE head from GitHub and compares it against this anchor
     before trusting a reported success.
+
+    #4136: before any of the above, consults
+    :func:`coord.drive_queue.may_dispatch_rework` for ``(entry.repo_name,
+    entry.issue_number)`` — the same live question every rework dispatch
+    site answers identically (#2096/#2085) — and returns ``None`` on a
+    refusal without touching the retry cap, machine selection, or any
+    GitHub write. This is the one call site among the seven that does NOT
+    already have a caller that asked the same question moments earlier
+    (``coord.board_doctor._dispatch_base_sync_fix`` does, for its own
+    ``base_sync_fix=True`` path only — see that function's docstring — so
+    this doubles one live read for that one path; every other path through
+    here had no such caller).
     """
+    from coord.drive_queue import may_dispatch_rework  # noqa: PLC0415
+
+    rework_allowed, rework_reason = may_dispatch_rework(
+        entry.repo_name, entry.issue_number, "conflict_fix", board=board,
+    )
+    if not rework_allowed:
+        return None
+
     if semantic:
         if has_prior_semantic_escalation(board, entry.assignment_id):
             return None
