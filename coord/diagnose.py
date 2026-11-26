@@ -437,6 +437,15 @@ def _confirm_dead_via_assignment_endpoint(
     unparsable body reads "unknown" — never "dead" on a probe that didn't
     actually answer, matching this module's never-finalize-on-a-probe-
     failure contract.
+
+    A bare ``404`` is not on its own proof of death: an agent that
+    predates this route answers every unmatched path with Starlette's
+    default plain-text ``404 Not Found`` (``agent_app.py`` installs no
+    custom 404 handler), which is indistinguishable at the status-code
+    level from this endpoint's own ``{"error": ...}`` "no such id" body.
+    So a 404 only reads "dead" when the body actually parses as this
+    endpoint's JSON error shape; a plain-text or unparsable 404 reads
+    "unknown", same as any other probe that didn't really answer.
     """
     if machine is None:
         return "dead"
@@ -452,7 +461,13 @@ def _confirm_dead_via_assignment_endpoint(
     except Exception:  # noqa: BLE001 — unreachable/timeout: unknown, never dead
         return "unknown"
     if resp.status_code == 404:
-        return "dead"
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 — plain-text/unparsable: unknown, never dead
+            return "unknown"
+        if isinstance(data, dict) and "error" in data:
+            return "dead"
+        return "unknown"
     if resp.status_code != 200:
         return "unknown"
     try:
