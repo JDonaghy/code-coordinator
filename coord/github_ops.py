@@ -3028,9 +3028,12 @@ def get_job_log(repo: str, job_id: str) -> str:
 # contract changes; :mod:`coord.ci_github`'s own `*_detail` methods are
 # what thread the reason on upward to `coord ci rerun`.
 _RUN_IN_PROGRESS_MARKERS: tuple[str, ...] = (
-    "is still in progress",
-    "still in progress",
-    "is already running",
+    # Bare "in progress" (not "is/still/already in progress" individually)
+    # so this matches whatever tense/qualifier precedes it — including this
+    # repo's own long-standing fixture for exactly this refusal, "run
+    # already in progress" (`tests/test_github_ops.py`, `tests/test_ci_store.py`),
+    # which a narrower marker list missed entirely.
+    "in progress",
     "already running",
     "has not completed",
     "hasn't completed",
