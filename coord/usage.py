@@ -16,10 +16,11 @@ Usage data is collected from two sources:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from coord.models import Assignment
 
@@ -686,6 +687,231 @@ def p90_attention_threshold(
     if not durations or len(durations) < min_samples:
         return None
     return percentile(durations, 90.0)
+
+
+# ── Heal/stall signals for `coord stats waste` (#4144) ──────────────────────
+#
+# The #4122 heal/stall/cost tranche (#4139-#4143) each landed a fix with no
+# durable before/after number attached — this section is the read side that
+# turns the audit trail those fixes already write into something `coord
+# stats waste` can print, so a later efficiency change against any of these
+# four shapes can be scored against a real baseline instead of an anecdote.
+# Pure functions over *already-fetched* ``fetch_usage_rows`` rows and
+# ``coord.state.list_audit_log`` entries — exactly the two read seams
+# ``coord.commands.stats.waste`` already composes for
+# :func:`coord.leg_waste.build_waste_report` — so nothing here does its own
+# I/O.
+
+#: `coord.notify._sweep_phantom_rows` audit event for one row #2536's sweep
+#: auto-healed. `coord.diagnose.sweep_dead_running_rows` is the ONLY writer.
+PHANTOM_ROW_HEALED_EVENT = "phantom_row_auto_healed"
+
+#: `coord.notify._sweep_stuck_test_state` audit event for one row #2803's
+#: watchdog cleared for a fresh Test-stage dispatch.
+STUCK_TEST_STATE_HEALED_EVENT = "stuck_test_state_auto_healed"
+
+#: `coord.diagnose.sweep_dead_running_rows`'s heal ``detail`` text always
+#: names how many CONSECUTIVE sweep passes agreed the row was dead before
+#: healing it (#4141's own two-miss confirmation gate — see
+#: ``coord.diagnose.PHANTOM_DEAD_CONFIRM_PASSES``). Parsed back out here
+#: rather than duplicating the gate's own threshold, so a heal event
+#: recorded by an OLDER coordinator build (pre-#4141, no such phrase at all)
+#: reads as "not miss-confirmed" rather than silently miscounted as one —
+#: the exact distinction that makes this number meaningful: it should read
+#: 0 for history before #4141 landed and equal the plain heal count after.
+_PHANTOM_HEAL_MISS_COUNT_RE = re.compile(r"across (\d+) consecutive sweep passes")
+
+
+@dataclass
+class HealCounts:
+    """How many of each #4122 auto-heal kind fired in the reported window —
+    see the module section docstring above for the audit events each counts.
+    """
+
+    phantom_row_healed: int = 0
+    phantom_row_miss_confirmed: int = 0
+    stuck_test_state_healed: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "phantom_row_healed": self.phantom_row_healed,
+            "phantom_row_miss_confirmed": self.phantom_row_miss_confirmed,
+            "stuck_test_state_healed": self.stuck_test_state_healed,
+        }
+
+
+def heal_counts_from_audit(audit_entries: "list[dict] | None") -> HealCounts:
+    """Tally #2536/#2803 auto-heal audit events — see :class:`HealCounts`.
+
+    Best-effort over whatever ``audit_entries`` the caller already fetched
+    (``coord.state.list_audit_log``'s shape); never raises, and an empty/
+    ``None`` list reads as all-zero rather than an error, mirroring
+    :func:`coord.leg_waste.audit_leg_kind_overrides`'s own posture toward
+    the same read seam.
+    """
+    counts = HealCounts()
+    for entry in audit_entries or ():
+        event_type = entry.get("event_type")
+        if event_type == PHANTOM_ROW_HEALED_EVENT:
+            counts.phantom_row_healed += 1
+            detail = str((entry.get("details") or {}).get("detail") or "")
+            m = _PHANTOM_HEAL_MISS_COUNT_RE.search(detail)
+            if m and int(m.group(1)) >= 2:
+                counts.phantom_row_miss_confirmed += 1
+        elif event_type == STUCK_TEST_STATE_HEALED_EVENT:
+            counts.stuck_test_state_healed += 1
+    return counts
+
+
+@dataclass
+class RepoThreshold:
+    """The wall-clock ``attention_threshold_for`` value actually applied to
+    one ``(repo_name, assignment_type)`` pair, and whether that value came
+    from #4142's per-repo learned p90 rather than the fleet-wide fixed
+    default/explicit ``coordinator.yml`` override — see
+    :func:`repo_attention_thresholds`.
+    """
+
+    repo_name: str
+    assignment_type: str
+    threshold_secs: float
+    is_learned: bool
+
+    def to_dict(self) -> dict[str, "float | str | bool"]:
+        return {
+            "repo_name": self.repo_name,
+            "assignment_type": self.assignment_type,
+            "threshold_secs": self.threshold_secs,
+            "is_learned": self.is_learned,
+        }
+
+
+def repo_attention_thresholds(
+    repo_names: Iterable[str],
+    *,
+    assignment_type: str = "work",
+    config: "Config",
+) -> list[RepoThreshold]:
+    """Per-repo #4142 learned-threshold override in effect for
+    *assignment_type*, one :class:`RepoThreshold` per name in *repo_names*
+    (de-duplicated, order preserved).
+
+    Reuses ``config.pipeline.attention_threshold_for`` — the one function
+    that already resolves explicit-override-vs-learned-vs-fixed-default —
+    rather than re-deriving that order here (#2096 "one question, one
+    answer"): comparing the *repo-scoped* call against the exact same call
+    with no ``repo_name`` isolates whether #4142's own per-repo learned
+    step is what's in effect, since that step is the ONLY thing
+    ``repo_name`` changes about the result.
+    """
+    generic = config.pipeline.attention_threshold_for(assignment_type)
+    seen: set[str] = set()
+    out: list[RepoThreshold] = []
+    for repo_name in repo_names:
+        if not repo_name or repo_name in seen:
+            continue
+        seen.add(repo_name)
+        effective = config.pipeline.attention_threshold_for(
+            assignment_type, repo_name=repo_name,
+        )
+        out.append(RepoThreshold(
+            repo_name=repo_name,
+            assignment_type=assignment_type,
+            threshold_secs=effective,
+            is_learned=effective != generic,
+        ))
+    return out
+
+
+@dataclass
+class FanoutFoldLatency:
+    """How long #3182's fold (``coord.smoke.finalize_smoke_fanout``) took to
+    write the parent's aggregate verdict after the LAST of its fan-out legs
+    actually finished — see :func:`fanout_fold_latencies`.
+    """
+
+    assignment_id: str
+    repo_name: str
+    issue_number: int
+    latency_secs: float
+
+    def to_dict(self) -> dict[str, "str | int | float"]:
+        return {
+            "assignment_id": self.assignment_id,
+            "repo_name": self.repo_name,
+            "issue_number": self.issue_number,
+            "latency_secs": self.latency_secs,
+        }
+
+
+def fanout_fold_latencies(
+    assignment_rows: list[dict],
+    audit_entries: "list[dict] | None",
+) -> list[FanoutFoldLatency]:
+    """Elapsed time, per #3182 fan-out round, between the LAST fan-out leg
+    finishing and :func:`coord.smoke.finalize_smoke_fanout` writing the
+    parent's own aggregate ``test_{state}`` verdict — i.e. how long the
+    fold itself took to catch up once every leg had reported in. #4143
+    fixed the two ``coord.reconcile`` call sites that let this wedge for
+    199-220m instead of folding promptly; this is the number that would
+    have caught that regression instead of 16 separate stuck-row sweeps
+    noticing it after the fact.
+
+    A parent's ``test_{state}`` audit event (recorded by
+    ``coord.state._record_test_verdict_local`` on EVERY terminal verdict
+    write, fan-out or not) carries that write's own ``test_reason`` in its
+    ``details`` — :func:`coord.smoke._parse_fanout_manifest` reads the
+    ``[[smoke-fanout:...]]`` manifest :func:`finalize_smoke_fanout`'s own
+    write always carries at the front of that text, which is how a
+    fan-out fold is told apart from an ordinary single-leg verdict here:
+    only a parsed, non-empty manifest counts. Each leg named in it is then
+    looked up by id in *assignment_rows* for its own ``finished_at``; the
+    round's latency is the fold event's own timestamp minus the LATEST of
+    those (the leg still being waited on when the fold finally ran).
+    A round with no resolvable leg ``finished_at`` (incomplete usage-row
+    history) contributes nothing rather than guessing.
+    """
+    from coord.smoke_tags import _parse_fanout_manifest  # noqa: PLC0415
+    from coord.usage_rollup import parse_timestamp  # noqa: PLC0415
+
+    rows_by_id = {
+        str(row.get("assignment_id")): row
+        for row in assignment_rows or ()
+        if row.get("assignment_id")
+    }
+
+    out: list[FanoutFoldLatency] = []
+    for entry in audit_entries or ():
+        event_type = entry.get("event_type")
+        if event_type not in ("test_passed", "test_failed", "test_skipped"):
+            continue
+        fold_ts = parse_timestamp(entry.get("ts"))
+        if fold_ts is None:
+            continue
+        details = entry.get("details") or {}
+        legs = _parse_fanout_manifest(details.get("test_reason"))
+        if not legs:
+            continue  # an ordinary (non-fan-out) verdict write
+
+        leg_finished: list[float] = []
+        for leg_id, _caps, _command in legs:
+            leg_row = rows_by_id.get(str(leg_id))
+            if leg_row is None:
+                continue
+            finished = parse_timestamp(leg_row.get("finished_at"))
+            if finished is not None:
+                leg_finished.append(finished)
+        if not leg_finished:
+            continue
+
+        assignment_id = str(entry.get("assignment_id") or "")
+        out.append(FanoutFoldLatency(
+            assignment_id=assignment_id,
+            repo_name=str(entry.get("repo") or ""),
+            issue_number=int(entry.get("issue") or 0),
+            latency_secs=max(0.0, fold_ts - max(leg_finished)),
+        ))
+    return out
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────

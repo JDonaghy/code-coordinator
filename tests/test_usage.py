@@ -2150,3 +2150,211 @@ class TestP90AttentionThreshold:
         monkeypatch.setattr(usage_mod, "fetch_usage_rows", boom)
 
         assert usage_mod.p90_attention_threshold("quadraui", "work") is None
+
+
+def _audit_entry(event_type: str, *, repo="quadraui", issue=1, ts=1000.0, details=None):
+    return {
+        "event_type": event_type,
+        "repo": repo,
+        "issue": issue,
+        "ts": ts,
+        "assignment_id": "a1",
+        "details": details or {},
+    }
+
+
+class TestHealCountsFromAudit:
+    """#4144: `coord stats waste`'s read of the #2536/#2803 auto-heal audit
+    trail, including #4141's two-consecutive-miss confirmation gate."""
+
+    def test_empty_or_none_reads_as_all_zero(self) -> None:
+        from coord import usage as usage_mod
+
+        assert usage_mod.heal_counts_from_audit(None).to_dict() == {
+            "phantom_row_healed": 0,
+            "phantom_row_miss_confirmed": 0,
+            "stuck_test_state_healed": 0,
+        }
+        assert usage_mod.heal_counts_from_audit([]).to_dict() == {
+            "phantom_row_healed": 0,
+            "phantom_row_miss_confirmed": 0,
+            "stuck_test_state_healed": 0,
+        }
+
+    def test_counts_phantom_and_stuck_test_state_heals(self) -> None:
+        from coord import usage as usage_mod
+
+        entries = [
+            _audit_entry(
+                "phantom_row_auto_healed",
+                details={
+                    "detail": (
+                        "work row running 70m ... session confirmed dead on "
+                        "machine 'laptop' and by its own agent across 2 "
+                        "consecutive sweep passes"
+                    ),
+                },
+            ),
+            _audit_entry("stuck_test_state_auto_healed"),
+            _audit_entry("test_passed"),  # unrelated event — ignored
+        ]
+        counts = usage_mod.heal_counts_from_audit(entries)
+        assert counts.phantom_row_healed == 1
+        assert counts.phantom_row_miss_confirmed == 1
+        assert counts.stuck_test_state_healed == 1
+
+    def test_pre_4141_heal_with_no_miss_phrase_not_counted_as_confirmed(self) -> None:
+        """A heal event recorded before #4141 landed (no "consecutive sweep
+        passes" phrase at all) must read as NOT miss-confirmed — the whole
+        point of tracking this separately from the plain heal count."""
+        from coord import usage as usage_mod
+
+        entries = [
+            _audit_entry(
+                "phantom_row_auto_healed",
+                details={"detail": "work row finalized as dead on machine 'laptop'"},
+            ),
+        ]
+        counts = usage_mod.heal_counts_from_audit(entries)
+        assert counts.phantom_row_healed == 1
+        assert counts.phantom_row_miss_confirmed == 0
+
+
+class TestRepoAttentionThresholds:
+    """#4144: surfacing which repos are actually running #4142's learned
+    per-repo threshold rather than the fleet-wide fixed default."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        from coord import usage as usage_mod
+
+        usage_mod.reset_p90_attention_cache()
+        yield
+        usage_mod.reset_p90_attention_cache()
+
+    def test_no_history_reports_fixed_not_learned(self, monkeypatch) -> None:
+        from coord import usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: [])
+        config = Config(repos=[], machines=[])
+
+        result = usage_mod.repo_attention_thresholds(["quadraui"], config=config)
+        assert len(result) == 1
+        assert result[0].repo_name == "quadraui"
+        assert result[0].is_learned is False
+        assert result[0].threshold_secs == config.pipeline.attention_threshold_for("work")
+
+    def test_enough_history_reports_learned(self, monkeypatch) -> None:
+        from coord import usage as usage_mod
+
+        now = time.time()
+        durations = [50 * 60.0] * 9 + [69 * 60.0]
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=d,
+            )
+            for i, d in enumerate(durations)
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: rows)
+        config = Config(repos=[], machines=[])
+
+        result = usage_mod.repo_attention_thresholds(["quadraui"], config=config)
+        assert len(result) == 1
+        assert result[0].is_learned is True
+        assert result[0].threshold_secs > 45 * 60.0
+
+    def test_dedupes_repo_names_preserving_order(self, monkeypatch) -> None:
+        from coord import usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: [])
+        config = Config(repos=[], machines=[])
+
+        result = usage_mod.repo_attention_thresholds(
+            ["b", "a", "b", "", "a"], config=config,
+        )
+        assert [t.repo_name for t in result] == ["b", "a"]
+
+    def test_learn_attention_thresholds_off_never_reports_learned(self, monkeypatch) -> None:
+        from coord import usage as usage_mod
+
+        now = time.time()
+        durations = [50 * 60.0] * 9 + [69 * 60.0]
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=d,
+            )
+            for i, d in enumerate(durations)
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: rows)
+        config = Config(repos=[], machines=[])
+        config.pipeline.learn_attention_thresholds = False
+
+        result = usage_mod.repo_attention_thresholds(["quadraui"], config=config)
+        assert result[0].is_learned is False
+
+
+class TestFanoutFoldLatencies:
+    """#4144: #3182 fan-out fold latency — the elapsed time between the
+    last fan-out leg finishing and `finalize_smoke_fanout` writing the
+    parent's aggregate verdict."""
+
+    def test_no_audit_entries_returns_empty(self) -> None:
+        from coord import usage as usage_mod
+
+        assert usage_mod.fanout_fold_latencies([], []) == []
+        assert usage_mod.fanout_fold_latencies([], None) == []
+
+    def test_ordinary_single_leg_verdict_ignored(self) -> None:
+        """A `test_passed` write with no `[[smoke-fanout:...]]` manifest in
+        its `test_reason` is an ordinary single-leg verdict, not a fold —
+        must never be mistaken for one."""
+        from coord import usage as usage_mod
+
+        entries = [
+            _audit_entry(
+                "test_passed",
+                details={"test_reason": "Test stage passed."},
+            ),
+        ]
+        assert usage_mod.fanout_fold_latencies([], entries) == []
+
+    def test_computes_latency_from_last_leg_to_fold(self) -> None:
+        from coord import usage as usage_mod
+        from coord.smoke_tags import _encode_fanout_manifest
+
+        manifest = _encode_fanout_manifest(
+            [("leg1", ("gtk",), None), ("leg2", ("windows",), None)],
+        )
+        rows = [
+            {"assignment_id": "leg1", "finished_at": 1000.0},
+            {"assignment_id": "leg2", "finished_at": 1200.0},  # the last to finish
+        ]
+        entries = [
+            _audit_entry(
+                "test_passed", repo="quadraui", issue=42, ts=1250.0,
+                details={"test_reason": f"{manifest}\nTest stage passed (#3182)."},
+            ),
+        ]
+
+        result = usage_mod.fanout_fold_latencies(rows, entries)
+        assert len(result) == 1
+        assert result[0].repo_name == "quadraui"
+        assert result[0].issue_number == 42
+        assert result[0].latency_secs == pytest.approx(50.0)  # 1250 - 1200
+
+    def test_missing_leg_rows_contribute_nothing(self) -> None:
+        """A fold round whose legs can't be found in assignment_rows at all
+        (incomplete usage-row history) must be skipped, not guessed at."""
+        from coord import usage as usage_mod
+        from coord.smoke_tags import _encode_fanout_manifest
+
+        manifest = _encode_fanout_manifest([("leg1", ("gtk",), None)])
+        entries = [
+            _audit_entry(
+                "test_failed", ts=1250.0,
+                details={"test_reason": f"{manifest}\nTest stage failed (#3182)."},
+            ),
+        ]
+        assert usage_mod.fanout_fold_latencies([], entries) == []

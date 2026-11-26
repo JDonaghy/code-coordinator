@@ -259,3 +259,111 @@ def test_stats_waste_board_fetch_failure_warns_instead_of_crashing(tmp_path, mon
     result = CliRunner().invoke(main, ["stats", "waste", "--config", str(config_path)])
     assert result.exit_code == 0, result.output
     assert "could not fetch board assignment rows" in output_and_stderr(result)
+
+
+def test_stats_waste_surfaces_heal_stall_signals_json(tmp_path, monkeypatch) -> None:
+    """#4144: phantom-heal counts, miss-confirmed heals, per-repo attention
+    threshold overrides, and fan-out fold latency all land in the JSON
+    output alongside the pre-existing waste report."""
+    config_path = _write_config(tmp_path)
+
+    import coord.usage as usage_mod
+
+    usage_mod.reset_p90_attention_cache()
+
+    rows = [
+        _row(assignment_id="r1", issue_number=1, status="merged"),
+        # The two fan-out legs the fold-latency audit event below names.
+        _row(
+            assignment_id="leg1", issue_number=1, type="smoke",
+            review_of_assignment_id="r1", dispatched_at=1100.0, finished_at=1200.0,
+        ),
+        _row(
+            assignment_id="leg2", issue_number=1, type="smoke",
+            review_of_assignment_id="r1", dispatched_at=1100.0, finished_at=1300.0,
+        ),
+    ]
+    monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: rows)
+
+    from coord.smoke_tags import _encode_fanout_manifest
+
+    manifest = _encode_fanout_manifest(
+        [("leg1", ("gtk",), None), ("leg2", ("windows",), None)]
+    )
+    audit_entries = [
+        {
+            "event_type": "phantom_row_auto_healed",
+            "repo": "api", "issue": 1, "assignment_id": "p1", "ts": 1000.0,
+            "details": {
+                "detail": (
+                    "work row running 70m ... confirmed dead ... across 2 "
+                    "consecutive sweep passes"
+                ),
+            },
+        },
+        {
+            "event_type": "stuck_test_state_auto_healed",
+            "repo": "api", "issue": 1, "assignment_id": "p2", "ts": 1000.0,
+            "details": {},
+        },
+        {
+            "event_type": "test_passed",
+            "repo": "api", "issue": 1, "assignment_id": "r1", "ts": 1350.0,
+            "details": {"test_reason": f"{manifest}\nTest stage passed (#3182)."},
+        },
+    ]
+
+    import coord.state as state_mod
+
+    monkeypatch.setattr(
+        state_mod, "list_audit_log",
+        lambda *, repo, since, limit, cursor: (
+            {"entries": audit_entries, "next_cursor": None, "has_more": False}
+            if cursor is None else {"entries": [], "next_cursor": None, "has_more": False}
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main, ["stats", "waste", "--repo", "api", "--json", "--config", str(config_path)]
+    )
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    signals = body["heal_stall_signals"]
+    assert signals["heal_counts"] == {
+        "phantom_row_healed": 1,
+        "phantom_row_miss_confirmed": 1,
+        "stuck_test_state_healed": 1,
+    }
+    (threshold,) = signals["repo_attention_thresholds"]
+    assert threshold["repo_name"] == "api"
+    assert threshold["assignment_type"] == "work"
+    (fold,) = signals["fanout_fold_latencies"]
+    assert fold["repo_name"] == "api"
+    assert fold["issue_number"] == 1
+    assert fold["latency_secs"] == pytest.approx(50.0)  # 1350 - 1300
+
+
+def test_stats_waste_surfaces_heal_stall_signals_human(tmp_path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+
+    import coord.usage as usage_mod
+
+    usage_mod.reset_p90_attention_cache()
+    monkeypatch.setattr(
+        usage_mod, "fetch_usage_rows",
+        lambda *a, **k: [_row(assignment_id="r1", issue_number=1, status="merged")],
+    )
+
+    import coord.state as state_mod
+
+    monkeypatch.setattr(
+        state_mod, "list_audit_log",
+        lambda *, repo, since, limit, cursor: {"entries": [], "next_cursor": None, "has_more": False},
+    )
+
+    result = CliRunner().invoke(main, ["stats", "waste", "--config", str(config_path)])
+    assert result.exit_code == 0, result.output
+    assert "Heal/stall signals (#4122):" in result.output
+    assert "Auto-heals:" in result.output
+    assert "Attention thresholds:" in result.output
+    assert "Fan-out fold latency (#3182):" in result.output
