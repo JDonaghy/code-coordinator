@@ -185,6 +185,38 @@ def is_rebase_refusal(error: str | None) -> bool:
     return any(sig in text for sig in _REBASE_REFUSAL_SIGNALS)
 
 
+def _try_mechanical_surface_resolution(
+    entry: "QueuedMerge", config, error_msg: str | None,
+) -> "MergeEvent | None":
+    """#4152: attempt :func:`coord.conflict_fix.attempt_mechanical_surface_
+    resolution` for a ``rebaseable`` conflict :func:`process` just
+    confirmed for *entry*, instead of leaving it for the ordinary
+    ``CONFLICT`` → ``_dispatch_conflict_fixes`` → conflict-fix-worker path.
+
+    Returns a ``conflict_resolved_mechanically`` event — and leaves *entry*
+    ``PENDING`` with ``error`` cleared, so the next pass retries the now-
+    clean merge — on confirmed success (the mechanical resolver's own push
+    is re-confirmed against the remote, not just its exit code; see that
+    function). Returns ``None`` with *entry* completely untouched the
+    moment *config* is unavailable, *error_msg* doesn't classify as
+    ``"rebaseable"``, or the mechanical resolver declines for any reason
+    (no declared surfaces, no local checkout, an uncovered conflicted path,
+    a failing ``regen``/``check``, a failed push, …) — the caller's own
+    unchanged ``CONFLICT`` handling runs exactly as if this was never
+    attempted.
+    """
+    if config is None or classify_conflict(error_msg) != "rebaseable":
+        return None
+    from coord.conflict_fix import attempt_mechanical_surface_resolution  # noqa: PLC0415
+
+    result = attempt_mechanical_surface_resolution(entry, config)
+    if not result.ok:
+        return None
+    entry.state = PENDING
+    entry.error = None
+    return MergeEvent(entry, "conflict_resolved_mechanically", result.detail)
+
+
 # ── Work-chain resolution (#567) ────────────────────────────────────────────
 
 def _chain_work_ids(entry: "QueuedMerge", pool: list) -> set[str]:
@@ -10327,6 +10359,14 @@ def process(
                         entry, smoke, gh_ops,
                     )
                     if conflict_msg is not None:
+                        # #4152: a mechanical resolution via a declared
+                        # integration surface never leaves CONFLICT at all.
+                        resolved = _try_mechanical_surface_resolution(
+                            entry, config, conflict_msg,
+                        )
+                        if resolved is not None:
+                            events.append(resolved)
+                            continue
                         entry.state = CONFLICT
                         entry.error = conflict_msg
                         events.append(
@@ -10509,6 +10549,14 @@ def process(
                                 f"the branch onto {entry.target_branch} and "
                                 "resolve."
                             )
+                            # #4152: same mechanical-first check as the
+                            # stale-smoke conflict route above.
+                            resolved = _try_mechanical_surface_resolution(
+                                entry, config, msg,
+                            )
+                            if resolved is not None:
+                                events.append(resolved)
+                                continue
                             entry.state = CONFLICT
                             entry.error = msg
                             events.append(MergeEvent(entry, "conflict", msg))
@@ -11403,6 +11451,13 @@ def process(
                     issue_resolution=issue_resolution,
                     issue_close_block_reason=issue_close_block_reason,
                 ))
+                continue
+            # #4152: a mechanical resolution via a declared integration
+            # surface runs before this real merge failure is ever recorded
+            # as CONFLICT — no conflict-fix worker needed for that shape.
+            resolved = _try_mechanical_surface_resolution(entry, config, msg)
+            if resolved is not None:
+                events.append(resolved)
                 continue
             entry.state = CONFLICT
             entry.error = msg
