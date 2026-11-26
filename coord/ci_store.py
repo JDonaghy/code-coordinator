@@ -148,6 +148,46 @@ class RunSummary:
     created_at: float | None
 
 
+@dataclass(frozen=True)
+class RerunOutcome:
+    """Structured result of one ``coord ci rerun`` attempt (#4165).
+
+    Before this, every rerun method on :class:`CiStore` returned a bare
+    ``bool`` — a ``gh`` refusal because the run was still in progress, a
+    stale/invalid id, and a real infra outage were all indistinguishable
+    ``False``, which is exactly what made the 2026-11-26 incident
+    (JDonaghy/vimcode#2199) undiagnosable from the CLI alone: two
+    `--failed` attempts mid-run printed nothing but "rerun failed", with no
+    way to tell that from a genuine bug.
+
+    Bool-compatible (``__bool__`` mirrors ``ok``) so every pre-#4165 caller
+    that treated a rerun result as a plain bool (``if ci.rerun_for_pr(...):``,
+    ``bool(rerun_for_pr(...))``) keeps working unmodified — only
+    ``coord/commands/ci.py``, which is why this exists, reads ``.reason``/
+    ``.in_progress``/``.per_run``.
+
+    ``ok`` is ``True`` only when at least one run id was found *and* every
+    rerun call issued for it exited clean. ``reason`` is ``None`` on
+    success, else a specific one: "no checks with a readable run id
+    found...", "no failing checks found", "gh refused: <stderr first
+    line>", or "run <id> is still in progress" — never a bare unexplained
+    failure. ``in_progress`` is ``True`` specifically when every run this
+    attempt touched failed for that one reason — the case
+    ``coord ci rerun --wait`` polls and retries. ``per_run`` is
+    ``[(run_id, ok, reason), ...]`` for every run id this attempt actually
+    issued a ``gh run rerun`` against — empty when discovery itself found
+    nothing to rerun.
+    """
+
+    ok: bool
+    reason: str | None = None
+    in_progress: bool = False
+    per_run: tuple[tuple[str, bool, str | None], ...] = ()
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 @dataclass
 class CIFailureDetail:
     """Structured detail behind a CONFIRMED CI failure (#3114) — the failing
@@ -449,6 +489,47 @@ class CiStore(Protocol):
         """
         ...
 
+    # ── #4165: structured-outcome counterparts ─────────────────────────
+    #
+    # `rerun_for_pr`/`rerun_failed_for_pr`/`rerun_job`/`rerun_run` above
+    # are the pre-#4165 bool contract, kept exactly as-is so every existing
+    # caller (`coord.merge_queue`, `coord.ci_fix`, `coord/commands/pr.py`)
+    # that treats a rerun result as a plain bool never has to change.
+    # `coord ci rerun` is the one caller that needs the REASON a refusal
+    # happened — "no checks found" vs "gh refused: ..." vs "still in
+    # progress" were all the same unexplained `False` before — and these
+    # four are its seam. Optional/duck-typed exactly like `rerun_job`/
+    # `rerun_run` above: a `CiStore` backend that predates this capability
+    # (a GitLab backend, most test stubs) simply doesn't offer it, and
+    # `coord/commands/ci.py` falls back to wrapping the plain bool method's
+    # result in a reason-less `RerunOutcome`.
+
+    def rerun_for_pr_detail(self, repo: str, number: int) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_for_pr` (#4165)."""
+        ...
+
+    def rerun_failed_for_pr_detail(self, repo: str, number: int) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_failed_for_pr` (#4165)."""
+        ...
+
+    def rerun_job_detail(self, repo: str, run_id: str, job_id: str) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_job` (#4165)."""
+        ...
+
+    def rerun_run_detail(self, repo: str, run_id: str) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_run` (#4165)."""
+        ...
+
+    def get_run_status(self, repo: str, run_id: str) -> str:
+        """Lifecycle status (``queued``/``in_progress``/``completed``/...)
+        of run *run_id* on *repo* (#4165) — what ``coord ci rerun --wait``
+        polls to learn a still-in-progress run has finished, so it can
+        retry the rerun that refusal blocked. Optional/duck-typed like the
+        ``*_detail`` methods above; a backend without it means ``--wait``
+        has nothing to poll and simply returns the original refusal.
+        """
+        ...
+
 
 class NoOpCi:
     """Always-available fallback that returns no checks and reruns nothing.
@@ -506,6 +587,29 @@ class NoOpCi:
         """No-op: CI gating is disabled entirely, so there is no run
         history to report (#3405)."""
         return []
+
+    _NO_CI_REASON = "CI gating is disabled (ci_store: type: none) — nothing to rerun"
+
+    def rerun_for_pr_detail(self, repo: str, number: int) -> RerunOutcome:
+        """No-op counterpart to :meth:`rerun_for_pr` (#4165)."""
+        return RerunOutcome(ok=False, reason=self._NO_CI_REASON)
+
+    def rerun_failed_for_pr_detail(self, repo: str, number: int) -> RerunOutcome:
+        """No-op counterpart to :meth:`rerun_failed_for_pr` (#4165)."""
+        return RerunOutcome(ok=False, reason=self._NO_CI_REASON)
+
+    def rerun_job_detail(self, repo: str, run_id: str, job_id: str) -> RerunOutcome:
+        """No-op counterpart to :meth:`rerun_job` (#4165)."""
+        return RerunOutcome(ok=False, reason=self._NO_CI_REASON)
+
+    def rerun_run_detail(self, repo: str, run_id: str) -> RerunOutcome:
+        """No-op counterpart to :meth:`rerun_run` (#4165)."""
+        return RerunOutcome(ok=False, reason=self._NO_CI_REASON)
+
+    def get_run_status(self, repo: str, run_id: str) -> str:
+        """No-op: CI gating is disabled entirely, so there is no run to
+        poll the status of (#4165)."""
+        return ""
 
 
 # ── Classification helpers ──────────────────────────────────────────────────
