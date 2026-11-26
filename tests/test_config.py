@@ -1801,6 +1801,98 @@ def test_pipeline_attention_thresholds_rejects_bad_duration(tmp_path: Path) -> N
         load(p)
 
 
+# ── #4142: learned per-repo p90 attention threshold ──────────────────────────
+
+
+def test_attention_threshold_no_repo_name_unaffected(monkeypatch) -> None:
+    """Omitting repo_name (every pre-#4142 caller) must reproduce today's
+    behaviour exactly — the learned path is only ever consulted when a
+    caller opts in by passing repo_name.
+    """
+    import coord.usage as usage_mod
+
+    def boom(*_a, **_kw):
+        raise AssertionError("usage must not be consulted without repo_name")
+
+    monkeypatch.setattr(usage_mod, "p90_attention_threshold", boom)
+    cfg = PipelineConfig()
+    assert cfg.attention_threshold_for("work") == 45 * 60.0
+
+
+def test_attention_threshold_learned_replaces_builtin_default(monkeypatch) -> None:
+    """#4142: with repo_name given and enough history, the learned p90
+    replaces the un-overridden built-in "work" default — the exact quadraui
+    false-alert scenario the issue describes (first-work legs normally run
+    45-69m, past the fixed 45m guess).
+    """
+    import coord.usage as usage_mod
+
+    cfg = PipelineConfig()
+    monkeypatch.setattr(
+        usage_mod, "p90_attention_threshold", lambda repo, atype: 69 * 60.0,
+    )
+    assert cfg.attention_threshold_for("work", repo_name="quadraui") == 69 * 60.0
+
+
+def test_attention_threshold_learned_falls_back_when_cold(monkeypatch) -> None:
+    """Too little history (usage.p90_attention_threshold returns None) keeps
+    the fixed default — never a population-of-a-few guess.
+    """
+    import coord.usage as usage_mod
+
+    cfg = PipelineConfig()
+    monkeypatch.setattr(usage_mod, "p90_attention_threshold", lambda repo, atype: None)
+    assert cfg.attention_threshold_for("work", repo_name="quadraui") == 45 * 60.0
+
+
+def test_attention_threshold_explicit_override_wins_over_learned(monkeypatch) -> None:
+    """A user who actually configured a non-default ``work`` threshold in
+    coordinator.yml still wins outright — the learned substitution only
+    ever replaces an UN-overridden built-in default, never a deliberate
+    operator choice.
+    """
+    import coord.usage as usage_mod
+
+    def boom(*_a, **_kw):
+        raise AssertionError("usage must not be consulted for an explicit override")
+
+    monkeypatch.setattr(usage_mod, "p90_attention_threshold", boom)
+    cfg = PipelineConfig(attention_thresholds={"work": 5.0})
+    assert cfg.attention_threshold_for("work", repo_name="quadraui") == 5.0
+
+
+def test_attention_threshold_learn_flag_off_disables_lookup(monkeypatch) -> None:
+    """``learn_attention_thresholds=False`` pins every type to its fixed
+    default regardless of repo_name — the opt-out escape hatch.
+    """
+    import coord.usage as usage_mod
+
+    def boom(*_a, **_kw):
+        raise AssertionError("usage must not be consulted when the flag is off")
+
+    monkeypatch.setattr(usage_mod, "p90_attention_threshold", boom)
+    cfg = PipelineConfig(learn_attention_thresholds=False)
+    assert cfg.attention_threshold_for("work", repo_name="quadraui") == 45 * 60.0
+
+
+def test_attention_threshold_learned_scoped_to_requested_type(monkeypatch) -> None:
+    """The learned lookup is keyed by the ACTUAL assignment_type requested,
+    not hardcoded to "work" — "per repo and leg type" per #4142.
+    """
+    import coord.usage as usage_mod
+
+    seen: list[tuple[str, str]] = []
+
+    def fake_p90(repo: str, atype: str) -> float | None:
+        seen.append((repo, atype))
+        return 12345.0
+
+    monkeypatch.setattr(usage_mod, "p90_attention_threshold", fake_p90)
+    cfg = PipelineConfig()
+    assert cfg.attention_threshold_for("review", repo_name="quadraui") == 12345.0
+    assert seen == [("quadraui", "review")]
+
+
 # ── #2048: liveness_auditor ──────────────────────────────────────────────────
 
 

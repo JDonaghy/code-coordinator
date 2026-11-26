@@ -225,6 +225,7 @@ def attention_signal(
     now: float | None = None,
     provider_name: str | None = None,
     review_of_assignment_id: str | None = None,
+    repo_name: str | None = None,
 ) -> tuple[str, str] | tuple[None, None]:
     """Pure #846 detection core: the two "needs attention" signals, decoupled
     from where the assignment's fields come from.
@@ -236,13 +237,15 @@ def attention_signal(
        wall-clock threshold.
     2. **Wall-clock**: running longer than
        ``config.pipeline.attention_threshold_for(assignment_type,
-       provider_name=..., review_of_assignment_id=...)``, computed from
-       *dispatched_at*. ``provider_name``/``review_of_assignment_id``
-       (#1137) let an interactive ``--fix-of``/``--rework-of`` session be
-       recognized despite sharing ``type="work"`` with headless coding
-       workers — see :meth:`Config.pipeline.attention_threshold_for`'s
-       docstring. Both default to ``None`` (no effect) for callers that
-       don't have the full assignment record.
+       provider_name=..., review_of_assignment_id=..., repo_name=...)``,
+       computed from *dispatched_at*. ``provider_name``/
+       ``review_of_assignment_id`` (#1137) let an interactive ``--fix-of``/
+       ``--rework-of`` session be recognized despite sharing ``type="work"``
+       with headless coding workers; ``repo_name`` (#4142) lets the fixed
+       default be replaced by that repo's own learned p90 once there's
+       enough history — see :meth:`Config.pipeline.attention_threshold_for`'s
+       docstring for both. All three default to ``None`` (no effect) for
+       callers that don't have the full assignment record.
 
     Deliberately time/round-based rather than self-report-based (#448: the
     failure mode that motivated this was a worker that never emitted a
@@ -274,6 +277,7 @@ def attention_signal(
         assignment_type,
         provider_name=provider_name,
         review_of_assignment_id=review_of_assignment_id,
+        repo_name=repo_name,
     )
     if dispatched_at is not None:
         running_for = now - dispatched_at
@@ -323,6 +327,7 @@ def detect_needs_attention(
             now=now,
             provider_name=record.get("provider_name"),
             review_of_assignment_id=record.get("review_of_assignment_id"),
+            repo_name=record.get("repo_name"),
         )
         if reason is None:
             continue
