@@ -699,11 +699,14 @@ def p90_attention_threshold(
 # Pure functions over *already-fetched* ``fetch_usage_rows`` rows and
 # ``coord.state.list_audit_log`` entries — exactly the two read seams
 # ``coord.commands.stats.waste`` already composes for
-# :func:`coord.leg_waste.build_waste_report` — so nothing here does its own
-# I/O.
+# :func:`coord.leg_waste.build_waste_report`. `repo_attention_thresholds` is
+# the one exception: it delegates to `config.pipeline.attention_threshold_for`,
+# which can itself fetch usage rows to compute a learned p90 (bounded,
+# cached) — see its own docstring below.
 
 #: `coord.notify._sweep_phantom_rows` audit event for one row #2536's sweep
-#: auto-healed. `coord.diagnose.sweep_dead_running_rows` is the ONLY writer.
+#: auto-healed. `coord.diagnose.sweep_dead_running_rows` computes which rows
+#: are dead; `_sweep_phantom_rows` is what actually calls `record_audit`.
 PHANTOM_ROW_HEALED_EVENT = "phantom_row_auto_healed"
 
 #: `coord.notify._sweep_stuck_test_state` audit event for one row #2803's
@@ -749,6 +752,8 @@ def heal_counts_from_audit(audit_entries: "list[dict] | None") -> HealCounts:
     :func:`coord.leg_waste.audit_leg_kind_overrides`'s own posture toward
     the same read seam.
     """
+    from coord.diagnose import PHANTOM_DEAD_CONFIRM_PASSES  # noqa: PLC0415
+
     counts = HealCounts()
     for entry in audit_entries or ():
         event_type = entry.get("event_type")
@@ -756,7 +761,7 @@ def heal_counts_from_audit(audit_entries: "list[dict] | None") -> HealCounts:
             counts.phantom_row_healed += 1
             detail = str((entry.get("details") or {}).get("detail") or "")
             m = _PHANTOM_HEAL_MISS_COUNT_RE.search(detail)
-            if m and int(m.group(1)) >= 2:
+            if m and int(m.group(1)) >= PHANTOM_DEAD_CONFIRM_PASSES:
                 counts.phantom_row_miss_confirmed += 1
         elif event_type == STUCK_TEST_STATE_HEALED_EVENT:
             counts.stuck_test_state_healed += 1
@@ -803,6 +808,10 @@ def repo_attention_thresholds(
     with no ``repo_name`` isolates whether #4142's own per-repo learned
     step is what's in effect, since that step is the ONLY thing
     ``repo_name`` changes about the result.
+
+    Unlike the rest of this module, this is not pure: a learned threshold
+    reaches ``p90_attention_threshold``, which does its own (cached,
+    bounded-window) ``fetch_usage_rows`` call.
     """
     generic = config.pipeline.attention_threshold_for(assignment_type)
     seen: set[str] = set()
@@ -871,8 +880,21 @@ def fanout_fold_latencies(
     A round with no resolvable leg ``finished_at`` (incomplete usage-row
     history) contributes nothing rather than guessing.
     """
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
     from coord.smoke_tags import _parse_fanout_manifest  # noqa: PLC0415
     from coord.usage_rollup import parse_timestamp  # noqa: PLC0415
+
+    # Every terminal state `finalize_smoke_fanout` can write for the parent
+    # row, prefixed the way `_record_test_verdict_local` names the event
+    # (`event_type=f"test_{test_state}"`) — "passed", "failed", "skipped",
+    # or TEST_STATE_BLOCKED. A round that folds to blocked is the one this
+    # function exists to catch, so it must not be filtered out here.
+    fold_event_types = (
+        "test_passed",
+        "test_failed",
+        "test_skipped",
+        f"test_{TEST_STATE_BLOCKED}",
+    )
 
     rows_by_id = {
         str(row.get("assignment_id")): row
@@ -883,7 +905,7 @@ def fanout_fold_latencies(
     out: list[FanoutFoldLatency] = []
     for entry in audit_entries or ():
         event_type = entry.get("event_type")
-        if event_type not in ("test_passed", "test_failed", "test_skipped"):
+        if event_type not in fold_event_types:
             continue
         fold_ts = parse_timestamp(entry.get("ts"))
         if fold_ts is None:
@@ -904,12 +926,19 @@ def fanout_fold_latencies(
         if not leg_finished:
             continue
 
+        latency_secs = fold_ts - max(leg_finished)
+        if latency_secs < 0:
+            # Clock skew or a `finished_at` written after the fold — a
+            # fabricated zero would still feed avg/max, so skip the round
+            # rather than guess.
+            continue
+
         assignment_id = str(entry.get("assignment_id") or "")
         out.append(FanoutFoldLatency(
             assignment_id=assignment_id,
             repo_name=str(entry.get("repo") or ""),
             issue_number=int(entry.get("issue") or 0),
-            latency_secs=max(0.0, fold_ts - max(leg_finished)),
+            latency_secs=latency_secs,
         ))
     return out
 
