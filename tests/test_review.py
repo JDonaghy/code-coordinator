@@ -4621,6 +4621,116 @@ def test_dispatch_review_two_sequential_dispatchers_both_denied_for_already_revi
     assert "#3670" in (completed_for_dispatcher_2.review_dispatch_reason or "")
 
 
+# ── #4153: surface-only ratchet-lowering delta → auto-reaffirm ─────────────
+
+
+def test_line_is_numeric_lowering_only_accepts_a_lowered_literal() -> None:
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert _line_is_numeric_lowering_only(
+        'const RATCHET: usize = 500;', 'const RATCHET: usize = 450;',
+    )
+    assert _line_is_numeric_lowering_only('"count": 100,', '"count": 100,')  # identical
+
+
+def test_line_is_numeric_lowering_only_rejects_a_raised_literal() -> None:
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert not _line_is_numeric_lowering_only(
+        'const RATCHET: usize = 500;', 'const RATCHET: usize = 600;',
+    )
+
+
+def test_line_is_numeric_lowering_only_rejects_non_numeric_content_change() -> None:
+    from coord.review import _line_is_numeric_lowering_only
+
+    # The number dropped, but the identifier changed too — not a pure
+    # numeric-literal edit.
+    assert not _line_is_numeric_lowering_only(
+        'const RATCHET: usize = 500;', 'const BUDGET: usize = 450;',
+    )
+
+
+def test_line_is_numeric_lowering_only_rejects_no_numbers_at_all() -> None:
+    from coord.review import _line_is_numeric_lowering_only
+
+    assert not _line_is_numeric_lowering_only('foo', 'bar')
+
+
+def test_file_is_surface_numeric_lowering_only_accepts_single_line_lowering() -> None:
+    from coord.review import _file_is_surface_numeric_lowering_only
+
+    assert _file_is_surface_numeric_lowering_only(
+        '{"count": 100}', '{"count": 90}',
+    )
+
+
+def test_file_is_surface_numeric_lowering_only_rejects_inserted_line() -> None:
+    from coord.review import _file_is_surface_numeric_lowering_only
+
+    assert not _file_is_surface_numeric_lowering_only(
+        'a\nb', 'a\nb\nc',
+    )
+
+
+def test_file_is_surface_numeric_lowering_only_rejects_mismatched_replace_block() -> None:
+    from coord.review import _file_is_surface_numeric_lowering_only
+
+    # Two old lines replaced by one new line — not a 1:1 value swap, even
+    # though the single remaining number is lower.
+    assert not _file_is_surface_numeric_lowering_only(
+        'count: 100\nextra: 1', 'count: 90',
+    )
+
+
+def test_review_delta_is_surface_only_ratchet_lowering_true_for_declared_lowering_path() -> None:
+    from coord.review import _review_delta_is_surface_only_ratchet_lowering
+    from coord.models import IntegrationSurface
+
+    surfaces = [IntegrationSurface(paths=["ratchet.json"], regen="x", check="y")]
+
+    def _compare_diff(repo: str, base: str, head: str) -> str:
+        marker = "A" if head == "oldsha" else "B"
+        return f"diff --git a/ratchet.json b/ratchet.json\n@@ -1 +1 @@\n-x\n+{marker}\n"
+
+    def _file_fetcher(repo: str, path: str, sha: str) -> str:
+        return {"oldsha": '{"count": 100}', "newsha": '{"count": 90}'}[sha]
+
+    class _GhOps:
+        get_compare_diff = staticmethod(_compare_diff)
+
+    assert _review_delta_is_surface_only_ratchet_lowering(
+        _GhOps(), "acme/api", surfaces, "main", "oldsha", "newsha",
+        file_fetcher=_file_fetcher,
+    )
+
+
+def test_review_delta_is_surface_only_ratchet_lowering_false_for_undeclared_path() -> None:
+    from coord.review import _review_delta_is_surface_only_ratchet_lowering
+    from coord.models import IntegrationSurface
+
+    surfaces = [IntegrationSurface(paths=["ratchet.json"], regen="x", check="y")]
+
+    def _compare_diff(repo: str, base: str, head: str) -> str:
+        marker = "A" if head == "oldsha" else "B"
+        return f"diff --git a/src/other.py b/src/other.py\n@@ -1 +1 @@\n-x\n+{marker}\n"
+
+    class _GhOps:
+        get_compare_diff = staticmethod(_compare_diff)
+
+    assert not _review_delta_is_surface_only_ratchet_lowering(
+        _GhOps(), "acme/api", surfaces, "main", "oldsha", "newsha",
+    )
+
+
+def test_review_delta_is_surface_only_ratchet_lowering_false_when_no_surfaces_declared() -> None:
+    from coord.review import _review_delta_is_surface_only_ratchet_lowering
+
+    assert not _review_delta_is_surface_only_ratchet_lowering(
+        None, "acme/api", [], "main", "oldsha", "newsha",
+    )
+
+
 # ── #1476: scoped re-review ──────────────────────────────────────────────────
 
 
@@ -5694,6 +5804,126 @@ def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_context_only(
     assert dispatched == []
 
 
+def _surface_compare_diff_fetcher(repo: str, base: str, head: str) -> str:
+    """Base-relative compare for a single declared surface path
+    (``ratchet.json``) whose text differs between *review_sha* (``oldsha``)
+    and *current_sha* (``newsha``) — enough to mark the path "changed" for
+    :func:`coord.review._review_delta_is_surface_only_ratchet_lowering`'s
+    path-isolation step. The actual numeric-lowering content check reads
+    through a separate ``get_repo_file`` fetch, not this diff text."""
+    marker = "review-side" if head == "oldsha" else "current-side"
+    return f"diff --git a/ratchet.json b/ratchet.json\n@@ -1 +1 @@\n-x\n+{marker}\n"
+
+
+def test_dispatch_scoped_reviews_for_queue_auto_reaffirms_surface_only_ratchet_lowering(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """#4153: a delta since approval confined to a declared
+    integration_surfaces path, where the only content change is a lowered
+    numeric literal, is auto-reaffirmed (`coord.state.record_review_reaffirm`)
+    instead of dispatching a scoped re-review."""
+    from unittest.mock import patch
+
+    from coord import merge_queue as mq
+    from coord.models import IntegrationSurface
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(
+            two_machine_config.repos[0],
+            integration_surfaces=[
+                IntegrationSurface(paths=["ratchet.json"], regen="regen", check="check"),
+            ],
+        )],
+    )
+    monkeypatch.setattr("coord.github_ops.get_compare_diff", _surface_compare_diff_fetcher)
+    monkeypatch.setattr(
+        "coord.github_ops.get_repo_file",
+        lambda repo, path, sha: {"oldsha": '{"count": 100}', "newsha": '{"count": 90}'}[sha],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    board = Board(completed=[work, prior])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    with patch("coord.state.record_review_reaffirm") as rec:
+        dispatched = dispatch_scoped_reviews_for_queue(
+            board, cfg,
+            queue_items=[entry],
+            http_client=_FakeHTTPClient({"id": "scoped-surface"}),
+            diff_fetcher=_scoped_diff_fetcher,
+        )
+    assert dispatched == []
+    rec.assert_called_once()
+    assert rec.call_args.kwargs["review_assignment_id"] == prior.assignment_id
+    assert rec.call_args.kwargs["new_head_sha"] == "newsha"
+    assert rec.call_args.kwargs["new_patch_id"] == "patchid-new"
+    # The in-memory review object is re-pointed too, same as
+    # `finisher_self_bless`'s own re-point, so a caller reusing `prior`
+    # afterward sees the reaffirmed anchors without re-reading the board.
+    assert prior.review_head_sha == "newsha"
+    assert prior.review_patch_id == "patchid-new"
+
+
+def test_dispatch_scoped_reviews_for_queue_dispatches_when_surface_delta_raises_value(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """A surface-path delta that RAISES a numeric literal (never lowers it)
+    is not auto-reaffirmed — it falls back to the ordinary attributable-leg
+    scoped-review path exactly like any other content-changing rebase."""
+    from unittest.mock import patch
+
+    from coord import merge_queue as mq
+    from coord.models import IntegrationSurface
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(
+            two_machine_config.repos[0],
+            integration_surfaces=[
+                IntegrationSurface(paths=["ratchet.json"], regen="regen", check="check"),
+            ],
+        )],
+    )
+    monkeypatch.setattr("coord.github_ops.get_compare_diff", _surface_compare_diff_fetcher)
+    monkeypatch.setattr(
+        "coord.github_ops.get_repo_file",
+        lambda repo, path, sha: {"oldsha": '{"count": 100}', "newsha": '{"count": 150}'}[sha],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    with patch("coord.state.record_review_reaffirm") as rec:
+        dispatched = dispatch_scoped_reviews_for_queue(
+            board, cfg,
+            queue_items=[entry],
+            http_client=_FakeHTTPClient({"id": "scoped-surface-raise"}),
+            diff_fetcher=_scoped_diff_fetcher,
+        )
+    rec.assert_not_called()
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+
+
 def test_dispatch_scoped_reviews_for_queue_dispatches_when_delta_has_non_ancillary_file(
     two_machine_config: Config, monkeypatch,
 ) -> None:
@@ -6482,6 +6712,62 @@ def test_maybe_scoped_review_skips_when_delta_is_ancillary_only(
         branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
     )
     assert result is None
+
+
+def test_maybe_scoped_review_auto_reaffirms_surface_only_ratchet_lowering(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """#4153: same auto-reaffirm short-circuit as the queue-scan entry point
+    (`dispatch_scoped_reviews_for_queue`) — `maybe_scoped_review_for_
+    completed_fix` must not dispatch when the delta since approval is
+    confined to a declared integration_surfaces path and only lowers a
+    numeric literal."""
+    from unittest.mock import patch
+
+    from coord import merge_queue as mq
+    from coord.models import IntegrationSurface
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(
+            two_machine_config.repos[0],
+            integration_surfaces=[
+                IntegrationSurface(paths=["ratchet.json"], regen="regen", check="check"),
+            ],
+        )],
+    )
+    monkeypatch.setattr("coord.github_ops.get_compare_diff", _surface_compare_diff_fetcher)
+    monkeypatch.setattr(
+        "coord.github_ops.get_repo_file",
+        lambda repo, path, sha: {"oldsha": '{"count": 100}', "newsha": '{"count": 90}'}[sha],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    with patch("coord.state.record_review_reaffirm") as rec:
+        result = maybe_scoped_review_for_completed_fix(
+            ci_fix, board, cfg,
+            http_client=_FakeHTTPClient({"id": "scoped-mb-surface"}),
+            diff_fetcher=_scoped_diff_fetcher,
+            branch_sha_fetcher=lambda repo, branch: "newsha",
+            branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+        )
+    assert result is None
+    rec.assert_called_once()
+    assert rec.call_args.kwargs["review_assignment_id"] == prior.assignment_id
+    assert prior.review_head_sha == "newsha"
 
 
 def test_maybe_scoped_review_dispatches_when_delta_has_non_ancillary_file(
