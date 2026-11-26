@@ -2342,16 +2342,18 @@ class GitMergeVerifier:
         Evidence is built from ``state.work_test_reason`` alone — the one
         failure text `coord drive` already has on hand for this issue,
         without a second log fetch. ``diff_stat``/``declared_files``/
-        ``machine_capabilities`` (#4124) are each a best-effort fetch —
+        ``machine_capabilities`` are each a best-effort fetch —
         :meth:`_diff_stat_for_test_state`/:meth:`_declared_files_for_test_state`/
-        :meth:`_machine_capabilities_for_state` — mirroring the SAME inputs
-        the CI-red edge (`coord.ci_fix.triage_ci_failure`) already feeds the
-        identical classifier (#2096: one classifier, fed consistently
-        across edges, never a Test-edge call that quietly runs the
-        mechanical-confinement check blind). Any of the three failing soft
-        degrades that one input to its empty default — the deterministic
-        infra/mechanical tiers and the model tier all degrade gracefully
-        without them, exactly as before #4124.
+        :meth:`_machine_capabilities_for_state`. ``diff_stat``/
+        ``declared_files`` mirror what `coord.ci_fix.triage_ci_failure`
+        already feeds the SAME classifier on the CI-red edge (one
+        classifier, fed consistently, never a Test-edge call that quietly
+        runs the mechanical-confinement check blind); ``machine_
+        capabilities`` has no CI-red-edge counterpart today — the Test
+        edge is the only one with a "which host saw this" to feed. Any of
+        the three failing soft degrades that one input to its empty
+        default — the deterministic infra/mechanical tiers and the model
+        tier all degrade gracefully without them.
 
         #4100: gated by `coord.board_doctor_policy._triage_tier_enabled`
         on `self.config` — read fresh every call, so the SAME mid-run
@@ -2389,15 +2391,19 @@ class GitMergeVerifier:
 
     def _diff_stat_for_test_state(self, state: IssueState) -> DiffStat:
         """Best-effort :class:`~coord.failure_triage.DiffStat` for *state*'s
-        work branch (#4124) — the Test-edge counterpart of
+        work branch — the Test-edge counterpart of
         `coord.ci_fix._diff_stat_for_entry`, feeding the SAME
         mechanical-confinement check that function already feeds for the
         CI-red and merge-failure edges (#2096). Compares *state*'s work
-        branch against the repo's default branch — the same base
-        `coord.ci_fix._diff_stat_for_entry` uses (`entry.target_branch`),
-        close enough for a mechanical-confinement check that only cares
-        WHICH files moved, not the exact merge-base for an epic's custom
-        target branch.
+        branch against the issue's own resolved base branch — the same
+        :func:`coord.branch_model.resolve_base_branch_for_issue_number`
+        call :meth:`has_scoped_review_candidate` already makes in this
+        class, falling back to `state.repo_default_branch` only when that
+        resolution itself fails. An epic-targeted issue's base is the epic
+        branch, not the repo default — comparing against the wrong one
+        would pull in every OTHER sibling issue's already-merged files,
+        making the mechanical-confinement check strictly more permissive
+        than it should be.
 
         Fails soft to an empty ``DiffStat`` on any read failure (no
         ``repo_github``/``work_branch`` yet, a throttled/malformed
@@ -2407,11 +2413,24 @@ class GitMergeVerifier:
         """
         if not state.repo_github or not state.work_branch:
             return DiffStat()
+        target_branch = state.repo_default_branch
+        repo_cfg = self.config.repo(state.repo) if self.config is not None else None
+        if repo_cfg is not None:
+            try:
+                from coord.branch_model import (  # noqa: PLC0415
+                    resolve_base_branch_for_issue_number,
+                )
+
+                target_branch = resolve_base_branch_for_issue_number(
+                    repo_cfg, repo_cfg.github, state.issue,
+                )
+            except Exception:  # noqa: BLE001 — fall back to the repo default
+                pass
         try:
             from coord import github_ops  # noqa: PLC0415
 
             diff_text = github_ops.get_compare_diff(
-                state.repo_github, state.repo_default_branch, state.work_branch,
+                state.repo_github, target_branch, state.work_branch,
             )
             if not diff_text:
                 return DiffStat()
@@ -2420,8 +2439,8 @@ class GitMergeVerifier:
             return DiffStat()
 
     def _declared_files_for_test_state(self, state: IssueState) -> tuple[str, ...]:
-        """Best-effort ``## Files`` declaration for *state*'s issue
-        (#4124) — read straight off the live issue body via
+        """Best-effort ``## Files`` declaration for *state*'s issue —
+        read straight off the live issue body via
         :func:`coord.overlap_predict.parse_declared_files`, the same
         source `coord.ci_fix._fetch_issue_body`/``parse_declared_files``
         use to feed the identical check on the CI-red edge (#2096).
@@ -2444,20 +2463,44 @@ class GitMergeVerifier:
 
     def _machine_capabilities_for_state(self, state: IssueState) -> tuple[str, ...]:
         """The capabilities the machine that ran *state*'s Test leg
-        advertises (#4124) — feeds `triage_failure`'s repro-capability
-        inference, so a mechanical verdict can say whether the SAME
-        machine class can reproduce the failure instead of guessing from
-        the issue text alone.
+        advertises — feeds `triage_failure`'s repro-capability inference,
+        so a mechanical verdict can say whether the SAME machine class can
+        reproduce the failure instead of guessing from the issue text
+        alone.
 
-        ``()`` — never raises — for a machine that no longer resolves (no
-        ``work_machine`` recorded yet, removed from config, unknown name,
-        or no config at all): classification input, never a dispatch
-        precondition.
+        Reads `state.smoke_machine` — the Test stage's OWN child
+        (`type="smoke"`) assignment's host — never `state.work_machine`.
+        `coord.smoke.rank_smoke_machines` routes the Test stage
+        independently of the work leg (preferring it, not pinning to it),
+        so the two can genuinely differ.
+
+        Returns ``()`` — never raises, never guesses — for every case
+        where "the machine" isn't a single well-defined answer:
+
+        - the Test stage fanned out across more than one capability
+          partition (`coord.smoke_tags._parse_fanout_manifest` finds more
+          than one leg in `state.work_test_reason`'s manifest) — there is
+          no SINGLE machine to attribute the failure to, so this reports
+          "can't attribute" rather than crediting one leg's host to all of
+          them;
+        - no smoke child row recorded yet (`state.smoke_machine` empty);
+        - that machine name no longer resolves in `self.config` (removed,
+          renamed, or no config at all).
         """
-        if not state.work_machine or self.config is None:
+        if self.config is None:
+            return ()
+        try:
+            from coord.smoke_tags import _parse_fanout_manifest  # noqa: PLC0415
+
+            legs = _parse_fanout_manifest(state.work_test_reason)
+        except Exception:  # noqa: BLE001 — see docstring: never guess
+            return ()
+        if legs is not None and len(legs) > 1:
+            return ()  # fanned out across multiple machines — no single answer
+        if not state.smoke_machine:
             return ()
         machine = next(
-            (m for m in self.config.machines if m.name == state.work_machine), None,
+            (m for m in self.config.machines if m.name == state.smoke_machine), None,
         )
         return tuple(machine.capabilities) if machine is not None else ()
 

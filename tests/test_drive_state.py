@@ -569,6 +569,29 @@ def test_smoke_row_is_keyed_on_the_work_row_too():
     assert state.smoke_status == "running"
 
 
+def test_smoke_machine_is_projected_from_the_smoke_row_not_the_work_row():
+    """`coord.drive.GitMergeVerifier._machine_capabilities_for_state` needs
+    the Test leg's OWN host, not the worker's — `coord.smoke.
+    rank_smoke_machines` routes the Test stage independently of the work
+    leg, so the two rows can genuinely name different machines."""
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", dispatched_at=100.0, machine_name="linux1"),
+            row(
+                assignment_id="s1",
+                type="smoke",
+                status="running",
+                dispatched_at=110.0,
+                review_of_assignment_id="w1",
+                machine_name="mac1",
+            ),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_machine == "linux1"
+    assert state.smoke_machine == "mac1"
+
+
 def test_smoke_failure_reason_is_projected_from_the_smoke_row():
     """#1605: `_decide_test` needs the Test-stage WORKER's own
     failure_reason (usage-limit-kill or terminal-API-error diagnostic) to
