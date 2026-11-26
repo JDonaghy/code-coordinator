@@ -195,16 +195,40 @@ def test_confirm_dead_via_assignment_endpoint_live_on_200(monkeypatch, config) -
 
 
 def test_confirm_dead_via_assignment_endpoint_dead_on_404(monkeypatch, config) -> None:
+    """A 404 whose body is the endpoint's own JSON error shape (what
+    ``agent_app.assignment_detail`` actually returns for an unknown id)
+    is a real "no such assignment" answer."""
+
     class _Resp:
         status_code = 404
 
         def json(self):
-            raise AssertionError("must not be called on 404")
+            return {"error": "unknown assignment w1"}
 
     monkeypatch.setattr("httpx.get", lambda *a, **k: _Resp())
     a = _assign(aid="w1", typ="work", status="running")
     machine = config.machines[0]
     assert diagnose._confirm_dead_via_assignment_endpoint(a, machine) == "dead"
+
+
+def test_confirm_dead_via_assignment_endpoint_unknown_on_plain_text_404(
+    monkeypatch, config,
+) -> None:
+    """An agent that predates the ``/assignments/<id>`` route (#4141)
+    answers the unmatched path with Starlette's default plain-text 404,
+    not this endpoint's JSON error body — that must never be read as
+    "dead", or every not-yet-upgraded agent would phantom-heal for free."""
+
+    class _Resp:
+        status_code = 404
+
+        def json(self):
+            raise ValueError("plain text body, not JSON")
+
+    monkeypatch.setattr("httpx.get", lambda *a, **k: _Resp())
+    a = _assign(aid="w1", typ="work", status="running")
+    machine = config.machines[0]
+    assert diagnose._confirm_dead_via_assignment_endpoint(a, machine) == "unknown"
 
 
 def test_confirm_dead_via_assignment_endpoint_unknown_on_network_error(
