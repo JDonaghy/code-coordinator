@@ -1084,6 +1084,79 @@ class TestUsageCommandByIssueAndDrillFlags:
         assert "invalid 'since' spec" in result.output
         assert "--since" in result.output
 
+    def test_issue_drill_defaults_to_bounded_window_without_since(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """#4139: a bare ``--issue N`` (no --today/--week/--month/--since)
+        must not fetch unbounded all-history — that is exactly what timed
+        out on a live fleet. It should resolve to a bounded recent window
+        and pass both ``since`` and ``issue`` down to the fetch."""
+        import coord.usage as usage_mod
+
+        calls: list[dict] = []
+
+        def fake_fetch(*, since=None, until=None, issue=None, timeout=None, **_kw):
+            calls.append({"since": since, "until": until, "issue": issue, "timeout": timeout})
+            return []
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", fake_fetch)
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--issue", "5"])
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert calls[0]["since"] is not None, "unbounded fetch — the #4139 regression"
+        assert calls[0]["issue"] == 5
+        assert calls[0]["timeout"] == usage_mod.USAGE_ROWS_DEFAULT_TIMEOUT
+
+    def test_issue_drill_usage_timeout_flag_overrides_default(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        calls: list[float | None] = []
+
+        def fake_fetch(*, since=None, until=None, issue=None, timeout=None, **_kw):
+            calls.append(timeout)
+            return []
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", fake_fetch)
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main,
+            ["usage", "--config", str(cfg_path), "--issue", "5", "--usage-timeout", "90"],
+        )
+        assert result.exit_code == 0, result.output
+        assert calls == [90.0]
+
+    def test_issue_drill_explicit_since_still_respected(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """An explicit --since must still win over the #4139 default window,
+        not be layered on top of it (which would spuriously look like two
+        window flags and raise)."""
+        import coord.usage as usage_mod
+
+        calls: list[dict] = []
+
+        def fake_fetch(*, since=None, until=None, issue=None, timeout=None, **_kw):
+            calls.append({"since": since, "until": until})
+            return []
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", fake_fetch)
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--issue", "5", "--since", "3d"]
+        )
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert calls[0]["since"] is not None
+
     def test_bad_since_spec_raises_clean_usage_error_for_issue_drill(
         self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
     ) -> None:
@@ -1704,6 +1777,22 @@ class TestLocalUsageRows:
         rows, _truncated = _local_usage_rows(since=now - 86400, until=None)
         assert [r["assignment_id"] for r in rows] == ["recent"]
 
+    def test_issue_filter_narrows_before_window_and_truncation(self, coord_db) -> None:
+        """#4139: ``issue=`` filters to one GitHub issue's legs — the
+        server-side half of ``coord usage --issue N`` no longer serializing
+        every row in the table before the client can filter."""
+        from coord.usage import _local_usage_rows
+
+        now = time.time()
+        _insert_assignment_row(coord_db, "assignments", "for-1", dispatched_at=now, issue_number=1)
+        _insert_assignment_row(coord_db, "assignments", "for-2", dispatched_at=now, issue_number=2)
+
+        rows, _truncated = _local_usage_rows(issue=1)
+        assert [r["assignment_id"] for r in rows] == ["for-1"]
+
+        rows_none, _truncated = _local_usage_rows(issue=999)
+        assert rows_none == []
+
     def test_wider_window_never_returns_fewer_rows_than_narrower_one(self, coord_db) -> None:
         """The exact non-monotonicity #3313 reported: a longer --since must
         never yield fewer rows than a shorter one."""
@@ -1778,7 +1867,7 @@ class TestFetchUsageRowsRoutesToUsageRowsNotBoard:
 
         calls: list[tuple] = []
 
-        def fake_fetch(svc, *, since=None, until=None, timeout=5.0):
+        def fake_fetch(svc, *, since=None, until=None, issue=None, timeout=5.0):
             calls.append((since, until))
             return {"rows": [{"assignment_id": "r-1"}], "truncated": False}
 
@@ -1792,6 +1881,28 @@ class TestFetchUsageRowsRoutesToUsageRowsNotBoard:
         rows = usage_mod.fetch_usage_rows(since=100.0, until=200.0)
         assert rows == [{"assignment_id": "r-1"}]
         assert calls == [(100.0, 200.0)]
+
+    def test_remote_branch_forwards_issue_to_daemon(self, monkeypatch) -> None:
+        """#4139: ``issue=`` reaches the daemon call so a capable daemon can
+        filter server-side before serializing the response."""
+        from coord import usage as usage_mod
+        from coord.client import ServiceConfig
+
+        monkeypatch.setattr(
+            "coord.client.resolve_board_service",
+            lambda *a, **k: ServiceConfig(url="http://daemon:7435", token=None),
+        )
+
+        calls: list[int | None] = []
+
+        def fake_fetch(svc, *, since=None, until=None, issue=None, timeout=5.0):
+            calls.append(issue)
+            return {"rows": [], "truncated": False}
+
+        monkeypatch.setattr("coord.client.fetch_usage_rows_from_daemon", fake_fetch)
+
+        usage_mod.fetch_usage_rows(issue=42)
+        assert calls == [42]
 
     def test_remote_branch_warns_when_daemon_reports_truncation(
         self, monkeypatch, caplog

@@ -1281,6 +1281,7 @@ def fetch_usage_rows_from_daemon(
     *,
     since: float | None = None,
     until: float | None = None,
+    issue: int | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> dict:
     """GET full-history usage rows from the daemon's ``/usage-rows`` (#3313).
@@ -1292,11 +1293,24 @@ def fetch_usage_rows_from_daemon(
     *until* (Unix-epoch floats) narrow the daemon-side read; omitting both
     fetches unbounded all-time history.
 
+    *issue* (#4139, optional): passed through as a query param so a daemon
+    new enough to understand it (``coord.serve_app``'s ``/usage-rows``
+    handler) filters to one GitHub issue's legs *before* serializing the
+    response — the serialization of every history row, not the SQLite scan,
+    is what blows past a short timeout on a live fleet. An older daemon
+    that doesn't recognize the param just ignores it; the caller must still
+    filter the (larger) result client-side in that case.
+
     Like :func:`fetch_audit_log`, this does NOT fail-soft: ``coord usage`` is
     an explicit read the user asked for, so a transport/HTTP error —
     including a 404 from a daemon that predates this endpoint — raises
     ``httpx.HTTPError`` for the CLI to report plainly, rather than silently
     rendering a truncated (or empty) total as if it were complete.
+
+    *timeout* defaults to the generic client timeout (``_DEFAULT_TIMEOUT``);
+    callers that know the read is wide (unbounded or unfiltered) should pass
+    :data:`coord.usage.USAGE_ROWS_DEFAULT_TIMEOUT` — :func:`coord.usage.fetch_usage_rows`
+    does this already for every call routed through it.
 
     Returns ``{"rows": [...], "truncated": bool}`` — ``truncated`` is set by
     the daemon when its own safety ceiling
@@ -1308,6 +1322,8 @@ def fetch_usage_rows_from_daemon(
         params["since"] = since
     if until is not None:
         params["until"] = until
+    if issue is not None:
+        params["issue"] = issue
     resp = httpx.get(
         f"{svc.url}/usage-rows", params=params, headers=_headers(svc), timeout=timeout
     )

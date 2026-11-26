@@ -4180,6 +4180,38 @@ def test_serve_usage_rows(tmp_path: Path, valid_config_path: Path, rw_db):
         assert r_bad.status_code == 400
 
 
+def test_serve_usage_rows_filters_by_issue(tmp_path: Path, valid_config_path: Path, rw_db):
+    """#4139: `?issue=` narrows `/usage-rows` server-side, before the
+    response is serialized — the actual fix for `coord usage --issue N`
+    timing out on a live fleet (serializing full history is what blows the
+    client timeout, not the SQLite scan)."""
+    now = time.time()
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, type, status, dispatched_at, cost_usd) "
+        "VALUES ('for-issue-1', 'm', 'api', 1, 't', 'work', 'done', ?, 1.5)",
+        (now,),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, type, status, dispatched_at, cost_usd) "
+        "VALUES ('for-issue-2', 'm', 'api', 2, 't', 'work', 'done', ?, 2.5)",
+        (now,),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r = cli.get("/usage-rows", params={"issue": 1})
+        assert r.status_code == 200
+        assert [row["assignment_id"] for row in r.json()["rows"]] == ["for-issue-1"]
+
+        r_none = cli.get("/usage-rows", params={"issue": 999})
+        assert r_none.json()["rows"] == []
+
+        r_bad = cli.get("/usage-rows", params={"issue": "not-a-number"})
+        assert r_bad.status_code == 400
+
+
 def test_serve_issues_collection(tmp_path: Path, valid_config_path: Path, rw_db):
     """#3227/#3228: `GET /issues` — the daemon-routed half of
     `coord.state.cached_open_issues`, backing `coord plans --lint-epics`/

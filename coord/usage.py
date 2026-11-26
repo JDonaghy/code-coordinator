@@ -404,14 +404,25 @@ def filter_assignments_in_window(assignments: list[Assignment], window) -> list[
 # silently rendering a partial read as if it were complete.
 USAGE_ROWS_MAX_ROWS = 50_000
 
+# #4139: the daemon round-trip for `/usage-rows` serializes every row in
+# `assignments` + `assignments_archive` as JSON before any issue/window
+# filtering narrows the payload — on a live fleet with real history that
+# routinely takes longer than a plain httpx default (5s), so an unbounded
+# `coord usage --issue N` (no --since) timed out every time. This is the
+# default for both `fetch_usage_rows` and `fetch_usage_rows_from_daemon`;
+# callers that know their fetch is cheap (a tightly windowed/issue-filtered
+# read) may still pass a smaller `timeout` explicitly.
+USAGE_ROWS_DEFAULT_TIMEOUT = 30.0
+
 
 def fetch_usage_rows(
     *,
     since: float | None = None,
     until: float | None = None,
+    issue: int | None = None,
     flag_url: str | None = None,
     flag_token: str | None = None,
-    timeout: float = 5.0,
+    timeout: float = USAGE_ROWS_DEFAULT_TIMEOUT,
 ) -> list[dict]:
     """Fetch board assignment rows as plain dicts for :mod:`coord.usage_rollup`.
 
@@ -445,12 +456,29 @@ def fetch_usage_rows(
     **or** ``finished_at`` falls in ``[since, until)``). Leaving both ``None``
     (the default) fetches unbounded all-time history, matching every
     call site's pre-#3313 behaviour.
+
+    *issue* (#4139, optional) narrows the fetch to legs attributed to one
+    GitHub issue (:func:`coord.usage_rollup.row_issue_number` semantics —
+    ``for_issue_number`` when set, else ``issue_number``), pushed down the
+    same way *since*/*until* are: the daemon branch sends it as a query
+    param so a capable daemon filters before serializing the response (the
+    whole point — on a live fleet, serializing every history row is what
+    blows the httpx timeout, not the SQLite scan), and the local branch
+    filters before truncation. An older daemon that doesn't recognize the
+    param simply ignores it and returns the window-filtered set, which the
+    caller (e.g. ``_usage_issue_drill``) must still filter client-side —
+    this is a narrowing optimization, never the only filter applied.
+
+    *timeout* defaults to :data:`USAGE_ROWS_DEFAULT_TIMEOUT`, not the
+    generic httpx default — see that constant's docstring for why.
     """
     from coord.client import fetch_usage_rows_from_daemon, resolve_board_service  # noqa: PLC0415
 
     svc = resolve_board_service(flag_url, flag_token)
     if svc is not None:
-        result = fetch_usage_rows_from_daemon(svc, since=since, until=until, timeout=timeout)
+        result = fetch_usage_rows_from_daemon(
+            svc, since=since, until=until, issue=issue, timeout=timeout
+        )
         rows = list(result.get("rows") or [])
         if result.get("truncated"):
             _log.warning(
@@ -460,7 +488,7 @@ def fetch_usage_rows(
             )
         return rows
 
-    rows, truncated = _local_usage_rows(since=since, until=until)
+    rows, truncated = _local_usage_rows(since=since, until=until, issue=issue)
     if truncated:
         _log.warning(
             "fetch_usage_rows: local usage-rows read was truncated at %d rows "
@@ -471,7 +499,10 @@ def fetch_usage_rows(
 
 
 def _local_usage_rows(
-    *, since: float | None = None, until: float | None = None
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    issue: int | None = None,
 ) -> tuple[list[dict], bool]:
     """Full-history local read spanning ``assignments`` + ``assignments_archive``
     (#3313) — backs both :func:`fetch_usage_rows`'s local branch and the
@@ -485,6 +516,11 @@ def _local_usage_rows(
     that boundary — exactly the "full history, not a retention-capped slice"
     promise this module's docstring already made and ``/board`` couldn't keep.
 
+    *issue* (#4139, optional) filters to legs attributed to one GitHub issue
+    (:func:`coord.usage_rollup.row_issue_number`) before the row-count
+    ceiling below is applied, so a single issue's drill-down never gets
+    truncated by unrelated history sharing the table.
+
     Returns ``(rows, truncated)`` — ``truncated`` is only ``True`` if
     :data:`USAGE_ROWS_MAX_ROWS` was hit, newest-dispatched rows kept. Callers
     must surface that rather than silently rendering a partial total as
@@ -493,7 +529,7 @@ def _local_usage_rows(
     from coord import sql  # noqa: PLC0415
     from coord.board_schema import decode_row  # noqa: PLC0415
     from coord.db import get_connection, rollback_after_driver_error  # noqa: PLC0415
-    from coord.usage_rollup import TimeWindow, leg_in_window  # noqa: PLC0415
+    from coord.usage_rollup import TimeWindow, leg_in_window, row_issue_number  # noqa: PLC0415
 
     conn = get_connection()
     rows: list[dict] = []
@@ -517,6 +553,9 @@ def _local_usage_rows(
         # Decode both tables under the "assignments" key so archived rows get
         # the identical slim projection live rows do.
         rows.extend(decode_row("assignments", r) for r in result)
+
+    if issue is not None:
+        rows = [r for r in rows if row_issue_number(r) == issue]
 
     if since is not None or until is not None:
         window = TimeWindow(start=since, end=until)
