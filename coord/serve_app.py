@@ -31,8 +31,10 @@ Endpoints:
   not part of ``/board`` or ``/drive-queue``.
 * ``GET /usage-rows`` — full-history assignment rows for ``coord usage``
   (#3313), optionally windowed by ``?since=``/``?until=`` (Unix-epoch
-  floats); spans ``assignments`` + ``assignments_archive`` like
-  ``/leg-counts``, deliberately NOT ``/board``'s retention-capped set.
+  floats) and/or narrowed to one GitHub issue by ``?issue=`` (#4139,
+  filtered server-side before serialization); spans ``assignments`` +
+  ``assignments_archive`` like ``/leg-counts``, deliberately NOT
+  ``/board``'s retention-capped set.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
   client needs no local config file.
 * ``POST /result``  — record an interactive-session result (#590); body is a
@@ -5406,10 +5408,21 @@ def openapi_spec() -> dict:
                         "schema": {"type": "number"},
                         "description": "Unix-epoch float; unbounded if omitted.",
                     },
+                    {
+                        "name": "issue",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "integer"},
+                        "description": (
+                            "#4139: filter to one issue's legs server-side, before "
+                            "serializing the response — a client-side filter still "
+                            "sees every unfiltered row over the wire."
+                        ),
+                    },
                 ],
                 "responses": {
                     "200": {"description": "OK"},
-                    "400": {"description": "Malformed since/until"},
+                    "400": {"description": "Malformed since/until/issue"},
                     "503": {"description": "usage-rows read failed"},
                 },
             },
@@ -9921,6 +9934,11 @@ def build_app(
         # -> 400" convention as `/audit`'s `_ts_param` (one question, one
         # answer — a malformed timestamp shouldn't be treated differently by
         # two sibling read endpoints).
+        #
+        # `issue` (#4139, optional): filters to one GitHub issue's legs
+        # before the rows are serialized — serializing full history is what
+        # blows past a short client timeout on a live fleet, so filtering
+        # only after the HTTP round-trip (client-side) doesn't help.
         from coord.usage import _local_usage_rows  # noqa: PLC0415
 
         def _parse_float(name: str) -> float | None:
@@ -9932,11 +9950,13 @@ def build_app(
         try:
             since = _parse_float("since")
             until = _parse_float("until")
+            issue_raw = request.query_params.get("issue")
+            issue = int(issue_raw) if issue_raw else None
         except ValueError as e:
             return JSONResponse({"error": f"bad query parameter: {e}"}, status_code=400)
 
         try:
-            rows, truncated = _local_usage_rows(since=since, until=until)
+            rows, truncated = _local_usage_rows(since=since, until=until, issue=issue)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "usage-rows read failed", "detail": str(e)},

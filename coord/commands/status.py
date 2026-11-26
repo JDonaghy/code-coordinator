@@ -3072,6 +3072,16 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     "with --by issue (#1119).",
 )
 @click.option(
+    "--usage-timeout",
+    "usage_timeout",
+    default=None,
+    type=float,
+    help="HTTP timeout (seconds) for the daemon/local usage-rows read behind "
+    "any of --issue/--by-issue/--by/--by-time (#4139). Default: "
+    "coord.usage.USAGE_ROWS_DEFAULT_TIMEOUT (30s) — higher than a plain "
+    "httpx default because an unbounded fetch serializes full history.",
+)
+@click.option(
     "--sort",
     "sort_by",
     type=click.Choice(["cost", "tokens", "time"]),
@@ -3103,6 +3113,7 @@ def usage(
     issue_number: int | None,
     by_dim: str | None,
     by_time: bool,
+    usage_timeout: float | None,
     sort_by: str | None,
     show_limits: bool,
     as_json: bool,
@@ -3123,7 +3134,11 @@ def usage(
             click.echo(format_plan_limits(limits))
         return
     if issue_number is not None:
-        _usage_issue_drill(config_path, issue_number, today=today, week=week, month=month, since_spec=since_spec)
+        _usage_issue_drill(
+            config_path, issue_number,
+            today=today, week=week, month=month, since_spec=since_spec,
+            timeout=usage_timeout,
+        )
         return
     if by_time:
         if by_dim in ("repo", "week", "month"):
@@ -3134,13 +3149,14 @@ def usage(
         _usage_by_time(
             config_path,
             today=today, week=week, month=month, since_spec=since_spec,
-            by_dim=by_dim, sort_by=sort_by,
+            by_dim=by_dim, sort_by=sort_by, timeout=usage_timeout,
         )
         return
     if by_issue or by_dim == "issue":
         _usage_by_issue(
             config_path,
             today=today, week=week, month=month, since_spec=since_spec,
+            timeout=usage_timeout,
             sort_by=_usage_resolve_sort(sort_by, default="cost"),
         )
         return
@@ -3149,6 +3165,7 @@ def usage(
             config_path, by_dim,
             today=today, week=week, month=month, since_spec=since_spec,
             sort_by=_usage_resolve_sort(sort_by, default="cost"),
+            timeout=usage_timeout,
         )
         return
 
@@ -3327,11 +3344,23 @@ def _usage_sort_key(sort_by: str):
 
 
 def _usage_by_issue(
-    config_path: Path, *, today: bool, week: bool, month: bool, since_spec: str | None, sort_by: str
+    config_path: Path,
+    *,
+    today: bool,
+    week: bool,
+    month: bool,
+    since_spec: str | None,
+    sort_by: str,
+    timeout: float | None = None,
 ) -> None:
     """``coord usage --by-issue`` (contract Mock 1, #1115) — daemon-board-
     sourced per-issue cost/token rollup for the resolved time window."""
-    from coord.usage import fetch_usage_rows, format_usage_by_issue, pricing_dict_from_config
+    from coord.usage import (
+        USAGE_ROWS_DEFAULT_TIMEOUT,
+        fetch_usage_rows,
+        format_usage_by_issue,
+        pricing_dict_from_config,
+    )
     from coord.usage_rollup import aggregate
 
     cfg = _load_config(config_path)
@@ -3340,7 +3369,10 @@ def _usage_by_issue(
     # only in `aggregate()` below let a thin client's truncated fetch (see
     # `coord.usage.fetch_usage_rows`) silently under-report, and a WIDER
     # window could report LESS than a narrower one.
-    rows = fetch_usage_rows(since=window.start, until=window.end)
+    rows = fetch_usage_rows(
+        since=window.start, until=window.end,
+        timeout=timeout if timeout is not None else USAGE_ROWS_DEFAULT_TIMEOUT,
+    )
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by="issue", window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
@@ -3348,34 +3380,66 @@ def _usage_by_issue(
     click.echo(format_usage_by_issue(result, window.label))
 
 
+# #4139: a bare `coord usage --issue N` (no --today/--week/--month/--since)
+# used to fetch truly unbounded all-history rows, which — combined with the
+# httpx default timeout — reliably timed out on any fleet with real history.
+# Default to a bounded recent window instead; an explicit window flag still
+# overrides this, and a genuinely older leg is reachable via --since.
+ISSUE_DRILL_DEFAULT_SINCE = "90d"
+
+
 def _usage_issue_drill(
-    config_path: Path, issue_number: int, *, today: bool, week: bool, month: bool, since_spec: str | None
+    config_path: Path,
+    issue_number: int,
+    *,
+    today: bool,
+    week: bool,
+    month: bool,
+    since_spec: str | None,
+    timeout: float | None = None,
 ) -> None:
     """``coord usage --issue N`` (contract Mock 2, #1115) — per-stage drill
-    for one issue's legs. Unbounded (all history) unless --today/--week/
-    --month/--since is also given."""
-    from coord.usage import fetch_usage_rows, format_usage_issue_drill
+    for one issue's legs. Defaults to the last :data:`ISSUE_DRILL_DEFAULT_SINCE`
+    (#4139) unless --today/--week/--month/--since overrides it."""
+    from coord.usage import USAGE_ROWS_DEFAULT_TIMEOUT, fetch_usage_rows, format_usage_issue_drill
     from coord.usage_rollup import leg_in_window, row_issue_number
 
     cfg = _load_config(config_path)
     has_window_flag = today or week or month or since_spec
-    window = _usage_resolve_window(today, week, month, since_spec) if has_window_flag else None
-    # #3313: push the resolved window down into the fetch itself (None/None
-    # when no window flag was given, i.e. unbounded all-history — unchanged
-    # from before). See `_usage_by_issue` above for why this can't be left to
-    # client-side filtering alone.
-    since = window.start if window is not None else None
-    until = window.end if window is not None else None
+    # #4139: only substitute the bounded default when the caller gave no
+    # window flag at all — `_usage_resolve_window` rejects more than one of
+    # --today/--week/--month/--since, so defaulting `since_spec` whenever it
+    # was merely unset (even with e.g. --today already given) would make a
+    # legitimate single-flag call look like two and raise spuriously.
+    window = _usage_resolve_window(
+        today, week, month, since_spec if has_window_flag else ISSUE_DRILL_DEFAULT_SINCE
+    )
+    # #3313: push the resolved window down into the fetch itself. #4139:
+    # unlike before, this is never (None, None) any more — see
+    # `ISSUE_DRILL_DEFAULT_SINCE` above. See `_usage_by_issue` for why the
+    # window can't be left to client-side filtering alone.
+    since = window.start
+    until = window.end
+    resolved_timeout = timeout if timeout is not None else USAGE_ROWS_DEFAULT_TIMEOUT
     # #1553: select by the *attributed* issue, matching the `--by issue`
     # summary above. Selecting on the raw `issue_number` while the summary
     # groups on `for_issue_number` would make the two views disagree — the
     # epic's drill would list slice legs the summary had already moved to
     # the child, and the child's drill would be empty.
+    #
+    # #4139: `issue=issue_number` is pushed down into the fetch (both the
+    # daemon query param and `_local_usage_rows`'s own filter use
+    # `row_issue_number` equality, same as below) so a capable daemon
+    # filters server-side before serializing. The client-side
+    # `row_issue_number`/`leg_in_window` recheck stays regardless, since an
+    # older daemon simply ignores the unknown `issue` param and returns
+    # everything in-window.
     rows = [
         row
-        for row in fetch_usage_rows(since=since, until=until)
-        if row_issue_number(row) == issue_number
-        and (window is None or leg_in_window(row, window))
+        for row in fetch_usage_rows(
+            since=since, until=until, issue=issue_number, timeout=resolved_timeout
+        )
+        if row_issue_number(row) == issue_number and leg_in_window(row, window)
     ]
     click.echo(format_usage_issue_drill(rows, issue_number, cfg.pricing))
 
@@ -3389,19 +3453,28 @@ def _usage_by_dim(
     month: bool,
     since_spec: str | None,
     sort_by: str,
+    timeout: float | None = None,
 ) -> None:
     """``coord usage --by repo|week|month`` (#1119) — cross-cut daemon-board
     usage by *by_dim* for the resolved time window. ``repo`` is the
     cross-repo rollup (contract Mock 3); ``week``/``month`` are a
     time-bucketed spend series over a wider window (e.g. ``--since 8w --by
     week``)."""
-    from coord.usage import fetch_usage_rows, format_usage_by_group, pricing_dict_from_config
+    from coord.usage import (
+        USAGE_ROWS_DEFAULT_TIMEOUT,
+        fetch_usage_rows,
+        format_usage_by_group,
+        pricing_dict_from_config,
+    )
     from coord.usage_rollup import aggregate
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
     # #3313: see `_usage_by_issue` above.
-    rows = fetch_usage_rows(since=window.start, until=window.end)
+    rows = fetch_usage_rows(
+        since=window.start, until=window.end,
+        timeout=timeout if timeout is not None else USAGE_ROWS_DEFAULT_TIMEOUT,
+    )
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by=by_dim, window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
@@ -3418,12 +3491,18 @@ def _usage_by_time(
     since_spec: str | None,
     by_dim: str | None,
     sort_by: str | None,
+    timeout: float | None = None,
 ) -> None:
     """``coord usage --by-time`` (contract Mock 4, #1119) — ranks where
     wall-clock is going: by stage-type (default) or, combined with
     ``--by issue``, by issue. Defaults to ranking by ``time`` (that's the
     point of the view) unless ``--sort`` explicitly overrides."""
-    from coord.usage import fetch_usage_rows, format_usage_by_time, pricing_dict_from_config
+    from coord.usage import (
+        USAGE_ROWS_DEFAULT_TIMEOUT,
+        fetch_usage_rows,
+        format_usage_by_time,
+        pricing_dict_from_config,
+    )
     from coord.usage_rollup import aggregate
 
     dim = "issue" if by_dim == "issue" else "stage"
@@ -3432,7 +3511,10 @@ def _usage_by_time(
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
     # #3313: see `_usage_by_issue` above.
-    rows = fetch_usage_rows(since=window.start, until=window.end)
+    rows = fetch_usage_rows(
+        since=window.start, until=window.end,
+        timeout=timeout if timeout is not None else USAGE_ROWS_DEFAULT_TIMEOUT,
+    )
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by=dim, window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(resolved_sort), reverse=True)
