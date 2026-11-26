@@ -2008,6 +2008,29 @@ class SplitChunk:
     #: not trust this field on its own, since a child can declare a
     #: dependency on something undeclared or filed later.
     after: tuple[int, ...] = field(default_factory=tuple)
+    #: #4175: symbol names (free-form strings — a function, type, API, or
+    #: any other seam the agent names) this chunk DELETES, e.g. a `Removes:
+    #: Foo::bar` line in the size-triage wire format
+    #: (`coord.decomposition_chat.parse_size_triage_response`). Carried
+    #: alongside `introduces`/`consumes` so a later chunk's `Consumes:` can
+    #: be checked against an earlier chunk's `Introduces:`/`Removes:` — this
+    #: slice only parses and stores the declaration; a sibling slice (#4176)
+    #: owns grepping a removed symbol against `AcceptanceConfig.
+    #: sealed_paths()`. Empty by default — no existing producer sets this.
+    removes: tuple[str, ...] = field(default_factory=tuple)
+    #: #4175: symbol names this chunk ADDS, e.g. an `Introduces: Foo::bar`
+    #: line. `coord.preflight_size.verify_split_proposal` cross-references
+    #: this against every LATER chunk's `consumes` to require a matching
+    #: `after:` edge — the same "a semantic dependency file-overlap can
+    #: never see must be declared" posture `after` itself already enforces
+    #: for prose dependencies. Empty by default.
+    introduces: tuple[str, ...] = field(default_factory=tuple)
+    #: #4175: symbol names this chunk USES but did not itself introduce,
+    #: e.g. a `Consumes: Foo::bar` line. A symbol here that matches an
+    #: EARLIER chunk's `introduces` is a dependency `verify_split_proposal`
+    #: requires a matching `after:` edge for — see `introduces` above. Empty
+    #: by default.
+    consumes: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
