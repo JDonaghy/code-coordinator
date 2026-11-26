@@ -1875,6 +1875,63 @@ def test_attention_threshold_learn_flag_off_disables_lookup(monkeypatch) -> None
     assert cfg.attention_threshold_for("work", repo_name="quadraui") == 45 * 60.0
 
 
+def test_pipeline_learn_attention_thresholds_parsed_from_yaml(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """``pipeline.learn_attention_thresholds: false`` in coordinator.yml must
+    actually reach ``PipelineConfig`` — the documented opt-out is read
+    through ``load()``, not just constructible directly in Python.
+    """
+    import coord.usage as usage_mod
+
+    def boom(*_a, **_kw):
+        raise AssertionError("usage must not be consulted when the flag is off")
+
+    monkeypatch.setattr(usage_mod, "p90_attention_threshold", boom)
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  learn_attention_thresholds: false\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.learn_attention_thresholds is False
+    assert cfg.pipeline.attention_threshold_for("work", repo_name="quadraui") == 45 * 60.0
+
+
+def test_pipeline_learn_attention_thresholds_defaults_true_from_yaml(tmp_path: Path) -> None:
+    """Omitting the key entirely keeps the documented default-on behaviour
+    when loaded through a real coordinator.yml (not just the dataclass
+    default)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.learn_attention_thresholds is True
+
+
+def test_pipeline_learn_attention_thresholds_rejects_non_bool(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  learn_attention_thresholds: not-a-bool\n"
+    )
+    with pytest.raises(ConfigError, match="learn_attention_thresholds"):
+        load(p)
+
+
 def test_attention_threshold_learned_scoped_to_requested_type(monkeypatch) -> None:
     """The learned lookup is keyed by the ACTUAL assignment_type requested,
     not hardcoded to "work" — "per repo and leg type" per #4142.

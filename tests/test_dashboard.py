@@ -2438,6 +2438,38 @@ class TestPollOnceNeedsAttention:
         assert not any(e.type == ASSIGNMENT_NEEDS_ATTENTION for e in es._history)
         assert seen == set()
 
+    def test_threads_repo_name_to_learned_threshold(self, monkeypatch) -> None:
+        """#4142 review: the live SSE toast must consult the same per-repo
+        learned p90 as coord notify's own sweep — not stay pinned to the
+        fixed default because repo_name was left unwired at this call
+        site."""
+        import coord.usage as usage_mod
+        from coord.dashboard.server import ASSIGNMENT_NEEDS_ATTENTION, _poll_once
+        from coord.events import EventSource
+
+        seen_repos: list[tuple[str, str]] = []
+
+        def fake_p90(repo: str, atype: str) -> float | None:
+            seen_repos.append((repo, atype))
+            return 5.0
+
+        monkeypatch.setattr(usage_mod, "p90_attention_threshold", fake_p90)
+
+        config = self._make_config()
+        es = EventSource()
+        board = self._running_board("abc", dispatched_at=0.0)
+
+        with patch("coord.dashboard.server._fetch_agent_status", return_value=None):
+            asyncio.run(_poll_once(
+                config, es, set(), {}, board=board, now=10.0,
+                needs_attention_seen=set(),
+            ))
+
+        assert seen_repos == [("api", "work")]
+        attn_events = [e for e in es._history if e.type == ASSIGNMENT_NEEDS_ATTENTION]
+        assert len(attn_events) == 1
+        assert attn_events[0].data["reason"] == "wall_clock"
+
 
 # ── Bug regression tests (HTML/JS) ──────────────────────────────────────────
 
