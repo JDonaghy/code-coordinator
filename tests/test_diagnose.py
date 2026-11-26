@@ -3439,6 +3439,73 @@ def test_sweep_finalize_failure_falls_back_to_mark_terminal(monkeypatch, sweep_c
     assert marked == ["w1"]
 
 
+def test_sweep_captures_cost_before_finalizing_phantom_row(monkeypatch, sweep_config) -> None:
+    """#4140: before a phantom row is finalized, the sweep must attempt to
+    recover whatever cost/token signal the dead session's log still
+    carries — the row goes terminal immediately after, and nothing ever
+    revisits a terminal row's cost on its own."""
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: "dead")
+    monkeypatch.setattr(diagnose, "_finalize_dead", lambda a, c: "advisory")
+
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        "coord.notify.capture_cost_and_tokens_for_assignment",
+        lambda aid, *, log_path, host, provider_name=None: (
+            captured.append((aid, log_path, host, provider_name)) or True
+        ),
+    )
+
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    from coord.usage import LOGS_DIR  # noqa: PLC0415
+
+    assert len(healed) == 1
+    assert captured == [("w1", str(LOGS_DIR / "w1.log"), "precision.tailnet", None)]
+
+
+def test_sweep_cost_capture_failure_does_not_block_heal(monkeypatch, sweep_config) -> None:
+    """A cost-capture exception must never stop the heal itself — the row
+    still gets finalized."""
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: "dead")
+    monkeypatch.setattr(diagnose, "_finalize_dead", lambda a, c: "advisory")
+    monkeypatch.setattr(
+        "coord.notify.capture_cost_and_tokens_for_assignment",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("log fetch failed")),
+    )
+
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert len(healed) == 1
+    assert "finalized phantom session" in healed[0].action
+
+
+def test_sweep_dry_run_never_captures_cost(monkeypatch, sweep_config) -> None:
+    """A dry run must not mutate anything — including cost capture."""
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: "dead")
+    captured: list[str] = []
+    monkeypatch.setattr(
+        "coord.notify.capture_cost_and_tokens_for_assignment",
+        lambda aid, **kw: captured.append(aid) or True,
+    )
+
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now, dry_run=True)
+
+    assert len(healed) == 1
+    assert captured == []
+
+
 # ── #3668: latest review is for a superseded work leg ───────────────────────
 
 
