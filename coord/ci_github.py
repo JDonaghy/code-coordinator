@@ -19,7 +19,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from coord import github_ops
-from coord.ci_store import CheckRun, CIFailureDetail, JobRun, JobStep, RunSummary, failed_checks
+from coord.ci_store import (
+    CheckRun,
+    CIFailureDetail,
+    JobRun,
+    JobStep,
+    RerunOutcome,
+    RunSummary,
+    failed_checks,
+)
 from coord.forge_availability import record_ci_check_fetch
 
 
@@ -489,6 +497,40 @@ def _conclusion_from_bucket(bucket: str) -> str | None:
     return _BUCKET_CONCLUSIONS.get(b, "unknown")
 
 
+def _fold_rerun_results(
+    results: list[tuple[str, "github_ops.GhRerunResult"]],
+) -> RerunOutcome:
+    """Fold per-run ``gh run rerun`` results into one :class:`RerunOutcome`
+    (#4165). *results* is never empty here — the "discovery found nothing
+    to rerun" case is handled by each caller before this is reached, since
+    that reason text differs per caller (`rerun_for_pr_detail` vs
+    `rerun_failed_for_pr_detail`).
+
+    ``ok`` is ``True`` only when every run id's ``gh run rerun`` exited
+    clean. ``in_progress`` is ``True`` only when EVERY failing run's own
+    refusal was specifically "still going" — a mix of "in progress" and
+    some other refusal is reported under the other, more actionable reason
+    instead, since that one isn't something ``--wait`` can fix by waiting.
+    """
+    per_run = tuple((run_id, r.ok, r.reason) for run_id, r in results)
+    failing = [(run_id, r) for run_id, r in results if not r.ok]
+    if not failing:
+        return RerunOutcome(ok=True, per_run=per_run)
+    all_in_progress = all(r.in_progress for _, r in failing)
+    first_run_id, first = failing[0]
+    if all_in_progress:
+        reason = (
+            f"run {first_run_id} is still in progress"
+            if len(failing) == 1
+            else f"{len(failing)} runs are still in progress"
+        )
+    elif len(failing) == 1:
+        reason = f"gh refused: {first.reason}"
+    else:
+        reason = f"gh refused ({len(failing)}/{len(results)} runs): {first.reason}"
+    return RerunOutcome(ok=False, reason=reason, in_progress=all_in_progress, per_run=per_run)
+
+
 @dataclass
 class GitHubCi:
     """Shell out to ``gh pr checks`` and cache results briefly."""
@@ -624,15 +666,40 @@ class GitHubCi:
         """Re-run every distinct Actions run behind *repo*#*number*'s current
         checks via ``gh run rerun`` (#1851).
 
+        Returns ``True`` only when at least one run id was found *and* every
+        rerun call it issued exited zero. A thin ``.ok``-projecting wrapper
+        over :meth:`rerun_for_pr_detail` (#4165) — kept at this exact bool
+        signature so every pre-#4165 caller (`coord.merge_queue`,
+        `coord.ci_fix`) that treats the result as a plain bool is
+        unaffected; see that method for *why* a ``False`` happened.
+        """
+        return self.rerun_for_pr_detail(repo, number).ok
+
+    def rerun_for_pr_detail(self, repo: str, number: int) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_for_pr` (#4165) — returns
+        *why*, not just whether.
+
         A PR's checks can span more than one workflow run — `test.yml` and
         `cargo-test.yml` in this repo, for instance — so this reruns every
         distinct ``run_id`` among the PR's checks, not just the first. Best
         effort throughout: a check with no readable run id (an empty ``link``,
         or a third-party check with no Actions run behind it at all) is
         skipped rather than failing the whole call, and any individual
-        ``gh run rerun`` failure is logged into the return value rather than
-        raised — a rerun that only partially succeeds still helps, but the
-        caller must not be told it fully worked.
+        ``gh run rerun`` failure is folded into :class:`RerunOutcome` rather
+        than raised — a rerun that only partially succeeds still helps, but
+        the caller must not be told it fully worked.
+
+        #2446: discovers run ids from :meth:`list_all_checks_for_pr` (every
+        reported check), not the merge-gate-narrowed :meth:`list_checks_for_pr`
+        (required contexts only) — a failing ADVISORY check (not yet added to
+        branch protection) would otherwise be silently invisible to rerun
+        discovery even though `gh pr checks` reports it and an explicit
+        ``--run``/``--job`` rerun of it works fine. This is the root cause
+        behind the #4165 incident (JDonaghy/vimcode#2199): `--failed`
+        reported a bare, unexplained failure on a completed run with exactly
+        one non-required failing job, because `list_checks_for_pr` had
+        already filtered that job's check out of the set this method
+        searched.
 
         #3266: ``gh run rerun`` replays the SAME run against the SAME event
         payload it originally fired against — including the SAME base SHA.
@@ -646,71 +713,79 @@ class GitHubCi:
         no-op. See ``coord.merge_queue.MAX_CI_STALE_RERUNS``'s comment for
         the caller-side fix (park and ask for a rebase instead).
 
-        Returns ``True`` only when at least one run id was found *and* every
-        rerun call it issued exited zero. Returns ``False`` when there was
-        nothing rerunnable (no checks, or none with a readable run id) or any
-        rerun call failed. Invalidates this PR's checks cache entry AND
-        (#1892) any cached :meth:`list_jobs_for_run` entry for the run ids
-        being rerun on any success, so neither the next
-        :meth:`list_checks_for_pr` nor the next :meth:`list_jobs_for_run`
-        can hand back a briefly-cached pre-rerun snapshot — `gh run rerun`
-        reruns the SAME Actions run id, so a stale `_jobs_cache` hit within
-        `cache_ttl` could otherwise launder a real failure into
-        "infrastructure" by pairing a fresh check re-read with stale
-        job/step detail from before the rerun.
+        Invalidates this PR's checks cache entry AND (#1892) any cached
+        :meth:`list_jobs_for_run` entry for the run ids being rerun on any
+        success, so neither the next :meth:`list_checks_for_pr` nor the next
+        :meth:`list_jobs_for_run` can hand back a briefly-cached pre-rerun
+        snapshot — `gh run rerun` reruns the SAME Actions run id, so a stale
+        `_jobs_cache` hit within `cache_ttl` could otherwise launder a real
+        failure into "infrastructure" by pairing a fresh check re-read with
+        stale job/step detail from before the rerun.
         """
-        checks = self.list_checks_for_pr(repo, number)
+        checks = self.list_all_checks_for_pr(repo, number)
         run_ids = sorted({c.run_id for c in checks if c.run_id})
         if not run_ids:
-            return False
-        all_ok = True
-        any_ok = False
-        for run_id in run_ids:
-            # #1483: route through the single `gh` sink instead of shelling
-            # out here directly.
-            if github_ops.rerun_workflow_run(repo, run_id):
-                any_ok = True
-            else:
-                all_ok = False
-        if any_ok:
+            names = ", ".join(c.name for c in checks) or "none reported"
+            return RerunOutcome(
+                ok=False,
+                reason=f"no checks with a readable run id found (checks: {names})",
+            )
+        # #1483: route through the single `gh` sink instead of shelling
+        # out here directly.
+        results = [(run_id, github_ops.rerun_workflow_run_detail(repo, run_id))
+                   for run_id in run_ids]
+        if any(r.ok for _, r in results):
             self.invalidate(repo, number)
             for run_id in run_ids:
                 self._jobs_cache.pop((repo, str(run_id)), None)
-        return all_ok and any_ok
+        return _fold_rerun_results(results)
 
     def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
         """Re-run only the FAILING job(s) behind *repo*#*number*'s current
         checks via ``gh run rerun <id> --failed`` (#2252).
 
-        Same shape as :meth:`rerun_for_pr` above, narrowed to the run ids
-        behind :func:`coord.ci_store.failed_checks` rather than every run id
-        among the PR's checks — a passing check's run is left untouched, so
-        the caller's #2252 flake re-check can't accidentally spend CI
+        Same best-effort / return-value / cache-invalidation contract as
+        `rerun_for_pr`: ``True`` only when at least one run id was found
+        among the currently-failing checks *and* every ``gh run rerun
+        --failed`` call issued exited zero. A thin ``.ok``-projecting
+        wrapper over :meth:`rerun_failed_for_pr_detail` (#4165).
+        """
+        return self.rerun_failed_for_pr_detail(repo, number).ok
+
+    def rerun_failed_for_pr_detail(self, repo: str, number: int) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_failed_for_pr` (#4165).
+
+        Same shape as :meth:`rerun_for_pr_detail` above, narrowed to the run
+        ids behind :func:`coord.ci_store.failed_checks` rather than every run
+        id among the PR's checks — a passing check's run is left untouched,
+        so the caller's #2252 flake re-check can't accidentally spend CI
         minutes re-proving a check that already reported green, and the
         green evidence itself (timestamps, logs) survives intact for the
         board to keep showing.
 
-        Same best-effort / return-value / cache-invalidation contract as
-        `rerun_for_pr`: ``True`` only when at least one run id was found
-        among the currently-failing checks *and* every ``gh run rerun
-        --failed`` call issued exited zero.
+        Discovers from :meth:`list_all_checks_for_pr` rather than
+        :meth:`list_checks_for_pr` for the same #4165/#2446 reason
+        documented on :meth:`rerun_for_pr_detail` — an advisory failing
+        check must be rerunnable via ``--failed`` same as a required one.
         """
-        checks = self.list_checks_for_pr(repo, number)
-        run_ids = sorted({c.run_id for c in failed_checks(checks) if c.run_id})
+        checks = self.list_all_checks_for_pr(repo, number)
+        failed = failed_checks(checks)
+        run_ids = sorted({c.run_id for c in failed if c.run_id})
         if not run_ids:
-            return False
-        all_ok = True
-        any_ok = False
-        for run_id in run_ids:
-            if github_ops.rerun_workflow_run_failed(repo, run_id):
-                any_ok = True
-            else:
-                all_ok = False
-        if any_ok:
+            if not failed:
+                return RerunOutcome(ok=False, reason="no failing checks found")
+            names = ", ".join(c.name for c in failed)
+            return RerunOutcome(
+                ok=False,
+                reason=f"no failing checks with a readable run id found (failing: {names})",
+            )
+        results = [(run_id, github_ops.rerun_workflow_run_failed_detail(repo, run_id))
+                   for run_id in run_ids]
+        if any(r.ok for _, r in results):
             self.invalidate(repo, number)
             for run_id in run_ids:
                 self._jobs_cache.pop((repo, str(run_id)), None)
-        return all_ok and any_ok
+        return _fold_rerun_results(results)
 
     def rerun_job(self, repo: str, run_id: str, job_id: str) -> bool:
         """Re-run a single job *job_id* within Actions run *run_id* on
@@ -725,19 +800,25 @@ class GitHubCi:
 
         Thin wrapper over :func:`github_ops.rerun_workflow_run_job` — same
         best-effort contract: ``True`` only on a clean (exit 0) rerun,
-        ``False`` on any failure rather than raising.
+        ``False`` on any failure rather than raising. A thin ``.ok``-
+        projecting wrapper over :meth:`rerun_job_detail` (#4165).
+        """
+        return self.rerun_job_detail(repo, run_id, job_id).ok
+
+    def rerun_job_detail(self, repo: str, run_id: str, job_id: str) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_job` (#4165).
 
         Invalidates this run's cached :meth:`list_jobs_for_run` entry on
-        success, same reasoning as `rerun_for_pr`'s own cache invalidation
-        — a stale pre-rerun job/step snapshot read within ``cache_ttl``
-        right after a successful rerun would misreport the job as still in
-        its old state. Does not touch the PR checks cache: this method is
-        never told which PR (if any) the run belongs to.
+        success, same reasoning as `rerun_for_pr_detail`'s own cache
+        invalidation — a stale pre-rerun job/step snapshot read within
+        ``cache_ttl`` right after a successful rerun would misreport the job
+        as still in its old state. Does not touch the PR checks cache: this
+        method is never told which PR (if any) the run belongs to.
         """
-        ok = github_ops.rerun_workflow_run_job(repo, run_id, job_id)
-        if ok:
+        result = github_ops.rerun_workflow_run_job_detail(repo, run_id, job_id)
+        if result.ok:
             self._jobs_cache.pop((repo, str(run_id)), None)
-        return ok
+        return _fold_rerun_results([(run_id, result)])
 
     def rerun_run(self, repo: str, run_id: str) -> bool:
         """Re-run the whole of Actions run *run_id* on *repo* via
@@ -752,17 +833,31 @@ class GitHubCi:
 
         Thin wrapper over :func:`github_ops.rerun_workflow_run` — same
         best-effort contract: ``True`` only on a clean (exit 0) rerun,
-        ``False`` on any failure rather than raising.
+        ``False`` on any failure rather than raising. A thin ``.ok``-
+        projecting wrapper over :meth:`rerun_run_detail` (#4165).
+        """
+        return self.rerun_run_detail(repo, run_id).ok
+
+    def rerun_run_detail(self, repo: str, run_id: str) -> RerunOutcome:
+        """Structured counterpart to :meth:`rerun_run` (#4165).
 
         Invalidates this run's cached :meth:`list_jobs_for_run` entry on
-        success, same reasoning as :meth:`rerun_job`'s own cache
+        success, same reasoning as :meth:`rerun_job_detail`'s own cache
         invalidation. Does not touch any PR's checks cache: this method is
         never told which PR (if any) the run belongs to.
         """
-        ok = github_ops.rerun_workflow_run(repo, run_id)
-        if ok:
+        result = github_ops.rerun_workflow_run_detail(repo, run_id)
+        if result.ok:
             self._jobs_cache.pop((repo, str(run_id)), None)
-        return ok
+        return _fold_rerun_results([(run_id, result)])
+
+    def get_run_status(self, repo: str, run_id: str) -> str:
+        """Lifecycle status of Actions run *run_id* on *repo* (#4165) — what
+        ``coord ci rerun --wait`` polls. Thin wrapper over
+        :func:`github_ops.get_run_status`; see that function's docstring
+        for the best-effort/fail-to-``""`` contract.
+        """
+        return github_ops.get_run_status(repo, run_id)
 
     def list_jobs_for_run(self, repo: str, run_id: str) -> list["JobRun"]:
         """Job/step detail for Actions run *run_id* on *repo* via ``gh api``

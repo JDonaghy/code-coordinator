@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
+from typing import Callable
 
 import click
 
+from coord.ci_store import RerunOutcome
 from coord.commands._common import _CONFIG_OPTION, _load_config, _resolve_repo_slug
 from coord.config import Config
 
@@ -213,6 +216,78 @@ def ci_checks_cmd(repo: str, pr: int, as_json: bool, config_path: Path) -> None:
         click.echo(f"{c.name}\t{c.status}\t{c.conclusion or '-'}{marker}\t{c.url}")
 
 
+# #4165: how far apart two `gh run view --json status` polls are spaced,
+# and how many `--wait` is willing to try before giving up — ~30 minutes at
+# the default interval. Both module-level so a test can monkeypatch either
+# down to make a `--wait` test run instantly rather than actually sleeping.
+_WAIT_POLL_INTERVAL_S = 15.0
+_WAIT_MAX_POLLS = 120
+
+
+def _detail_or_bool_attempt(
+    ci_store, detail_name: str, bool_name: str, *args,
+) -> Callable[[], RerunOutcome] | None:
+    """Build a 0-arg callable returning a :class:`RerunOutcome` for one
+    `coord ci rerun` attempt (#4165).
+
+    Prefers *detail_name* (the reason-carrying method) and falls back to
+    *bool_name* (the pre-#4165 contract) wrapped into a reason-less
+    outcome, for a `CiStore` backend that predates the `_detail`
+    capability — a GitLab backend, or a test stub. Returns ``None`` when
+    the backend offers neither, so the caller can print the existing
+    "does not support ..." refusal instead of raising deep inside a
+    backend-specific call.
+    """
+    detail_fn = getattr(ci_store, detail_name, None)
+    if detail_fn is not None:
+        return lambda: detail_fn(*args)
+    bool_fn = getattr(ci_store, bool_name, None)
+    if bool_fn is None:
+        return None
+
+    def _attempt() -> RerunOutcome:
+        ok = bool_fn(*args)
+        return RerunOutcome(
+            ok=ok,
+            reason=None if ok else "rerun failed (this backend reports no further detail)",
+        )
+
+    return _attempt
+
+
+def _run_with_wait(
+    ci_store, slug: str, attempt: Callable[[], RerunOutcome], wait: bool,
+) -> RerunOutcome:
+    """Run *attempt* once; if it was refused because the run hasn't
+    finished and *wait* was requested, poll ``ci_store.get_run_status``
+    until every pending run id reports ``completed``, then retry *attempt*
+    exactly once more (#4165) — ``gh run rerun`` refuses an in-progress run
+    outright, so there is nothing more productive to do in between than
+    wait for it, which is exactly what a human had to do by hand (``gh run
+    view --json status``) in the JDonaghy/vimcode#2199 incident this closes.
+
+    Gives up and returns the ORIGINAL (still-in-progress) outcome once
+    :data:`_WAIT_MAX_POLLS` is exhausted, or when the backend offers no
+    ``get_run_status`` to poll at all (``NoOpCi``, a GitLab backend, most
+    test stubs) — the caller still gets the honest "still in progress"
+    reason, just without a retry.
+    """
+    outcome = attempt()
+    if outcome.ok or not wait or not outcome.in_progress:
+        return outcome
+    get_status = getattr(ci_store, "get_run_status", None)
+    if get_status is None:
+        return outcome
+    pending = [run_id for run_id, ok, _ in outcome.per_run if not ok]
+    if not pending:
+        return outcome
+    for _ in range(_WAIT_MAX_POLLS):
+        time.sleep(_WAIT_POLL_INTERVAL_S)
+        if all(get_status(slug, run_id) == "completed" for run_id in pending):
+            return attempt()
+    return outcome
+
+
 @ci_group.command(
     "rerun",
     help=(
@@ -226,7 +301,9 @@ def ci_checks_cmd(repo: str, pr: int, as_json: bool, config_path: Path) -> None:
         "job within that run. --stuck (requires --run and --job) marks "
         "this as a manual auto-heal escalation for a checks/jobs desync — "
         "the exact command the merge-queue sweep recommends once its own "
-        "bounded auto-rerun budget is exhausted.\n\n"
+        "bounded auto-rerun budget is exhausted. --wait polls until an "
+        "in-progress run completes and then retries, instead of failing "
+        "immediately on gh's refusal to rerun a run that hasn't finished.\n\n"
         "This is the sanctioned seam for triggering a CI rerun — call this "
         "instead of a raw `gh run rerun` invocation."
     ),
@@ -249,6 +326,13 @@ def ci_checks_cmd(repo: str, pr: int, as_json: bool, config_path: Path) -> None:
         "(#4070/#4071) — requires --run and --job."
     ),
 )
+@click.option(
+    "--wait", "wait_for_run", is_flag=True,
+    help=(
+        "If gh refuses because the run hasn't finished yet, poll until it "
+        "completes and retry once, instead of failing immediately (#4165)."
+    ),
+)
 @_CONFIG_OPTION
 def ci_rerun_cmd(
     repo: str,
@@ -257,6 +341,7 @@ def ci_rerun_cmd(
     run_id: str | None,
     job_id: str | None,
     stuck: bool,
+    wait_for_run: bool,
     config_path: Path,
 ) -> None:
     if failed and run_id is not None:
@@ -271,6 +356,7 @@ def ci_rerun_cmd(
 
     cfg = _load_config(config_path)
     slug = _resolve_repo_slug(cfg, repo)
+    ci_store = _build_ci_store(cfg)
 
     try:
         if run_id is not None and job_id is not None:
@@ -280,37 +366,40 @@ def ci_rerun_cmd(
             # that doesn't support it (no GitHub Actions run/job model
             # behind it) declines rather than erroring deep inside a
             # backend-specific call.
-            ci_store = _build_ci_store(cfg)
-            rerun_job = getattr(ci_store, "rerun_job", None)
-            if rerun_job is None:
+            attempt = _detail_or_bool_attempt(
+                ci_store, "rerun_job_detail", "rerun_job", slug, run_id, job_id,
+            )
+            if attempt is None:
                 click.echo(
                     f"error: {type(ci_store).__name__} does not support "
                     "single-job reruns",
                     err=True,
                 )
                 sys.exit(1)
-            ok = rerun_job(slug, run_id, job_id)
         elif run_id is not None:
             # Explicit-run-id rerun, bypassing PR-check discovery — duck-typed
             # exactly like the --job branch above, so a non-GitHub backend
             # (or the `type: none` opt-out) declines rather than this command
             # silently talking to GitHub regardless of `ci_store.type`.
-            ci_store = _build_ci_store(cfg)
-            rerun_run = getattr(ci_store, "rerun_run", None)
-            if rerun_run is None:
+            attempt = _detail_or_bool_attempt(
+                ci_store, "rerun_run_detail", "rerun_run", slug, run_id,
+            )
+            if attempt is None:
                 click.echo(
                     f"error: {type(ci_store).__name__} does not support "
                     "explicit run-id reruns",
                     err=True,
                 )
                 sys.exit(1)
-            ok = rerun_run(slug, run_id)
         elif failed:
-            ci_store = _build_ci_store(cfg)
-            ok = ci_store.rerun_failed_for_pr(slug, pr)
+            attempt = _detail_or_bool_attempt(
+                ci_store, "rerun_failed_for_pr_detail", "rerun_failed_for_pr", slug, pr,
+            )
         else:
-            ci_store = _build_ci_store(cfg)
-            ok = ci_store.rerun_for_pr(slug, pr)
+            attempt = _detail_or_bool_attempt(
+                ci_store, "rerun_for_pr_detail", "rerun_for_pr", slug, pr,
+            )
+        outcome = _run_with_wait(ci_store, slug, attempt, wait_for_run)
     except Exception as e:  # noqa: BLE001
         click.echo(f"error: ci rerun failed: {e}", err=True)
         sys.exit(1)
@@ -319,7 +408,10 @@ def ci_rerun_cmd(
     if run_id is not None:
         target = f"{slug} run {run_id}" + (f" job {job_id}" if job_id is not None else "")
     label = "stuck-check rerun" if stuck else "rerun"
-    if not ok:
-        click.echo(f"{label} failed for {target}", err=True)
+    if not outcome.ok:
+        reason = outcome.reason or "unknown reason"
+        if outcome.in_progress and not wait_for_run:
+            reason += " (pass --wait to retry once it finishes)"
+        click.echo(f"{label} failed for {target}: {reason}", err=True)
         sys.exit(1)
     click.echo(f"{label} triggered for {target}")

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, NamedTuple
 
@@ -3009,132 +3010,233 @@ def get_job_log(repo: str, job_id: str) -> str:
     )
 
 
-def rerun_workflow_run(repo: str, run_id: str) -> bool:
-    """Re-run Actions workflow run *run_id* on *repo* via ``gh run rerun``.
+# ── #4165: structured rerun outcomes ────────────────────────────────────────
+#
+# The three best-effort mutators below used to fold EVERY `gh run rerun`
+# failure shape into a bare `False` — `gh` refusing because the run is
+# still going, a stale/invalid id, and a real infra outage were all
+# indistinguishable to every caller, even though `stderr` (already captured
+# for `record_gh_call`'s `detail=` below) knew the difference the whole
+# time. The incident this closes (2026-11-26, JDonaghy/vimcode#2199): two
+# `coord ci rerun --failed` attempts mid-run printed nothing but "rerun
+# failed for ...", and a human had to run `gh run view --json status` by
+# hand to learn the run simply hadn't finished yet.
+#
+# `GhRerunResult` is the structured outcome each of the three now produces
+# internally. The public functions themselves stay plain-bool-returning
+# (`.ok`, via `__bool__` *and* explicitly below) so no existing caller's
+# contract changes; :mod:`coord.ci_github`'s own `*_detail` methods are
+# what thread the reason on upward to `coord ci rerun`.
+_RUN_IN_PROGRESS_MARKERS: tuple[str, ...] = (
+    "is still in progress",
+    "still in progress",
+    "is already running",
+    "already running",
+    "has not completed",
+    "hasn't completed",
+    "not yet completed",
+)
 
-    The single ``gh`` sink (#1483) for :meth:`coord.ci_github.GitHubCi.
-    rerun_for_pr` (#1851) — the same seam :func:`get_pr_checks` is for
-    reading checks. Returns ``True`` only on a clean (exit 0) rerun; any
-    subprocess failure (missing ``gh``, timeout, non-zero exit — e.g. the run
-    is already in progress, or the id is stale/invalid) returns ``False``
-    rather than raising, matching this module's other best-effort mutators
-    (:func:`merge_pr`, :func:`edit_pr_body`).
 
-    Shells out directly rather than through :func:`_gh` because it needs
-    "any failure -> False" rather than a raise — but still records the same
-    #1896 forge-availability observation :func:`_gh` would have.
+def _is_run_in_progress_stderr(stderr: str) -> bool:
+    """Best-effort: ``True`` when *stderr* reads as "``gh`` refused because
+    the run/job hasn't finished yet" rather than a stale id, a permissions
+    problem, or a genuine infra failure (#4165).
+
+    Substring matching against ``gh``'s own plain-text wording — like
+    :func:`_is_transient_error` above, this is not a committed API
+    contract, just the closest signal a CLI error message offers.
     """
-    args = ["run", "rerun", str(run_id), "--repo", repo]
+    low = stderr.lower()
+    return any(marker in low for marker in _RUN_IN_PROGRESS_MARKERS)
+
+
+@dataclass(frozen=True)
+class GhRerunResult:
+    """Structured outcome of one ``gh run rerun ...`` invocation (#4165).
+
+    Bool-compatible (``__bool__`` mirrors ``ok``) so :func:`rerun_workflow_run`/
+    :func:`rerun_workflow_run_failed`/:func:`rerun_workflow_run_job` can stay
+    thin, plain-``bool``-returning wrappers over the ``*_detail`` sibling
+    that actually produces this — every existing caller of the three (an
+    ``if`` check, a ``bool()`` call, a ternary) keeps working unmodified.
+
+    ``reason`` is ``None`` on success, else ``gh``'s own first stderr line
+    (or a short description for the handful of failures — missing/timed-out
+    ``gh`` — that never reach a subprocess exit code at all) — never the
+    bare ``False`` a caller used to have to re-derive a cause for by hand.
+    ``in_progress`` is ``True`` specifically when :func:`_is_run_in_progress_stderr`
+    recognized the refusal as "this run/job hasn't finished yet" — the case
+    ``coord ci rerun --wait`` polls and retries.
+    """
+
+    ok: bool
+    reason: str | None = None
+    in_progress: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _rerun_gh(args: list[str], caller: str) -> GhRerunResult:
+    """Shared body behind the three ``gh run rerun ...`` shapes below.
+
+    Shells out directly rather than through :func:`_gh` for the same reason
+    each of the three documented before this was factored out: "any failure
+    -> a result, never a raise" rather than :func:`_gh`'s raise-on-nonzero
+    contract. Still records the same #1896 forge-availability observation
+    :func:`_gh` would have — and, new in #4165, actually classifies *why* a
+    non-zero exit happened instead of discarding ``stderr`` once
+    :func:`record_gh_call` has read it.
+    """
     _t0 = time.monotonic()
     try:
         result = subprocess.run(
             ["gh", *args],
             capture_output=True, text=True, timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail="timed out",
+                        caller=caller)
+        return GhRerunResult(ok=False, reason=f"gh timed out: {exc}")
+    except OSError as exc:
         record_gh_call(tuple(args), outcome="unreachable",
                         duration_s=time.monotonic() - _t0, detail=str(exc),
-                        caller="github_ops.rerun_workflow_run")
-        return False
+                        caller=caller)
+        return GhRerunResult(ok=False, reason=str(exc))
     duration = time.monotonic() - _t0
     if result.returncode != 0:
         stderr = result.stderr.strip()
         record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr,
-                        caller="github_ops.rerun_workflow_run")
-        return False
-    record_gh_call(tuple(args), outcome="ok", duration_s=duration,
-                    caller="github_ops.rerun_workflow_run")
-    return True
+                        duration_s=duration, detail=stderr, caller=caller)
+        first_line = stderr.splitlines()[0] if stderr else "gh exited non-zero with no output"
+        return GhRerunResult(
+            ok=False, reason=first_line, in_progress=_is_run_in_progress_stderr(stderr),
+        )
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration, caller=caller)
+    return GhRerunResult(ok=True)
+
+
+def rerun_workflow_run_detail(repo: str, run_id: str) -> GhRerunResult:
+    """Re-run Actions workflow run *run_id* on *repo* via ``gh run rerun``,
+    returning the full :class:`GhRerunResult` (#4165) — the single ``gh``
+    sink (#1483) for :meth:`coord.ci_github.GitHubCi.rerun_for_pr_detail`
+    (#1851) — the same seam :func:`get_pr_checks` is for reading checks.
+
+    :func:`rerun_workflow_run` is a thin ``.ok``-projecting wrapper over
+    this; see :class:`GhRerunResult` for what the non-bool callers get that
+    the old bare-bool contract discarded.
+    """
+    return _rerun_gh(
+        ["run", "rerun", str(run_id), "--repo", repo],
+        caller="github_ops.rerun_workflow_run",
+    )
+
+
+def rerun_workflow_run(repo: str, run_id: str) -> bool:
+    """Re-run Actions workflow run *run_id* on *repo* via ``gh run rerun``.
+
+    Returns ``True`` only on a clean (exit 0) rerun; any subprocess failure
+    (missing ``gh``, timeout, non-zero exit — e.g. the run is already in
+    progress, or the id is stale/invalid) returns ``False`` rather than
+    raising, matching this module's other best-effort mutators
+    (:func:`merge_pr`, :func:`edit_pr_body`). A thin wrapper over
+    :func:`rerun_workflow_run_detail` — see that function (and
+    :class:`GhRerunResult`) for *why* a ``False`` happened.
+    """
+    return rerun_workflow_run_detail(repo, run_id).ok
+
+
+def rerun_workflow_run_failed_detail(repo: str, run_id: str) -> GhRerunResult:
+    """Re-run only the FAILING job(s) of Actions workflow run *run_id* on
+    *repo* via ``gh run rerun <id> --failed`` (#2252), returning the full
+    :class:`GhRerunResult` (#4165) — the single ``gh`` sink for
+    :meth:`coord.ci_github.GitHubCi.rerun_failed_for_pr_detail`, the
+    narrower sibling of :func:`rerun_workflow_run_detail` (#1851/#1892),
+    which restarts the WHOLE run including jobs that already reported
+    green. ``--failed`` is exactly #2252's own scoping ask: cheaper, and it
+    keeps the first pass's green evidence intact instead of discarding it
+    for no reason.
+
+    :func:`rerun_workflow_run_failed` is a thin ``.ok``-projecting wrapper
+    over this.
+    """
+    return _rerun_gh(
+        ["run", "rerun", str(run_id), "--repo", repo, "--failed"],
+        caller="github_ops.rerun_workflow_run_failed",
+    )
 
 
 def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
     """Re-run only the FAILING job(s) of Actions workflow run *run_id* on
     *repo* via ``gh run rerun <id> --failed`` (#2252).
 
-    The single ``gh`` sink for :meth:`coord.ci_github.GitHubCi.
-    rerun_failed_for_pr` — the narrower sibling of
-    :func:`rerun_workflow_run` (#1851/#1892), which restarts the WHOLE run
-    including jobs that already reported green. ``--failed`` is exactly
-    #2252's own scoping ask: cheaper, and it keeps the first pass's green
-    evidence intact instead of discarding it for no reason.
-
     Returns ``True`` only on a clean (exit 0) rerun; any subprocess failure
-    (missing ``gh``, timeout, non-zero exit — e.g. the run is already in
-    progress, or the id is stale/invalid) returns ``False`` rather than
-    raising, matching :func:`rerun_workflow_run`'s own best-effort contract.
-
-    Shells out directly rather than through :func:`_gh` for the same reason
-    as :func:`rerun_workflow_run` — see that docstring — but still records
-    the same #1896 forge-availability observation.
+    returns ``False`` rather than raising, matching
+    :func:`rerun_workflow_run`'s own best-effort contract. A thin wrapper
+    over :func:`rerun_workflow_run_failed_detail`.
     """
-    args = ["run", "rerun", str(run_id), "--repo", repo, "--failed"]
-    _t0 = time.monotonic()
-    try:
-        result = subprocess.run(
-            ["gh", *args],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc),
-                        caller="github_ops.rerun_workflow_run_failed")
-        return False
-    duration = time.monotonic() - _t0
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr,
-                        caller="github_ops.rerun_workflow_run_failed")
-        return False
-    record_gh_call(tuple(args), outcome="ok", duration_s=duration,
-                    caller="github_ops.rerun_workflow_run_failed")
-    return True
+    return rerun_workflow_run_failed_detail(repo, run_id).ok
+
+
+def rerun_workflow_run_job_detail(repo: str, run_id: str, job_id: str) -> GhRerunResult:
+    """Re-run a single job *job_id* within Actions run *run_id* on *repo*
+    via ``gh run rerun <run_id> --job <job_id>``, returning the full
+    :class:`GhRerunResult` (#4165).
+
+    The narrowest of this module's three rerun primitives:
+    :func:`rerun_workflow_run_detail` restarts the whole run,
+    :func:`rerun_workflow_run_failed_detail` restarts every
+    currently-failing job in it, and this restarts exactly the one job the
+    caller already knows about — the sanctioned seam
+    ``coord ci rerun --run ID --job ID`` (and anything else that would
+    otherwise shell out to ``gh`` directly for this) calls.
+
+    :func:`rerun_workflow_run_job` is a thin ``.ok``-projecting wrapper
+    over this.
+    """
+    return _rerun_gh(
+        ["run", "rerun", str(run_id), "--repo", repo, "--job", str(job_id)],
+        caller="github_ops.rerun_workflow_run_job",
+    )
 
 
 def rerun_workflow_run_job(repo: str, run_id: str, job_id: str) -> bool:
     """Re-run a single job *job_id* within Actions run *run_id* on *repo*
     via ``gh run rerun <run_id> --job <job_id>``.
 
-    The narrowest of this module's three rerun primitives:
-    :func:`rerun_workflow_run` restarts the whole run, :func:`
-    rerun_workflow_run_failed` restarts every currently-failing job in it,
-    and this restarts exactly the one job the caller already knows about —
-    the sanctioned seam `coord ci rerun --run ID --job ID` (and anything
-    else that would otherwise shell out to ``gh`` directly for this) calls.
-
     Returns ``True`` only on a clean (exit 0) rerun; any subprocess failure
-    (missing ``gh``, timeout, non-zero exit — e.g. the job id doesn't belong
-    to that run, or the run is already in progress) returns ``False``
-    rather than raising, matching :func:`rerun_workflow_run`'s own
-    best-effort contract.
-
-    Shells out directly rather than through :func:`_gh` for the same reason
-    as :func:`rerun_workflow_run` — see that docstring — but still records
-    the same forge-availability observation.
+    returns ``False`` rather than raising, matching
+    :func:`rerun_workflow_run`'s own best-effort contract. A thin wrapper
+    over :func:`rerun_workflow_run_job_detail`.
     """
-    args = ["run", "rerun", str(run_id), "--repo", repo, "--job", str(job_id)]
-    _t0 = time.monotonic()
+    return rerun_workflow_run_job_detail(repo, run_id, job_id).ok
+
+
+def get_run_status(repo: str, run_id: str) -> str:
+    """Lifecycle status (``queued``/``in_progress``/``completed``/...) of
+    Actions run *run_id* on *repo* via ``gh run view --json status`` (#4165)
+    — the exact read ``coord ci rerun --wait`` polls so a rerun attempt that
+    failed because the run was still going can be retried the moment it
+    finishes, instead of a human re-running ``gh run view ... --json
+    status`` by hand (the JDonaghy/vimcode#2199 incident this closes).
+
+    Best-effort like :func:`get_run_jobs`'s sibling reads: any failure
+    (missing ``gh``, timeout, malformed JSON, a retention-expired run id)
+    returns ``""`` — the caller's poll loop treats an unknown status as
+    "not yet confirmed done", never as "done".
+    """
     try:
-        result = subprocess.run(
-            ["gh", *args],
-            capture_output=True, text=True, timeout=30,
+        data = _gh_json(
+            "run", "view", str(run_id), "--repo", repo, "--json", "status",
+            default=None, caller="github_ops.get_run_status",
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        record_gh_call(tuple(args), outcome="unreachable",
-                        duration_s=time.monotonic() - _t0, detail=str(exc),
-                        caller="github_ops.rerun_workflow_run_job")
-        return False
-    duration = time.monotonic() - _t0
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
-                        duration_s=duration, detail=stderr,
-                        caller="github_ops.rerun_workflow_run_job")
-        return False
-    record_gh_call(tuple(args), outcome="ok", duration_s=duration,
-                    caller="github_ops.rerun_workflow_run_job")
-    return True
+    except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("status") or "")
 
 
 def diff_file_paths(diff_text: str) -> list[str]:
