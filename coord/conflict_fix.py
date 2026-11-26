@@ -2210,6 +2210,39 @@ def pick_conflict_fix_machine(
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
 
+def _record_rework_guard_decline(
+    entry: QueuedMerge, kind: str, reason: str,
+) -> None:
+    """#4136: the durable, greppable trace a
+    :func:`coord.drive_queue.may_dispatch_rework` refusal leaves — this
+    module's own counterpart to :func:`_record_conflict_fix_machine_failure`
+    (#3353), which only ever fires once machine selection has already run.
+    This guard sits ahead of that, so without a row of its own here the
+    refusal would leave no trace anywhere, and every caller of
+    :func:`dispatch_conflict_fix` that reports a decline (e.g.
+    ``board_doctor_permissions.sweep_dispatch_fixit_leg``,
+    ``coord/commands/merge.py``) would keep blaming "no capable machine or
+    one already active" for a cause that is neither.
+
+    ``record_audit`` is itself best-effort (swallows all write failures),
+    so a DB hiccup here never takes down the dispatch decline it's
+    recording.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="merge",
+        event_type="rework_guard_declined",
+        actor="daemon",
+        summary=f"{kind} not dispatched for {entry.repo_name}#{entry.issue_number}: {reason}",
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={"reason": reason, "kind": kind},
+    )
+
+
 def _record_conflict_fix_machine_failure(
     entry: QueuedMerge, pick: ConflictFixMachinePick,
 ) -> None:
@@ -2526,6 +2559,7 @@ def dispatch_conflict_fix(
         entry.repo_name, entry.issue_number, "conflict_fix", board=board,
     )
     if not rework_allowed:
+        _record_rework_guard_decline(entry, "conflict_fix", rework_reason)
         return None
 
     if semantic:

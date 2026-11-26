@@ -1133,6 +1133,10 @@ def dispatch_ci_fix(
         entry.repo_name, entry.issue_number, "ci_fix", board=board,
     )
     if not rework_allowed:
+        _log.warning(
+            "ci_fix: NOT dispatching for %s#%d — %s",
+            entry.repo_name, entry.issue_number, rework_reason,
+        )
         return None
 
     work = dispatch_precheck(entry, board)
