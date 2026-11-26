@@ -123,7 +123,9 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool, skip_rev
     # the mechanism built for it instead of formatting a diagnosis nobody acts
     # on.
     if conflicted:
-        _dispatch_revalidation_conflicts(conflicted, config, dry_run=dry_run)
+        _dispatch_revalidation_conflicts(
+            conflicted, config, gh_ops, dry_run=dry_run,
+        )
 
     if not recorded_any:
         return board
@@ -236,7 +238,9 @@ def _reload_board_after_wait(board, *, dry_run: bool):
     return refreshed if refreshed is not None else _Board(active=[], completed=[])
 
 
-def _dispatch_revalidation_conflicts(conflicted, config, *, dry_run: bool) -> None:
+def _dispatch_revalidation_conflicts(
+    conflicted, config, gh_ops: "GhOps | None" = None, *, dry_run: bool,
+) -> None:
     """#2231: turn ``--revalidate``'s conflict verdict into a #241 dispatch.
 
     *conflicted* is :attr:`coord.revalidate.BatchRevalidationResult.conflicted`
@@ -273,6 +277,12 @@ def _dispatch_revalidation_conflicts(conflicted, config, *, dry_run: bool) -> No
 
     Under ``--dry-run`` nothing is mutated and nothing is dispatched (the
     revalidation itself never ran either — see :func:`_apply_revalidation`).
+
+    *gh_ops*, forwarded straight to :func:`_dispatch_conflict_fixes`, is used
+    there ONLY by #4152's mechanical-surface gate (to re-anchor a
+    mechanically-resolved entry's freshness fields) — these synthetic events
+    carry no ``issue_resolution``, so #3836's inert-base-move takeover stays
+    off for them exactly as before.
     """
     if dry_run or not conflicted:
         return
@@ -292,7 +302,7 @@ def _dispatch_revalidation_conflicts(conflicted, config, *, dry_run: bool) -> No
             "(#241) instead of re-testing (#2231)."
         )
         events.append(MergeEvent(entry, "conflict", entry.error))
-    _dispatch_conflict_fixes(events, config, dry_run=False)
+    _dispatch_conflict_fixes(events, config, dry_run=False, gh_ops=gh_ops)
 
 
 def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) -> list:
@@ -362,15 +372,18 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
             f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — "
             f"{ev.message}"
         )
-    # #3836: `gh_ops` is deliberately omitted (not threaded through) here —
-    # a swept sibling's conflict was discovered on a LATER tick than the
+    # #3836: `gh_ops` is passed through only for #4152's mechanical-surface
+    # gate (to re-anchor a mechanically-resolved sibling's freshness fields)
+    # — a swept sibling's conflict was discovered on a LATER tick than the
     # merge that broke it, so this tick's gate chain (CI, approval
     # staleness, smoke/UAT verdict, group/batch ordering, the #1318/#3502
-    # closing-keyword refusal) never ran against it. The inert-base-move
-    # takeover requires an in-pass conflict event (see
-    # `_dispatch_conflict_fixes`'s docstring); a standing/swept one falls
-    # through to the unchanged conflict-fix dispatch below instead.
-    _dispatch_conflict_fixes(sweep_events, config, dry_run=False)
+    # closing-keyword refusal) never ran against it. The #3836 inert-base-
+    # move takeover itself still requires an in-pass conflict event (see
+    # `_dispatch_conflict_fixes`'s docstring) — these swept events carry no
+    # ``issue_resolution``, so that takeover stays off regardless of
+    # *gh_ops* being supplied; a standing/swept conflict still falls through
+    # to the unchanged conflict-fix dispatch below when not mechanical.
+    _dispatch_conflict_fixes(sweep_events, config, dry_run=False, gh_ops=gh_ops)
     # #2246 review: `_dispatch_conflict_fixes` can advance a swept sibling's
     # state a second time in place — e.g. `entry.state = HUMAN_REQUIRED` when
     # `has_prior_conflict_fix` finds this sibling already burned a
@@ -415,31 +428,51 @@ def _dispatch_conflict_fixes(
     ``PENDING`` entries, so a bare ``CONFLICT`` row is never reprocessed and
     never gets a second chance at this classify-and-dispatch step.
 
-    *gh_ops*, when supplied, gates a ``"rebaseable"`` conflict through
-    #3836's direct-merge takeover first: a base-move skew that is provably
-    inert (``ev.entry`` touches no file the base moved) is merged by this
-    finisher directly, with no conflict-fix leg and no voided review
-    approval — see :func:`coord.merge_queue.conflict_base_move_is_inert`.
-    Defaults to ``None`` (the gate is a no-op) so the one call site whose
-    conflicts are already verified a stronger way —
-    ``_dispatch_revalidation_conflicts``'s real local ``git merge`` attempt
-    against the live base — is unaffected.
+    #4152: EVERY caller — the in-pass whole-queue/``--only`` paths, the
+    sibling sweep, the standing-``CONFLICT`` redispatch, and
+    ``--revalidate``'s conflict route — routes its ``"should a claude -p
+    conflict-fix leg run for this entry?"`` decision through this one
+    function, so the mechanical integration-surface resolver
+    (:func:`coord.merge_queue._try_mechanical_surface_resolution`) is tried
+    FIRST for every ``"rebaseable"`` conflict event, here, rather than at
+    each caller's own detection site. On success ``ev.entry`` is already
+    back at ``PENDING`` (freshness anchors re-live-anchored via *gh_ops*
+    when supplied) and a ``"conflict_resolved_mechanically"`` event is
+    appended to *events*; neither the #3836 takeover below nor any
+    conflict-fix worker ever sees that entry. The in-pass whole-queue/
+    ``--only`` paths already tried this same gate inside
+    ``merge_queue.process()`` itself, so it is a guaranteed no-op here for
+    those — a mechanically-resolved entry never reaches this loop as a
+    ``"conflict"`` event in the first place.
 
-    The takeover ALSO requires ``ev.issue_resolution is not None`` —
+    *gh_ops*, when supplied, ALSO gates a ``"rebaseable"`` conflict the
+    #4152 gate above declined through #3836's direct-merge takeover next: a
+    base-move skew that is provably inert (``ev.entry`` touches no file the
+    base moved) is merged by this finisher directly, with no conflict-fix
+    leg and no voided review approval — see
+    :func:`coord.merge_queue.conflict_base_move_is_inert`. Defaults to
+    ``None`` (both gates still run — #4152's needs no *gh_ops*; the #3836
+    takeover becomes a no-op) so the one call site whose conflicts are
+    already verified a stronger way —
+    ``_dispatch_revalidation_conflicts``'s real local ``git merge`` attempt
+    against the live base — can still opt in for #4152 without the #3836
+    takeover ever firing there (see the next paragraph for why).
+
+    The #3836 takeover ALSO requires ``ev.issue_resolution is not None`` —
     populated only on a ``"conflict"`` event `merge_queue.process()` raised
     from its own merge-attempt failure this same tick, never on a standing
     ``CONFLICT`` row picked up on a later tick (a sibling-sweep retry, a
-    ``--only``/whole-queue retry of an already-``CONFLICT`` entry). Those
-    later-tick entries never had this tick's gate chain (CI, approval
-    staleness, smoke/UAT verdict, group/batch ordering, the #1318/#3502
-    closing-keyword refusal) run against them, so skipping them here keeps
-    the takeover from ever merging a PR whose gates were not just verified
-    — they fall straight through to the unchanged retry-cap/dispatch logic
-    below instead. Callers that only ever see in-pass events (the ``--only``
-    and whole-queue paths, right after their own ``merge_queue.process()``
-    call this tick) pass ``gh_ops``; callers reading a standing/swept
-    ``CONFLICT`` row (the sibling sweep, a ``--only``/whole-queue retry of
-    an entry already at ``CONFLICT``) must not.
+    ``--only``/whole-queue retry of an already-``CONFLICT`` entry, a
+    ``--revalidate`` conflict). Those later-tick entries never had this
+    tick's gate chain (CI, approval staleness, smoke/UAT verdict,
+    group/batch ordering, the #1318/#3502 closing-keyword refusal) run
+    against them, so skipping them here keeps the takeover from ever
+    merging a PR whose gates were not just verified — they fall straight
+    through to the unchanged retry-cap/dispatch logic below instead. Every
+    caller now passes its own *gh_ops* (purely so #4152's gate can
+    re-anchor a mechanically-resolved entry); the #3836 takeover's
+    safety therefore rests entirely on ``issue_resolution``, never on
+    whether *gh_ops* was supplied.
 
     On a successful takeover, the new merge-success events (an
     ``"inert_base_move_merged"`` plus whatever `_finalize_merged_entry`
@@ -477,6 +510,7 @@ def _dispatch_conflict_fixes(
     from coord.failure_triage import BUCKET_MECHANICAL  # noqa: PLC0415
     from coord.merge_queue import (  # noqa: PLC0415
         HUMAN_REQUIRED,
+        _try_mechanical_surface_resolution,
         attempt_direct_merge_for_inert_base_move,
         classify_conflict,
         conflict_base_move_is_inert,
@@ -492,6 +526,45 @@ def _dispatch_conflict_fixes(
     for ev in conflict_events:
         kind = classify_conflict(ev.entry.error)
         if kind == "rebaseable":
+            # #4152: before any of the routes below spend a `claude -p`
+            # conflict-fix leg, give the mechanical integration-surface
+            # resolver a chance — this is the single chokepoint EVERY
+            # conflict route funnels a dispatch decision through (the
+            # sibling sweep, the standing-CONFLICT redispatch, and
+            # `--revalidate`'s conflict route all call this function; the
+            # in-pass whole-queue/`--only` paths already tried this same
+            # gate inside `merge_queue.process()` itself, so it is a no-op
+            # here for those — a mechanically-resolved entry never reaches
+            # this loop as a `"conflict"` event in the first place). On
+            # success `ev.entry` is already back at `PENDING` with its
+            # freshness anchors re-live-anchored; nothing further to persist
+            # here beyond what the caller's own save-queue step already does.
+            mechanical = _try_mechanical_surface_resolution(
+                ev.entry, config, ev.entry.error, gh_ops,
+            )
+            if mechanical is not None:
+                events.append(mechanical)
+                click.echo(
+                    f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                    f"resolved mechanically via declared integration "
+                    f"surface(s) — {mechanical.message}"
+                )
+                # A daemon-side force-push to a work branch is a fleet
+                # mutation worth a durable trace — the same convention as
+                # the #3836 takeover's own audit row just below.
+                record_audit(
+                    tier="operational",
+                    category="merge",
+                    event_type="conflict_resolved_mechanically",
+                    actor="daemon",
+                    summary="mechanical integration-surface regen resolved "
+                    f"conflict: {ev.entry.repo_name}#{ev.entry.issue_number}",
+                    repo=ev.entry.repo_name,
+                    issue=ev.entry.issue_number,
+                    assignment_id=ev.entry.assignment_id,
+                    details={"detail": mechanical.message},
+                )
+                continue
             # #3836: an inert base-move skew doesn't need a conflict-fix
             # worker (and a rebase there would void the review approval,
             # which is bound to patch-id) — the finisher merges it directly
@@ -2610,16 +2683,20 @@ def merge(
                 f"({only_entry.branch}): still CONFLICT — {_verb} #241 "
                 "conflict-fix dispatch instead of refusing outright (#2558)"
             )
-            # #3836: `gh_ops` is deliberately omitted here — this CONFLICT
-            # entry is a STANDING row from an earlier tick (it didn't just
-            # fail `process()` this pass), so this tick's gate chain never
-            # ran against it. The inert-base-move direct-merge takeover
-            # requires an in-pass conflict event (see
-            # `_dispatch_conflict_fixes`'s docstring); a standing entry falls
-            # through to the unchanged conflict-fix dispatch below instead.
+            # #3836: `gh_ops` is passed through only for #4152's mechanical-
+            # surface gate (to re-anchor a mechanically-resolved entry's
+            # freshness fields) — this CONFLICT entry is a STANDING row from
+            # an earlier tick (it didn't just fail `process()` this pass), so
+            # this tick's gate chain never ran against it. The #3836 inert-
+            # base-move direct-merge takeover itself still requires an
+            # in-pass conflict event (see `_dispatch_conflict_fixes`'s
+            # docstring) — this synthetic event carries no
+            # ``issue_resolution``, so that takeover stays off; a standing
+            # entry that isn't mechanically resolvable falls through to the
+            # unchanged conflict-fix dispatch below instead.
             _dispatch_conflict_fixes(
                 [mq.MergeEvent(only_entry, "conflict", only_entry.error)],
-                cfg_only, dry_run=dry_run,
+                cfg_only, dry_run=dry_run, gh_ops=gh_ops,
             )
             if not dry_run:
                 _save_merge_back([only_entry])
@@ -3110,17 +3187,20 @@ def merge(
                 f"  {x.repo_name} #{x.issue_number} ({x.branch}): still "
                 f"CONFLICT — {_verb} #241 conflict-fix dispatch (#2558)"
             )
-        # #3836: `gh_ops` is deliberately omitted here — every entry in
-        # `standing_conflicts` transitioned to CONFLICT on an EARLIER tick
-        # (that's the whole reason this block exists, per the #2558 comment
-        # above), so this tick's gate chain never ran against any of them.
-        # The inert-base-move direct-merge takeover requires an in-pass
-        # conflict event (see `_dispatch_conflict_fixes`'s docstring); a
-        # standing entry falls through to the unchanged conflict-fix
-        # dispatch below instead.
+        # #3836: `gh_ops` is passed through only for #4152's mechanical-
+        # surface gate (to re-anchor a mechanically-resolved entry's
+        # freshness fields) — every entry in `standing_conflicts`
+        # transitioned to CONFLICT on an EARLIER tick (that's the whole
+        # reason this block exists, per the #2558 comment above), so this
+        # tick's gate chain never ran against any of them. The #3836 inert-
+        # base-move direct-merge takeover itself still requires an in-pass
+        # conflict event (see `_dispatch_conflict_fixes`'s docstring) — these
+        # synthetic events carry no ``issue_resolution``, so that takeover
+        # stays off; a standing entry that isn't mechanically resolvable
+        # falls through to the unchanged conflict-fix dispatch below.
         _dispatch_conflict_fixes(
             [mq.MergeEvent(x, "conflict", x.error) for x in standing_conflicts],
-            cfg, dry_run=dry_run,
+            cfg, dry_run=dry_run, gh_ops=gh_ops,
         )
 
     if not pending:

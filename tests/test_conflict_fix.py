@@ -2725,6 +2725,45 @@ class TestAttemptMechanicalSurfaceResolution:
         # The worktree is cleaned up — no stale registration left behind.
         worktrees = _git(["worktree", "list"], checkout).stdout
         assert "conflict-fix-surface-worktrees" not in worktrees
+
+    def test_success_cancels_a_stale_smoke_leg_on_the_same_branch(
+        self, tmp_path: Path,
+    ) -> None:
+        """#3696: the push this resolver just made replaces whatever head
+        `issue-1-fix` pointed at — a Test-stage leg still running against
+        that now-gone commit must be cancelled, same as any other
+        conflict-fix dispatch."""
+        from coord.conflict_fix import attempt_mechanical_surface_resolution
+        from coord.models import Assignment, Board, IntegrationSurface
+        from coord.network import CancelResult
+        from coord.state import load_board, save_board
+
+        checkout = _build_surface_fleet(tmp_path)
+        config = _surface_config(checkout, surfaces=[
+            IntegrationSurface(
+                paths=["derived.json"], regen="python3 regen.py",
+                check="python3 check.py",
+            ),
+        ])
+        stale_leg = Assignment(
+            machine_name="local", repo_name="api", issue_number=1,
+            issue_title="Test: Fix the thing", briefing="Smoke briefing.",
+            assignment_id="smoke-3696", status="running",
+            branch="issue-1-fix", dispatched_at=0.0, type="smoke",
+        )
+        save_board(Board(active=[stale_leg]))
+
+        cancelled: list[str] = []
+        with patch(
+            "coord.network.cancel_assignment",
+            side_effect=lambda machine, assignment_id, **kwargs: (
+                cancelled.append(assignment_id) or CancelResult(ok=True, status="cancelled")
+            ),
+        ):
+            result = attempt_mechanical_surface_resolution(_surface_entry(), config)
+
+        assert result.ok, result.detail
+        assert cancelled == ["smoke-3696"]
         # The pushed commit's tree genuinely satisfies the surface's own
         # `check` — merged source.txt plus a regenerated derived.json.
         show = _git(["show", "origin/issue-1-fix:source.txt"], checkout).stdout
@@ -2825,6 +2864,81 @@ class TestAttemptMechanicalSurfaceResolution:
 
         assert not result.ok
 
+    def test_regen_timeout_declines_without_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `regen`/`check` carrying `timeout=1800` is EXPECTED to time out
+        occasionally (that's the whole reason the timeout is so generous) —
+        this must decline exactly like a failing command, never propagate a
+        `subprocess.TimeoutExpired` out of `attempt_mechanical_surface_
+        resolution` and abort the whole merge tick."""
+        from coord import conflict_fix as cf
+        from coord.conflict_fix import attempt_mechanical_surface_resolution
+        from coord.models import IntegrationSurface
+
+        checkout = _build_surface_fleet(tmp_path)
+        config = _surface_config(checkout, surfaces=[
+            IntegrationSurface(
+                paths=["derived.json"], regen="python3 regen.py",
+                check="python3 check.py",
+            ),
+        ])
+        before = _git(["rev-parse", "origin/issue-1-fix"], checkout).stdout.strip()
+
+        real_run = cf.subprocess.run
+
+        def _flaky_run(args, **kwargs):
+            if kwargs.get("shell") and "regen.py" in args:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=1800)
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(cf.subprocess, "run", _flaky_run)
+
+        result = attempt_mechanical_surface_resolution(_surface_entry(), config)
+
+        assert not result.ok
+        assert "timed out" in result.detail
+        _git(["fetch", "origin"], checkout)
+        after = _git(["rev-parse", "origin/issue-1-fix"], checkout).stdout.strip()
+        assert after == before, "a timeout decline must never touch the real branch"
+        # No leftover in-progress merge state in the base checkout.
+        status = _git(["status", "--porcelain"], checkout).stdout
+        assert status == ""
+        # No stale worktree registration left behind either.
+        worktrees = _git(["worktree", "list"], checkout).stdout
+        assert "conflict-fix-surface-worktrees" not in worktrees
+
+    def test_worktree_add_oserror_declines_without_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An `OSError` spawning `git worktree add` itself (not just a
+        regen/check command) must also decline, not raise."""
+        from coord import conflict_fix as cf
+        from coord.conflict_fix import attempt_mechanical_surface_resolution
+        from coord.models import IntegrationSurface
+
+        checkout = _build_surface_fleet(tmp_path)
+        config = _surface_config(checkout, surfaces=[
+            IntegrationSurface(
+                paths=["derived.json"], regen="python3 regen.py",
+                check="python3 check.py",
+            ),
+        ])
+
+        real_run = cf.subprocess.run
+
+        def _flaky_run(args, **kwargs):
+            if isinstance(args, list) and "worktree" in args and "add" in args:
+                raise OSError("fork failed: resource temporarily unavailable")
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(cf.subprocess, "run", _flaky_run)
+
+        result = attempt_mechanical_surface_resolution(_surface_entry(), config)
+
+        assert not result.ok
+        assert "could not create worktree" in result.detail
+
 
 class TestTryMechanicalSurfaceResolutionWiring:
     """Unit coverage of :func:`coord.merge_queue._try_mechanical_surface_
@@ -2902,6 +3016,92 @@ class TestTryMechanicalSurfaceResolutionWiring:
         )
 
         assert event is None
+
+    def test_success_re_anchors_entry_so_the_stale_sha_is_cleared(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A successful mechanical resolution force-pushes a brand-new
+        commit onto `entry.branch` — the cached `branch_head_sha`/
+        `branch_patch_id`/`target_branch_head_sha` from BEFORE that push
+        must not survive, or the #821/#1475/#1479 staleness checks read
+        "unchanged head" against a commit that no longer exists."""
+        from coord.conflict_fix import MechanicalSurfaceResolution
+        from coord.merge_queue import _try_mechanical_surface_resolution
+        from tests.test_merge_queue import FakeGh
+
+        entry = _entry(error=None)
+        entry.state = CONFLICT
+        entry.branch_head_sha = "stale-sha"
+        entry.branch_patch_id = "stale-patch-id"
+        entry.target_branch_head_sha = "stale-target-sha"
+        monkeypatch.setattr(
+            "coord.conflict_fix.attempt_mechanical_surface_resolution",
+            lambda e, c: MechanicalSurfaceResolution(True, "resolved via derived.json"),
+        )
+
+        event = _try_mechanical_surface_resolution(
+            entry, Config(repos=[], machines=[]), "merge conflict in derived.json",
+            FakeGh(),
+        )
+
+        assert event is not None
+        assert entry.state == PENDING
+        # `FakeGh.get_branch_sha`/`get_branch_patch_id` both return `None`
+        # by default — proving these were actually RE-FETCHED (and came
+        # back empty) rather than left at their pre-push, now-stale values.
+        assert entry.branch_head_sha is None
+        assert entry.branch_patch_id is None
+        assert entry.target_branch_head_sha is None
+
+    def test_success_without_gh_ops_leaves_anchors_unrefreshed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No *gh_ops* (the default) is a documented no-op for the re-anchor
+        step — same fail-open convention as `live_anchor_entry` itself —
+        not a crash."""
+        from coord.conflict_fix import MechanicalSurfaceResolution
+        from coord.merge_queue import _try_mechanical_surface_resolution
+
+        entry = _entry(error=None)
+        entry.state = CONFLICT
+        entry.branch_head_sha = "stale-sha"
+        monkeypatch.setattr(
+            "coord.conflict_fix.attempt_mechanical_surface_resolution",
+            lambda e, c: MechanicalSurfaceResolution(True, "resolved via derived.json"),
+        )
+
+        event = _try_mechanical_surface_resolution(
+            entry, Config(repos=[], machines=[]), "merge conflict in derived.json",
+        )
+
+        assert event is not None
+        assert entry.state == PENDING
+        assert entry.branch_head_sha == "stale-sha"
+
+    def test_resolver_exception_falls_through_without_raising(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Belt-and-suspenders: even though
+        `attempt_mechanical_surface_resolution` guards every subprocess call
+        it makes, an unexpected exception from it (or anything it calls)
+        must still never escape into `process()` and abort the merge tick —
+        it degrades to an ordinary decline."""
+        from coord.merge_queue import _try_mechanical_surface_resolution
+
+        entry = _entry(error="merge conflict in foo.py")
+        entry.state = CONFLICT
+        monkeypatch.setattr(
+            "coord.conflict_fix.attempt_mechanical_surface_resolution",
+            lambda e, c: (_ for _ in ()).throw(RuntimeError("unexpected")),
+        )
+
+        event = _try_mechanical_surface_resolution(
+            entry, Config(repos=[], machines=[]), "merge conflict in foo.py",
+        )
+
+        assert event is None
+        assert entry.state == CONFLICT
+        assert entry.error == "merge conflict in foo.py"
 
 
 # ── #3696: a dispatched conflict-fix cancels stale Test-stage legs ─────────

@@ -4186,6 +4186,122 @@ class TestDispatchConflictFixesInertBaseMoveTakeover:
         assert gh.merge_calls == []
 
 
+class TestDispatchConflictFixesMechanicalSurfaceGate:
+    """#4152: `_dispatch_conflict_fixes` is the single chokepoint every
+    conflict route (the in-pass whole-queue/`--only` paths, the sibling
+    sweep, the standing-`CONFLICT` redispatch, `--revalidate`) funnels its
+    "should a conflict-fix leg run?" decision through — so the mechanical
+    integration-surface gate lives HERE, not at each caller's own
+    detection site, and applies even to callers (the sibling sweep, the
+    standing redispatch) that never set `gh_ops` for #3836's own takeover.
+    """
+
+    def _entry(self, aid: str = "r1", *, pr: int = 42) -> mq.QueuedMerge:
+        return mq.QueuedMerge(
+            assignment_id=aid,
+            repo_name="api",
+            repo_github="acme/api",
+            branch=f"worker/{aid}",
+            target_branch="main",
+            issue_number=309,
+            issue_title="t",
+            state=mq.CONFLICT,
+            pr_number=pr,
+            error="merge conflict in derived.json",
+        )
+
+    def test_mechanical_success_skips_takeover_and_dispatch(
+        self, coord_dir: Path,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board
+        from coord.state import save_board
+
+        save_board(Board())
+        entry = self._entry()
+        # No `issue_resolution` — the same shape a standing/swept CONFLICT
+        # row carries, proving this gate (unlike #3836's takeover) does not
+        # require it.
+        ev = mq.MergeEvent(entry, "conflict", entry.error)
+        events = [ev]
+        resolved_event = mq.MergeEvent(
+            entry, "conflict_resolved_mechanically", "resolved via derived.json",
+        )
+
+        with patch.object(
+            mq, "_try_mechanical_surface_resolution", return_value=resolved_event,
+        ) as mechanical, patch.object(
+            mq, "conflict_base_move_is_inert",
+        ) as inert_check, patch(
+            "coord.conflict_fix.dispatch_conflict_fix",
+        ) as dispatch:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=None,
+            )
+
+        mechanical.assert_called_once_with(entry, None, entry.error, None)
+        inert_check.assert_not_called()
+        dispatch.assert_not_called()
+        assert resolved_event in events
+
+    def test_mechanical_decline_falls_through_to_ordinary_dispatch(
+        self, coord_dir: Path,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board
+        from coord.state import save_board
+
+        save_board(Board())
+        entry = self._entry()
+        ev = mq.MergeEvent(entry, "conflict", entry.error)
+        events = [ev]
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch.object(
+            mq, "_try_mechanical_surface_resolution", return_value=None,
+        ) as mechanical, patch(
+            "coord.conflict_fix.dispatch_conflict_fix", return_value=fake_fix,
+        ) as dispatch:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=None,
+            )
+
+        mechanical.assert_called_once()
+        dispatch.assert_called_once()
+        assert entry.state == mq.CONFLICT
+
+    def test_gh_ops_forwarded_to_mechanical_gate_for_a_standing_row(
+        self, coord_dir: Path,
+    ) -> None:
+        """A standing/swept row (no `issue_resolution`) must still get
+        *gh_ops* threaded into the mechanical gate — #3836's OWN takeover
+        stays off for it (no `issue_resolution`), but #4152's gate needs
+        *gh_ops* only to re-anchor a successful resolution."""
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry()
+        ev = mq.MergeEvent(entry, "conflict", entry.error)
+        events = [ev]
+        gh = FakeGh(merge_results={})
+
+        with patch.object(
+            mq, "_try_mechanical_surface_resolution", return_value=None,
+        ) as mechanical, patch(
+            "coord.conflict_fix.dispatch_conflict_fix", return_value=None,
+        ):
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=gh,
+            )
+
+        mechanical.assert_called_once_with(entry, None, entry.error, gh)
+
+
 class TestDispatchConflictFixesMechanicalTriage:
     """#4097: the merge-failure edge of triage-first routing. A
     "rebaseable" conflict Trigger B's direct-merge takeover did NOT already

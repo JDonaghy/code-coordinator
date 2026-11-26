@@ -186,7 +186,7 @@ def is_rebase_refusal(error: str | None) -> bool:
 
 
 def _try_mechanical_surface_resolution(
-    entry: "QueuedMerge", config, error_msg: str | None,
+    entry: "QueuedMerge", config, error_msg: str | None, gh_ops: "GhOps | None" = None,
 ) -> "MergeEvent | None":
     """#4152: attempt :func:`coord.conflict_fix.attempt_mechanical_surface_
     resolution` for a ``rebaseable`` conflict :func:`process` just
@@ -197,23 +197,45 @@ def _try_mechanical_surface_resolution(
     ``PENDING`` with ``error`` cleared, so the next pass retries the now-
     clean merge — on confirmed success (the mechanical resolver's own push
     is re-confirmed against the remote, not just its exit code; see that
-    function). Returns ``None`` with *entry* completely untouched the
-    moment *config* is unavailable, *error_msg* doesn't classify as
-    ``"rebaseable"``, or the mechanical resolver declines for any reason
-    (no declared surfaces, no local checkout, an uncovered conflicted path,
-    a failing ``regen``/``check``, a failed push, …) — the caller's own
-    unchanged ``CONFLICT`` handling runs exactly as if this was never
-    attempted.
+    function). Also re-anchors *entry* via :func:`live_anchor_entry` on
+    success: the resolver force-pushed a brand-new commit onto
+    ``entry.branch``, so the cached ``branch_head_sha``/``branch_patch_id``/
+    ``target_branch_head_sha`` from before the push would otherwise still
+    describe a commit that no longer exists, and the #821/#1475/#1479
+    staleness checks (and #3754's CI rerun-budget reset) key on exactly
+    those fields to tell "unchanged" from "stale" — this is what makes a
+    mechanical resolution void a prior review approval the same way any
+    other conflict-fix does.
+
+    Returns ``None`` with *entry* completely untouched the moment *config*
+    is unavailable, *error_msg* doesn't classify as ``"rebaseable"``, the
+    mechanical resolver declines for any reason (no declared surfaces, no
+    local checkout, an uncovered conflicted path, a failing
+    ``regen``/``check``, a failed push, …), or — belt and suspenders,
+    since :func:`attempt_mechanical_surface_resolution` already guards
+    every subprocess call it makes — anything downstream raises: the
+    caller's own unchanged ``CONFLICT`` handling must always get a chance
+    to run exactly as if this was never attempted, never an exception that
+    aborts the whole merge tick before `_save_merge_back` persists it.
     """
     if config is None or classify_conflict(error_msg) != "rebaseable":
         return None
     from coord.conflict_fix import attempt_mechanical_surface_resolution  # noqa: PLC0415
 
-    result = attempt_mechanical_surface_resolution(entry, config)
+    try:
+        result = attempt_mechanical_surface_resolution(entry, config)
+    except Exception:  # noqa: BLE001
+        _log.exception(
+            "#4152 mechanical surface resolution raised for %s#%d (%s) — "
+            "falling through to the ordinary conflict-fix path",
+            entry.repo_name, entry.issue_number, entry.branch,
+        )
+        return None
     if not result.ok:
         return None
     entry.state = PENDING
     entry.error = None
+    live_anchor_entry(entry, gh_ops)
     return MergeEvent(entry, "conflict_resolved_mechanically", result.detail)
 
 
@@ -10362,7 +10384,7 @@ def process(
                         # #4152: a mechanical resolution via a declared
                         # integration surface never leaves CONFLICT at all.
                         resolved = _try_mechanical_surface_resolution(
-                            entry, config, conflict_msg,
+                            entry, config, conflict_msg, gh_ops,
                         )
                         if resolved is not None:
                             events.append(resolved)
@@ -10552,7 +10574,7 @@ def process(
                             # #4152: same mechanical-first check as the
                             # stale-smoke conflict route above.
                             resolved = _try_mechanical_surface_resolution(
-                                entry, config, msg,
+                                entry, config, msg, gh_ops,
                             )
                             if resolved is not None:
                                 events.append(resolved)
@@ -11455,7 +11477,7 @@ def process(
             # #4152: a mechanical resolution via a declared integration
             # surface runs before this real merge failure is ever recorded
             # as CONFLICT — no conflict-fix worker needed for that shape.
-            resolved = _try_mechanical_surface_resolution(entry, config, msg)
+            resolved = _try_mechanical_surface_resolution(entry, config, msg, gh_ops)
             if resolved is not None:
                 events.append(resolved)
                 continue
