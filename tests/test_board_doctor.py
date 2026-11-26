@@ -95,6 +95,7 @@ from coord.drive_queue import (
     IssueFacts,
     QueueEntry,
     STATE_BLOCKED,
+    STATE_DONE,
     STATE_MERGED_PARTIAL,
     STATE_PARKED,
     STATE_RUNNING,
@@ -6016,6 +6017,22 @@ class TestCollectRowsOnlySweepsLiveQueueRows:
             r.key == "quadraui#2467" and r.cause == queue_diagnose.CAUSE_PREMISE_REFUSAL
             for r in rows
         )
+
+    def test_a_row_that_went_done_is_not_rebuilt_from_its_settled_episode(
+        self, monkeypatch,
+    ) -> None:
+        """#4135/quadraui#2825: the drive-queue row is still ON the live
+        queue (so the #4039 presence check above does not drop it) but has
+        since moved to `STATE_DONE` — e.g. the PR merged after `block_log`
+        settled this episode's stored diagnosis. The live row's `done`
+        state must win over the stale stored cause; rebuilding a stuck row
+        here is exactly the "acted on state that was already settled"
+        shape this issue closes."""
+        live_entry = QueueEntry(repo="quadraui", issue=2467, state=STATE_DONE)
+
+        rows = self._collect(monkeypatch, live_entry=live_entry)
+
+        assert rows == []
 
 
 class TestIdleFleetRootRows:

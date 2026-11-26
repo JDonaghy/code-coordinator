@@ -1,5 +1,6 @@
 """Unit tests for ``coord.drive_queue.may_dispatch_rework`` (#4133) and its
-wiring into the auto-loop's own fix dispatchers (#4134).
+wiring into the auto-loop's own fix dispatchers (#4134), plus the
+board-doctor dispatch sites (#4135).
 
 #4133 is slice 1 of 5 of #4121 (the quadraui#2825 incident: a merged PR
 re-dispatched a fix leg about 22 times because nothing checked the live
@@ -7,9 +8,12 @@ PR/row state before firing). The tests above the ``#4134`` marker pin the
 guard itself; #4134 is slice 2, wiring it into
 ``coord.auto_loop._dispatch_fix`` and ``coord.auto_loop.
 _dispatch_fix_for_review`` — the tests below that marker cover the wiring,
-not the predicate's own logic (already exhaustive above). The remaining
-sibling slices (#4135-#4137) wire the same guard into board-doctor,
-conflict-fix, ci-fix and review dispatch, which stay out of scope here.
+not the predicate's own logic (already exhaustive above). #4135 is slice 3,
+wiring the same guard into ``coord.board_doctor._dispatch_base_sync_fix``
+and ``coord.board_doctor_permissions.sweep_dispatch_fixit_leg`` — the tests
+below the ``#4135`` marker cover those two sites. The remaining sibling
+slices (#4136-#4137) wire the same guard into conflict-fix, ci-fix and
+review dispatch, which stay out of scope here.
 """
 
 from __future__ import annotations
@@ -669,3 +673,93 @@ def test_every_auto_loop_fix_dispatch_site_calls_may_dispatch_rework():
             f"coord.auto_loop.{name} calls may_dispatch_rework() only AFTER "
             f"{dispatch_marker!r} — a guard below the dispatch guards nothing"
         )
+
+
+# ── #4135: wiring into the board-doctor dispatchers ─────────────────────────
+#
+# The tests above pin `may_dispatch_rework` itself (and #4134's auto-loop
+# wiring); these pin that `coord.board_doctor._dispatch_base_sync_fix` and
+# `coord.board_doctor_permissions.sweep_dispatch_fixit_leg` actually CALL it
+# and honor a refusal, rather than re-deriving the predicate's own logic.
+
+
+def test_every_board_doctor_rework_dispatch_site_calls_may_dispatch_rework():
+    """Grep-based, same shape as `test_every_auto_loop_fix_dispatch_site_
+    calls_may_dispatch_rework` above: every board-doctor function that
+    dispatches a rework leg must call `may_dispatch_rework` BEFORE it
+    dispatches."""
+    import inspect
+
+    from coord import board_doctor, board_doctor_permissions
+
+    sites = {
+        (board_doctor, "_dispatch_base_sync_fix"): "dispatch_conflict_fix(",
+        (board_doctor_permissions, "sweep_dispatch_fixit_leg"): "_dispatch_fix(",
+    }
+    for (module, name), dispatch_marker in sites.items():
+        source = inspect.getsource(getattr(module, name))
+        guard_at = source.find("may_dispatch_rework(")
+        assert guard_at != -1, (
+            f"{module.__name__}.{name} must call may_dispatch_rework() "
+            "before dispatching a rework leg (#4135)"
+        )
+        dispatch_at = source.find(dispatch_marker)
+        assert dispatch_at != -1, (
+            f"{module.__name__}.{name} no longer dispatches via "
+            f"{dispatch_marker!r} — update this test's site table"
+        )
+        assert guard_at < dispatch_at, (
+            f"{module.__name__}.{name} calls may_dispatch_rework() only "
+            f"AFTER {dispatch_marker!r} — a guard below the dispatch "
+            "guards nothing"
+        )
+
+
+def test_2825_shape_done_row_refuses_base_sync_fix_dispatch():
+    """The #2825 incident shape against `_dispatch_base_sync_fix`: a
+    drive-queue row already `done` must refuse the budget-free base-sync
+    fix before `dispatch_conflict_fix` is ever reached."""
+    from coord import merge_queue as mq
+    from coord.board_doctor import _dispatch_base_sync_fix
+
+    mq.save_queue([
+        mq.QueuedMerge(
+            assignment_id="w2825", repo_name=REPO, repo_github="org/quadraui",
+            branch="issue-2825-fix", target_branch="main", issue_number=ISSUE,
+            issue_title="t", state=mq.PENDING,
+        ),
+    ])
+
+    with patch(
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
+    ), patch("coord.conflict_fix.dispatch_conflict_fix") as mock_dispatch:
+        result = _dispatch_base_sync_fix(REPO, ISSUE, config=_config())
+
+    mock_dispatch.assert_not_called()
+    assert result["dispatched"] is False
+    assert "done" in result["detail"]
+
+
+def test_2825_shape_done_row_refuses_fixit_leg_dispatch():
+    """The #2825 incident shape against `sweep_dispatch_fixit_leg`: a
+    drive-queue row already `done` must refuse the fix-it leg before
+    `_dispatch_fix` (and so the agent `/assign` POST it would make) is
+    ever reached."""
+    from coord.board_doctor_permissions import sweep_dispatch_fixit_leg
+
+    work = _work_row()
+    board = _board(work)
+    mock_http = MagicMock()
+
+    with patch(
+        "coord.state.get_drive_queue_entry", return_value=_done_row_entry(),
+    ), patch("coord.auto_loop._dispatch_fix") as mock_dispatch_fix:
+        result = sweep_dispatch_fixit_leg(
+            REPO, ISSUE, board, _config(),
+            cause="ci_rerun_exhausted", http_client=mock_http,
+        )
+
+    mock_dispatch_fix.assert_not_called()
+    assert result["dispatched"] is False
+    assert "done" in result["detail"]
+    mock_http.post.assert_not_called()
