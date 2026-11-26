@@ -306,6 +306,47 @@ class TestDetectNeedsAttention:
         results = notify_mod.detect_needs_attention(config, now=_time.time() + 3600)
         assert results == []
 
+    def test_passes_record_repo_name_into_learned_threshold(
+        self, coord_dir: Path, monkeypatch,
+    ) -> None:
+        """#4142: detect_needs_attention threads each record's own
+        repo_name into attention_signal -> attention_threshold_for, so the
+        learned per-repo threshold (when configured and cached) actually
+        gets consulted for the repo the row belongs to — not left at the
+        fixed default because the wiring silently dropped it.
+        """
+        import time as _time
+
+        # No attention_thresholds override here — "work" stays at its
+        # built-in default (2700s), so it's eligible for learned
+        # substitution (see attention_threshold_for's step 2).
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tailnet", repos=["api"],
+                    repo_paths={"api": "/tmp/api"},
+                ),
+            ],
+            pipeline=PipelineConfig(convergence_rounds=3),
+        )
+        _record(coord_dir, "abc123")
+
+        seen: list[tuple[str, str]] = []
+
+        def fake_p90(repo_name: str, assignment_type: str) -> float | None:
+            seen.append((repo_name, assignment_type))
+            return 50.0  # far below the 2700s built-in default
+
+        monkeypatch.setattr("coord.usage.p90_attention_threshold", fake_p90)
+
+        # 100s in — under the fixed 45m default, but over the learned 50s.
+        results = notify_mod.detect_needs_attention(cfg, now=_time.time() + 100)
+
+        assert seen == [("api", "work")]
+        assert len(results) == 1
+        assert results[0][0].reason == "wall_clock"
+
     def test_terminal_assignment_not_flagged_by_completion_notify(
         self, coord_dir: Path, config: Config
     ) -> None:

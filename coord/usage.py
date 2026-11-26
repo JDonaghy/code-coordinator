@@ -568,6 +568,126 @@ def _local_usage_rows(
     return rows, truncated
 
 
+# ── Per-repo p90 attention threshold (#4142) ─────────────────────────────────
+#
+# `coord.config.PipelineConfig.attention_threshold_for`'s fixed "work" default
+# (45m) is a fleet-wide guess that doesn't fit every repo — quadraui's own
+# first-work legs normally run 45-69m, so the fixed default fired a false
+# "needs attention" alert on nearly every one of them. This section learns a
+# per-(repo, assignment type) threshold from that repo's own history instead,
+# so attention_threshold_for can replace the guess with "what normal actually
+# looks like here" once there's enough history to trust, and otherwise keep
+# the fixed default unchanged.
+
+#: Terminal leg statuses that count as a *successful* run, for the purpose of
+#: learning a threshold. Deliberately narrower than
+#: `coord.notifier.baseline.SAMPLE_STATUSES` (which also keeps "failed"/
+#: "advisory" — that module is answering "how long does this kind of leg
+#: take", not "how long does it take to succeed"): a failed leg's duration
+#: says nothing about how long a normal, converging run of this type takes,
+#: and mixing it in would pull the threshold toward whatever makes a leg fail
+#: (a timeout, a crash loop) rather than toward what a healthy one looks like.
+SUCCESSFUL_LEG_STATUSES = frozenset({"done", "merged"})
+
+#: Minimum successful-leg samples before a repo/type's learned p90 is trusted
+#: over the fixed default — mirrors `coord.notifier.baseline.MIN_SAMPLES`'s
+#: "never fire off a population of one" rule.
+P90_ATTENTION_MIN_SAMPLES = 5
+
+#: How long the learned-threshold index is cached before being refetched.
+#: `attention_signal` is evaluated for every running assignment on every
+#: `coord notify` sweep, so an unbounded `fetch_usage_rows()` call per check
+#: would turn one sweep into dozens of full-history scans; this amortizes it
+#: to one fetch per TTL window regardless of how many assignments are active.
+P90_ATTENTION_CACHE_TTL = 300.0
+
+#: Only legs dispatched within this trailing window feed the learned p90 — a
+#: repo's recent normal is what matters for "is THIS leg running long", not a
+#: multi-year history the fleet's hardware/model mix has long since outgrown.
+#: Also keeps the underlying fetch bounded rather than scanning full history
+#: (#4139's exact timeout failure mode) on every cache refresh.
+P90_ATTENTION_HISTORY_WINDOW_SECS = 30 * 24 * 3600.0
+
+# (cached-at monotonic time, {(repo_name, assignment_type): [duration_secs]})
+# — module-level memo, mirrors `coord.config._TS_SELF_DNS_MEMO`'s shape.
+_SUCCESSFUL_DURATIONS_CACHE: tuple[float, dict[tuple[str, str], list[float]]] | None = None
+
+
+def reset_p90_attention_cache() -> None:
+    """Forget the memoized successful-leg-duration index (tests only)."""
+    global _SUCCESSFUL_DURATIONS_CACHE
+    _SUCCESSFUL_DURATIONS_CACHE = None
+
+
+def _successful_durations_index(
+    *, now: float | None = None,
+) -> dict[tuple[str, str], list[float]]:
+    """The cached ``(repo_name, assignment_type) -> [duration_secs, ...]``
+    index of successful-leg durations, refetched at most once per
+    :data:`P90_ATTENTION_CACHE_TTL`.
+    """
+    global _SUCCESSFUL_DURATIONS_CACHE
+
+    now = time.monotonic() if now is None else now
+    cached = _SUCCESSFUL_DURATIONS_CACHE
+    if cached is not None:
+        cached_at, index = cached
+        if now - cached_at < P90_ATTENTION_CACHE_TTL:
+            return index
+
+    from coord.usage_rollup import leg_duration  # noqa: PLC0415
+
+    since = time.time() - P90_ATTENTION_HISTORY_WINDOW_SECS
+    rows = fetch_usage_rows(since=since)
+    index: dict[tuple[str, str], list[float]] = {}
+    for row in rows:
+        if str(row.get("status") or "") not in SUCCESSFUL_LEG_STATUSES:
+            continue
+        secs, is_open = leg_duration(row)
+        if is_open or secs <= 0:
+            continue
+        key = (str(row.get("repo_name") or ""), str(row.get("type") or "work"))
+        index.setdefault(key, []).append(secs)
+
+    _SUCCESSFUL_DURATIONS_CACHE = (now, index)
+    return index
+
+
+def p90_attention_threshold(
+    repo_name: str,
+    assignment_type: str,
+    *,
+    min_samples: int = P90_ATTENTION_MIN_SAMPLES,
+    now: float | None = None,
+) -> float | None:
+    """P90 duration (seconds) of *repo_name*'s successful *assignment_type*
+    legs over the trailing history window, or ``None`` when there are fewer
+    than *min_samples* qualifying legs — the caller's signal to fall back to
+    the fixed default instead of trusting a thin population.
+
+    Best-effort: any read failure (daemon unreachable, DB error, ...) is
+    swallowed and reported as ``None``, exactly like a cold/empty population.
+    This feeds an attention-threshold *default*, not a gate — a transient
+    read failure must fall back to the fixed default, never raise and break
+    the `coord notify` needs-attention sweep.
+    """
+    from coord.notifier.baseline import percentile  # noqa: PLC0415
+
+    try:
+        index = _successful_durations_index(now=now)
+    except Exception:  # noqa: BLE001
+        _log.warning(
+            "p90_attention_threshold(%r, %r): usage fetch failed, falling "
+            "back to the fixed default", repo_name, assignment_type,
+            exc_info=True,
+        )
+        return None
+    durations = index.get((repo_name, assignment_type))
+    if not durations or len(durations) < min_samples:
+        return None
+    return percentile(durations, 90.0)
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 

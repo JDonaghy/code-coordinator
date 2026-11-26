@@ -1972,6 +1972,18 @@ class PipelineConfig:
     --max-parallel N`` on the command line always wins over this, exactly
     mirroring ``max_parallel_per_repo``'s own resolution order — see
     ``coord.commands.drive_queue.drive_queue_tick``.
+
+    ``learn_attention_thresholds`` (#4142) controls whether
+    :meth:`attention_threshold_for` replaces an un-overridden built-in
+    default with the p90 duration of that repo's own successful legs of the
+    same type (:func:`coord.usage.p90_attention_threshold`) once there is
+    enough history — see that method's docstring for the full resolution
+    order. **Defaults to ``True``**: the fixed 45m ``work`` default is a
+    fleet-wide guess, and a repo whose first-work legs normally run
+    45-69m (quadraui) fires a false alert on nearly every one under the
+    fixed default alone. Set ``false`` to pin every type to its fixed
+    default regardless of history — e.g. while validating a fleet
+    migration, or if a repo's history is too noisy to trust.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -2010,6 +2022,8 @@ class PipelineConfig:
     # #3388 — None means "derive from the fleet shape", see
     # coord.drive_queue.default_max_parallel. See the class docstring.
     max_parallel: int | None = None
+    # #4142 — DEFAULT ON. See the class docstring / attention_threshold_for.
+    learn_attention_thresholds: bool = True
 
     def attention_threshold_for(
         self,
@@ -2017,6 +2031,7 @@ class PipelineConfig:
         *,
         provider_name: str | None = None,
         review_of_assignment_id: str | None = None,
+        repo_name: str | None = None,
     ) -> float:
         """Wall-clock threshold (seconds) for *assignment_type*.
 
@@ -2047,24 +2062,50 @@ class PipelineConfig:
            ``attention_thresholds`` always carries built-in ``"work"``/
            ``"review"``/``"smoke"`` entries (the dataclass default copies
            the whole ``_DEFAULT_ATTENTION_THRESHOLDS`` dict), so checking
-           that dict first would make this branch unreachable.
+           that dict first would make this branch unreachable. Deliberately
+           does *not* forward *repo_name* to the recursive ``conflict-fix``
+           call — a human-attended session's duration says nothing about a
+           headless leg's normal runtime, so it must never feed (or be
+           judged against) the learned population below.
         2. **Explicit override** — an ``attention_thresholds`` entry for
-           *this exact* ``assignment_type`` (built-in default or
-           user-configured) always wins.
+           *this exact* ``assignment_type`` whose value DIFFERS from
+           :data:`_DEFAULT_ATTENTION_THRESHOLDS` (i.e. a user actually typed
+           something in ``coordinator.yml``) always wins outright, with no
+           learned substitution. An entry equal to the built-in default —
+           which is every type's normal state, since the dataclass default
+           copies the whole built-in table — is treated the same as "not
+           configured" by step 4 below: it's a default waiting to be
+           replaced by something better, not a deliberate choice.
         3. **Interactive session type** (#1133,
            :data:`INTERACTIVE_SESSION_TYPES`) — human-attended
            chat/troubleshoot/review-style sessions with no
            headless-convergence concept — exempted (``inf``, never flagged)
-           rather than inheriting a headless-worker threshold.
-        4. **Fallback to this config's own ``"work"`` entry** (so a user who
-           only overrides ``work`` gets that value applied to unlisted
-           *headless* types too, not the hardcoded default) — and only
-           reaches for the hardcoded default when even ``"work"`` was never
-           configured. This fallback is deliberately scoped to headless
-           types by the ``INTERACTIVE_SESSION_TYPES`` check above it: unlike
-           an unlisted headless type (probably work-like), an unlisted
-           interactive type has no wall-clock-stuck concept at all, so
-           silently reusing ``"work"``'s threshold for it would be a
+           rather than inheriting a headless-worker threshold. Checked
+           *before* step 4's learned substitution for the same reason it
+           already precedes the fallback: a type with no wall-clock-stuck
+           concept at all must never gain one just because a repo happens
+           to have duration history under that type string.
+        4. **Learned per-repo p90, then the fixed default** (#4142). When
+           *repo_name* is given and :data:`learn_attention_thresholds` is
+           on, :func:`coord.usage.p90_attention_threshold` is consulted for
+           ``(repo_name, assignment_type)`` — the p90 duration of that
+           repo's own successful legs of this type. A fixed 45m "work"
+           default is a fleet-wide guess that doesn't fit every repo (a
+           quadraui first-work leg normally runs 45-69m, well past the
+           guess), so once there's enough same-repo history
+           (``coord.usage.P90_ATTENTION_MIN_SAMPLES``) to trust, "what
+           normal looks like here" replaces it. Falls back to this config's
+           own ``"work"`` entry when there's no *repo_name*, the feature is
+           off, or the repo/type is too new to have a learned population —
+           the exact pre-#4142 behaviour — so a user who only overrides
+           ``work`` still gets that value applied to unlisted *headless*
+           types too, not the hardcoded default; the hardcoded default is
+           reached only when even ``"work"`` was never configured. This
+           fallback chain is deliberately scoped to headless types by the
+           ``INTERACTIVE_SESSION_TYPES`` check above it: unlike an unlisted
+           headless type (probably work-like), an unlisted interactive type
+           has no wall-clock-stuck concept at all, so silently reusing
+           ``"work"``'s threshold (learned or fixed) for it would be a
            category error, not a reasonable guess.
         """
         if (
@@ -2073,13 +2114,40 @@ class PipelineConfig:
             and review_of_assignment_id is not None
         ):
             return self.attention_threshold_for("conflict-fix")
+
         if assignment_type in self.attention_thresholds:
-            return self.attention_thresholds[assignment_type]
+            configured = self.attention_thresholds[assignment_type]
+            builtin_default = _DEFAULT_ATTENTION_THRESHOLDS.get(assignment_type)
+            if builtin_default is None or configured != builtin_default:
+                return configured
+            learned = self._learned_threshold(repo_name, assignment_type)
+            return configured if learned is None else learned
+
         if assignment_type in INTERACTIVE_SESSION_TYPES:
             return float("inf")
+
+        learned = self._learned_threshold(repo_name, assignment_type)
+        if learned is not None:
+            return learned
         return self.attention_thresholds.get(
             "work", _DEFAULT_ATTENTION_THRESHOLDS["work"]
         )
+
+    def _learned_threshold(
+        self, repo_name: str | None, assignment_type: str,
+    ) -> float | None:
+        """The learned per-repo p90 for *assignment_type* (#4142), or
+        ``None`` when it isn't applicable/available — see
+        :meth:`attention_threshold_for`'s step 4. Never raises: a usage-read
+        failure must fall back to the fixed default, not break every caller
+        of ``attention_threshold_for`` (the dashboard poller, the
+        ``/api/pipeline`` field, every ``coord notify`` tick).
+        """
+        if repo_name is None or not self.learn_attention_thresholds:
+            return None
+        from coord.usage import p90_attention_threshold  # noqa: PLC0415
+
+        return p90_attention_threshold(repo_name, assignment_type)
 
     def stall_threshold_secs(
         self, active_types: Iterable[str], *, default_secs: float

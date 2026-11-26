@@ -1970,3 +1970,183 @@ class TestFetchUsageRowsRoutesToUsageRowsNotBoard:
 
         assert len(rows) == 1
         assert any("truncated" in rec.message for rec in caplog.records)
+
+
+# ── #4142: per-repo p90 attention threshold ──────────────────────────────────
+
+
+def _usage_row(
+    *, repo_name: str, leg_type: str, status: str, dispatched_at: float, duration_secs: float,
+) -> dict:
+    return {
+        "repo_name": repo_name,
+        "type": leg_type,
+        "status": status,
+        "dispatched_at": dispatched_at,
+        "finished_at": dispatched_at + duration_secs,
+    }
+
+
+class TestP90AttentionThreshold:
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        from coord import usage as usage_mod
+
+        usage_mod.reset_p90_attention_cache()
+        yield
+        usage_mod.reset_p90_attention_cache()
+
+    def test_too_few_samples_returns_none(self, monkeypatch) -> None:
+        """#4142: a population under MIN_SAMPLES is cold — never trusted,
+        same "never fire off a population of one" rule as
+        coord.notifier.baseline.
+        """
+        from coord import usage as usage_mod
+
+        now = time.time()
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=3000.0,
+            )
+            for i in range(usage_mod.P90_ATTENTION_MIN_SAMPLES - 1)
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: rows)
+
+        assert usage_mod.p90_attention_threshold("quadraui", "work") is None
+
+    def test_enough_samples_returns_p90(self, monkeypatch) -> None:
+        """Once a repo/type clears MIN_SAMPLES, the p90 of its successful
+        legs' durations is returned (#4142's whole point: quadraui
+        first-work legs normally run 45-69m, so the learned threshold
+        should sit up near the slow end, not the fixed 45m guess).
+        """
+        from coord import usage as usage_mod
+
+        now = time.time()
+        # 10 successful legs: 9 at 50m, 1 outlier at 69m. Linear-interpolated
+        # p90 of 10 sorted values sits 90% of the way from the 9th to the
+        # 10th (coord.notifier.baseline.percentile's interpolation), well
+        # above the fixed 45m default either way.
+        durations = [50 * 60.0] * 9 + [69 * 60.0]
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=d,
+            )
+            for i, d in enumerate(durations)
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: rows)
+
+        result = usage_mod.p90_attention_threshold("quadraui", "work")
+        assert result == pytest.approx(3000.0 + (4140.0 - 3000.0) * 0.1)
+        assert result > 45 * 60.0
+
+    def test_failed_legs_excluded_from_population(self, monkeypatch) -> None:
+        """A failed leg's duration doesn't belong in the "how long does a
+        successful run take" population (#4142) — only "done"/"merged" rows
+        count, unlike coord.notifier.baseline's broader SAMPLE_STATUSES.
+        """
+        from coord import usage as usage_mod
+
+        now = time.time()
+        # 5 successful legs at 10m, plus a pile of failed legs at 1000m that
+        # must NOT drag the p90 up even though there are more of them.
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=10 * 60.0,
+            )
+            for i in range(5)
+        ] + [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="failed",
+                dispatched_at=now - i * 100, duration_secs=1000 * 60.0,
+            )
+            for i in range(20)
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: rows)
+
+        result = usage_mod.p90_attention_threshold("quadraui", "work")
+        assert result == pytest.approx(10 * 60.0)
+
+    def test_other_repo_or_type_not_mixed_in(self, monkeypatch) -> None:
+        """The population is scoped to (repo_name, assignment_type) — a
+        different repo's or a different type's history must not count
+        toward this repo/type's sample size or p90 (#4142's stratification
+        requirement).
+        """
+        from coord import usage as usage_mod
+
+        now = time.time()
+        min_samples = usage_mod.P90_ATTENTION_MIN_SAMPLES
+        # Only 2 real samples for (quadraui, work); the rest are a different
+        # repo or a different type and must not count toward MIN_SAMPLES.
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=3000.0,
+            )
+            for i in range(2)
+        ] + [
+            _usage_row(
+                repo_name="other-repo", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=5.0,
+            )
+            for i in range(min_samples)
+        ] + [
+            _usage_row(
+                repo_name="quadraui", leg_type="review", status="done",
+                dispatched_at=now - i * 100, duration_secs=5.0,
+            )
+            for i in range(min_samples)
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda **_kw: rows)
+
+        assert usage_mod.p90_attention_threshold("quadraui", "work") is None
+
+    def test_cache_amortizes_repeated_calls(self, monkeypatch) -> None:
+        """#4142: the underlying fetch happens at most once per TTL window —
+        attention_signal is evaluated per running assignment on every
+        coord-notify tick, so an unbounded fetch per check (rather than per
+        sweep) would reintroduce the #4139 unbounded-scan cost on a much
+        tighter loop.
+        """
+        from coord import usage as usage_mod
+
+        now = time.time()
+        rows = [
+            _usage_row(
+                repo_name="quadraui", leg_type="work", status="done",
+                dispatched_at=now - i * 100, duration_secs=3000.0,
+            )
+            for i in range(usage_mod.P90_ATTENTION_MIN_SAMPLES)
+        ]
+        calls = []
+
+        def fake_fetch(**kw):
+            calls.append(kw)
+            return rows
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", fake_fetch)
+
+        usage_mod.p90_attention_threshold("quadraui", "work")
+        usage_mod.p90_attention_threshold("quadraui", "review")
+        usage_mod.p90_attention_threshold("other-repo", "work")
+
+        assert len(calls) == 1
+
+    def test_fetch_failure_falls_back_to_none(self, monkeypatch) -> None:
+        """A read failure (daemon down, DB error) must degrade to "no
+        learned threshold", never raise — this feeds a default, not a gate,
+        and attention_threshold_for must never break on a transient read
+        failure.
+        """
+        from coord import usage as usage_mod
+
+        def boom(**_kw):
+            raise RuntimeError("daemon unreachable")
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", boom)
+
+        assert usage_mod.p90_attention_threshold("quadraui", "work") is None
