@@ -314,6 +314,70 @@ def test_excluded_keys_never_become_pre_reqs():
     assert not prediction
 
 
+# ── #4154: surface-only intersections are not collisions ───────────────────
+
+
+def test_a_surface_only_intersection_predicts_nothing():
+    footprint = Footprint(
+        key=f"{REPO}#1",
+        issue_number=1,
+        files=("tests/backend_method_ratchet.rs",),
+        source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap(
+        ["tests/backend_method_ratchet.rs"],
+        [footprint],
+        surface_paths=["tests/backend_method_ratchet.rs"],
+    )
+    assert not prediction
+
+
+def test_a_partially_surface_intersection_still_predicts():
+    # One of the two matched files is a real, uncovered collision — the
+    # whole hit list (surface file included) is kept, not filtered down to
+    # just the non-surface file.
+    footprint = Footprint(
+        key=f"{REPO}#1",
+        issue_number=1,
+        files=("tests/backend_method_ratchet.rs", "coord/drive_queue.py"),
+        source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap(
+        ["tests/backend_method_ratchet.rs", "coord/drive_queue.py"],
+        [footprint],
+        surface_paths=["tests/backend_method_ratchet.rs"],
+    )
+    assert prediction
+    assert prediction.overlaps[0].files == (
+        "tests/backend_method_ratchet.rs",
+        "coord/drive_queue.py",
+    )
+
+
+def test_no_surface_paths_behaves_exactly_as_before():
+    footprint = Footprint(
+        key=f"{REPO}#1", issue_number=1, files=("coord/a.py",), source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap(["coord/a.py"], [footprint])
+    assert prediction
+    assert prediction.overlaps[0].files == ("coord/a.py",)
+
+
+def test_surface_paths_honor_the_directory_overlap_rule():
+    footprint = Footprint(
+        key=f"{REPO}#1",
+        issue_number=1,
+        files=("scripts/baselines/backend_loc.json",),
+        source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap(
+        ["scripts/baselines/backend_loc.json"],
+        [footprint],
+        surface_paths=["scripts/baselines/"],
+    )
+    assert not prediction
+
+
 # ── #2603: an edge's PROVENANCE, not just its conclusion ────────────────────
 
 

@@ -109,6 +109,30 @@ round when the answer says to reverse it. The decision of WHICH overlaps to
 reverse still lives in ``coord.commands.drive_queue`` (it needs the queue's
 positions and the write path to apply an edge onto an entry other than the
 one being added), so this module only supplies the pure primitives.
+
+#4154: an intersection that falls ENTIRELY on a repo's declared
+``integration_surfaces`` paths (#4151 — a mechanically-derived file like a
+ratchet-test fixture or a generated baseline, regenerated from source rather
+than hand-edited) is not a real collision between two branches' own work; it
+is two branches both touching the same derived artifact, which #4152's
+mechanical conflict resolution already untangles without a worker leg. Rule
+1 still holds — this does not add a NEW way to refuse an edge, it narrows
+what counts as an intersection in the first place, the same way `exclude_keys`
+already does. :func:`_intersect` takes the declared surface paths as an
+optional, purely-data argument (never a config/DB read of its own — callers
+that have :class:`coord.models.IntegrationSurface`\\ s flatten their `paths`
+before passing them in) and returns an EMPTY hit list when every matched path
+is covered; a hit list with even one non-surface path is untouched, because
+that one file is still real, uncovered work. :func:`predict_overlap` threads
+the same ``surface_paths`` through to every footprint it compares against —
+dropping the resulting empty-hit overlap via the existing ``if hits:`` guard,
+not a new code path — so a candidate whose ONLY overlap with an in-flight
+branch is a surface file now yields `Prediction()` (rule 3: no prediction,
+not a refusal) for that footprint, exactly as if the two branches had never
+touched the same file at all. :func:`classify_outcome` does not take this
+parameter: scoring a PAST prediction against the real diffs is a different
+question ("was the recorded claim true") from ordering a NEW one, and
+widening that signature was not asked for here.
 """
 
 from __future__ import annotations
@@ -622,11 +646,31 @@ def overlap_would_run_before(
     return int(new_position) <= int(other_position)
 
 
-def _intersect(candidate: Sequence[str], other: Sequence[str]) -> tuple[str, ...]:
+def _intersect(
+    candidate: Sequence[str],
+    other: Sequence[str],
+    *,
+    surface_paths: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """The candidate paths that also appear in *other*, via :func:`paths_overlap`.
+
+    #4154: when *surface_paths* is given and every hit is covered by one of
+    them, the whole match is dropped (``()``) — a collision that is entirely
+    on a declared ``integration_surfaces`` path (#4151) is not a real
+    collision between the two branches' own work; see the module docstring.
+    A single non-surface hit keeps the ENTIRE result, surface hits included:
+    this only decides whether the match counts as a collision at all, it
+    does not selectively hide files from an edge that is real for another
+    reason.
+    """
     hits: list[str] = []
     for path in candidate:
         if any(paths_overlap(path, o) for o in other) and path not in hits:
             hits.append(path)
+    if hits and surface_paths and all(
+        any(paths_overlap(hit, surface) for surface in surface_paths) for hit in hits
+    ):
+        return ()
     return tuple(hits)
 
 
@@ -635,22 +679,32 @@ def predict_overlap(
     footprints: Iterable[Footprint],
     *,
     exclude_keys: Iterable[str] = (),
+    surface_paths: Iterable[str] = (),
 ) -> Prediction:
     """Pure core: intersect the candidate's predicted files with *footprints*.
 
     ``exclude_keys`` drops entries the caller must not chain against — the
     candidate itself above all (a redispatch of an issue that already has a
     running branch must never be ordered after itself).
+
+    ``surface_paths`` (#4154) is the repo's declared ``integration_surfaces``
+    paths (#4151), flattened by the caller — this function never fetches
+    config itself. Threaded into every :func:`_intersect` call below: a
+    footprint whose ONLY matched file is a declared surface yields no hit at
+    all, so no :class:`Overlap` is recorded for it and `--after` is never
+    applied for that reason alone. Defaults to ``()``, which is a no-op —
+    every existing caller that doesn't pass it keeps today's behaviour.
     """
     files = tuple(dict.fromkeys(f for f in (candidate_files or ()) if f))
     if not files:
         return Prediction()
     skip = {str(k) for k in exclude_keys}
+    surfaces = tuple(dict.fromkeys(str(p) for p in (surface_paths or ()) if p))
     overlaps: list[Overlap] = []
     for fp in footprints or ():
         if not fp or fp.key in skip or not fp.files:
             continue
-        hits = _intersect(files, fp.files)
+        hits = _intersect(files, fp.files, surface_paths=surfaces)
         if hits:
             overlaps.append(
                 Overlap(
