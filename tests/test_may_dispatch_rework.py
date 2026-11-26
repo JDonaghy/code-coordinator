@@ -1,15 +1,20 @@
-"""Unit tests for ``coord.drive_queue.may_dispatch_rework`` (#4133).
+"""Unit tests for ``coord.drive_queue.may_dispatch_rework`` (#4133) and its
+wiring into the auto-loop's own fix dispatchers (#4134).
 
 #4133 is slice 1 of 5 of #4121 (the quadraui#2825 incident: a merged PR
 re-dispatched a fix leg about 22 times because nothing checked the live
-PR/row state before firing). This file pins the guard itself; the sibling
-slices (#4134-#4137) wire it into the actual dispatch sites, which are out
-of scope here.
+PR/row state before firing). The tests above the ``#4134`` marker pin the
+guard itself; #4134 is slice 2, wiring it into
+``coord.auto_loop._dispatch_fix`` and ``coord.auto_loop.
+_dispatch_fix_for_review`` — the tests below that marker cover the wiring,
+not the predicate's own logic (already exhaustive above). The remaining
+sibling slices (#4135-#4137) wire the same guard into board-doctor,
+conflict-fix, ci-fix and review dispatch, which stay out of scope here.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from coord.drive_queue import (
     NON_CONVERGENCE_LATCH_MARKER,
@@ -21,6 +26,7 @@ from coord.drive_queue import (
 )
 from coord.config import Config
 from coord.models import Assignment, Board, Repo
+from coord.review import ReviewFindings
 
 REPO = "quadraui"
 ISSUE = 2825
@@ -404,3 +410,116 @@ def test_accepts_a_caller_supplied_board_instead_of_building_its_own():
         ok, _ = may_dispatch_rework(REPO, ISSUE, "fix", board=_board(work))
     assert ok is True
     build_board_mock.assert_not_called()
+
+
+# ── #4134: wiring into the auto-loop's own fix dispatchers ──────────────────
+#
+# The tests above pin `may_dispatch_rework` itself; these pin that
+# `coord.auto_loop._dispatch_fix` and `coord.auto_loop._dispatch_fix_for_review`
+# actually CALL it and honor a refusal, rather than re-deriving the
+# predicate's own logic (already exhaustive above).
+
+
+def _work_row(**overrides) -> Assignment:
+    defaults = dict(
+        machine_name="laptop",
+        repo_name=REPO,
+        issue_number=ISSUE,
+        issue_title="Fix the thing",
+        briefing="Original briefing text.",
+        assignment_id="work-2825",
+        status="done",
+        branch="issue-2825-fix",
+        pr_url="https://github.com/org/quadraui/pull/999",
+        dispatched_at=100.0,
+        finished_at=101.0,
+        type="work",
+        review_state="dispatched",
+        review_iteration=0,
+    )
+    defaults.update(overrides)
+    return Assignment(**defaults)
+
+
+def _review_row(**overrides) -> Assignment:
+    defaults = dict(
+        machine_name="laptop",
+        repo_name=REPO,
+        issue_number=ISSUE,
+        issue_title="[review] Fix the thing",
+        assignment_id="review-2825",
+        status="done",
+        branch="issue-2825-fix",
+        dispatched_at=102.0,
+        finished_at=103.0,
+        type="review",
+        review_of_assignment_id="work-2825",
+    )
+    defaults.update(overrides)
+    return Assignment(**defaults)
+
+
+def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
+    """The #2825 incident shape — a merged PR, a drive-queue row that
+    already reads `done`, and (per the daemon log) a block_log episode the
+    board-doctor sweep kept re-classifying `integration-red` — must
+    produce ZERO fix dispatches from either auto-loop dispatcher.
+    `block_log` itself is not consulted by `may_dispatch_rework` or by
+    either dispatcher below (that binding is #4135/#4137's own scope), so
+    it is not part of what these two assertions exercise; the `done` row
+    and the live-merged PR are, and either alone already refuses."""
+    from coord.auto_loop import _dispatch_fix, _dispatch_fix_for_review
+
+    work = _work_row()
+    review = _review_row()
+    board = Board(
+        repos=[Repo(name=REPO, github="org/quadraui", default_branch="main")],
+        machines=[],
+        active=[],
+        completed=[work, review],
+    )
+    config = Config(
+        repos=[Repo(name=REPO, github="org/quadraui", default_branch="main")],
+        machines=[],
+    )
+    mock_http = MagicMock()
+
+    with patch(
+        "coord.state.get_drive_queue_entry",
+        return_value={"repo_name": REPO, "issue_number": ISSUE, "state": STATE_DONE},
+    ), patch("coord.github_ops.work_is_terminal", return_value=True):
+        fix_result = _dispatch_fix(
+            work, "fix it", board, config, 1, http_client=mock_http,
+        )
+
+        findings = ReviewFindings(
+            verdict="request-changes", body="## Blocking\n- 1. fix it\n"
+        )
+        actions = _dispatch_fix_for_review(
+            review, findings, board, config, http_client=mock_http,
+        )
+
+    assert fix_result is None
+    assert len(actions) == 1
+    assert actions[0].kind == "rework_refused"
+    assert "done" in actions[0].detail
+    mock_http.post.assert_not_called()
+
+
+def test_every_auto_loop_fix_dispatch_site_calls_may_dispatch_rework():
+    """Grep-based: every function in `coord/auto_loop.py` that dispatches a
+    rework leg must call `may_dispatch_rework` before it dispatches.
+    Covers the two sites #4134 wires (`_dispatch_fix`,
+    `_dispatch_fix_for_review`); the sibling slices extend this same shape
+    of assertion for their own dispatch sites rather than inventing a
+    second way to ask the same question (#2096/#2085)."""
+    import inspect
+
+    from coord import auto_loop
+
+    for name in ("_dispatch_fix", "_dispatch_fix_for_review"):
+        source = inspect.getsource(getattr(auto_loop, name))
+        assert "may_dispatch_rework(" in source, (
+            f"coord.auto_loop.{name} must call may_dispatch_rework() before "
+            "dispatching a rework leg (#4134)"
+        )
