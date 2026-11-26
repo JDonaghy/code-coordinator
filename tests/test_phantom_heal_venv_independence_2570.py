@@ -105,7 +105,7 @@ def test_broken_venv_kills_the_coord_notify_subprocess(tmp_path: Path) -> None:
 
 
 def test_phantom_heal_tick_heals_a_real_row_independent_of_any_venv(
-    tmp_path: Path, config: Config,
+    tmp_path: Path, config: Config, monkeypatch,
 ) -> None:
     """The whole point: `_phantom_heal_tick` never shells out to
     `~/.coord-venv/bin/coord` at all — it calls straight into
@@ -120,17 +120,26 @@ def test_phantom_heal_tick_heals_a_real_row_independent_of_any_venv(
     venv_dir = tmp_path / ".coord-venv"
     _write_broken_coord_shim(venv_dir)
 
-    # ...but the daemon's own tick never touches it. Only the liveness probe
-    # is stubbed (it would otherwise SSH/tmux-probe a machine that doesn't
-    # exist in this test); the recovery write (`_finalize_dead`) is real.
+    # #4141's own miss-counter file must not land in the real `~/.coord/`.
+    monkeypatch.setattr("coord.state.COORD_DIR", tmp_path / "coord_home")
+
+    # ...but the daemon's own tick never touches it. Only the liveness
+    # probes are stubbed (they would otherwise SSH/tmux-probe, or HTTP-GET
+    # `/assignments/<id>` from, a machine that doesn't exist in this test);
+    # the recovery write (`_finalize_dead`) is real.
     now = time.time()
     board = _phantom_row(now)
 
     with patch("coord.diagnose._session_state", return_value="dead"), \
+         patch("coord.diagnose._confirm_dead_via_assignment_endpoint", return_value="dead"), \
          patch("coord.board_service.read_board", return_value=board), \
          patch("coord.notify.github_ops.post_issue_comment") as mock_post:
         from coord.serve_app import _phantom_heal_tick
 
+        # #4141: two consecutive confirmed-dead ticks are required before a
+        # heal — the first only arms the streak.
+        first = _phantom_heal_tick(config)
+        assert first == []
         healed = _phantom_heal_tick(config)
 
     assert len(healed) == 1

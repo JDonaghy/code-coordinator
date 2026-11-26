@@ -839,6 +839,22 @@ def _openapi_spec() -> dict:
                 "responses": {"200": {"description": "OK"}},
             }
         },
+        "/assignments/{id}": {
+            "get": {
+                "summary": "This agent's own record for one assignment id",
+                "description": (
+                    "#4141: regardless of status (PENDING/RUNNING/DONE/"
+                    "FAILED/CANCELLED/ADVISORY) — unlike /status's `active` "
+                    "list, which a just-finished assignment has already "
+                    "left by the time a caller reads it."
+                ),
+                "parameters": [_path_param("id", "assignment id")],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Unknown assignment id"},
+                },
+            }
+        },
         "/repos": {
             "get": {
                 "summary": "Repos this agent can dispatch work into",
@@ -1232,6 +1248,26 @@ def build_app(
     async def status(request: Request) -> JSONResponse:
         data = server.list_assignments()
         data["version"] = __version__
+        return JSONResponse(data)
+
+    async def assignment_detail(request: Request) -> JSONResponse:
+        """``GET /assignments/<id>`` — this agent's own record for ONE
+        assignment id, regardless of status (#4141).
+
+        Backs ``coord.diagnose``'s phantom-row heal cross-check: ``/status``
+        alone only exposes a snapshot "active" list, which a real completion
+        has already left by the time it lands — so a bare match-in-active
+        check reads a just-finished assignment the same as a never-existed
+        one. This route answers the narrower, more precise question
+        "what does this agent itself still remember about this id" so that
+        distinction survives the trip over the wire.
+        """
+        data = server.get_assignment_status(request.path_params["id"])
+        if data is None:
+            return JSONResponse(
+                {"error": f"unknown assignment {request.path_params['id']}"},
+                status_code=404,
+            )
         return JSONResponse(data)
 
     async def repos(request: Request) -> JSONResponse:
@@ -2255,6 +2291,10 @@ def build_app(
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
+        # #4141: single-assignment counterpart to /status, for a caller that
+        # needs this agent's own record for exactly one id (never a false
+        # "dead" read off a snapshot list the id may have just left).
+        Route("/assignments/{id}", assignment_detail, methods=["GET"]),
         Route("/repos", repos, methods=["GET"]),
         Route("/assign", assign, methods=["POST"]),
         Route("/cancel/{id}", cancel, methods=["POST"]),

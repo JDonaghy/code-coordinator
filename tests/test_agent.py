@@ -6915,6 +6915,65 @@ class TestListAssignmentsTokens:
         assert entry.get("input_tokens", 0) == 0
 
 
+# ── #4141: single-assignment counterpart to list_assignments/`/status` ─────────
+
+
+class TestGetAssignmentStatus:
+    """`get_assignment_status` (backing `GET /assignments/<id>`) answers for
+    ONE id regardless of its status — the agent's own cross-check for
+    `coord.diagnose.sweep_dead_running_rows`'s phantom-row heal."""
+
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_unknown_id_returns_none(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        assert server.get_assignment_status("ghost") is None
+
+    def test_running_id_matches_the_active_list_entry(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        a = AgentAssignment(id="r1", spec=spec, status=RUNNING)
+        server._assignments[a.id] = a
+
+        single = server.get_assignment_status("r1")
+        [listed] = server.list_assignments()["active"]
+
+        assert single is not None
+        assert single["id"] == "r1"
+        assert single == listed
+
+    def test_completed_id_still_answers_after_it_leaves_the_active_list(
+        self, tmp_path: Path,
+    ) -> None:
+        """The exact #4141 scenario: a terminal assignment has already left
+        `/status`'s `active` list, but this agent still has a record of it
+        — so the caller can tell "just finished" from "never existed"."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        a = AgentAssignment(
+            id="d1", spec=spec, status=DONE, finished_at=1.0, exit_code=0,
+        )
+        server._assignments[a.id] = a
+
+        listing = server.list_assignments()
+        assert listing["active"] == []
+
+        single = server.get_assignment_status("d1")
+        assert single is not None
+        assert single["status"] == "done"
+
+
 # ── #2316: stop_reason / truncation_reason reach /status ───────────────────────
 
 

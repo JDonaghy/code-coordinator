@@ -9451,9 +9451,67 @@ class AgentServer:
             self._persist()
         return active
 
-    def list_assignments(self) -> dict:
+    def _status_dict_for(self, a: "AgentAssignment") -> dict:
+        """Per-assignment ``/status`` enrichment shared by
+        :meth:`list_assignments` (all ids) and :meth:`get_assignment_status`
+        (one id, #4141) — one place computes this answer rather than two
+        independently-drifting ones (#2096)."""
         from coord.worker_events import is_stream_json, parse_log
 
+        d = a.to_status_dict()
+        if a.status == RUNNING:
+            try:
+                prog = self.progress(a.id)
+            except Exception:
+                prog = None
+            if prog:
+                d["progress"] = prog
+            # #1632: when this worker last SAID anything, as Unix
+            # seconds.  The output-silence probe is the one that catches
+            # failures with no symptom except duration, and only this
+            # machine can see its own log file — the coordinator cannot
+            # stat a remote path.  A single `stat` on a file that is
+            # already open for append, wrapped so a vanished log can
+            # never break `/status`.
+            if a.log_path:
+                try:
+                    d["last_output_at"] = os.path.getmtime(a.log_path)
+                except OSError:
+                    pass
+            # Tail-read stream-json log for live summary fields.
+            if a.log_path and is_stream_json(a.log_path):
+                try:
+                    summary = parse_log(a.log_path)
+                except Exception:
+                    summary = None
+                if summary is not None:
+                    d["model_used"] = summary.model_used
+                    d["turns"] = summary.num_turns
+                    d["cost_so_far"] = summary.total_cost_usd
+                    d["last_tool"] = summary.last_tool
+                    d["rate_limited"] = summary.rate_limited
+        else:
+            # For terminal assignments, parse the whole log (tail_bytes=0)
+            # so we can report final totals reliably.
+            if a.log_path and is_stream_json(a.log_path):
+                try:
+                    summary = parse_log(a.log_path, tail_bytes=0)
+                except Exception:
+                    summary = None
+                if summary is not None:
+                    d["model_used"] = summary.model_used
+                    d["total_cost_usd"] = summary.total_cost_usd
+                    d["num_turns"] = summary.num_turns
+                    d["stop_reason"] = summary.stop_reason
+                    # #667: expose token counts so the coordinator can
+                    # persist them even when the log is only on this machine.
+                    d["input_tokens"] = summary.input_tokens
+                    d["output_tokens"] = summary.output_tokens
+                    d["cache_creation_tokens"] = summary.cache_creation_tokens
+                    d["cache_read_tokens"] = summary.cache_read_tokens
+        return d
+
+    def list_assignments(self) -> dict:
         # #1492: clear any ADVISORY entry that's gone terminal on GitHub
         # before serving the completed list — see `_prune_terminal_advisory`
         # docstring for the rate limiting and fail-open behavior.
@@ -9474,60 +9532,35 @@ class AgentServer:
         active = []
         completed = []
         for a in assignments:
-            d = a.to_status_dict()
+            d = self._status_dict_for(a)
             if a.status == RUNNING:
-                try:
-                    prog = self.progress(a.id)
-                except Exception:
-                    prog = None
-                if prog:
-                    d["progress"] = prog
-                # #1632: when this worker last SAID anything, as Unix
-                # seconds.  The output-silence probe is the one that catches
-                # failures with no symptom except duration, and only this
-                # machine can see its own log file — the coordinator cannot
-                # stat a remote path.  A single `stat` on a file that is
-                # already open for append, wrapped so a vanished log can
-                # never break `/status`.
-                if a.log_path:
-                    try:
-                        d["last_output_at"] = os.path.getmtime(a.log_path)
-                    except OSError:
-                        pass
-                # Tail-read stream-json log for live summary fields.
-                if a.log_path and is_stream_json(a.log_path):
-                    try:
-                        summary = parse_log(a.log_path)
-                    except Exception:
-                        summary = None
-                    if summary is not None:
-                        d["model_used"] = summary.model_used
-                        d["turns"] = summary.num_turns
-                        d["cost_so_far"] = summary.total_cost_usd
-                        d["last_tool"] = summary.last_tool
-                        d["rate_limited"] = summary.rate_limited
                 active.append(d)
             else:
-                # For terminal assignments, parse the whole log (tail_bytes=0)
-                # so we can report final totals reliably.
-                if a.log_path and is_stream_json(a.log_path):
-                    try:
-                        summary = parse_log(a.log_path, tail_bytes=0)
-                    except Exception:
-                        summary = None
-                    if summary is not None:
-                        d["model_used"] = summary.model_used
-                        d["total_cost_usd"] = summary.total_cost_usd
-                        d["num_turns"] = summary.num_turns
-                        d["stop_reason"] = summary.stop_reason
-                        # #667: expose token counts so the coordinator can
-                        # persist them even when the log is only on this machine.
-                        d["input_tokens"] = summary.input_tokens
-                        d["output_tokens"] = summary.output_tokens
-                        d["cache_creation_tokens"] = summary.cache_creation_tokens
-                        d["cache_read_tokens"] = summary.cache_read_tokens
                 completed.append(d)
         return {"active": active, "completed": completed}
+
+    def get_assignment_status(self, assignment_id: str) -> dict | None:
+        """Single-id counterpart to :meth:`list_assignments`/``/status``,
+        backing the ``GET /assignments/<id>`` endpoint (#4141).
+
+        ``coord.diagnose.sweep_dead_running_rows``'s phantom-row heal used
+        to infer an assignment's liveness only from whether its id appeared
+        in ``/status``'s ``active`` list — an assignment that just reached a
+        terminal state on THIS agent (a real completion landing right as the
+        sweep runs) has already left that list, so a match-in-active check
+        alone reads identically to "this agent has no memory of it", i.e. a
+        truly dead/phantom row. Returning the agent's own record for one id
+        regardless of its status (PENDING/RUNNING/DONE/FAILED/CANCELLED/
+        ADVISORY) lets a caller tell "finishing right now" apart from
+        "actually gone" instead of conflating them.
+
+        Returns ``None`` (the route serves this as 404) when this agent has
+        no record of *assignment_id* at all.
+        """
+        a = self.get(assignment_id)
+        if a is None:
+            return None
+        return self._status_dict_for(a)
 
     def _servable_repos(self) -> tuple[list[str], dict[str, str]]:
         """#1527: split ``self.repos`` into servable vs degraded.

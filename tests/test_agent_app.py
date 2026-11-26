@@ -113,6 +113,30 @@ def test_assign_then_status(tmp_path: Path) -> None:
     server.shutdown()
 
 
+def test_assignment_detail_endpoint_returns_record_by_id(tmp_path: Path) -> None:
+    """GET /assignments/<id> (#4141) answers for this one id regardless of
+    status — the same enrichment /status's completed list carries."""
+    repo = _init_repo(tmp_path / "repo")
+    client, server = _client(tmp_path, repo_path=repo)
+    r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
+    aid = r.json()["id"]
+
+    server.wait_for(aid)
+
+    r = client.get(f"/assignments/{aid}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == aid
+    assert body["status"] in ("done", "advisory")
+    server.shutdown()
+
+
+def test_assignment_detail_endpoint_unknown_id_returns_404(tmp_path: Path) -> None:
+    client, _ = _client(tmp_path)
+    r = client.get("/assignments/ghost")
+    assert r.status_code == 404
+
+
 def test_assign_invalid_json(tmp_path: Path) -> None:
     client, _ = _client(tmp_path)
     r = client.post("/assign", content="not json", headers={"content-type": "application/json"})
