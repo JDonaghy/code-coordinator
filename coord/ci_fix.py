@@ -1116,7 +1116,25 @@ def dispatch_ci_fix(
     through (declined, or no log to triage at all) proceeds to the
     unconditional worker dispatch below exactly as before #4097 — now with
     the verdict's own diagnosis (if any) carried into the briefing.
+
+    #4136: before any of the above — the infra rerun, the mechanic-leg
+    route, and the ordinary worker dispatch are each their own live action
+    against *entry* — consults
+    :func:`coord.drive_queue.may_dispatch_rework` for ``(entry.repo_name,
+    entry.issue_number)`` and returns ``None`` on a refusal without firing
+    any of them. The ordinary worker dispatch below goes through
+    :func:`coord.auto_loop._dispatch_fix` with ``rework_guard_checked=True``
+    so that path does not re-ask the same live question a second time in
+    the same call.
     """
+    from coord.drive_queue import may_dispatch_rework  # noqa: PLC0415
+
+    rework_allowed, rework_reason = may_dispatch_rework(
+        entry.repo_name, entry.issue_number, "ci_fix", board=board,
+    )
+    if not rework_allowed:
+        return None
+
     work = dispatch_precheck(entry, board)
     if work is None:
         return None
@@ -1234,7 +1252,7 @@ def dispatch_ci_fix(
 
     fix = _dispatch_fix(
         work, briefing, board, config, entry.ci_fix_dispatches + 1,
-        http_client=http_client,
+        http_client=http_client, rework_guard_checked=True,
     )
     if fix is None:
         return None

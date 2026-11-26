@@ -4407,6 +4407,21 @@ def dispatch_review(
             "the worker may not have pushed yet"
         )
 
+    # #4136: the same live question every rework dispatch site answers
+    # before firing (#2096/#2085) — a fresh review is rework exactly like a
+    # fix/conflict-fix/ci-fix leg is, and the #2825 incident shape applies
+    # here too: nothing upstream of this point asks GitHub whether the PR
+    # this would review is already merged or closed. Ahead of the #3670
+    # duplicate-review checks and the claim below, so a refusal here never
+    # spends either.
+    from coord.drive_queue import may_dispatch_rework  # noqa: PLC0415
+
+    rework_allowed, rework_reason = may_dispatch_rework(
+        completed.repo_name, completed.issue_number, "review", board=board,
+    )
+    if not rework_allowed:
+        return _deny(rework_reason)
+
     # #3670: ONE review per leg — once a work assignment has a recorded
     # terminal verdict (approve OR request-changes), it must never be
     # reviewed again. `has_active_followup` just below only guards against
