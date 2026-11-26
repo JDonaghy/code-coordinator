@@ -4115,6 +4115,98 @@ def test_git_merge_verifier_triage_test_failure_compile_error_guard_is_not_degra
     assert verifier.triage_test_failure(s).bucket == "substantive"
 
 
+def test_git_merge_verifier_triage_test_failure_feeds_diff_stat_declared_files_and_capabilities(
+    tmp_path, monkeypatch,
+):
+    """#4124: the Test edge must feed `triage_failure`'s mechanical-
+    confinement check the SAME three inputs the CI-red edge
+    (`coord.ci_fix.triage_ci_failure`) already feeds it — a branch diff's
+    touched files, the issue's own `## Files` declaration, and the
+    capabilities of the machine that ran the Test leg — never leave them
+    at their empty defaults when they are cheaply available (#2096: one
+    classifier, fed consistently across edges)."""
+    import coord.failure_triage as failure_triage
+    import coord.github_ops as github_ops
+
+    captured: dict = {}
+
+    def fake_triage_failure(**kw):
+        captured.update(kw)
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="a real bug",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.9,
+            via="model",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
+    monkeypatch.setattr(
+        github_ops, "get_compare_diff",
+        lambda repo, base, head: "diff --git a/src/foo.rs b/src/foo.rs",
+    )
+    monkeypatch.setattr(
+        github_ops, "diff_file_paths", lambda diff_text: ["src/foo.rs"],
+    )
+    monkeypatch.setattr(
+        github_ops, "get_issue",
+        lambda repo, issue_number: {"body": "## Files\n- src/foo.rs\n"},
+    )
+
+    cfg = _config_with_triage_enabled()
+    cfg.machines.append(Machine(name="mac1", host="mac1.tail", capabilities=["mac", "rust"]))
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(cfg)
+    s = state(
+        work_test_reason="3 failed",
+        work_branch="issue-4124-fix",
+        work_machine="mac1",
+    )
+
+    verdict = verifier.triage_test_failure(s)
+
+    assert verdict is not None and verdict.bucket == "substantive"
+    assert captured["diff_stat"].files == ("src/foo.rs",)
+    assert captured["declared_files"] == ("src/foo.rs",)
+    assert captured["machine_capabilities"] == ("mac", "rust")
+
+
+def test_git_merge_verifier_triage_test_failure_diff_declared_and_capabilities_fail_soft(
+    tmp_path, monkeypatch,
+):
+    """#4124: a branch with no work branch/machine recorded yet (or a
+    `gh`/network hiccup fetching them) must never block the classifier —
+    each input degrades to its own empty default, exactly as before this
+    wiring existed."""
+    import coord.failure_triage as failure_triage
+
+    captured: dict = {}
+
+    def fake_triage_failure(**kw):
+        captured.update(kw)
+        return failure_triage.TriageVerdict(
+            bucket=failure_triage.BUCKET_SUBSTANTIVE,
+            diagnosis="a real bug",
+            repro_capability=None,
+            proposed_scope=failure_triage.ProposedScope(),
+            confidence=0.9,
+            via="model",
+        )
+
+    monkeypatch.setattr(failure_triage, "triage_failure", fake_triage_failure)
+    verifier = GitMergeVerifier(repo_path=str(tmp_path))
+    verifier.set_config(_config_with_triage_enabled())
+    s = state(work_test_reason="3 failed")
+
+    verdict = verifier.triage_test_failure(s)
+
+    assert verdict is not None and verdict.bucket == "substantive"
+    assert captured["diff_stat"].files == ()
+    assert captured["declared_files"] == ()
+    assert captured["machine_capabilities"] == ()
+
+
 def test_empty_fix_round_does_not_spend_the_budget():
     """#3713: if a fix worker pushes 0 commits (SHA unchanged), the fix_rounds
     increment is undone so an infra death doesn't consume the budget."""
