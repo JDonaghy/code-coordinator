@@ -1230,10 +1230,13 @@ _STALLED_DISPATCH_KINDS = frozenset({
 # `coord fix`'s own `write_board` decision. `superseded_by_approval` (#4002)
 # mutates the review row's own `review_verdict` (request-changes, recorded
 # non-blocking) without dispatching anything — same "mutates but doesn't
-# dispatch" shape as `terminal_skip`.
+# dispatch" shape as `terminal_skip`. `rework_refused` (#4134) is the same
+# shape again: `may_dispatch_rework`'s refusal is reached only after
+# `propagate_review_verdict` already wrote `review.review_verdict`/
+# `work.review_state` onto the board.
 _MUTATING_REVIEW_COMPLETION_KINDS = frozenset({
     "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
-    "finisher_dispatched", "superseded_by_approval",
+    "finisher_dispatched", "superseded_by_approval", "rework_refused",
 })
 
 

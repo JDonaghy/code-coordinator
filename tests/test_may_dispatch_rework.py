@@ -484,10 +484,19 @@ def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
     )
     mock_http = MagicMock()
 
+    # `config.machines=[]` alone already makes `select_fix_machine` return
+    # no candidate, so `_dispatch_fix` would return `None` even with the
+    # guard removed — that would make this arm pass vacuously. Patch
+    # `select_fix_machine` itself (imported inside `_dispatch_fix` at call
+    # time, so patching the `coord.dispatch` module attribute is seen) and
+    # assert it is never even reached: that is the fact that can only hold
+    # with the `may_dispatch_rework` guard in place.
     with patch(
         "coord.state.get_drive_queue_entry",
         return_value={"repo_name": REPO, "issue_number": ISSUE, "state": STATE_DONE},
-    ), patch("coord.github_ops.work_is_terminal", return_value=True):
+    ), patch("coord.github_ops.work_is_terminal", return_value=True), patch(
+        "coord.dispatch.select_fix_machine"
+    ) as mock_select_fix_machine:
         fix_result = _dispatch_fix(
             work, "fix it", board, config, 1, http_client=mock_http,
         )
@@ -500,6 +509,7 @@ def test_2825_shape_merged_pr_done_row_zero_dispatches_from_fix_dispatchers():
         )
 
     assert fix_result is None
+    mock_select_fix_machine.assert_not_called()
     assert len(actions) == 1
     assert actions[0].kind == "rework_refused"
     assert "done" in actions[0].detail

@@ -1315,9 +1315,13 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
     # dispatch" shape as terminal_skip, and must persist and exit clean for
     # the same reason: it is a deliberate, successful outcome (a
     # request-changes against an already-approved head, recorded
-    # non-blocking), not a failure mode.
+    # non-blocking), not a failure mode. #4134: rework_refused is the same
+    # shape again — may_dispatch_rework's refusal is reached only after
+    # process_review_completion already wrote review_verdict/review_state
+    # onto the board.
     terminal = any(
-        a.kind in ("terminal_skip", "superseded_by_approval") for a in actions
+        a.kind in ("terminal_skip", "superseded_by_approval", "rework_refused")
+        for a in actions
     )
     if dispatched or terminal:
         write_board(board)
@@ -1327,9 +1331,12 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
 
     if not dispatched:
         # Distinguish clean outcomes (approve / already-merged-or-closed /
-        # superseded-by-approval) from genuine failure modes.
+        # superseded-by-approval / rework-refused) from genuine failure modes.
         if any(
-            a.kind in ("approved", "terminal_skip", "superseded_by_approval")
+            a.kind in (
+                "approved", "terminal_skip", "superseded_by_approval",
+                "rework_refused",
+            )
             for a in actions
         ):
             sys.exit(0)
