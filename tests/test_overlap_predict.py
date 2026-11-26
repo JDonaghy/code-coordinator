@@ -20,6 +20,8 @@ from coord.overlap_predict import (
     Footprint,
     Overlap,
     Prediction,
+    _intersect,
+    _surface_covers,
     classify_outcome,
     collect_candidate_files,
     declared_footprints,
@@ -376,6 +378,87 @@ def test_surface_paths_honor_the_directory_overlap_rule():
         surface_paths=["scripts/baselines/"],
     )
     assert not prediction
+
+
+def test_surface_covers_is_directed_not_bidirectional():
+    # The surface is the specific file; a candidate declaring the whole
+    # directory is NOT "covered" just because `paths_overlap` would match
+    # both ways -- only the surface side is allowed to be the directory.
+    assert not _surface_covers("scripts/", "scripts/backend_loc_baseline.json")
+    # The forward direction (surface is the directory) still works.
+    assert _surface_covers("scripts/backend_loc_baseline.json", "scripts/")
+    # Exact match either way.
+    assert _surface_covers("scripts/backend_loc_baseline.json", "scripts/backend_loc_baseline.json")
+
+
+def test_a_coarse_directory_candidate_is_not_dropped_as_surface_only():
+    # #4154 review: a candidate that declares the bare directory `scripts/`
+    # overlaps a footprint that touches both the declared surface
+    # (`scripts/backend_loc_baseline.json`) and real, non-surface work
+    # (`scripts/deploy.py`). The old bidirectional check treated the
+    # candidate's directory hit as "covered" by the surface file and
+    # dropped the whole match -- hiding the genuine collision on
+    # `scripts/deploy.py`.
+    footprint = Footprint(
+        key=f"{REPO}#1",
+        issue_number=1,
+        files=("scripts/deploy.py", "scripts/backend_loc_baseline.json"),
+        source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap(
+        ["scripts/"],
+        [footprint],
+        surface_paths=["scripts/backend_loc_baseline.json"],
+    )
+    assert prediction
+    assert prediction.overlaps[0].files == ("scripts/",)
+
+
+def test_a_coarse_directory_on_the_other_side_is_not_dropped_either():
+    # The candidate declares the exact surface file; the OTHER side only
+    # declares the bare directory `scripts/` (a coarse `## Files` entry on
+    # a queued-but-unbranched sibling). That directory declaration could be
+    # standing in for non-surface work this function never sees directly,
+    # so the matched `other` path must also be covered before the hit is
+    # dropped.
+    footprint = Footprint(
+        key=f"{REPO}#1",
+        issue_number=1,
+        files=("scripts/",),
+        source=SOURCE_DECLARED,
+    )
+    prediction = predict_overlap(
+        ["scripts/backend_loc_baseline.json"],
+        [footprint],
+        surface_paths=["scripts/backend_loc_baseline.json"],
+    )
+    assert prediction
+    assert prediction.overlaps[0].files == ("scripts/backend_loc_baseline.json",)
+
+
+def test_intersect_drop_rule_directly():
+    # Every hit AND every matched `other` path covered -- dropped.
+    assert _intersect(
+        ["a/surface.json"], ["a/surface.json"], surface_paths=["a/surface.json"],
+    ) == ()
+    # A non-surface hit alongside a surface one -- kept in full.
+    assert _intersect(
+        ["a/surface.json", "a/real.py"],
+        ["a/surface.json", "a/real.py"],
+        surface_paths=["a/surface.json"],
+    ) == ("a/surface.json", "a/real.py")
+
+
+def test_intersect_no_surface_paths_given_zero_hits():
+    assert _intersect(["a/x.py"], ["b/y.py"], surface_paths=["a/x.py"]) == ()
+
+
+def test_intersect_every_hit_covered_but_by_different_surfaces():
+    assert _intersect(
+        ["a/one.json", "b/two.json"],
+        ["a/one.json", "b/two.json"],
+        surface_paths=["a/one.json", "b/two.json"],
+    ) == ()
 
 
 # ── #2603: an edge's PROVENANCE, not just its conclusion ────────────────────

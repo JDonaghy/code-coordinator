@@ -642,6 +642,45 @@ def test_two_issues_declaring_the_same_file_are_ordered_not_refused(cli, declare
     assert len(state._list_drive_queue_local()) == 2
 
 
+def test_a_surface_only_collision_yields_no_after_edge(tmp_path: Path, declare):
+    """#4154: `drive-queue add` must not chain `--after` on a collision that
+    falls entirely on a declared `integration_surfaces` path (#4151) —
+    unlike the plain-file collision above, two branches that only touch a
+    mechanically-regenerated fixture are not doing conflicting work."""
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        f"""\
+repos:
+  - name: {REPO}
+    github: john/claude-coordinator
+    default_branch: main
+    integration_surfaces:
+      - paths: [scripts/backend_loc_baseline.json]
+        regen: "python3 scripts/backend_loc_ratchet.py --write"
+        check: "python3 scripts/backend_loc_ratchet.py"
+machines:
+  - name: dellserver
+    host: dellserver
+    repos: [{REPO}]
+"""
+    )
+
+    def run(*args: str):
+        return CliRunner().invoke(
+            main, ["drive-queue", *args, "--config", str(config_path)]
+        )
+
+    declare(306, "scripts/backend_loc_baseline.json")
+    declare(307, "scripts/backend_loc_baseline.json")
+
+    assert run("add", REPO, "306").exit_code == 0
+    result = run("add", REPO, "307")
+
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == []
+    assert "overlap" not in result.output
+
+
 def test_an_unrelated_pair_still_runs_in_parallel(cli, declare):
     declare(306, "coord/drive_queue.py")
     declare(307, "tui/src/main.rs")
