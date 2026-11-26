@@ -2383,6 +2383,35 @@ def _surface_tail(text: str, limit: int = 4000) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
+def _surface_run(
+    args: "list[str] | str",
+    *,
+    cwd: Path,
+    timeout: float,
+    shell: bool = False,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run`` wrapper used by every step of the #4152 mechanical
+    resolver: a ``subprocess.TimeoutExpired`` or ``OSError`` — both routine
+    for a ``regen``/``check`` that legitimately takes up to 1800s — is
+    turned into a synthetic non-zero :class:`subprocess.CompletedProcess`
+    instead of propagating. Every call site already treats a non-zero
+    ``returncode`` as "decline and clean up", so this keeps that the ONLY
+    failure shape the resolver has to handle, and no exception can escape
+    :func:`attempt_mechanical_surface_resolution` into its caller.
+    """
+    try:
+        return subprocess.run(
+            args, shell=shell, cwd=str(cwd),  # noqa: S602
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            args, 124, stdout="", stderr=f"timed out after {timeout}s: {e}",
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr=str(e))
+
+
 def _surface_rev_parse(cwd: Path, ref: str) -> str | None:
     """Resolve *ref* to a full SHA in *cwd*, or ``None`` on any failure."""
     try:
@@ -2462,40 +2491,38 @@ def _resolve_surfaces_in_worktree(
 
     Never leaves *wt_path* mid-merge on a decline — every early return is
     preceded by ``git merge --abort``; the caller removes the worktree
-    itself regardless of outcome.
+    itself regardless of outcome. Every subprocess call (including the
+    abort itself) goes through :func:`_surface_run`, so a
+    ``TimeoutExpired``/``OSError`` anywhere in here degrades to an ordinary
+    non-zero-returncode decline rather than propagating out of this
+    function — see that helper's docstring.
     """
-    merged = subprocess.run(
+    def _abort() -> None:
+        _surface_run(["git", "merge", "--abort"], cwd=wt_path, timeout=60)
+
+    merged = _surface_run(
         ["git", "merge", "--no-ff", "--no-commit", f"origin/{entry.branch}"],
-        cwd=str(wt_path), capture_output=True, text=True, timeout=120,
+        cwd=wt_path, timeout=120,
     )
     if merged.returncode == 0:
         # A clean local merge is not the shape this resolves (the conflict
         # that triggered this call may already be stale) — decline and let
         # the caller's own unchanged CONFLICT handling re-evaluate it.
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-        )
+        _abort()
         return MechanicalSurfaceResolution(
             False, "merge is clean locally — not a real conflict"
         )
 
     conflicted = _surface_conflicted_paths(wt_path)
     if not conflicted:
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-        )
+        _abort()
         return MechanicalSurfaceResolution(
             False, "merge failed but reported no conflicted paths"
         )
 
     uncovered = sorted(p for p in conflicted if p not in declared_paths)
     if uncovered:
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-        )
+        _abort()
         return MechanicalSurfaceResolution(
             False,
             "conflicted path(s) not covered by a declared integration "
@@ -2505,29 +2532,19 @@ def _resolve_surfaces_in_worktree(
     # Every conflicted path is a declared surface — take the base side
     # (`origin/{target_branch}`, checked out as `ours` in this worktree).
     for path in conflicted:
-        took_base = subprocess.run(
-            ["git", "checkout", "--ours", "--", path],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
+        took_base = _surface_run(
+            ["git", "checkout", "--ours", "--", path], cwd=wt_path, timeout=60,
         )
         if took_base.returncode != 0:
-            subprocess.run(
-                ["git", "merge", "--abort"],
-                cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-            )
+            _abort()
             return MechanicalSurfaceResolution(
                 False,
                 f"could not take the base side of {path}: "
                 f"{_surface_tail(took_base.stderr)}",
             )
-        staged = subprocess.run(
-            ["git", "add", "--", path],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-        )
+        staged = _surface_run(["git", "add", "--", path], cwd=wt_path, timeout=60)
         if staged.returncode != 0:
-            subprocess.run(
-                ["git", "merge", "--abort"],
-                cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-            )
+            _abort()
             return MechanicalSurfaceResolution(
                 False, f"could not stage {path}: {_surface_tail(staged.stderr)}",
             )
@@ -2535,34 +2552,23 @@ def _resolve_surfaces_in_worktree(
     conflicted_set = set(conflicted)
     ran_surfaces = [s for s in surfaces if conflicted_set & set(s.paths)]
     for surface in ran_surfaces:
-        regen = subprocess.run(
-            surface.regen, shell=True, cwd=str(wt_path),  # noqa: S602
-            capture_output=True, text=True, timeout=1800,
+        regen = _surface_run(
+            surface.regen, shell=True, cwd=wt_path, timeout=1800,
         )
         if regen.returncode != 0:
-            subprocess.run(
-                ["git", "merge", "--abort"],
-                cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-            )
+            _abort()
             return MechanicalSurfaceResolution(
                 False,
                 f"regen command failed for {surface.paths}: "
                 f"{_surface_tail(regen.stdout + regen.stderr)}",
             )
         for path in surface.paths:
-            subprocess.run(
-                ["git", "add", "--", path],
-                cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-            )
-        check = subprocess.run(
-            surface.check, shell=True, cwd=str(wt_path),  # noqa: S602
-            capture_output=True, text=True, timeout=1800,
+            _surface_run(["git", "add", "--", path], cwd=wt_path, timeout=60)
+        check = _surface_run(
+            surface.check, shell=True, cwd=wt_path, timeout=1800,
         )
         if check.returncode != 0:
-            subprocess.run(
-                ["git", "merge", "--abort"],
-                cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-            )
+            _abort()
             return MechanicalSurfaceResolution(
                 False,
                 f"check command failed for {surface.paths}: "
@@ -2571,28 +2577,22 @@ def _resolve_surfaces_in_worktree(
 
     remaining = _surface_conflicted_paths(wt_path)
     if remaining:
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-        )
+        _abort()
         return MechanicalSurfaceResolution(
             False,
             f"unresolved conflict remains after regen: {', '.join(remaining)}",
         )
 
-    commit = subprocess.run(
+    commit = _surface_run(
         [
-            "git", "commit", "--no-edit", "-m",
+            "git", "commit", "-m",
             f"Merge {entry.target_branch} into {entry.branch} "
             "(mechanical integration-surface regen)",
         ],
-        cwd=str(wt_path), capture_output=True, text=True, timeout=120,
+        cwd=wt_path, timeout=120,
     )
     if commit.returncode != 0:
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=str(wt_path), capture_output=True, text=True, timeout=60,
-        )
+        _abort()
         return MechanicalSurfaceResolution(
             False, f"commit failed: {_surface_tail(commit.stderr)}",
         )
@@ -2603,13 +2603,13 @@ def _resolve_surfaces_in_worktree(
             False, "resolved and committed, but could not read the new HEAD sha",
         )
 
-    pushed = subprocess.run(
+    pushed = _surface_run(
         [
             "git", "push",
             f"--force-with-lease={entry.branch}:{old_branch_sha}",
             "origin", f"HEAD:{entry.branch}",
         ],
-        cwd=str(wt_path), capture_output=True, text=True, timeout=180,
+        cwd=wt_path, timeout=180,
     )
     if pushed.returncode != 0:
         return MechanicalSurfaceResolution(
@@ -2619,9 +2619,9 @@ def _resolve_surfaces_in_worktree(
     # #2096: confirm from an observation taken AFTER the push — re-fetch the
     # branch ref from the remote rather than trusting the push subprocess's
     # exit code alone.
-    confirm = subprocess.run(
+    confirm = _surface_run(
         ["git", "ls-remote", "origin", f"refs/heads/{entry.branch}"],
-        cwd=str(wt_path), capture_output=True, text=True, timeout=60,
+        cwd=wt_path, timeout=60,
     )
     remote_sha = confirm.stdout.split()[0] if confirm.stdout.strip() else None
     if confirm.returncode != 0 or not remote_sha:
@@ -2699,13 +2699,9 @@ def attempt_mechanical_surface_resolution(
             False, "no local repo checkout available on this machine",
         )
 
-    try:
-        fetched = subprocess.run(
-            ["git", "fetch", "origin", "--prune"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=120,
-        )
-    except (subprocess.SubprocessError, OSError) as e:
-        return MechanicalSurfaceResolution(False, f"git fetch failed: {e}")
+    fetched = _surface_run(
+        ["git", "fetch", "origin", "--prune"], cwd=repo_dir, timeout=120,
+    )
     if fetched.returncode != 0:
         return MechanicalSurfaceResolution(
             False, f"git fetch failed: {_surface_tail(fetched.stderr)}",
@@ -2721,14 +2717,19 @@ def attempt_mechanical_surface_resolution(
         entry.repo_name, entry.target_branch, entry.branch,
     )
     _remove_surface_worktree(repo_dir, wt_path)
-    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return MechanicalSurfaceResolution(
+            False, f"could not create worktree parent directory: {e}",
+        )
 
-    added = subprocess.run(
+    added = _surface_run(
         [
             "git", "worktree", "add", "--force", "--detach",
             str(wt_path), f"origin/{entry.target_branch}",
         ],
-        cwd=str(repo_dir), capture_output=True, text=True, timeout=120,
+        cwd=repo_dir, timeout=120,
     )
     if added.returncode != 0:
         return MechanicalSurfaceResolution(
@@ -2738,11 +2739,36 @@ def attempt_mechanical_surface_resolution(
         )
 
     try:
-        return _resolve_surfaces_in_worktree(
+        result = _resolve_surfaces_in_worktree(
             wt_path, entry, surfaces, declared_paths, old_branch_sha,
         )
     finally:
         _remove_surface_worktree(repo_dir, wt_path)
+
+    # #3696: same reasoning as `dispatch_conflict_fix`'s own post-dispatch
+    # cancellation — the push above replaces whatever head `entry.branch`
+    # currently points at, so a Test-stage leg still running/queued against
+    # it would be verifying a commit that no longer exists. This function
+    # (unlike `dispatch_conflict_fix`) receives no `board` to mutate and
+    # have a caller persist later, so it loads and saves its own — best
+    # effort, and never allowed to turn an already-pushed success into a
+    # reported failure.
+    if result.ok and entry.branch:
+        try:
+            from coord.smoke import cancel_stale_smoke_legs  # noqa: PLC0415
+            from coord.state import load_board, save_board  # noqa: PLC0415
+
+            fresh_board = load_board()
+            if fresh_board is not None:
+                cancel_stale_smoke_legs(
+                    fresh_board, config,
+                    repo_name=entry.repo_name, branch=entry.branch,
+                )
+                save_board(fresh_board)
+        except Exception:  # noqa: BLE001 — best-effort, never voids a success
+            pass
+
+    return result
 
 
 def dispatch_conflict_fix(
