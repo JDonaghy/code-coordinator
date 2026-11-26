@@ -7,6 +7,17 @@
 failure->green time, and the known-broken-SHA avoidable check need it) — and
 hands both to the pure aggregator, :mod:`coord.leg_waste`, mirroring
 :mod:`coord.commands.scorecard`'s own fetch-then-aggregate split.
+
+#4144 feeds the same two already-fetched reads into three more pure
+aggregators in :mod:`coord.usage` — :func:`coord.usage.heal_counts_from_audit`
+(phantom-row/stuck-test-state auto-heal counts, #2536/#2803, including how
+many went through #4141's two-consecutive-miss confirmation gate),
+:func:`coord.usage.repo_attention_thresholds` (which repos are actually
+running #4142's learned per-repo threshold rather than the fleet-wide fixed
+default), and :func:`coord.usage.fanout_fold_latencies` (how long #3182's
+fan-out fold took to catch up once every leg reported in, #4143) — so a later
+efficiency change against any of those four shapes has a real before/after
+number instead of an anecdote.
 """
 
 from __future__ import annotations
@@ -105,6 +116,50 @@ def format_waste_report(report, *, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
+def format_heal_stall_signals(
+    heal_counts, repo_thresholds: list, fanout_latencies: list,
+) -> str:
+    """Human-readable rendering of the #4144 heal/stall signals section —
+    see :func:`coord.usage.heal_counts_from_audit`,
+    :func:`coord.usage.repo_attention_thresholds`, and
+    :func:`coord.usage.fanout_fold_latencies`.
+    """
+    lines = [
+        "",
+        "Heal/stall signals (#4122):",
+        "  Auto-heals:  "
+        f"phantom_row={heal_counts.phantom_row_healed}"
+        f" (miss_confirmed={heal_counts.phantom_row_miss_confirmed})"
+        f" stuck_test_state={heal_counts.stuck_test_state_healed}",
+    ]
+
+    if repo_thresholds:
+        learned = [t for t in repo_thresholds if t.is_learned]
+        lines.append(
+            f"  Attention thresholds: {len(learned)}/{len(repo_thresholds)} "
+            "repo(s) on a #4142 learned per-repo threshold"
+        )
+        for t in sorted(repo_thresholds, key=lambda t: t.repo_name):
+            tag = "learned" if t.is_learned else "fixed/explicit"
+            lines.append(
+                f"    {t.repo_name:<12} {t.assignment_type:<6} "
+                f"{_fmt_hms(t.threshold_secs):<8} ({tag})"
+            )
+    else:
+        lines.append("  Attention thresholds: no repo data")
+
+    if fanout_latencies:
+        secs = [f.latency_secs for f in fanout_latencies]
+        lines.append(
+            f"  Fan-out fold latency (#3182): n={len(secs)} "
+            f"avg={_fmt_hms(sum(secs) / len(secs))} max={_fmt_hms(max(secs))}"
+        )
+    else:
+        lines.append("  Fan-out fold latency (#3182): no fan-out rounds in window")
+
+    return "\n".join(lines)
+
+
 @click.group("stats")
 def stats_group() -> None:
     """Triage-first fleet metrics (#4099): is the pipeline actually getting
@@ -135,7 +190,12 @@ def waste(
 ) -> None:
     from coord.leg_waste import build_waste_report, waste_report_to_dict  # noqa: PLC0415
     from coord.state import list_audit_log  # noqa: PLC0415
-    from coord.usage import fetch_usage_rows  # noqa: PLC0415
+    from coord.usage import (  # noqa: PLC0415
+        fanout_fold_latencies,
+        fetch_usage_rows,
+        heal_counts_from_audit,
+        repo_attention_thresholds,
+    )
     from coord.usage_rollup import TimeWindow, window_since  # noqa: PLC0415
 
     cfg = _load_config(config_path)
@@ -193,8 +253,30 @@ def waste(
         pricing=cfg.pricing,
     )
 
+    # #4144: feed the #4122 heal/stall tranche's own audit trail + the
+    # #4142 learned-threshold config knob into the same report, scoped to
+    # the same repo(s)/window as everything above — never a second,
+    # independently-filtered read. Best-effort, mirroring the board/audit
+    # fetches above: a problem computing one of these three signals must
+    # never take down the rest of `coord stats waste`.
+    heal_counts = heal_counts_from_audit(audit_entries)
+    try:
+        threshold_repo_names = {repo} if repo else {i.repo_name for i in report.issues}
+        repo_thresholds = repo_attention_thresholds(threshold_repo_names, config=cfg)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"warning: could not compute repo attention thresholds: {e}", err=True)
+        repo_thresholds = []
+    fold_latencies = fanout_fold_latencies(assignment_rows, audit_entries)
+
     if output_json:
-        click.echo(_json.dumps(waste_report_to_dict(report), indent=2, default=str))
+        body = waste_report_to_dict(report)
+        body["heal_stall_signals"] = {
+            "heal_counts": heal_counts.to_dict(),
+            "repo_attention_thresholds": [t.to_dict() for t in repo_thresholds],
+            "fanout_fold_latencies": [f.to_dict() for f in fold_latencies],
+        }
+        click.echo(_json.dumps(body, indent=2, default=str))
         return
 
     click.echo(format_waste_report(report, verbose=verbose))
+    click.echo(format_heal_stall_signals(heal_counts, repo_thresholds, fold_latencies))
