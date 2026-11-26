@@ -735,6 +735,175 @@ def test_ancillary_files_non_string_element(tmp_path: Path) -> None:
         load(p)
 
 
+# ── integration_surfaces (#4151) ─────────────────────────────────────────────
+
+
+def test_integration_surfaces_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - paths: [tests/ratchet.rs]\n"
+        "        regen: RATCHET_WRITE=1 cargo test --test ratchet\n"
+        "        check: cargo test --test ratchet\n"
+        "      - paths: [scripts/baseline.json, scripts/other.json]\n"
+        "        regen: python3 scripts/baseline.py --write\n"
+        "        check: python3 scripts/baseline.py\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    surfaces = cfg.repo("api").integration_surfaces
+    assert len(surfaces) == 2
+    assert surfaces[0].paths == ["tests/ratchet.rs"]
+    assert surfaces[0].regen == "RATCHET_WRITE=1 cargo test --test ratchet"
+    assert surfaces[0].check == "cargo test --test ratchet"
+    assert surfaces[1].paths == ["scripts/baseline.json", "scripts/other.json"]
+
+
+def test_integration_surfaces_default_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").integration_surfaces == []
+
+
+def test_integration_surfaces_not_a_list(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces: nope\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="integration_surfaces must be a list"):
+        load(p)
+
+
+def test_integration_surfaces_entry_not_a_mapping(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - nope\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="integration_surfaces\\[0\\] must be a mapping"):
+        load(p)
+
+
+def test_integration_surfaces_unknown_key(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - paths: [a.txt]\n"
+        "        regen: foo\n"
+        "        check: bar\n"
+        "        extra: baz\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load(p)
+
+
+def test_integration_surfaces_missing_paths(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - regen: foo\n"
+        "        check: bar\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="paths must be a non-empty list"):
+        load(p)
+
+
+def test_integration_surfaces_empty_paths(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - paths: []\n"
+        "        regen: foo\n"
+        "        check: bar\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="paths must be a non-empty list"):
+        load(p)
+
+
+def test_integration_surfaces_non_string_path(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - paths: [42]\n"
+        "        regen: foo\n"
+        "        check: bar\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="paths\\[0\\] must be a non-empty string"):
+        load(p)
+
+
+def test_integration_surfaces_missing_regen(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - paths: [a.txt]\n"
+        "        check: bar\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="regen must be a non-empty string"):
+        load(p)
+
+
+def test_integration_surfaces_missing_check(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    integration_surfaces:\n"
+        "      - paths: [a.txt]\n"
+        "        regen: foo\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="check must be a non-empty string"):
+        load(p)
+
+
 # ── requires (#3351) ─────────────────────────────────────────────────────────
 
 

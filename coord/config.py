@@ -28,6 +28,7 @@ from coord.liveness_auditor import (
 )
 from coord.models import (
     BoardDoctorRepoConfig,
+    IntegrationSurface,
     Machine,
     QuietHours,
     Repo,
@@ -3898,6 +3899,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "new_issue_guidance",
         "artifact_paths",
         "ancillary_files",
+        "integration_surfaces",
         "provider",
         "uat_preview",
         "uat_live_preview",
@@ -4167,6 +4169,14 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 )
         ancillary_files: list[str] = list(ancillary_files_raw)
 
+        # #4151: integration_surfaces — mechanically-derived files this
+        # repo's CI regenerates from source, each with its own regen/check
+        # command. See `IntegrationSurface`'s docstring for the shape; this
+        # is parsing only — no sibling issue reads it yet.
+        integration_surfaces = _parse_integration_surfaces(
+            entry.get("integration_surfaces"), i
+        )
+
         # #323: optional per-repo provider override.
         repo_provider = entry.get("provider")
         if repo_provider is not None and not isinstance(repo_provider, str):
@@ -4259,6 +4269,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 new_issue_guidance=new_issue_guidance,
                 artifact_paths=artifact_paths,
                 ancillary_files=ancillary_files,
+                integration_surfaces=integration_surfaces,
                 provider=repo_provider,
                 uat_preview=uat_preview,
                 uat_live_preview=uat_live_preview_raw,
@@ -4298,6 +4309,55 @@ def _parse_worker_permissions(raw: Any, repo_index: int) -> WorkerPermissionsCon
         )
 
     return WorkerPermissionsConfig(allow=allow, deny=deny)
+
+
+def _parse_integration_surfaces(raw: Any, repo_index: int) -> list[IntegrationSurface]:
+    """Parse the ``integration_surfaces`` list for a single repo (#4151).
+
+    ``raw`` is absent/``None`` by default, meaning this repo declares no
+    surfaces -- every call site that will eventually read this list treats
+    an empty list identically to "not configured". Each entry is a mapping
+    with a required non-empty ``paths`` list and required non-empty
+    ``regen``/``check`` command strings; validated the same way
+    ``ancillary_files`` is, just with more fields per entry.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"repos[{repo_index}].integration_surfaces must be a list")
+
+    surfaces: list[IntegrationSurface] = []
+    for j, entry in enumerate(raw):
+        ctx = f"repos[{repo_index}].integration_surfaces[{j}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{ctx} must be a mapping")
+
+        unknown = sorted(set(entry) - {"paths", "regen", "check"})
+        if unknown:
+            raise ConfigError(f"{ctx} has unknown key(s): {', '.join(unknown)}")
+
+        paths_raw = entry.get("paths")
+        if not isinstance(paths_raw, list) or not paths_raw:
+            raise ConfigError(f"{ctx}.paths must be a non-empty list of strings")
+        for k, p in enumerate(paths_raw):
+            if not isinstance(p, str) or not p.strip():
+                raise ConfigError(
+                    f"{ctx}.paths[{k}] must be a non-empty string, "
+                    f"got {type(p).__name__}"
+                )
+
+        regen = entry.get("regen")
+        if not isinstance(regen, str) or not regen.strip():
+            raise ConfigError(f"{ctx}.regen must be a non-empty string")
+
+        check = entry.get("check")
+        if not isinstance(check, str) or not check.strip():
+            raise ConfigError(f"{ctx}.check must be a non-empty string")
+
+        surfaces.append(
+            IntegrationSurface(paths=list(paths_raw), regen=regen, check=check)
+        )
+    return surfaces
 
 
 def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRepoConfig:

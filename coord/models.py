@@ -41,6 +41,29 @@ class WorkerPermissionsConfig:
     deny: list[str] = field(default_factory=list)
 
 
+@dataclass
+class IntegrationSurface:
+    """One mechanically-derived set of files this repo's CI regenerates
+    from source rather than hand-edits -- e.g. a Rust ratchet-test fixture
+    or a generated baseline JSON.
+
+    ``paths`` are the files this surface owns (relative to the repo root).
+    ``regen`` is the shell command that rewrites them from current source
+    (run in the repo root). ``check`` is the command CI itself runs to
+    verify they're up to date -- it MUST be a command CI also runs, so a
+    passing ``check`` here means the same thing a passing CI run does.
+
+    This dataclass only describes the surface; nothing in this repo yet
+    reads ``regen``/``check`` to act on a conflict or a ratchet-lowering
+    delta -- see `Repo.integration_surfaces`'s docstring for which sibling
+    issues wire that up.
+    """
+
+    paths: list[str] = field(default_factory=list)
+    regen: str = ""
+    check: str = ""
+
+
 class _UatPreviewVars(dict):
     """``dict`` for ``str.format_map`` that leaves an unknown ``{placeholder}``
     unrendered instead of raising ``KeyError`` (see ``Repo.uat_preview``)."""
@@ -280,6 +303,19 @@ class Repo:
     # present".  Unset/empty means every content-changing rebase voids
     # the approval.
     ancillary_files: list[str] = field(default_factory=list)
+    # #4151: integration_surfaces -- mechanically-derived files this repo's
+    # CI regenerates from source (e.g. a ratchet-test fixture or a generated
+    # baseline JSON), each with its own `regen`/`check` command. See
+    # `IntegrationSurface`'s docstring for the shape and validation.
+    #
+    # This field is the foundation three sibling issues read from (#4123):
+    # mechanical conflict regen when every conflicted path is a declared
+    # surface, auto-reaffirming an approval on a surface-only
+    # ratchet-lowering delta, and having `coord.overlap_predict` ignore
+    # overlap confined to surface files. None of that wiring exists yet --
+    # parsing this block into `Repo.integration_surfaces` has no effect on
+    # behavior until a sibling issue reads it.
+    integration_surfaces: list[IntegrationSurface] = field(default_factory=list)
     # #323: optional provider override for workers dispatched to this repo.
     # When set, overrides providers.default from coordinator.yml.  The value
     # must match a key in providers.definitions (or be "claude" which is
