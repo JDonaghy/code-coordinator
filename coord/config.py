@@ -5769,6 +5769,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
             )
         cfg.attention_thresholds = parsed
 
+    if "learn_attention_thresholds" in raw:
+        value = raw["learn_attention_thresholds"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.learn_attention_thresholds must be a boolean")
+        cfg.learn_attention_thresholds = value
+
     if "convergence_rounds" in raw:
         value = raw["convergence_rounds"]
         if not isinstance(value, int) or value < 1:

@@ -652,6 +652,32 @@ class TestNeedsAttentionField:
         pv = compute_pipeline(a, Board(active=[], completed=[a]), [], cfg)
         assert pv.needs_attention is False
 
+    def test_wall_clock_threads_repo_name_to_learned_threshold(self, monkeypatch) -> None:
+        """#4142 review: compute_pipeline's needs_attention_reason is the
+        same ``/api/pipeline`` field the phone pipeline badge renders — it
+        must consult the per-repo learned p90 the same way coord notify
+        does, not stay pinned to the fixed default because repo_name was
+        left unwired at this call site.
+        """
+        import coord.usage as usage_mod
+
+        seen: list[tuple[str, str]] = []
+
+        def fake_p90(repo: str, atype: str) -> float | None:
+            seen.append((repo, atype))
+            return 60.0
+
+        monkeypatch.setattr(usage_mod, "p90_attention_threshold", fake_p90)
+        cfg = _config()
+        a = _work(status="running")
+        a.dispatched_at = 0.0
+        with patch("coord.notify.time") as mock_time:
+            mock_time.time.return_value = 120.0
+            pv = compute_pipeline(a, _board(a), [], cfg)
+        assert pv.needs_attention is True
+        assert pv.needs_attention_reason == "wall_clock"
+        assert seen == [("api", "work")]
+
 
 # ── Required-gates persistence ──────────────────────────────────────────────
 

@@ -815,6 +815,7 @@ async def _poll_once(
                 now=now,
                 provider_name=assignment.provider_name,
                 review_of_assignment_id=assignment.review_of_assignment_id,
+                repo_name=assignment.repo_name,
             )
             if reason is None:
                 continue

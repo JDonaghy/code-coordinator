@@ -618,6 +618,7 @@ def compute_pipeline(
         now=now,
         provider_name=assignment.provider_name,
         review_of_assignment_id=assignment.review_of_assignment_id,
+        repo_name=assignment.repo_name,
     )
 
     # #1277: a failed row is "superseded" once a LATER work assignment for
