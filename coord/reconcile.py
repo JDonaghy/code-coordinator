@@ -629,17 +629,57 @@ def reconcile_completed_assignments(
         # this clears the verdict for a fresh auto-dispatch or records a real
         # test failure.
         if a.type == "smoke" and terminal == "failed":
-            propagate_smoke_terminal_failure(
-                parent_assignment_id=a.review_of_assignment_id,
-                failure_reason=_failure_reason,
-                # #4018 review: see `_smoke_environmental_override` above —
-                # `True` only when `_failure_reason` resolved from the
-                # agent-authored `error` fallback (no worker ever ran, or
-                # the agent lost track of one), `None` otherwise so every
-                # pre-#4018 call keeps classifying from the text as before.
-                environmental=True if _smoke_environmental_override else None,
-                exit_code=entry.get("exit_code"),
+            from coord.smoke import (  # noqa: PLC0415
+                finalize_smoke_fanout,
+                smoke_leg_capabilities,
             )
+
+            # #4143: a #3182 capability-partition fan-out leg must self-record
+            # onto ITS OWN row (never straight onto the shared parent — two
+            # concurrent sibling legs racing to overwrite the same row is the
+            # #1797 shape) and then fold every leg's own verdict into the
+            # parent's aggregate immediately — the same split `coord.notify`'s
+            # EVENT_FAILURE handler already uses, applied here too so this
+            # passive daemon tick (often the first place an operator `coord
+            # stop` or a crashed worker is observed) doesn't leave the
+            # aggregate stuck at `test_state="running"` until the slower
+            # stuck-test-state sweep eventually folds it.
+            leg_caps = smoke_leg_capabilities(a.issue_title)
+            # #3333: the agent's own `status == "cancelled"` marker on the
+            # raw `/status` entry — never evidence the code under test is
+            # broken, so `propagate_smoke_terminal_failure` can protect a
+            # still-live/already-passed sibling partition instead of folding
+            # this leg's cancellation straight into the aggregate.
+            operator_cancelled = entry.get("status") == "cancelled"
+            if leg_caps is not None:
+                propagate_smoke_terminal_failure(
+                    parent_assignment_id=aid,
+                    failure_reason=_failure_reason,
+                    fanout_parent_id=a.review_of_assignment_id,
+                    operator_cancelled=operator_cancelled,
+                    # #4018 review: see `_smoke_environmental_override`
+                    # above — `True` only when `_failure_reason` resolved
+                    # from the agent-authored `error` fallback (no worker
+                    # ever ran, or the agent lost track of one), `None`
+                    # otherwise so every pre-#4018 call keeps classifying
+                    # from the text as before.
+                    environmental=True if _smoke_environmental_override else None,
+                    exit_code=entry.get("exit_code"),
+                )
+                finalize_smoke_fanout(a.review_of_assignment_id)
+            else:
+                propagate_smoke_terminal_failure(
+                    parent_assignment_id=a.review_of_assignment_id,
+                    failure_reason=_failure_reason,
+                    operator_cancelled=operator_cancelled,
+                    # #4018 review: see `_smoke_environmental_override` above —
+                    # `True` only when `_failure_reason` resolved from the
+                    # agent-authored `error` fallback (no worker ever ran, or
+                    # the agent lost track of one), `None` otherwise so every
+                    # pre-#4018 call keeps classifying from the text as before.
+                    environmental=True if _smoke_environmental_override else None,
+                    exit_code=entry.get("exit_code"),
+                )
 
         # #666 Gap A: best-effort cost/token capture from the agent completed
         # entry.  Must never raise — a tick crash breaks the daemon.
@@ -808,11 +848,30 @@ def _reconcile_no_agent_record(
         # (`terminal_status` is always "failed" for `smoke` in practice — the
         # branch check above only ever fires for WORK_LIKE_TYPES — but the
         # guard keeps this correct even if that scoping ever changes.)
-        propagate_smoke_terminal_failure(
-            parent_assignment_id=a.review_of_assignment_id,
-            failure_reason=reason,
-            environmental=True,
+        from coord.smoke import (  # noqa: PLC0415
+            finalize_smoke_fanout,
+            smoke_leg_capabilities,
         )
+
+        # #4143: same self-record-then-fold split as the ordinary
+        # `terminal == "failed"` path above — a #3182 fan-out leg must
+        # resolve onto ITS OWN row and have the aggregate folded
+        # immediately, not left for the slower stuck-test-state sweep.
+        leg_caps = smoke_leg_capabilities(a.issue_title)
+        if leg_caps is not None:
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=aid,
+                failure_reason=reason,
+                fanout_parent_id=a.review_of_assignment_id,
+                environmental=True,
+            )
+            finalize_smoke_fanout(a.review_of_assignment_id)
+        else:
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=a.review_of_assignment_id,
+                failure_reason=reason,
+                environmental=True,
+            )
 
     reconciled.append(
         {

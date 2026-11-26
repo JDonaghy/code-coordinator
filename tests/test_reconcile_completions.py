@@ -992,3 +992,130 @@ def test_smoke_work_failure_records_test_failed(coord_db) -> None:
     ).fetchone()
     assert work_row["test_state"] == "failed"
     assert work_row["smoke_test"] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# #4143: a #3182 capability-partition fan-out leg observed terminal by this
+# same daemon tick (not `coord.notify`'s EVENT_FAILURE handler) must resolve
+# onto its OWN row and have the aggregate folded into the parent
+# immediately via `finalize_smoke_fanout` — never clobber the shared parent
+# row directly, and never leave the aggregate stuck at "running" for the
+# slower stuck-test-state sweep to pick up later.
+# ---------------------------------------------------------------------------
+
+
+def _seed_fanout_topology(coord_db) -> Assignment:
+    """Seed a #3182 fan-out: parent `work-fanout` carries a manifest naming
+    two legs, `leg-gtk` already recorded a passing verdict (its own row is
+    terminal, outside the board the daemon tick polls), and `leg-macos` is
+    still `running` — both on the board and in the DB — about to be observed
+    terminal by the agent poll below. Returns the `leg-macos` Assignment so
+    callers can put it on the in-memory board (`reconcile_completed_
+    assignments` reads `board`, not the DB, for the RUNNING row it polls)."""
+    from coord.smoke import smoke_leg_issue_title  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        record_test_verdict,
+    )
+
+    work = Assignment(
+        machine_name="dellserver", repo_name="cc", issue_number=411,
+        issue_title="t", status="done", assignment_id="work-fanout",
+        type="work", branch="issue-411-x",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/cc")
+    record_test_verdict(
+        assignment_id="work-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-macos=macos,leg-gtk=gtk+windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) "
+            "(#3182): [macos]; [gtk+windows]."
+        ),
+    )
+
+    leg_gtk = Assignment(
+        machine_name="dellserver", repo_name="cc", issue_number=411,
+        issue_title=smoke_leg_issue_title("t", ("gtk", "windows")),
+        status="done", assignment_id="leg-gtk", type="smoke",
+        branch="issue-411-x", review_of_assignment_id="work-fanout",
+    )
+    _record_dispatched_assignment_local(assignment=leg_gtk, repo_github="acme/cc")
+    record_test_verdict(assignment_id="leg-gtk", test_state="passed")
+
+    leg_macos = Assignment(
+        machine_name="dellserver", repo_name="cc", issue_number=411,
+        issue_title=smoke_leg_issue_title("t", ("macos",)),
+        status="running", assignment_id="leg-macos", type="smoke",
+        branch="issue-411-x", review_of_assignment_id="work-fanout",
+    )
+    _record_dispatched_assignment_local(assignment=leg_macos, repo_github="acme/cc")
+    return leg_macos
+
+
+def test_fanout_leg_terminal_failure_folds_into_parent_immediately(coord_db) -> None:
+    """A fan-out leg dying with a genuine (non-environmental, non-cancelled)
+    work failure must resolve onto ITS OWN row — never straight onto the
+    shared parent — and `finalize_smoke_fanout` must fold the aggregate
+    right here, since the other leg already carries a real verdict."""
+    leg_macos = _seed_fanout_topology(coord_db)
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(leg_macos),
+        agent_status_fn=lambda host: {"completed": [
+            {"id": "leg-macos", "status": "failed", "exit_code": 1},
+        ]},
+        capture_plan=False,
+    )
+
+    leg_row = coord_db.execute(
+        "SELECT test_state FROM assignments WHERE assignment_id='leg-macos'"
+    ).fetchone()
+    assert leg_row["test_state"] == "failed", (
+        "the leg's own verdict must land on its own row, not the shared "
+        f"parent — got {leg_row['test_state']!r}"
+    )
+
+    work_row = coord_db.execute(
+        "SELECT test_state FROM assignments WHERE assignment_id='work-fanout'"
+    ).fetchone()
+    assert work_row["test_state"] == "failed", (
+        "finalize_smoke_fanout must fold the aggregate to 'failed' (worst "
+        "wins) immediately — not leave it at 'running' for the "
+        f"stuck-test-state sweep to find later — got {work_row['test_state']!r}"
+    )
+
+
+def test_fanout_leg_operator_cancel_clears_its_own_verdict_without_failing_parent(
+    coord_db,
+) -> None:
+    """#3333: an operator `coord stop` on a fan-out leg observed via this
+    daemon tick (agent `/status` entry `status == "cancelled"`) is never
+    evidence the code under test is broken. While the sibling leg already
+    carries a real passing verdict, the leg's own `test_state` clears for a
+    fresh retry and the parent's aggregate must NOT be folded to 'failed'."""
+    leg_macos = _seed_fanout_topology(coord_db)
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(leg_macos),
+        agent_status_fn=lambda host: {"completed": [
+            {"id": "leg-macos", "status": "cancelled", "exit_code": None},
+        ]},
+        capture_plan=False,
+    )
+
+    leg_row = coord_db.execute(
+        "SELECT test_state FROM assignments WHERE assignment_id='leg-macos'"
+    ).fetchone()
+    assert leg_row["test_state"] is None, (
+        "a cancelled leg must clear for a bounded automatic retry of its "
+        f"own partition, never record a genuine 'failed' verdict — got "
+        f"{leg_row['test_state']!r}"
+    )
+
+    work_row = coord_db.execute(
+        "SELECT test_state FROM assignments WHERE assignment_id='work-fanout'"
+    ).fetchone()
+    assert work_row["test_state"] == "running", (
+        "an operator cancellation must not fail the aggregate while a "
+        f"sibling leg already passed — got {work_row['test_state']!r}"
+    )
