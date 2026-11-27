@@ -32,6 +32,7 @@ from coord.review import (
     CEILING_MODEL_ENV_VAR,
     CeilingModelDecision,
     ReviewFindings,
+    _ceiling_continue_override_count,
     decide_ceiling_action,
     dispatch_pending_reviews,
 )
@@ -4227,6 +4228,72 @@ class TestCeilingModelDecisionWiring:
         mock_post.assert_not_called()
         # Left eligible (review_state untouched) rather than parked cap_hit.
         assert capped.review_state is None
+
+
+class TestCeilingContinueOverrideSurvivesTheHop:
+    """#4190 review follow-up: a granted "continue" override must survive
+    the #1612 test-gate deferral between `run_for_fix_transition` and
+    `dispatch_pending_reviews` — one grant must buy exactly one round, not
+    get discarded when the deferred dispatch re-asks the model and finds
+    the budget it just spent already gone."""
+
+    def test_grant_survives_test_gate_deferral_and_buys_one_round(
+        self, config: Config, coord_db, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(CEILING_MODEL_ENV_VAR, "1")
+        from coord.state import load_board, save_board
+
+        # Test precedes Review by default, and this fix's own test verdict
+        # isn't in yet — forces run_for_fix_transition to defer to
+        # dispatch_pending_reviews rather than dispatch directly, which is
+        # exactly the hop the override used to get discarded across.
+        fix = _fix_assignment(assignment_id="fix-3", review_iteration=3, test_state=None)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        continue_raw = (
+            '{"action": "continue", "confidence": 0.8, '
+            '"reasoning": "one more round should close it", "remainder": ""}'
+        )
+        model_calls = MagicMock(return_value=continue_raw)
+
+        with patch("coord.review._invoke_ceiling_model", model_calls):
+            actions = run_for_fix_transition("fix-3", config)
+
+        assert actions[0].kind == "test_gate_held"
+        model_calls.assert_called_once()
+        loaded = load_board()
+        assert loaded.find_by_id("fix-3").review_state == "pending"
+        # The round the grant bought has not been dispatched yet — the
+        # override must not read as spent while it's merely pending.
+        assert _ceiling_continue_override_count("api", 1) == 0
+
+        # The test verdict lands; dispatch_pending_reviews picks the row
+        # back up and must NOT consult the model a second time.
+        board2 = load_board()
+        fix2 = board2.find_by_id("fix-3")
+        fix2.test_state = "passed"
+
+        stub_review = _stub_review_assignment(assignment_id="re-review-grant")
+        with (
+            patch("coord.review._invoke_ceiling_model", model_calls),
+            patch(
+                "coord.review.maybe_scoped_review_for_completed_fix",
+                return_value=None,
+            ),
+            patch(
+                "coord.review.dispatch_review", return_value=stub_review,
+            ) as mock_dispatch,
+        ):
+            dispatch_pending_reviews(board2, config)
+
+        # Still only the ONE model consultation across both passes — the
+        # pending grant was reused, not re-asked for.
+        model_calls.assert_called_once()
+        mock_dispatch.assert_called_once()
+        assert fix2.review_state == "dispatched"
+        # NOW the round it bought has actually been dispatched — spent.
+        assert _ceiling_continue_override_count("api", 1) == 1
 
 
 class TestPostCeilingDecisionNotice:

@@ -4559,8 +4559,20 @@ CEILING_MODEL_MAX_CONTINUE_OVERRIDES = 1
 #: ``actor="auto_loop_ceiling_model"``. Mirrors
 #: `coord.board_doctor_policy.MODEL_DECISION_EVENT_TYPE`'s own shape/reason
 #: for existing (one event type for both `score_model_investigator_decisions`-
-#: style trails AND the override cap count to read from).
+#: style trails AND :func:`_ceiling_continue_grant_count` to read from).
 CEILING_MODEL_DECISION_EVENT_TYPE = "ceiling_model_decision"
+
+#: A granted "continue" override only actually buys a round once one of the
+#: three ceiling-hit call sites dispatches off it (a fix round or a review),
+#: not at the moment the model grants it — granting and dispatching can be
+#: two different passes (the #1612 test-gate deferral between `run_for_
+#: fix_transition` and `dispatch_pending_reviews` is the common case).
+#: Written by :func:`record_ceiling_continue_override_consumed` once a
+#: dispatch actually happens; :func:`_ceiling_continue_override_count` (the
+#: cap gate in :func:`decide_ceiling_action`) counts THESE entries, not
+#: every granted decision, so a grant that is still waiting to be used does
+#: not spend the budget out from under itself.
+CEILING_MODEL_OVERRIDE_CONSUMED_EVENT_TYPE = "ceiling_model_override_consumed"
 
 #: Opt-in switch for the whole #4190 ceiling-model path (default off,
 #: mirroring `coord.board_doctor_policy.MODEL_INVESTIGATOR_ENV_VAR`/
@@ -4737,14 +4749,14 @@ def _parse_ceiling_model_response(text: str) -> tuple[str | None, float, str, st
     return action, float(confidence), reasoning, remainder
 
 
-def _ceiling_continue_override_count(repo_name: str, issue_number: int) -> int:
-    """How many #4190 ``"continue"`` overrides *repo_name*#*issue_number*
-    has already spent, ever — the cap counter for
-    :data:`CEILING_MODEL_MAX_CONTINUE_OVERRIDES`. Fails open to 0 on an
-    unreadable audit log (same posture as
-    `coord.board_doctor_policy._model_decision_window_count`): a cap that
-    can never be read is worse than a cap occasionally under-counted by a
-    transient DB error.
+def _ceiling_continue_grant_count(repo_name: str, issue_number: int) -> int:
+    """How many times :func:`decide_ceiling_action` has ever granted
+    *repo_name*#*issue_number* a ``"continue"`` override — regardless of
+    whether that grant has gone on to actually buy a round yet. Feeds
+    :func:`ceiling_continue_override_pending`, never the cap gate itself
+    (see :func:`_ceiling_continue_override_count` for that). Fails open to
+    0 on an unreadable audit log, same posture as
+    `coord.board_doctor_policy._model_decision_window_count`.
     """
     from coord.audit import query_audit_log  # noqa: PLC0415
 
@@ -4756,7 +4768,7 @@ def _ceiling_continue_override_count(repo_name: str, issue_number: int) -> int:
     except Exception:  # noqa: BLE001 — fails open, see docstring
         log.warning(
             "auto_loop ceiling: could not read %s audit log for %s#%s — "
-            "continue-override cap check fails open to 0",
+            "pending-grant check fails open to 0",
             CEILING_MODEL_DECISION_EVENT_TYPE, repo_name, issue_number,
             exc_info=True,
         )
@@ -4767,6 +4779,95 @@ def _ceiling_continue_override_count(repo_name: str, issue_number: int) -> int:
         for e in entries
         if (e.get("details") or {}).get("action") == "continue"
         and not (e.get("details") or {}).get("fell_back")
+    )
+
+
+def _ceiling_continue_override_count(repo_name: str, issue_number: int) -> int:
+    """How many #4190 ``"continue"`` overrides *repo_name*#*issue_number*
+    has actually SPENT, ever — the cap counter for
+    :data:`CEILING_MODEL_MAX_CONTINUE_OVERRIDES`, read by
+    :func:`decide_ceiling_action`.
+
+    Counts :func:`record_ceiling_continue_override_consumed` entries, not
+    every granted decision (:func:`_ceiling_continue_grant_count` reads
+    those): a grant is only "spent" once it has actually bought a round —
+    a fix dispatch or a review dispatch — not at the moment the model
+    grants it. Counting at grant time let the same override be discarded
+    by a later call site re-asking the model (the #1612 test-gate deferral
+    between `run_for_fix_transition` and `dispatch_pending_reviews` is the
+    common hop) without ever having bought anything. Fails open to 0 on an
+    unreadable audit log (same posture as
+    `coord.board_doctor_policy._model_decision_window_count`): a cap that
+    can never be read is worse than a cap occasionally under-counted by a
+    transient DB error.
+    """
+    from coord.audit import query_audit_log  # noqa: PLC0415
+
+    try:
+        result = query_audit_log(
+            event_type=CEILING_MODEL_OVERRIDE_CONSUMED_EVENT_TYPE,
+            repo=repo_name, issue=issue_number, limit=500,
+        )
+    except Exception:  # noqa: BLE001 — fails open, see docstring
+        log.warning(
+            "auto_loop ceiling: could not read %s audit log for %s#%s — "
+            "continue-override cap check fails open to 0",
+            CEILING_MODEL_OVERRIDE_CONSUMED_EVENT_TYPE, repo_name, issue_number,
+            exc_info=True,
+        )
+        return 0
+    entries = result.get("entries") or []
+    return len(entries)
+
+
+def ceiling_continue_override_pending(repo_name: str, issue_number: int) -> bool:
+    """Does *repo_name*#*issue_number* already have a #4190 ``"continue"``
+    grant outstanding — granted but not yet actually used to dispatch a
+    round?
+
+    Every one of the three ceiling-hit call sites must check this BEFORE
+    calling :func:`decide_ceiling_action` and, when it is True, skip the
+    model call entirely and dispatch directly off the existing grant
+    instead: the question has already been answered for this issue, and
+    re-asking only risks the model answering differently (or the cap
+    gate inside :func:`decide_ceiling_action` denying a SECOND "continue"
+    outright, discarding the first grant for nothing — the exact bug this
+    function exists to close).
+    """
+    granted = _ceiling_continue_grant_count(repo_name, issue_number)
+    if granted == 0:
+        return False
+    return _ceiling_continue_override_count(repo_name, issue_number) < granted
+
+
+def record_ceiling_continue_override_consumed(
+    repo_name: str, issue_number: int, *, assignment_id: str | None,
+) -> None:
+    """Mark a previously-granted #4190 ``"continue"`` override as actually
+    spent — called by a ceiling-hit call site immediately AFTER it
+    successfully dispatches the round the grant bought (a fix round or a
+    review), never before: a dispatch that fails must leave the grant
+    outstanding for the next pass to retry, not burn it on nothing.
+
+    This is what :func:`_ceiling_continue_override_count` (the cap gate)
+    actually counts — see its docstring for why counting at grant time
+    instead was the #4190 review bug.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="business",
+        category="auto_loop_ceiling",
+        event_type=CEILING_MODEL_OVERRIDE_CONSUMED_EVENT_TYPE,
+        actor="auto_loop_ceiling_model",
+        summary=(
+            f"ceiling continue override consumed for {repo_name}#{issue_number} "
+            f"(assignment={assignment_id})"
+        ),
+        repo=repo_name,
+        issue=issue_number,
+        assignment_id=assignment_id,
+        details={},
     )
 
 
@@ -6838,6 +6939,14 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
     # path, a manual edit) would silently bypass the fix-loop cap instead of
     # stopping it here the same way the other bulk-path guards are duplicated
     # (claude-pty, terminal-work).
+    # #4190 review follow-up: assignment ids whose eligibility below rests on
+    # a continue override that is still outstanding (granted either in this
+    # loop or by one of the two sibling call sites in `coord.auto_loop`) —
+    # the dispatch loop further down consumes the grant only once it has
+    # actually dispatched a review for one of these, never here at decision
+    # time (see `coord.review.record_ceiling_continue_override_consumed`'s
+    # docstring for why counting any earlier discards the grant for free).
+    _ceiling_override_pending_ids: set[str] = set()
     _max_review_iter = config.pipeline.max_review_iterations
     for c in board.completed:
         if (
@@ -6865,12 +6974,33 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
                 _post_ceiling_decision_notice,
             )
 
+            # A "continue" grant for this issue may already be outstanding
+            # from an earlier call to one of #4190's three ceiling-hit call
+            # sites but not yet used to dispatch anything — reuse it rather
+            # than re-consulting the model, which would either answer
+            # differently or have the cap gate inside `decide_ceiling_action`
+            # deny a second "continue" outright, discarding the still-unused
+            # first grant for nothing. See `ceiling_continue_override_pending`.
+            if ceiling_continue_override_pending(c.repo_name, c.issue_number):
+                logger.info(
+                    "dispatch_pending_reviews cap guard (#1612): %s (%s #%s) "
+                    "has review_iteration=%d >= max_review_iterations=%d, but "
+                    "issue #%s already has an outstanding #4190 continue "
+                    "grant — reusing it rather than consulting the model "
+                    "again",
+                    c.assignment_id, c.repo_name, c.issue_number,
+                    c.review_iteration or 0, _max_review_iter, c.issue_number,
+                )
+                _ceiling_override_pending_ids.add(c.assignment_id)
+                continue
+
             decision = decide_ceiling_action(
                 repo_name=c.repo_name, issue_number=c.issue_number,
                 assignment_id=c.assignment_id, branch=c.branch,
                 completed_rounds=c.review_iteration or 0, max_iter=_max_review_iter,
                 findings_body=_latest_blocking_findings_body(
-                    c.assignment_id, board, config, repo_name=c.repo_name,
+                    c.review_of_assignment_id or c.assignment_id, board, config,
+                    repo_name=c.repo_name,
                 ),
                 config=config,
             )
@@ -6887,6 +7017,9 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             if decision.action == "continue":
                 # The model granted a one-time override (capped per issue) —
                 # leave `review_state` as-is so this row stays eligible below.
+                # Spending it is deferred to the dispatch loop, in case this
+                # row still fails to dispatch this pass too.
+                _ceiling_override_pending_ids.add(c.assignment_id)
                 continue
             _post_ceiling_decision_notice(
                 c, config, decision, completed_rounds=c.review_iteration or 0,
@@ -6981,6 +7114,13 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             # now running" case reaches "dispatched".
             if review.status != "done":
                 completed.review_state = "dispatched"
+            if completed.assignment_id in _ceiling_override_pending_ids:
+                # The review the grant was for just dispatched successfully
+                # — spend the override now, not back when it was granted.
+                record_ceiling_continue_override_consumed(
+                    completed.repo_name, completed.issue_number,
+                    assignment_id=completed.assignment_id,
+                )
             dispatched.append(review)
         # On failure leave review_state as "pending" so the next pass retries.
         # Terminal rows are marked review_state="done" inside dispatch_review
