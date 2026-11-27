@@ -234,6 +234,7 @@ from coord.board_doctor import (
     stranded_prereq_guard,
 )
 from coord.board_doctor_permissions import (
+    INVESTIGATOR_ACTIONS,
     SAFE_TIER_ACTIONS,
     SweepPermissionError,
     SweepWriteNotConfirmedError,
@@ -245,6 +246,7 @@ from coord.drive_queue import parse_key as _parse_row_key
 from coord.queue_diagnose import DiagnosisOption, EnvProbeResult
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.board_doctor_permissions import InvestigatorActionResult
     from coord.config import Config
     from coord.models import Assignment, Board, Machine, Repo
 
@@ -1739,6 +1741,698 @@ def _investigate_tier_enabled(repo_name: str, config: "Config") -> bool:
     return bool(repo is not None and repo.board_doctor.investigate)
 
 
+# ── #4126: a model-chosen investigator decision, in place of a fix-it leg ──
+#
+# ci-pending/gate-blocked (and most of the rest of `INVESTIGATE_CAUSES`) are
+# coordinator-state problems — nothing a worker leg editing code can fix —
+# yet :func:`_investigate` today dispatches exactly that for every one of
+# them. This section gives `_investigate` a cheaper, narrower first move for
+# those rows: one bounded `claude -p` call that picks a verb from the SAME
+# closed #3881 investigator vocabulary (`coord.board_doctor_permissions.
+# INVESTIGATOR_ACTIONS`) a human running `coord drive-queue doctor-act`
+# would, through the identical precondition-checked wrapper
+# (`dispatch_investigator_action`) — never a new, independently-reasoned
+# write path. Opt-in only (:data:`MODEL_INVESTIGATOR_ENV_VAR`, default off):
+# a model fed the same stale evidence a fixed classifier already loops on
+# would loop the same way, so this stays off until the dispatch-guard and
+# measurement work the rest of this epic adds has actually landed.
+
+MODEL_INVESTIGATOR_ENV_VAR = "COORD_BOARD_DOCTOR_MODEL_INVESTIGATOR"
+"""Process-wide opt-in read by :func:`_model_investigator_enabled`.
+
+Unlike :data:`NO_INVESTIGATE_ENV_VAR`/:data:`NO_FINISHER_ENV_VAR` (both
+default-on kill switches), this one defaults OFF: set it (to any truthy
+string) to turn the model-chosen decision on. There is deliberately no
+``coordinator.yml`` field for this yet — it is a single fleet-wide switch,
+not a per-repo opt-in, until this epic's own dispatch-guard/measurement
+issues land and a per-repo config knob is worth adding.
+"""
+
+#: The #3881 investigator verbs this model call is allowed to choose from —
+#: a deliberate, narrower subset of :data:`coord.board_doctor_permissions.
+#: INVESTIGATOR_ACTIONS` than a human `doctor-act` invocation gets. Every
+#: name here resolves to a live board/config-only call
+#: (:func:`_dispatch_model_eligible_action` below) — ``raise_budget``,
+#: ``bounce``, ``integration_fix`` and ``restage`` all need an extra
+#: identifier (a review assignment id, a sibling repo/issue, a restage
+#: stage) this function makes no attempt to infer from evidence alone, so
+#: they stay off this list until a future change threads that identifier in
+#: too. ``"none"`` is not a member — it is the sentinel the model itself
+#: returns for "do nothing," handled as a no-op before this set is ever
+#: consulted.
+MODEL_ELIGIBLE_ACTIONS: frozenset[str] = frozenset(
+    {"requeue", "mark_done", "clear_latch", "merge"}
+)
+
+#: ``mark_done``/``merge`` mutate the board/merge queue in a way that is
+#: awkward to undo (reconciling a row to done, or actually merging a PR) —
+#: the #4126 ask requires a higher confidence bar for these than for
+#: ``requeue``/``clear_latch``, which only reset a row back to its own
+#: declared starting state.
+_MODEL_HIGH_STAKES_ACTIONS: frozenset[str] = frozenset({"mark_done", "merge"})
+_MODEL_HIGH_STAKES_CONFIDENCE_FLOOR = 0.8
+
+#: Below this confidence, and only once the row has sat stuck longer than
+#: :data:`_MODEL_ESCALATE_STUCK_HOURS`, the haiku-first call escalates to a
+#: second, sonnet call rather than acting (or not acting) on a shaky first
+#: read.
+_MODEL_LOW_CONFIDENCE_ESCALATE = 0.5
+_MODEL_ESCALATE_STUCK_HOURS = 6.0
+
+#: Caps (#4126's own ask): at most this many model decisions per row in a
+#: rolling 24h window, plus a fleet-default per-repo daily cap — both
+#: counted off the audit trail this module itself writes
+#: (:data:`MODEL_DECISION_EVENT_TYPE`), the same "count audited events, not
+#: an in-memory counter that resets on daemon restart" shape
+#: :func:`_fixit_leg_in_flight_count` already uses.
+MODEL_DECISION_CAP_PER_ROW_24H = 3
+MODEL_DECISION_CAP_PER_REPO_DAILY = 10
+_MODEL_DECISION_WINDOW_HOURS = 24.0
+
+#: Every #4126 model decision — acted or not — is audited under this event
+#: type, with ``actor="board_doctor_investigator_model"`` (distinct from
+#: both ``"board_doctor_investigator"``, the human `doctor-act` CLI's own
+#: default, and ``"sweep"``, the deterministic mechanical tier's). This is
+#: NOT a second answer to "did the action land" — that question is asked
+#: and answered exactly once, by :func:`coord.board_doctor_permissions.
+#: _investigator_result` inside :func:`dispatch_investigator_action`; this
+#: event only carries that already-computed ``acted`` value forward as
+#: metadata (confidence, model used, escalation) the underlying primitive's
+#: own audit row has no field for, so :func:`score_model_investigator_decisions`
+#: and the per-row/per-repo cap checks have one place to read from.
+MODEL_DECISION_EVENT_TYPE = "investigator_model_decision"
+
+
+def _check_model_eligible_actions_are_in_the_closed_set() -> None:
+    unknown = MODEL_ELIGIBLE_ACTIONS - INVESTIGATOR_ACTIONS
+    if unknown:
+        raise RuntimeError(
+            f"coord.board_doctor_policy.MODEL_ELIGIBLE_ACTIONS names "
+            f"verb(s) outside INVESTIGATOR_ACTIONS: {sorted(unknown)!r}"
+        )
+
+
+_check_model_eligible_actions_are_in_the_closed_set()
+
+
+def _model_investigator_enabled() -> bool:
+    """Is the #4126 model-chosen decision path armed for this process?"""
+    return bool(os.environ.get(MODEL_INVESTIGATOR_ENV_VAR))
+
+
+@dataclass
+class ModelInvestigatorDecision:
+    """One #4126 model-chosen decision against a stuck row — the unit both
+    :func:`decide_with_model_investigator` returns and the test suite
+    asserts on."""
+
+    repo_name: str
+    issue_number: int
+    action: str | None
+    confidence: float
+    reasoning: str
+    model_used: str
+    escalated: bool
+    acted: bool
+    detail: str
+
+
+def _model_decision_window_count(
+    repo_name: str, issue_number: int | None, *, hours: float,
+) -> int:
+    """How many :data:`MODEL_DECISION_EVENT_TYPE` events exist for
+    *repo_name* (and, when given, *issue_number*) in the last *hours* — the
+    cap counter for both the per-row and the per-repo-daily check. Fails
+    open to 0 on an unreadable audit log (same posture as
+    :func:`_fixit_leg_in_flight_count`): a cap that can never be read is
+    worse than a cap occasionally under-counted by a transient DB error.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.audit import query_audit_log  # noqa: PLC0415
+
+    try:
+        result = query_audit_log(
+            event_type=MODEL_DECISION_EVENT_TYPE,
+            repo=repo_name,
+            issue=issue_number,
+            since=_time.time() - hours * 3600.0,
+            limit=500,
+        )
+    except Exception:  # noqa: BLE001 — fails open, see docstring
+        _log.warning(
+            "board-doctor: could not read %s audit log for %s — model "
+            "decision cap check fails open to 0",
+            MODEL_DECISION_EVENT_TYPE,
+            repo_name,
+            exc_info=True,
+        )
+        return 0
+    return len(result.get("entries") or [])
+
+
+def _model_investigator_cap_reason(repo_name: str, issue_number: int) -> str | None:
+    """``None`` when #4126's model path may still decide against this row;
+    otherwise the human-readable reason it is capped this round."""
+    row_count = _model_decision_window_count(
+        repo_name, issue_number, hours=_MODEL_DECISION_WINDOW_HOURS,
+    )
+    if row_count >= MODEL_DECISION_CAP_PER_ROW_24H:
+        return (
+            f"{repo_name}#{issue_number} already had {row_count} model "
+            f"investigator decision(s) in the last 24h (cap "
+            f"{MODEL_DECISION_CAP_PER_ROW_24H})"
+        )
+    repo_count = _model_decision_window_count(
+        repo_name, None, hours=_MODEL_DECISION_WINDOW_HOURS,
+    )
+    if repo_count >= MODEL_DECISION_CAP_PER_REPO_DAILY:
+        return (
+            f"{repo_name} already had {repo_count} model investigator "
+            f"decision(s) fleet-repo-wide in the last 24h (cap "
+            f"{MODEL_DECISION_CAP_PER_REPO_DAILY})"
+        )
+    return None
+
+
+def _row_stuck_hours(repo_name: str, issue_number: int) -> float | None:
+    """How long *repo_name*#*issue_number*'s drive-queue row has sat in its
+    current shape, in hours — the escalation clock's input. ``None`` when
+    there is no drive-queue row (a merge-queue-only row, or one this read
+    can't resolve) rather than guessed as either "just now" or "ages ago" —
+    the caller treats unknown the same conservative way
+    :func:`coord.board_doctor._no_progress_age_seconds` documents its own
+    unknown case: never escalate on a guess.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.board_doctor import _no_progress_age_seconds  # noqa: PLC0415
+    from coord.drive_queue import QueueEntry  # noqa: PLC0415
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    try:
+        row = get_drive_queue_entry(repo_name, issue_number)
+    except Exception:  # noqa: BLE001 — best-effort; unknown beats a crash
+        return None
+    if row is None:
+        return None
+    entry = QueueEntry.from_row(row)
+    age_seconds = _no_progress_age_seconds(entry, now=_time.time())
+    return age_seconds / 3600.0 if age_seconds is not None else None
+
+
+def _live_pr_snapshot(
+    repo_name: str, issue_number: int, config: "Config",
+) -> dict[str, Any] | None:
+    """Best-effort live PR state for *repo_name*#*issue_number* (#4126) —
+    the evidence bundle's own freshest signal, never the board's possibly-
+    stale snapshot. ``None`` when this row has no merge-queue entry yet (no
+    PR, or not queued there) or any read fails — folded into "no live PR
+    evidence" rather than raised, the same posture as every other
+    enrichment in this module (e.g. :func:`_merge_ref_instruction`).
+
+    Reuses the SAME `coord.ci_store` read :func:`_live_ci_red_only`
+    (`coord.board_doctor_permissions`) already makes for the identical
+    question "what does this PR's CI say right now" — one live-CI
+    abstraction answering it, never a second hand-rolled parse of
+    ``gh pr checks``' raw JSON here.
+    """
+    try:
+        from coord.merge_queue import load_queue  # noqa: PLC0415
+
+        entry = next(
+            (
+                e
+                for e in load_queue()
+                if e.repo_name == repo_name and e.issue_number == issue_number
+            ),
+            None,
+        )
+        if entry is None or not entry.pr_number:
+            return None
+
+        from coord import github_ops  # noqa: PLC0415
+        from coord.ci_store import build_ci_store, failed_checks, in_flight_checks  # noqa: PLC0415
+
+        ci_store = build_ci_store(
+            config.ci_store.type, host=config.ci_store.host, token_env=config.ci_store.token_env,
+        )
+        checks = (
+            ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+            if ci_store.is_available
+            else []
+        )
+        return {
+            "pr_number": entry.pr_number,
+            "issue_state": github_ops.get_issue_state(entry.repo_github, entry.pr_number),
+            "failing_check_names": [c.name for c in failed_checks(checks)],
+            "pending_check_names": [c.name for c in in_flight_checks(checks)],
+        }
+    except Exception:  # noqa: BLE001 — best-effort live enrichment only
+        return None
+
+
+def _render_model_evidence(
+    row: StuckRow,
+    repo_name: str,
+    issue_number: int,
+    *,
+    stuck_hours: float | None,
+    pr_snapshot: dict[str, Any] | None,
+) -> str:
+    """The evidence bundle text handed to the #4126 model call — every
+    field a human running `coord drive-queue diagnose` would already see,
+    plus the live PR snapshot a stored diagnosis can't carry."""
+    lines = [
+        f"repo: {repo_name}",
+        f"issue: {issue_number}",
+        f"queue: {row.queue}",
+        f"state: {row.state}",
+        f"cause: {row.cause}",
+        f"diagnosis_confidence: {row.confidence}",
+        f"stuck_hours: {stuck_hours:.1f}" if stuck_hours is not None else "stuck_hours: unknown",
+    ]
+    if row.evidence:
+        lines.append("evidence:")
+        lines.extend(f"  - {line}" for line in row.evidence)
+    if pr_snapshot is not None:
+        lines.append(f"live_pr_number: {pr_snapshot['pr_number']}")
+        lines.append(f"live_pr_issue_state: {pr_snapshot['issue_state']}")
+        lines.append(f"live_pr_failing_checks: {pr_snapshot['failing_check_names']}")
+        lines.append(f"live_pr_pending_checks: {pr_snapshot['pending_check_names']}")
+    else:
+        lines.append("live_pr_number: none (no merge-queue entry/PR found)")
+    return "\n".join(lines)
+
+
+_MODEL_INVESTIGATOR_SYSTEM_PROMPT = """\
+You are the board-doctor investigator for one stuck row in a Claude Code \
+fleet coordinator. You will be given evidence about a drive-queue or \
+merge-queue row that has stopped making progress. Choose exactly ONE \
+action from this closed list: requeue, mark_done, clear_latch, merge, none.
+
+- requeue: the row's own blocker has already cleared live; take it down \
+and put it back exactly as declared.
+- mark_done: the PR already merged (or the issue already closed) out of \
+band; reconcile the row.
+- clear_latch: a stale HUMAN_REQUIRED merge-queue latch whose approval is \
+already bound to the current branch content.
+- merge: the row already reads green/approved/mergeable but the ordinary \
+merge tick keeps missing it.
+- none: the evidence does not clearly support any of the above — defer to \
+a human rather than guess. Prefer none over a wrong guess.
+
+Respond with ONLY a single JSON object, no prose, no code fences:
+{"action": "<one of the five names above>", "confidence": <float 0.0-1.0>, \
+"reasoning": "<one sentence>"}
+"""
+
+
+def _invoke_investigator_model(
+    system_prompt: str, user_prompt: str, *, model: str, timeout: float = 60.0,
+) -> str:
+    """One bounded ``claude -p`` call with an explicit ``--model`` (#4126).
+
+    Deliberately does not go through `coord.brain.call_claude` /
+    `coord.providers.claude.ClaudeProvider.oneshot_command`: that method's
+    own docstring says it never threads ``self._model`` through an oneshot
+    call (#1706) — brain planning and the dashboard assistant never needed
+    per-call model selection, this one genuinely does (haiku-first,
+    sonnet-on-low-confidence), so it builds its own argv rather than
+    quietly relying on a path that would silently ignore *model*.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from coord.agent import DEFAULT_WORKER_BINARY  # noqa: PLC0415
+
+    cmd = [
+        DEFAULT_WORKER_BINARY, "-p", "--system-prompt", system_prompt,
+        "--model", model, "--output-format", "json",
+    ]
+    result = subprocess.run(
+        cmd, input=user_prompt, capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"board-doctor model investigator call failed (exit "
+            f"{result.returncode}): {result.stderr.strip()}"
+        )
+    try:
+        outer = _json.loads(result.stdout)
+        if isinstance(outer, dict) and "result" in outer:
+            return outer["result"]
+    except (_json.JSONDecodeError, ValueError):
+        pass
+    return result.stdout
+
+
+def _parse_model_response(text: str) -> tuple[str | None, float, str]:
+    """Parse the #4126 model's JSON reply into ``(action, confidence,
+    reasoning)``.
+
+    Never raises on malformed input — a response this cannot parse, whose
+    ``action`` is not one of :data:`MODEL_ELIGIBLE_ACTIONS` plus the
+    ``"none"`` sentinel, or whose ``confidence`` is not a finite number in
+    ``[0, 1]``, reads as ``(None, 0.0, "<why>")`` — a refusal to act, never
+    a guessed action (#2096: the gate that follows must be able to fail,
+    which means a parse failure can never accidentally read as a
+    confident, actionable decision).
+    """
+    import json as _json  # noqa: PLC0415
+    import re as _re  # noqa: PLC0415
+
+    cleaned = text.strip()
+    fence = _re.match(r"^```(?:json)?\s*\n(.*?)```\s*$", cleaned, _re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+    try:
+        data = _json.loads(cleaned)
+    except (_json.JSONDecodeError, ValueError) as exc:
+        return None, 0.0, f"unparseable model response: {exc}"
+    if not isinstance(data, dict):
+        return None, 0.0, "model response was not a JSON object"
+
+    action = data.get("action")
+    if action == "none":
+        action = None
+    elif action not in MODEL_ELIGIBLE_ACTIONS:
+        return None, 0.0, f"model returned unrecognized action {action!r}"
+
+    confidence = data.get("confidence")
+    if not isinstance(confidence, (int, float)) or not (0.0 <= float(confidence) <= 1.0):
+        return None, 0.0, f"model returned invalid confidence {confidence!r}"
+
+    reasoning = data.get("reasoning")
+    reasoning = str(reasoning) if reasoning is not None else ""
+    return action, float(confidence), reasoning
+
+
+def _dispatch_model_eligible_action(
+    action: str,
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    reason: str,
+) -> "InvestigatorActionResult":
+    """Call `dispatch_investigator_action` for one of
+    :data:`MODEL_ELIGIBLE_ACTIONS` with that verb's own required args —
+    *action* is assumed already validated against that set.
+
+    ``allow_fix_dispatch=False`` for ``merge`` (#4126, mirroring
+    `_merge_pending_stuck_row`'s own #3902 note): this call is unattended,
+    so it must never let `investigator_merge`'s own post-merge fan-out
+    (dispatching a conflict-fix/ci-fix/sibling-conflict leg) spend a
+    machine slot on this decision's behalf.
+    """
+    actor = "board_doctor_investigator_model"
+    if action == "requeue":
+        return dispatch_investigator_action(
+            "requeue", repo_name, issue_number, board, reason=reason, actor=actor,
+        )
+    if action == "mark_done":
+        return dispatch_investigator_action(
+            "mark_done", repo_name, issue_number, board, config, reason=reason, actor=actor,
+        )
+    from coord import github_ops as gh_ops  # noqa: PLC0415
+
+    if action == "clear_latch":
+        return dispatch_investigator_action(
+            "clear_latch", repo_name, issue_number, board, config, gh_ops,
+            reason=reason, actor=actor,
+        )
+    if action == "merge":
+        return dispatch_investigator_action(
+            "merge", repo_name, issue_number, board, config, gh_ops,
+            reason=reason, actor=actor, allow_fix_dispatch=False,
+        )
+    raise ValueError(f"unhandled model-eligible action {action!r}")  # pragma: no cover
+
+
+def decide_with_model_investigator(
+    row: StuckRow,
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    invoke_model: Callable[..., str] | None = None,
+) -> ModelInvestigatorDecision:
+    """The #4126 entry point: one bounded model call deciding whether (and
+    how) to act on *row*, in place of dispatching a fix-it leg.
+
+    *invoke_model* defaults to :func:`_invoke_investigator_model`; tests
+    inject a stub so this never shells out to a real ``claude -p``.
+
+    Always audits a :data:`MODEL_DECISION_EVENT_TYPE` row — capped,
+    declined, failed-to-parse and acted decisions alike — so
+    :func:`_model_investigator_cap_reason`'s own counters and
+    :func:`score_model_investigator_decisions` have one consistent trail to
+    read, regardless of outcome. Never raises: every failure mode (a
+    capped row, an unparseable model reply, a subprocess timeout) resolves
+    to ``action=None, acted=False``, the same "gate fails, nothing
+    mutates" direction `dispatch_investigator_action`'s own preconditions
+    already fail toward.
+    """
+    call = invoke_model if invoke_model is not None else _invoke_investigator_model
+
+    def _audit(decision: ModelInvestigatorDecision) -> ModelInvestigatorDecision:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category="board_doctor_investigator",
+            event_type=MODEL_DECISION_EVENT_TYPE,
+            actor="board_doctor_investigator_model",
+            summary=(
+                f"model investigator decided {decision.action or 'none'} for "
+                f"{repo_name}#{issue_number} (confidence={decision.confidence:.2f}, "
+                f"model={decision.model_used}, acted={decision.acted})"
+            ),
+            repo=repo_name,
+            issue=issue_number,
+            details={
+                "cause": row.cause,
+                "action": decision.action,
+                "confidence": decision.confidence,
+                "reasoning": decision.reasoning,
+                "model_used": decision.model_used,
+                "escalated": decision.escalated,
+                "acted": decision.acted,
+                "detail": decision.detail,
+            },
+        )
+        return decision
+
+    cap_reason = _model_investigator_cap_reason(repo_name, issue_number)
+    if cap_reason is not None:
+        return _audit(
+            ModelInvestigatorDecision(
+                repo_name=repo_name,
+                issue_number=issue_number,
+                action=None,
+                confidence=0.0,
+                reasoning=cap_reason,
+                model_used="",
+                escalated=False,
+                acted=False,
+                detail=cap_reason,
+            )
+        )
+
+    stuck_hours = _row_stuck_hours(repo_name, issue_number)
+    pr_snapshot = _live_pr_snapshot(repo_name, issue_number, config)
+    evidence = _render_model_evidence(
+        row, repo_name, issue_number, stuck_hours=stuck_hours, pr_snapshot=pr_snapshot,
+    )
+
+    haiku_model = config.models.resolve("haiku") or "haiku"
+    sonnet_model = config.models.resolve("sonnet") or "sonnet"
+
+    def _call(model: str) -> tuple[str | None, float, str]:
+        try:
+            raw = call(_MODEL_INVESTIGATOR_SYSTEM_PROMPT, evidence, model=model, timeout=60.0)
+        except Exception as exc:  # noqa: BLE001 — a model-call failure is a refusal, not a crash
+            return None, 0.0, f"model call failed: {exc}"
+        return _parse_model_response(raw)
+
+    action, confidence, reasoning = _call(haiku_model)
+    model_used = haiku_model
+    escalated = False
+    if (
+        confidence < _MODEL_LOW_CONFIDENCE_ESCALATE
+        and stuck_hours is not None
+        and stuck_hours > _MODEL_ESCALATE_STUCK_HOURS
+    ):
+        action, confidence, reasoning = _call(sonnet_model)
+        model_used = sonnet_model
+        escalated = True
+
+    if action is None:
+        return _audit(
+            ModelInvestigatorDecision(
+                repo_name=repo_name,
+                issue_number=issue_number,
+                action=None,
+                confidence=confidence,
+                reasoning=reasoning,
+                model_used=model_used,
+                escalated=escalated,
+                acted=False,
+                detail=reasoning,
+            )
+        )
+
+    if action in _MODEL_HIGH_STAKES_ACTIONS and confidence < _MODEL_HIGH_STAKES_CONFIDENCE_FLOOR:
+        detail = (
+            f"model chose {action!r} at confidence {confidence:.2f}, below the "
+            f"{_MODEL_HIGH_STAKES_CONFIDENCE_FLOOR} floor required for a "
+            "high-stakes action — not acted on"
+        )
+        return _audit(
+            ModelInvestigatorDecision(
+                repo_name=repo_name,
+                issue_number=issue_number,
+                action=action,
+                confidence=confidence,
+                reasoning=reasoning,
+                model_used=model_used,
+                escalated=escalated,
+                acted=False,
+                detail=detail,
+            )
+        )
+
+    reason = (
+        f"board-doctor model investigator ({model_used}, confidence="
+        f"{confidence:.2f}): {reasoning}"
+    )
+    try:
+        result = _dispatch_model_eligible_action(
+            action, repo_name, issue_number, board, config, reason=reason,
+        )
+        acted, detail = result["acted"], result["detail"]
+    except Exception as exc:  # noqa: BLE001 — a dispatch failure is a refusal, not a crash
+        acted, detail = False, f"dispatch failed: {exc}"
+
+    return _audit(
+        ModelInvestigatorDecision(
+            repo_name=repo_name,
+            issue_number=issue_number,
+            action=action,
+            confidence=confidence,
+            reasoning=reasoning,
+            model_used=model_used,
+            escalated=escalated,
+            acted=acted,
+            detail=detail,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class ModelDecisionOutcome:
+    """One #4126 model decision's scored outcome — the unit
+    :func:`score_model_investigator_decisions` returns and
+    `coord.commands.stats` renders."""
+
+    repo_name: str
+    issue_number: int
+    ts: float
+    action: str | None
+    confidence: float
+    model_used: str
+    escalated: bool
+    acted: bool
+    #: ``"too_recent"`` | ``"declined"`` | ``"unstuck"`` | ``"still_stuck"``
+    outcome: str
+
+
+def score_model_investigator_decisions(
+    audit_entries: Sequence[Mapping[str, Any]],
+    assignment_rows: Sequence[Mapping[str, Any]],
+    *,
+    now: float | None = None,
+    score_after_hours: float = _MODEL_DECISION_WINDOW_HOURS,
+) -> list[ModelDecisionOutcome]:
+    """Score every #4126 :data:`MODEL_DECISION_EVENT_TYPE` row in
+    *audit_entries* against *assignment_rows* — the SAME two already-
+    fetched reads `coord stats waste` hands every other aggregator (see
+    that command's own module docstring), never a fresh live board/GitHub
+    read of this function's own. Pure dict-in/dict-out, like every other
+    aggregator in that command's pipeline.
+
+    ``outcome``:
+
+    * ``"too_recent"`` — fewer than *score_after_hours* have elapsed since
+      the decision; not enough time has passed to judge it yet.
+    * ``"declined"`` — the model chose not to act (``acted=False``: a
+      capped row, a parse failure, ``"none"``, or a confidence below the
+      high-stakes floor) — nothing to score.
+    * ``"unstuck"`` — an *acted* decision with a LATER assignment row for
+      the same issue reading a terminal status (``merged``/``done``).
+    * ``"still_stuck"`` — an *acted* decision with no such later row. This
+      reads identically whether the action never moved the row at all, or
+      moved it and it re-stuck afterward — telling those two apart needs a
+      denser history of this row's state over time than the board/audit
+      reads this function is handed carry; a future change can sharpen
+      this once that's available, but "did this decision's action stick"
+      is the question #4126 asks, and a false "unstuck" is the wrong
+      direction to be permissive in.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.usage_rollup import parse_timestamp, row_issue_number  # noqa: PLC0415
+
+    resolved_now = now if now is not None else _time.time()
+    terminal_statuses = {"merged", "done"}
+
+    outcomes: list[ModelDecisionOutcome] = []
+    for entry in audit_entries:
+        if entry.get("event_type") != MODEL_DECISION_EVENT_TYPE:
+            continue
+        details = entry.get("details") or {}
+        repo_name = str(entry.get("repo") or "")
+        issue_number = int(entry.get("issue") or 0)
+        ts = parse_timestamp(entry.get("ts")) or 0.0
+        acted = bool(details.get("acted"))
+        action = details.get("action")
+        confidence = float(details.get("confidence") or 0.0)
+        model_used = str(details.get("model_used") or "")
+        escalated = bool(details.get("escalated"))
+
+        if resolved_now - ts < score_after_hours * 3600.0:
+            outcome = "too_recent"
+        elif not acted:
+            outcome = "declined"
+        else:
+            later_terminal = any(
+                str(row.get("repo_name") or "") == repo_name
+                and row_issue_number(row) == issue_number
+                and str(row.get("status") or "") in terminal_statuses
+                and (parse_timestamp(row.get("finished_at")) or 0.0) >= ts
+                for row in assignment_rows
+            )
+            outcome = "unstuck" if later_terminal else "still_stuck"
+
+        outcomes.append(
+            ModelDecisionOutcome(
+                repo_name=repo_name,
+                issue_number=issue_number,
+                ts=ts,
+                action=action,
+                confidence=confidence,
+                model_used=model_used,
+                escalated=escalated,
+                acted=acted,
+                outcome=outcome,
+            )
+        )
+    return outcomes
+
+
 NO_FINISHER_ENV_VAR = "COORD_BOARD_DOCTOR_NO_FINISHER"
 """Process-wide kill switch read by :func:`_finisher_tier_enabled`.
 
@@ -2934,6 +3628,21 @@ def _investigate(row: StuckRow) -> bool:
     # leg.
     if row.queue == "drive-queue" and row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
         if _release_leaked_review_claim_for_row(repo_name, issue_number, board):
+            return True
+
+    # #4126: try the model-chosen investigator decision first, in place of
+    # a fix-it leg — a bounded `claude -p` call picking a verb from
+    # `MODEL_ELIGIBLE_ACTIONS` through the SAME precondition-checked
+    # `dispatch_investigator_action` wrapper a human `doctor-act`
+    # invocation uses. Opt-in only (`_model_investigator_enabled`,
+    # default off): when it declines (capped, low-confidence, "none", a
+    # parse/dispatch failure) this falls straight through to the existing
+    # fix-it-leg dispatch below, unchanged.
+    if _model_investigator_enabled():
+        model_decision = decide_with_model_investigator(
+            row, repo_name, issue_number, board, config,
+        )
+        if model_decision.acted:
             return True
 
     evidence = row.evidence
