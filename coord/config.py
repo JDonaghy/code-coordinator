@@ -461,6 +461,30 @@ class SmokeTestsConfig:
     native_execution_capabilities: list[str] = field(default_factory=lambda: ["windows"])
     command_stages: tuple[SmokeStage, ...] = ()
     cross_platform_checks: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: #4130: load-aware Test-leg admission. `coord.smoke.rank_smoke_
+    #: machines`/`_walk_candidates_and_dispatch` skip a capability-matched
+    #: candidate whenever its last-probed 1-minute load average (the
+    #: `/health` `load` block — `coord.agent._current_load_snapshot`)
+    #: divided by its own CPU count exceeds this multiple: a parallel cargo
+    #: fan-out starving a cold target dir is exactly the shape that blew
+    #: macmini's sole `macos` Test leg into its own timeout (#4130). `None`
+    #: (the default) disables the check entirely — a skipped candidate is
+    #: still tried exactly as before this field existed, and still queues
+    #: if genuinely busy. A candidate whose load could not be measured (no
+    #: live `/health` reply, or the host's own `os.getloadavg()` is
+    #: unavailable, e.g. Windows) is never skipped on this check alone —
+    #: fails open, same discipline as the sibling `/health` tool-version
+    #: probe (`coord.smoke._capability_probe_reasons`).
+    max_load_per_core: float | None = None
+    #: #4130: a host that is the ONLY configured holder of some capability
+    #: (`coord.dispatch.sole_test_capabilities`) reserves its capacity for
+    #: the Test leg only it can run: while that leg is `pending`/`running`
+    #: there, `coord.dispatch.dispatch` reroutes a NEW `type="work"`
+    #: dispatch proposed for that same host onto another repo-capable,
+    #: unpaused, unreserved machine — or refuses outright when none exists.
+    #: Defaults to `True`; set `False` to restore pre-#4130 behaviour (Work
+    #: and Test compete for the same host with no reservation at all).
+    reserve_sole_capability_hosts: bool = True
 
 
 @dataclass
@@ -5073,6 +5097,24 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
                 "smoke_tests.native_execution_capabilities must be a list of strings"
             )
         cfg.native_execution_capabilities = value
+
+    if "max_load_per_core" in raw:
+        value = raw["max_load_per_core"]
+        if value is not None and (
+            not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
+        ):
+            raise ConfigError(
+                "smoke_tests.max_load_per_core must be a positive number or null"
+            )
+        cfg.max_load_per_core = float(value) if value is not None else None
+
+    if "reserve_sole_capability_hosts" in raw:
+        value = raw["reserve_sole_capability_hosts"]
+        if not isinstance(value, bool):
+            raise ConfigError(
+                "smoke_tests.reserve_sole_capability_hosts must be a boolean"
+            )
+        cfg.reserve_sole_capability_hosts = value
 
     rules_raw = raw.get("capability_rules", []) or []
     if not isinstance(rules_raw, list):

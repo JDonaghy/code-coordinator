@@ -52,6 +52,28 @@ def test_health_includes_a_health_block(tmp_path: Path) -> None:
     assert block["results"], "machine-scope checks (disk, worktrees, ...) should have run"
 
 
+def test_health_includes_a_load_block(tmp_path: Path, monkeypatch) -> None:
+    """#4130: `/health` publishes this host's OS load so a dispatcher can
+    make load-aware Test admission decisions without SSHing in."""
+    import coord.agent as agent_mod
+
+    monkeypatch.setattr(
+        agent_mod, "_current_load_snapshot",
+        lambda: {"load1": 4.5, "load5": 3.0, "load15": 2.0, "cpu_count": 4},
+    )
+    server = _server(tmp_path)
+    h = server.health()
+    assert h["load"] == {"load1": 4.5, "load5": 3.0, "load15": 2.0, "cpu_count": 4}
+
+
+def test_health_load_block_is_none_when_unmeasurable(tmp_path: Path, monkeypatch) -> None:
+    import coord.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_current_load_snapshot", lambda: None)
+    server = _server(tmp_path)
+    assert server.health()["load"] is None
+
+
 def test_health_block_results_carry_a_per_check_timestamp(tmp_path: Path) -> None:
     """#1630: a renderer must be able to tell "OK, just measured" apart from
     "last measured OK, a while ago" — every result row carries its own

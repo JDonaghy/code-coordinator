@@ -102,6 +102,51 @@ def test_run_plain_runner_command_timeout_is_a_failure_not_a_crash() -> None:
     assert "timed out after 30s" in verdict.log_tail
 
 
+def test_run_plain_runner_command_timeout_sets_timed_out_and_records_load(monkeypatch) -> None:
+    """#4130: a wall-clock kill is distinguishable from an ordinary
+    `exit_code=-1` failure via `timed_out`, and the host's load at the
+    moment of the kill is captured so the triage classifier (and a human
+    reading the log) can see it."""
+    monkeypatch.setattr(
+        agent_mod, "_current_load_snapshot",
+        lambda: {"load1": 33.2, "load5": 20.0, "load15": 10.0, "cpu_count": 8},
+    )
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="pytest", timeout=30)
+
+    verdict = run_plain_runner_command("pytest", "/tmp/repo", timeout=30, run=fake_run)
+
+    assert verdict.timed_out is True
+    assert verdict.timeout_load == {
+        "load1": 33.2, "load5": 20.0, "load15": 10.0, "cpu_count": 8,
+    }
+
+
+def test_run_plain_runner_command_timeout_load_none_when_unmeasurable(monkeypatch) -> None:
+    """A host whose `os.getloadavg()` is unavailable (e.g. Windows) still
+    produces a verdict — `timeout_load` is simply `None`, never a crash."""
+    monkeypatch.setattr(agent_mod, "_current_load_snapshot", lambda: None)
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="pytest", timeout=30)
+
+    verdict = run_plain_runner_command("pytest", "/tmp/repo", timeout=30, run=fake_run)
+
+    assert verdict.timed_out is True
+    assert verdict.timeout_load is None
+
+
+def test_current_load_snapshot_shape() -> None:
+    """A real read, on this (POSIX) test host: a 5-key dict with a positive
+    cpu_count, or `None` if this platform genuinely can't measure it."""
+    snapshot = agent_mod._current_load_snapshot()
+    if snapshot is None:
+        return
+    assert set(snapshot) == {"load1", "load5", "load15", "cpu_count"}
+    assert snapshot["cpu_count"] >= 1
+
+
 def test_run_plain_runner_command_never_calls_the_real_runner_when_injected() -> None:
     """The injected `run` is the ONLY thing `run_plain_runner_command` calls
     to get an exit code — never `subprocess.Popen`, never the `claude`
@@ -216,6 +261,30 @@ def test_plain_runner_smoke_marker_lines_matches_claude_worker_vocabulary() -> N
     crash_text = plain_runner_smoke_marker_lines(_smoke_spec(), harness_crash)
     assert "SMOKE: harness-crash exit=3" in crash_text
     assert "SMOKE: fail" not in crash_text
+
+
+def test_plain_runner_smoke_marker_lines_timeout_carries_the_load_note() -> None:
+    """#4130: a `timed_out` verdict's `SMOKE: fail` marker carries the
+    host's load at kill time, in the exact shape
+    `coord.failure_triage`'s deterministic timeout rule scans for — this
+    is the one line that eventually reaches `failure_reason`/
+    `terminal_reason` via `coord.notify`'s "headless smoke: {reason}"
+    headline."""
+    timed_out = PlainRunnerVerdict(
+        passed=False, exit_code=-1, log_tail="timed out after 2400s",
+        timed_out=True, timeout_load={"load1": 33.2, "cpu_count": 8},
+    )
+    text = plain_runner_smoke_marker_lines(_smoke_spec(), timed_out)
+    assert "SMOKE: fail timed out, exit=-1" in text
+    assert "(host load at kill: 1m=33.20, cores=8)" in text
+
+    unmeasurable = PlainRunnerVerdict(
+        passed=False, exit_code=-1, log_tail="timed out after 2400s",
+        timed_out=True, timeout_load=None,
+    )
+    assert "(host load at kill: unknown)" in plain_runner_smoke_marker_lines(
+        _smoke_spec(), unmeasurable,
+    )
 
 
 # ── End-to-end through the real AgentServer: no claude Popen for a plain

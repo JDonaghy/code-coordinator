@@ -7766,3 +7766,117 @@ def test_dispatch_pending_smoke_proceeds_to_the_real_fanout_after_a_passed_prech
     # left `running` — the whole point of #4098's "a pass proceeds to the
     # fan-out exactly as if no precheck had run".
     assert work.test_state is None
+
+
+# ── #4130: load-aware Test admission (_load_probe_reason) ──────────────────
+
+
+def test_load_probe_reason_none_when_max_load_per_core_unset() -> None:
+    from coord.smoke import _load_probe_reason
+
+    machine = _machine("desktop-a", "desktop-a.tail", caps=["gtk"])
+    client = _FakeClient({}, health={"load": {"load1": 99.0, "cpu_count": 2}})
+    assert _load_probe_reason(machine, None, http_client=client) is None
+    # Not even probed — the check is off, no network call made at all.
+    assert client.get_calls == []
+
+
+def test_load_probe_reason_refuses_over_the_ceiling() -> None:
+    from coord.smoke import _load_probe_reason
+
+    machine = _machine("desktop-a", "desktop-a.tail", caps=["gtk"])
+    client = _FakeClient({}, health={"load": {"load1": 20.0, "cpu_count": 4}})
+    reason = _load_probe_reason(machine, 1.5, http_client=client)
+    assert reason is not None
+    assert "20.0" in reason or "20.00" in reason
+    assert client.get_calls == ["http://desktop-a.tail:7433/health"]
+
+
+def test_load_probe_reason_none_when_under_the_ceiling() -> None:
+    from coord.smoke import _load_probe_reason
+
+    machine = _machine("desktop-a", "desktop-a.tail", caps=["gtk"])
+    client = _FakeClient({}, health={"load": {"load1": 2.0, "cpu_count": 4}})
+    assert _load_probe_reason(machine, 1.5, http_client=client) is None
+
+
+def test_load_probe_reason_fails_open_when_health_has_no_load_block() -> None:
+    """An agent that predates #4130 publishes no `load` key at all — never
+    refuse a candidate on a reading this function could not take."""
+    from coord.smoke import _load_probe_reason
+
+    machine = _machine("desktop-a", "desktop-a.tail", caps=["gtk"])
+    client = _FakeClient({}, health={})
+    assert _load_probe_reason(machine, 1.5, http_client=client) is None
+
+
+def test_load_probe_reason_fails_open_when_load_is_unmeasurable() -> None:
+    """`load: null` — a host whose own `os.getloadavg()` is unavailable
+    (e.g. Windows) — must never refuse either."""
+    from coord.smoke import _load_probe_reason
+
+    machine = _machine("desktop-a", "desktop-a.tail", caps=["gtk"])
+    client = _FakeClient({}, health={"load": None})
+    assert _load_probe_reason(machine, 1.5, http_client=client) is None
+
+
+def test_load_probe_reason_fails_open_on_connectivity_error() -> None:
+    import httpx
+
+    from coord.smoke import _load_probe_reason
+
+    class _BoomClient:
+        def get(self, url, *, timeout):
+            raise httpx.ConnectError("nope")
+
+    machine = _machine("desktop-a", "desktop-a.tail", caps=["gtk"])
+    assert _load_probe_reason(machine, 1.5, http_client=_BoomClient()) is None
+
+
+def test_walk_candidates_and_dispatch_skips_overloaded_machine_then_tries_next(
+    gtk_and_server_config: Config,
+) -> None:
+    """#4130: an overloaded capability-matched candidate is skipped (never
+    dispatched to) and the walk proceeds to the next one — "requeue, or
+    pick another capable host", never a dispatch straight into the
+    overload."""
+    from coord.smoke import SmokeMachineChoice, _walk_candidates_and_dispatch
+
+    overloaded = _machine("desktop-a", "desktop-a.tail", caps=["python", "gtk"])
+    idle = _machine("desktop-b", "desktop-b.tail", caps=["python", "gtk"])
+    candidates = [
+        SmokeMachineChoice(machine=overloaded, is_worker=False, rationale="r1"),
+        SmokeMachineChoice(machine=idle, is_worker=False, rationale="r2"),
+    ]
+
+    class _PerHostClient:
+        def __init__(self) -> None:
+            self.posts: list[str] = []
+
+        def get(self, url, *, timeout):
+            if "desktop-a" in url:
+                return _FakeResp({"load": {"load1": 50.0, "cpu_count": 4}})
+            return _FakeResp({"load": {"load1": 1.0, "cpu_count": 4}})
+
+        def post(self, url, *, json, timeout):
+            self.posts.append(url)
+            return _FakeResp({"id": "assigned"})
+
+    client = _PerHostClient()
+    dispatched, attempts = _walk_candidates_and_dispatch(
+        candidates,
+        completed=_completed(),
+        repo=Repo(name="api", github="acme/api", depends_on=[], default_branch="main"),
+        required_caps=[],
+        issue_title="t",
+        build_briefing=lambda is_worker, native_unverified: "briefing",
+        smoke_model_wire="sonnet",
+        http_client=client,
+        smoke_timeout_s=600,
+        max_load_per_core=1.0,
+    )
+
+    assert dispatched is not None
+    assert dispatched[0].machine.name == "desktop-b"
+    assert client.posts == ["http://desktop-b.tail:7433/assign"]
+    assert any("desktop-a" in a.machine_name and "load" in a.reason for a in attempts)

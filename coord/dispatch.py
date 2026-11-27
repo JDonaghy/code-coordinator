@@ -1276,6 +1276,59 @@ def dispatch(
                         "under machines[].repo_paths."
                     )
 
+    # #4130: STRUCTURAL TEST-HOST RESERVATION GATE — a sole-capability Test
+    # host (the one `macos`/`windows` box in the fleet) must not take on a
+    # NEW Work/tranche leg while it is busy running the one Test leg only
+    # it can run: a parallel cargo build starving that leg's cold target
+    # dir is exactly what blew its own timeout in the 2026-11-25 macmini
+    # incident this issue is named for. Runs AFTER the capability/liveness
+    # gates above — `proposal.machine_name` here is already whatever they
+    # chose — and is opt-in via *board* (`None` performs no check at all,
+    # same shape as *status_fetcher*/*credential_fetcher*) and via
+    # `smoke_tests.reserve_sole_capability_hosts` (`True` by default).
+    if (
+        proposal.type == "work"
+        and board is not None
+        and config.smoke_tests.reserve_sole_capability_hosts
+    ):
+        reservation_routing = route_work_by_test_reservation(
+            proposed_machine_name=proposal.machine_name,
+            repo_name=proposal.repo_name,
+            machines=config.machines,
+            board=board,
+        )
+        if reservation_routing is not None:
+            if reservation_routing.machine_name is None:
+                detail = "; ".join(
+                    f"{name} ({why})" for name, why in reservation_routing.tried
+                )
+                raise ValueError(
+                    f"no machine can take this {proposal.repo_name!r} dispatch "
+                    "right now — every candidate is reserved for a sole-"
+                    f"capability Test leg: {detail} — nothing dispatched (#4130)"
+                )
+            if reservation_routing.rerouted:
+                proposal.machine_name = reservation_routing.machine_name
+                machine = next(
+                    (m for m in config.machines if m.name == reservation_routing.machine_name),
+                    None,
+                )
+                if machine is None:  # pragma: no cover — route_work_by_test_
+                    # reservation only ever names a machine it drew from
+                    # config.machines.
+                    raise ValueError(
+                        f"Unknown machine: {reservation_routing.machine_name!r}"
+                    )
+                repo_path = machine.repo_path(proposal.repo_name)
+                if repo_path is None:  # pragma: no cover — route_work_by_test_
+                    # reservation's candidate filter already requires a
+                    # configured repo_path.
+                    raise ValueError(
+                        f"No repo_path configured for {proposal.repo_name!r} on "
+                        f"machine {machine.name!r}. Add it to coordinator.yml "
+                        "under machines[].repo_paths."
+                    )
+
     # #4004: wrap *credential_fetcher* once, before the reroute search just
     # below, so every later probe of the same machine within this ONE
     # dispatch call reuses the first answer instead of asking twice — see
@@ -2462,6 +2515,131 @@ def route_work_by_liveness(
 
     tried.extend(skipped)
     return LivenessRouting(machine_name=None, rerouted=False, tried=tuple(tried))
+
+
+def sole_test_capabilities(machine: Machine, machines: list[Machine]) -> frozenset[str]:
+    """Every capability *machine* is the ONLY member of *machines* to
+    declare (#4130) — a `macos`/`windows`-shaped single point of
+    Test-stage capacity: the 2026-11-25 macmini incident this exists for
+    (the issue's own `## Problem`) is exactly "the one `macos` Test host
+    also ran a heavy Work tranche".
+
+    Capability membership only — never busy/paused/reachability, which
+    stay the caller's own concern, same separation
+    :func:`coord.smoke._capability_matched_machines` keeps. A machine with
+    no capabilities at all, or every one of whose capabilities some OTHER
+    machine also declares, returns an empty set — never reserved by
+    :func:`machine_reserved_for_test`.
+    """
+    elsewhere: set[str] = set()
+    for m in machines:
+        if m.name != machine.name:
+            elsewhere.update(m.capabilities)
+    return frozenset(c for c in machine.capabilities if c not in elsewhere)
+
+
+def machine_reserved_for_test(machine: Machine, machines: list[Machine], board: "Board") -> bool:
+    """Is *machine* currently reserved for a Test leg (#4130)?
+
+    True only when BOTH hold: *machine* is the sole holder of some
+    capability (:func:`sole_test_capabilities` non-empty) AND *board*
+    carries at least one `type="smoke"` assignment that is
+    `pending`/`running` there right now. A machine with no sole capability
+    is never reserved — ordinary routing (capacity caps, liveness, pause)
+    governs it exactly as it did before this field existed, and a
+    sole-capability host with no Test leg in flight has nothing to
+    protect either.
+    """
+    if not sole_test_capabilities(machine, machines):
+        return False
+    return any(
+        a.machine_name == machine.name
+        and a.type == "smoke"
+        and a.status in ("pending", "running")
+        for a in board.active
+    )
+
+
+@dataclass(frozen=True)
+class TestReservationRouting:
+    """Outcome of routing a `type="work"` dispatch around a sole-capability
+    Test host while it is busy running the one Test leg only it can run
+    (#4130).
+
+    `machine_name` is `None` when the proposed machine is reserved
+    (:func:`machine_reserved_for_test`) AND no other repo-capable, unpaused,
+    unreserved candidate exists — the caller must refuse the dispatch
+    rather than silently starving the Test leg the reservation exists to
+    protect. Unlike :class:`LivenessRouting`'s unreachable-machine refusal,
+    this condition is TRANSIENT (it clears the moment the Test leg
+    finishes), so a caller must raise a plain ``ValueError``, never
+    :class:`DispatchRefused` (see that class's own docstring on why it is
+    reserved for conditions that cannot change between attempts).
+
+    `tried` mirrors `LivenessRouting.tried`'s shape — every machine
+    considered, paired with why it was skipped.
+    """
+
+    machine_name: str | None
+    rerouted: bool
+    tried: tuple[tuple[str, str], ...] = ()
+
+
+_TEST_RESERVATION_REASON = "reserved for a sole-capability Test leg (#4130)"
+
+
+def route_work_by_test_reservation(
+    *,
+    proposed_machine_name: str,
+    repo_name: str,
+    machines: list[Machine],
+    board: "Board | None",
+    now: "datetime | None" = None,
+) -> TestReservationRouting | None:
+    """Reroute a `type="work"` dispatch away from a sole-capability Test
+    host while it is reserved (#4130), onto any other repo-capable,
+    unpaused, unreserved machine.
+
+    Returns `None` — "nothing for the caller to do, proceed unchanged" —
+    when *board* is `None` (opt-in, same shape as *status_fetcher* on
+    :func:`route_work_by_liveness`), `proposed_machine_name` isn't in
+    *machines*, or it is not currently reserved
+    (:func:`machine_reserved_for_test`). Returns a routing with
+    `machine_name=None` — a hard refusal, never "proceed with the original
+    pick" — only when the proposed machine is reserved AND every fallback
+    is too (or none exists at all).
+
+    Candidate filter mirrors `route_work_by_liveness`'s own fallback search
+    (:func:`repo_capable_unpaused_candidates`) plus this gate's own
+    reservation check — a fallback that is ITSELF reserved protects
+    nothing.
+
+    *now* is forwarded to `paused_set` untouched, same contract as every
+    other routing function in this module.
+    """
+    if board is None:
+        return None
+
+    proposed = next((m for m in machines if m.name == proposed_machine_name), None)
+    if proposed is None:
+        return None
+    if not machine_reserved_for_test(proposed, machines, board):
+        return None
+
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+
+    tried: list[tuple[str, str]] = [(proposed_machine_name, _TEST_RESERVATION_REASON)]
+    paused = paused_set(machines, now=now)
+    fallbacks = repo_capable_unpaused_candidates(
+        repo_name, machines, paused, exclude=proposed_machine_name,
+    )
+    for m in fallbacks:
+        if machine_reserved_for_test(m, machines, board):
+            tried.append((m.name, _TEST_RESERVATION_REASON))
+            continue
+        return TestReservationRouting(machine_name=m.name, rerouted=True, tried=tuple(tried))
+
+    return TestReservationRouting(machine_name=None, rerouted=False, tried=tuple(tried))
 
 
 @dataclass(frozen=True)

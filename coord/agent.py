@@ -6881,6 +6881,28 @@ def _user_message_line(text: str) -> bytes:
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
+#: #4130: this host's current OS load, read fresh on every call — published
+#: in `/health` (`AgentServer.health`) for a dispatcher's load-aware Test
+#: admission, and stamped onto a plain-runner timeout kill
+#: (`run_plain_runner_command`) so the triage classifier
+#: (`coord.failure_triage`) can tell "killed for hitting its own wall-clock
+#: budget" apart from a genuine code failure. `os.getloadavg()` is
+#: POSIX-only — absent/raising on Windows — so this returns `None` there
+#: rather than guessing; every caller treats `None` as "unmeasurable on this
+#: host", never as "idle".
+def _current_load_snapshot() -> dict[str, float | int] | None:
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except (OSError, AttributeError):
+        return None
+    return {
+        "load1": round(load1, 2),
+        "load5": round(load5, 2),
+        "load15": round(load15, 2),
+        "cpu_count": os.cpu_count() or 1,
+    }
+
+
 # ── #3673: plain-runner smoke executor ──────────────────────────────────────
 #
 # A Test-stage leg's whole job is "pull the branch, run the smoke command,
@@ -6981,6 +7003,23 @@ class PlainRunnerVerdict:
     #: never has to treat `None` here as ambiguous between "not extracted"
     #: and "extracted, found nothing".
     failure_evidence: FailureEvidence | None = None
+    #: #4130: True when this verdict came from `subprocess.run` raising
+    #: `TimeoutExpired` — the command never returned an exit status within
+    #: its own configured budget, so there is no graded pass/fail signal
+    #: here at all, only a wall-clock kill. `exit_code` is still `-1` on
+    #: this path (unchanged from pre-#4130 behaviour); this flag is the
+    #: authoritative way to tell "killed at timeout" apart from any other
+    #: failure that happened to also exit `-1`.
+    timed_out: bool = False
+    #: #4130: this host's `_current_load_snapshot()` at the moment the
+    #: process group was killed, or `None` when unmeasurable (no POSIX
+    #: `os.getloadavg()`, e.g. Windows). Only ever set alongside
+    #: `timed_out=True`. Folded into the `SMOKE: fail` marker
+    #: (`plain_runner_smoke_marker_lines`) so the triage classifier
+    #: (`coord.failure_triage`) can recognise the shape and the number is
+    #: visible to a human reading the log, without re-probing a host that
+    #: may no longer be under the same load by the time anyone looks.
+    timeout_load: dict | None = None
 
 
 def run_plain_runner_command(
@@ -7037,7 +7076,17 @@ def run_plain_runner_command(
         )
         evidence = extract_failure_evidence(text)
         tail = _tail_text(text, evidence=evidence)
-        return PlainRunnerVerdict(passed=False, exit_code=-1, log_tail=tail, failure_evidence=evidence)
+        # #4130: record this host's load at the moment of the kill — a
+        # concurrent Work/tranche leg starving the one `macos`/`windows`
+        # Test host is exactly what blows a leg's own timeout before it
+        # ever produces a verdict. `timed_out=True` lets a caller (and,
+        # via `plain_runner_smoke_marker_lines`, `coord.failure_triage`'s
+        # deterministic classifier) tell this apart from any other failure
+        # that happens to also report `exit_code=-1`.
+        return PlainRunnerVerdict(
+            passed=False, exit_code=-1, log_tail=tail, failure_evidence=evidence,
+            timed_out=True, timeout_load=_current_load_snapshot(),
+        )
 
     combined = (result.stdout or "") + (result.stderr or "")
     # #4092: extract from the FULL `combined` text, before `_tail_text` has
@@ -7112,12 +7161,32 @@ def execute_plain_runner_smoke(
     return verdict
 
 
+def format_timeout_load_note(load: dict | None) -> str:
+    """Render `_current_load_snapshot`'s shape as the short, coordinator-
+    authored suffix #4130's deterministic infra-timeout rule
+    (`coord.failure_triage`'s ``_TIMEOUT_KILL_RE``) scans for — stable text,
+    never a worker's own prose. `None` (unmeasurable on this platform, e.g.
+    Windows) renders as "unknown" rather than silently omitting the fact a
+    load reading was attempted at all.
+    """
+    if load is None:
+        return " (host load at kill: unknown)"
+    return f" (host load at kill: 1m={load['load1']:.2f}, cores={load['cpu_count']})"
+
+
 def plain_runner_smoke_marker_lines(spec: AssignmentSpec, verdict: PlainRunnerVerdict) -> str:
     """The exact `SMOKE:` marker text a plain-runner leg's log carries
     (#3673) — byte-for-byte the same vocabulary `SMOKE_SYSTEM_PROMPT` asks a
     `claude -p` smoke worker to print, so `coord.notify._record_smoke_verdict`
     parses a plain-runner leg's log identically to a worker-printed one; no
     downstream verdict-parsing code needs to know which path produced it.
+
+    #4130: a `timed_out` verdict's `reason` (everything `_SMOKE_VERDICT_RE`
+    captures after `SMOKE: fail`) carries the host's load at the moment of
+    the kill, via :func:`format_timeout_load_note` — a short, coordinator-
+    authored string, safe for `coord.notify`'s "headless smoke: {reason}"
+    headline to carry into `test_reason`/`failure_reason` unanchored, same
+    discipline every other marker branch here already follows.
     """
     header = (
         f"# plain-runner (#3673): executing `{spec.smoke_command}` — no claude -p "
@@ -7130,6 +7199,11 @@ def plain_runner_smoke_marker_lines(spec: AssignmentSpec, verdict: PlainRunnerVe
         marker = "SMOKE: pass"
     elif verdict.harness_crash:
         marker = f"SMOKE: harness-crash exit={verdict.exit_code}"
+    elif verdict.timed_out:
+        marker = (
+            f"SMOKE: fail timed out, exit={verdict.exit_code}"
+            f"{format_timeout_load_note(verdict.timeout_load)}"
+        )
     else:
         marker = f"SMOKE: fail exit={verdict.exit_code}"
     return f"{header}{body}\n{marker}\n"
@@ -8013,6 +8087,12 @@ class AgentServer:
             "degraded": degraded_repos,
             "active": active,
             "completed": completed,
+            # #4130: this host's current OS load (`None` when unmeasurable,
+            # e.g. Windows) — `coord.smoke`'s load-aware Test admission
+            # reads this exactly like the sibling `tool_versions` probe:
+            # cheap, best-effort, fails OPEN (never refuses a candidate on
+            # a missing/old reading alone).
+            "load": _current_load_snapshot(),
             # Monotonic-ish stamp of when THIS Python process started.
             # exec_restart replaces the image so this changes across an
             # /update — letting the CLI distinguish "old agent still

@@ -27,19 +27,24 @@ disambiguation). Both of those neighbours already export a
   rote fix, not evidence the model needs to be smarter) and the two must
   never be unified into one verdict.
 
-TWO TIERS, DETERMINISTIC FIRST. :func:`triage_failure` tries, in order:
+DETERMINISTIC TIERS FIRST. :func:`triage_failure` tries, in order:
 
 1. **Infra** — :mod:`coord.failure_class`'s own environmental verdict (usage
    limit / API 5xx / network / #3670 infra outage / #4018 setup failure /
    #3912's toolchain-collision signatures, all already folded into that
    module's ``classify_failure``). Any of those means "wait and retry", which
    this taxonomy calls ``infra`` — none of it is evidence about the CODE.
-2. **Mechanical** — a ``compile_error``, ``ratchet``, or ``lint`` signal
+2. **Timeout-under-load** (#4130) — a Test leg killed for hitting its own
+   wall-clock timeout (:func:`_timeout_verdict`) never produced a verdict at
+   all, so it is ``infra`` too, by the same reasoning as tier 1 — just a
+   signature :mod:`coord.failure_class` doesn't carry, matched directly
+   against *failure_reason*/*terminal_reason* here instead.
+3. **Mechanical** — a ``compile_error``, ``ratchet``, or ``lint`` signal
    (:class:`coord.failure_evidence.FailureSignals`) with a SMALL number of
    error sites, each one confined to a file of the same kind the branch diff
    (or the issue's own ``## Files``) already touches. A rote, well-scoped fix
    needs no model judgement to recognise.
-3. Otherwise, **one cheap ``claude -p`` call** (haiku by default, configurable
+4. Otherwise, **one cheap ``claude -p`` call** (haiku by default, configurable
    — see :func:`triage_failure`'s ``model=``). It sees the already-extracted
    evidence record and the diff stat, NEVER the raw log, and must reply with
    exactly one JSON object matching the verdict schema. A malformed reply, an
@@ -260,7 +265,71 @@ def _infra_verdict(
     )
 
 
-# ── tier 1b: mechanical ──────────────────────────────────────────────────────
+# ── tier 1b: timeout-under-load (#4130) ──────────────────────────────────────
+
+#: `coord.agent.format_timeout_load_note`'s exact suffix, embedded in the
+#: plain-runner's own `SMOKE: fail timed out, ...` marker and, from there
+#: (via `coord.notify`'s "headless smoke: {reason}" headline), in
+#: `failure_reason`/`terminal_reason` — a short, coordinator-authored
+#: string, never a worker's test-output prose, so safe to scan
+#: unconditionally, same discipline as `coord.failure_class`'s own infra/
+#: setup signatures. The load group is optional: `format_timeout_load_note`
+#: renders `(host load at kill: unknown)` when the host's own
+#: `os.getloadavg()` is unavailable (e.g. Windows).
+_TIMEOUT_KILL_RE = re.compile(
+    r"timed out\b.*?\(host load at kill: (?:1m=([0-9.]+), cores=(\d+)|unknown)\)",
+    re.IGNORECASE,
+)
+
+
+def _timeout_verdict(
+    failure_reason: str | None, terminal_reason: str | None,
+) -> TriageVerdict | None:
+    """#4130: a Test leg killed for hitting ITS OWN wall-clock timeout never
+    produced a graded verdict — nothing ran to completion, so there is no
+    code failure to diagnose, only infrastructure that ran out of time
+    (routinely because a concurrent Work/tranche leg was starving the same
+    sole-capability host — see `coord.dispatch.sole_test_capabilities`).
+
+    Recognised by :data:`_TIMEOUT_KILL_RE` in *failure_reason* or
+    *terminal_reason* — the SAME two coordinator-authored evidence channels
+    :func:`_infra_verdict` already scans unconditionally, never a worker's
+    own prose. The load figures (when the host could measure them) are
+    folded into the diagnosis for operator visibility only; this rule fires
+    on the timeout shape alone and never second-guesses it against a load
+    threshold — the kill already proved the budget ran out, whatever the
+    number says.
+    """
+    for text in (failure_reason, terminal_reason):
+        if not text:
+            continue
+        m = _TIMEOUT_KILL_RE.search(text)
+        if m is None:
+            continue
+        load1, cores = m.group(1), m.group(2)
+        load_note = (
+            f"a 1-minute load average of {load1} across {cores} core(s)"
+            if load1 and cores
+            else "load that could not be measured on that host"
+        )
+        return TriageVerdict(
+            bucket=BUCKET_INFRA,
+            diagnosis=(
+                "Deterministic infra classification (#4130): the Test leg "
+                "was killed for hitting its own wall-clock timeout — no "
+                "exit status was ever produced, so there is nothing here "
+                f"to grade as a code failure. The host reported {load_note} "
+                "at the moment of the kill. No model call was needed."
+            ),
+            repro_capability=None,
+            proposed_scope=ProposedScope(),
+            confidence=1.0,
+            via="deterministic:infra:timeout",
+        )
+    return None
+
+
+# ── tier 1c: mechanical ──────────────────────────────────────────────────────
 
 _RUSTC_ERROR_HEADER_RE = re.compile(r"^error(\[E\d+\])?:", re.MULTILINE)
 _ARROW_LOCATION_RE = re.compile(r"^\s*-->\s*(\S+):\d+:\d+", re.MULTILINE)
@@ -764,6 +833,10 @@ def triage_failure(
     )
     if infra is not None:
         return infra
+
+    timeout_infra = _timeout_verdict(failure_reason, terminal_reason)
+    if timeout_infra is not None:
+        return timeout_infra
 
     mechanical = _mechanical_verdict(evidence, diff_stat, declared_files, machine_capabilities)
     if mechanical is not None:

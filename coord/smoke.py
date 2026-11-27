@@ -1773,6 +1773,56 @@ def _capability_probe_reasons(
     return unmet_capabilities(required_caps, probes)
 
 
+def _load_probe_reason(
+    machine: Machine,
+    max_load_per_core: float | None,
+    *,
+    http_client: httpx.Client | None = None,
+    timeout: float = 5.0,
+) -> str | None:
+    """#4130: is `machine` too loaded to admit a NEW Test leg right now?
+
+    Reads the live `load` block `AgentServer.health` publishes
+    (`coord.agent._current_load_snapshot`) and compares its 1-minute load
+    average against `cpu_count * max_load_per_core`. Returns a human-
+    readable refusal reason when it's over, else `None`.
+
+    Fails OPEN on every "can't tell" shape, same discipline as the sibling
+    `_capability_probe_reasons`: `max_load_per_core is None` (the default —
+    the check is off), a connectivity/parse hiccup, a `/health` reply with
+    no `load` block (an agent that predates #4130), or a host whose own
+    `os.getloadavg()` is unavailable (`load` is `None` — e.g. Windows) all
+    return `None` — never refuse a candidate on a reading this function
+    could not actually take.
+    """
+    if max_load_per_core is None or max_load_per_core <= 0:
+        return None
+    client = http_client or httpx
+    try:
+        resp = client.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=timeout)
+        resp.raise_for_status()
+        health = resp.json()
+    except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+        return None
+    load = health.get("load") if isinstance(health, dict) else None
+    if not isinstance(load, dict):
+        return None
+    load1 = load.get("load1")
+    cpu_count = load.get("cpu_count")
+    if not isinstance(load1, (int, float)) or not isinstance(cpu_count, (int, float)):
+        return None
+    if cpu_count <= 0:
+        return None
+    ceiling = max_load_per_core * cpu_count
+    if load1 <= ceiling:
+        return None
+    return (
+        f"1-minute load {load1:.2f} across {cpu_count:.0f} core(s) exceeds "
+        f"the configured ceiling of {max_load_per_core:g}/core "
+        f"({ceiling:.2f}) — #4130"
+    )
+
+
 # ── CI-equivalence of the Test-stage command (#2091) ────────────────────────
 
 
@@ -2826,6 +2876,7 @@ def _dispatch_cross_platform_precheck(
             smoke_command=command,
             smoke_needs_judgement=False,
             smoke_timeout_s=smoke_cfg.timeout_seconds,
+            max_load_per_core=smoke_cfg.max_load_per_core,
         )
         if dispatched_one is None:
             logger.warning(
@@ -3695,11 +3746,19 @@ def _walk_candidates_and_dispatch(
     smoke_command: str | None = None,
     smoke_needs_judgement: bool = False,
     smoke_timeout_s: float | None = None,
+    max_load_per_core: float | None = None,
 ) -> tuple[tuple[SmokeMachineChoice, str, dict] | None, list[SmokeAttempt]]:
     """Walk *candidates* best-first, probing then POSTing ``/assign`` — the
     #1672 full-candidate-list walk every smoke dispatch does. Returns the
     dispatched ``(choice, briefing, agent_response)`` (or ``None`` if every
     candidate was exhausted) and the `SmokeAttempt`\\ s burned getting there.
+
+    *max_load_per_core* (#4130) skips a candidate whose live `/health` load
+    reading is over this many times its CPU count (:func:`_load_probe_
+    reason`) — a parallel cargo fan-out starving a cold target dir is
+    exactly the shape that blew a sole-capability Test host's own timeout.
+    `None` (the default) performs no such check, byte-for-byte the
+    pre-#4130 behaviour.
 
     *build_briefing(is_worker, native_unverified)* builds the briefing for
     one candidate — a callback rather than a plain string because the
@@ -3750,6 +3809,27 @@ def _walk_candidates_and_dispatch(
     attempts: list[SmokeAttempt] = []
     client = http_client or httpx
     for choice in candidates:
+        overloaded = _load_probe_reason(
+            choice.machine, max_load_per_core, http_client=http_client,
+        )
+        if overloaded is not None:
+            # #4130: requeue rather than dispatch into a host that is
+            # already too busy to finish within its own Test-stage
+            # timeout. #1672: per-machine, so keep walking the candidate
+            # list instead of ending the stage — transient, unlike the
+            # #1570 D capability-probe refusal just below: this host is
+            # perfectly eligible again the moment its load drops.
+            logger.warning(
+                "dispatch_smoke: skipping machine %s for %s#%s — %s. "
+                "Trying the next capability-matched machine (#1672, #4130).",
+                choice.machine.name, completed.repo_name,
+                completed.issue_number, overloaded,
+            )
+            attempts.append(SmokeAttempt(
+                machine_name=choice.machine.name, reason=overloaded,
+            ))
+            continue
+
         if required_caps:
             unmet = _capability_probe_reasons(
                 choice.machine, required_caps, http_client=http_client
@@ -4620,6 +4700,7 @@ def _dispatch_smoke_single_leg(
                 required_caps, smoke_cfg.native_execution_capabilities,
             ),
             smoke_timeout_s=smoke_cfg.timeout_seconds,
+            max_load_per_core=smoke_cfg.max_load_per_core,
         )
 
         if dispatched is None:
@@ -5009,6 +5090,7 @@ def _dispatch_smoke_fanout(
                     caps, smoke_cfg.native_execution_capabilities,
                 ),
                 smoke_timeout_s=smoke_cfg.timeout_seconds,
+                max_load_per_core=smoke_cfg.max_load_per_core,
             )
 
             if result is None:
