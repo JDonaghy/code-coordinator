@@ -590,7 +590,7 @@ def _load_sealed_amendment_artifact(path: Path) -> SealedAmendmentArtifact:
     """Parse *path* (JSON, as written by ``coord acceptance
     propose-amendment``) into a :class:`SealedAmendmentArtifact`, or raise a
     ``click.ClickException`` naming exactly what's wrong — a worker/planner-
-    emitted file is untrusted input, so a missing/mistyped field must be a
+    emitted file is untrusted input, so a missing/mistyped/empty field is a
     clear error, never a silent default that papers over a malformed
     artifact."""
     try:
@@ -602,24 +602,32 @@ def _load_sealed_amendment_artifact(path: Path) -> SealedAmendmentArtifact:
     if not isinstance(raw, dict):
         raise click.ClickException(f"artifact {path} must be a JSON object")
     try:
+        touched_paths_raw = raw["touched_paths"]
+        if not isinstance(touched_paths_raw, list) or not touched_paths_raw:
+            raise ValueError("touched_paths must be a non-empty list")
+        rationale = str(raw["rationale"])
+        if not rationale:
+            raise ValueError("rationale must not be empty")
         return SealedAmendmentArtifact(
             repo_name=str(raw["repo_name"]),
             issue_number=int(raw["issue_number"]),
             diff=str(raw["diff"]),
-            touched_paths=tuple(str(p) for p in raw.get("touched_paths", [])),
-            rationale=str(raw.get("rationale", "")),
+            touched_paths=tuple(str(p) for p in touched_paths_raw),
+            rationale=rationale,
             proposed_by=str(raw.get("proposed_by", "worker")),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise click.ClickException(f"artifact {path} is malformed: {e}") from e
 
 
-def _out_of_scope_paths(artifact: SealedAmendmentArtifact, sealed_paths: list[str]) -> list[str]:
-    """*artifact*'s declared ``touched_paths`` that are NOT inside
-    *sealed_paths* — an absolute path, a ``..`` traversal segment, or a
-    path simply outside the repo's sealed set are all rejected the same
-    way, fail-closed: this command only verifies an amendment to the
-    sealed oracle, not an arbitrary patch.
+def _out_of_scope_paths(diff_paths: list[str], sealed_paths: list[str]) -> list[str]:
+    """*diff_paths* (the real file paths :func:`_verify_sealed_amendment`
+    parsed out of the artifact's diff text — never the artifact's
+    self-declared ``touched_paths``) that are NOT inside *sealed_paths* —
+    an absolute path, a ``..`` traversal segment, or a path simply outside
+    the repo's sealed set are all rejected the same way, fail-closed: this
+    command only verifies an amendment to the sealed oracle, not an
+    arbitrary patch.
 
     The "is this path covered by that declared prefix/file" question
     itself is answered by :func:`coord.models.path_is_sealed_entry` — the
@@ -628,7 +636,7 @@ def _out_of_scope_paths(artifact: SealedAmendmentArtifact, sealed_paths: list[st
     a second copy of the prefix-matching logic living here too.
     """
     out = []
-    for p in artifact.touched_paths:
+    for p in diff_paths:
         if (
             Path(p).is_absolute()
             or ".." in Path(p).parts
@@ -636,6 +644,35 @@ def _out_of_scope_paths(artifact: SealedAmendmentArtifact, sealed_paths: list[st
         ):
             out.append(p)
     return out
+
+
+def _touched_paths_mismatch(
+    declared_touched_paths: tuple[str, ...], diff_paths: list[str],
+) -> str | None:
+    """``None`` when *declared_touched_paths* (the artifact's self-declared
+    ``touched_paths``) names exactly the set of file paths the diff itself
+    touches; otherwise a human-readable reason naming the mismatch.
+
+    Grading the artifact's self-declared metadata instead of the diff it
+    is about to apply lets a diff carry edits the declared list hides —
+    comparing both sides closes that gap rather than trusting either one
+    alone.
+    """
+    declared = set(declared_touched_paths)
+    actual = set(diff_paths)
+    if declared == actual:
+        return None
+    parts = []
+    extra = sorted(actual - declared)
+    if extra:
+        parts.append(f"diff touches {', '.join(extra)}, not declared in touched_paths")
+    missing = sorted(declared - actual)
+    if missing:
+        parts.append(f"touched_paths declares {', '.join(missing)}, not touched by the diff")
+    return (
+        "declared touched_paths does not match the diff's actual file "
+        "paths: " + "; ".join(parts)
+    )
 
 
 def _apply_sealed_amendment_diff(scratch_path: Path, diff: str) -> str | None:
@@ -671,11 +708,18 @@ def _verify_sealed_amendment(
     failing — no default-permissive fallback: an unresolvable driver or
     missing local checkout raises the same way ``run``/``record`` already
     do (via :func:`_resolve_driver`/:func:`_check_local_capability`,
-    exit(1) with a clear message), an out-of-scope path or a diff that
-    won't apply returns ``ok=False`` before anything runs, and the sealed
-    suite's own re-run result in the scratch copy is a real, freshly
-    observed verdict (:func:`coord.acceptance.build_verdict`), never
-    inferred from the mere absence of an exception.
+    exit(1) with a clear message), an out-of-scope path, a declared/actual
+    touched-path mismatch, or a diff that won't apply returns ``ok=False``
+    before anything runs, and the sealed suite's own re-run result in the
+    scratch copy is a real, freshly observed verdict
+    (:func:`coord.acceptance.build_verdict`), never inferred from the mere
+    absence of an exception.
+
+    The scope check is graded against the paths the diff text itself
+    touches (:func:`coord.github_ops.diff_file_paths`), not the artifact's
+    self-declared ``touched_paths`` — a declared list is untrusted input
+    from the proposing session, so it is cross-checked against the diff
+    rather than taken as ground truth.
     """
     from coord.test_orchestrator import find_local_repo_path  # noqa: PLC0415
 
@@ -683,17 +727,21 @@ def _verify_sealed_amendment(
     _check_local_capability(driver_cfg, repo, cfg)
 
     sealed_paths = cfg.acceptance.sealed_paths(repo)
-    out_of_scope = _out_of_scope_paths(artifact, sealed_paths)
+    diff_paths = github_ops.diff_file_paths(artifact.diff)
+    out_of_scope = _out_of_scope_paths(diff_paths, sealed_paths)
     if out_of_scope:
         return SealedAmendmentVerdict(
             ok=False,
             reason=(
-                "artifact declares touched_paths outside the repo's sealed "
-                f"set ({', '.join(sorted(out_of_scope))}) — verify-amendment "
+                "diff touches paths outside the repo's sealed set "
+                f"({', '.join(sorted(out_of_scope))}) — verify-amendment "
                 "only checks amendments to the declared sealed acceptance "
                 "paths (AcceptanceConfig.sealed_paths())"
             ),
         )
+    mismatch = _touched_paths_mismatch(artifact.touched_paths, diff_paths)
+    if mismatch:
+        return SealedAmendmentVerdict(ok=False, reason=mismatch)
 
     repo_dir = find_local_repo_path(repo, cfg)
     if repo_dir is None or not repo_dir.exists():

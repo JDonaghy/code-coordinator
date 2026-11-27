@@ -2065,13 +2065,14 @@ class SealedAmendmentArtifact:
     ``repo_name``/``issue_number`` name the work-in-progress issue the
     amendment unblocks. ``diff`` is a plain unified diff (``git
     apply``-compatible, e.g. the output of ``git diff``). ``touched_paths``
-    is the repo-relative file(s) the diff edits, declared up front rather
-    than parsed out of the diff text, so a verify can reject an artifact
-    that reaches outside the sealed set it claims to amend before ever
-    shelling out to ``git apply``. ``rationale`` is the human-readable
-    "why" an approver reads before signing off. ``proposed_by`` records
-    which kind of session emitted it, for audit purposes only — it does
-    not change how the artifact is verified.
+    is the repo-relative file(s) the proposer declares the diff edits —
+    ``verify-amendment`` cross-checks this declaration against the file
+    paths the diff text itself touches (:func:`coord.github_ops.
+    diff_file_paths`) rather than trusting either one alone, since a
+    worker/planner-emitted artifact is untrusted input. ``rationale`` is
+    the human-readable "why" an approver reads before signing off.
+    ``proposed_by`` records which kind of session emitted it, for audit
+    purposes only — it does not change how the artifact is verified.
     """
 
     repo_name: str
@@ -2089,16 +2090,18 @@ class SealedAmendmentVerdict:
     approval (see :class:`SealedAmendmentArtifact`'s docstring for the
     full propose/verify/approve/apply flow).
 
-    ``ok`` is ``True`` only when the artifact's ``touched_paths`` all
-    resolved inside the repo's declared sealed set, the diff applied
-    cleanly in the scratch copy, AND the sealed suite re-run there came
-    back green — each a real, independently-failing check (never a
-    default-permissive fallback). ``reason`` carries the first failure's
-    cause when ``ok`` is ``False``. ``acceptance_verdict`` is the raw
+    ``ok`` is ``True`` only when the diff's own file paths (not the
+    artifact's self-declared ``touched_paths`` alone) all resolved inside
+    the repo's declared sealed set, those paths matched the declared
+    ``touched_paths`` exactly, the diff applied cleanly in the scratch
+    copy, AND the sealed suite re-run there came back green — each a
+    real, independently-failing check (never a default-permissive
+    fallback). ``reason`` carries the first failure's cause when ``ok`` is
+    ``False``. ``acceptance_verdict`` is the raw
     :func:`coord.acceptance.build_verdict` dict from the scratch-copy
     re-run, present only once the suite actually ran — ``None`` when
-    verification failed earlier (out-of-scope path, or the diff didn't
-    apply).
+    verification failed earlier (out-of-scope path, declared/actual
+    mismatch, or the diff didn't apply).
     """
 
     ok: bool
