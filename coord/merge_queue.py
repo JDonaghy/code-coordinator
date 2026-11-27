@@ -1036,6 +1036,64 @@ def head_already_approved(
     )
 
 
+def full_review_already_approves_head(
+    board,
+    *,
+    assignment_id: str,
+    branch: str,
+    branch_head_sha: str | None,
+) -> bool:
+    """Narrower sibling of :func:`head_already_approved`: is *branch*'s
+    current head already covered by a FULL (non-scoped) approving review,
+    specifically?
+
+    :func:`coord.review.dispatch_review`'s
+    ``require_full_review_for_out_of_delta_gate`` caller needs exactly this
+    question, not :func:`head_already_approved`'s — that caller's whole
+    point is to dispatch a full review on top of a head a *scoped* review
+    already approved, so the plain "any approving review" answer would
+    refuse the very dispatch it exists to make. But once a FULL review has
+    itself approved this exact head, re-checking that bare SHA match here
+    (rather than skipping the #4002 check outright, which the out-of-delta
+    gate's own ``check_already_approved=False`` would otherwise do
+    unconditionally) is what stops a later, independent dispatch call from
+    re-reviewing a leg a full review has already cleared.
+
+    Deliberately does NOT delegate to :func:`scan_approved_reviews` (unlike
+    :func:`head_already_approved`) — that scan returns on the FIRST
+    matching approval it finds walking the chain, which in the exact
+    scenario this function exists for is the SCOPED approval (it is always
+    recorded before the full one this function is looking for), not the
+    full one. This walks the same chain (:func:`_chain_work_ids`) but
+    checks every review in it rather than stopping at the first hit, so a
+    later full approval is never hidden behind an earlier scoped one.
+
+    Same fail-closed-on-unknown-head and same-exact-SHA-only semantics as
+    :func:`head_already_approved` — no patch-id/ancillary-diff carry
+    forward, see its docstring for why that's correct for this narrow a
+    question.
+    """
+    if not branch or not branch_head_sha:
+        return False
+    probe = _ApprovalProbe(
+        assignment_id=assignment_id,
+        branch=branch,
+        branch_head_sha=branch_head_sha,
+    )
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    branch_work_ids = _chain_work_ids(probe, pool)
+    if not branch_work_ids:
+        return False
+    return any(
+        getattr(a, "type", None) == "review"
+        and getattr(a, "review_of_assignment_id", None) in branch_work_ids
+        and getattr(a, "review_verdict", None) == "approve"
+        and not getattr(a, "review_scoped", False)
+        and getattr(a, "review_head_sha", None) == branch_head_sha
+        for a in pool
+    )
+
+
 def find_scoped_review_candidate(
     entry: "QueuedMerge",
     board,
