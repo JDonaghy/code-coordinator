@@ -3023,10 +3023,48 @@ class FixMachineSelection:
     (unreachable — with the classified network reason — not capable, or
     paused) so a refusal can name names instead of leaving the operator to
     guess which piece of infrastructure is at fault.
+
+    ``uncovered_failing_capabilities`` (#4147) names every capability from
+    *failing_capability_sets* that ``machine`` still does NOT declare — e.g.
+    ``("macos",)`` when the fleet simply has no other macOS-capable box to
+    route to and the chosen machine is dell64 (Linux/WSL) by elimination.
+    Empty whenever no *failing_capability_sets* were passed (every caller
+    that predates #4147) or ``machine`` happens to cover every one of them.
+    A non-empty tuple is the caller's signal to tell the fix worker, in its
+    briefing, which of the ORIGINAL Test-stage failures it is dispatched on
+    this host cannot even be reproduced here — see
+    ``fix_machine_capability_note``.
     """
 
     machine: Machine | None
     tried: list[tuple[str, str]]
+    uncovered_failing_capabilities: tuple[str, ...] = ()
+
+
+def fix_machine_capability_note(machine_name: str, uncovered: "tuple[str, ...]") -> str:
+    """One appended same-branch-fix-briefing block (#4147) naming the
+    capabilities *machine_name* cannot verify, mirroring
+    ``CapabilityRouting.briefing_note`` above but for the FIX-dispatch door
+    rather than the original work dispatch — same directive shape: a
+    worker must not self-record a verdict for a stage it could never
+    actually run here, and must instead re-run it on capable hardware
+    (``coord smoke run-leg``) before reporting it as done.
+    """
+    caps = ", ".join(uncovered)
+    return (
+        "\n\n## Capabilities this host cannot verify (#4147)\n\n"
+        f"This machine ({machine_name}) does not declare: {caps}. The Test "
+        "stage's failure(s) for that capability set were observed on "
+        "whatever machine actually ran it — this host cannot reproduce or "
+        "re-verify them locally. Before finishing: re-run that capability "
+        "set remotely and wait for its verdict — "
+        f"`coord smoke run-leg --repo <repo> --branch <branch> --capability "
+        f"{uncovered[0] if uncovered else '<capability>'} --wait` (see "
+        "`coord smoke run-leg --help`). Report `UNVERIFIED: "
+        f"{caps}` in your final message instead of treating those stages "
+        "as done — a verdict you could not personally reproduce is not a "
+        "confirmed one."
+    )
 
 
 def select_fix_machine(
@@ -3036,6 +3074,7 @@ def select_fix_machine(
     machines: list[Machine],
     override_machine_name: str | None = None,
     status_fetcher=None,
+    failing_capability_sets: "Iterable[Iterable[str]]" = (),
 ) -> FixMachineSelection:
     """Pick a machine for a same-branch fix dispatch (#3208).
 
@@ -3047,11 +3086,33 @@ def select_fix_machine(
     dispatch instead of routing around it, even though the branch lives on
     the remote and a fresh worktree can be built anywhere (#3208).
 
+    *failing_capability_sets* (#4147) is one tuple of capability names per
+    FAILING Test leg this fix is responding to — e.g. ``[("macos",)]`` for
+    a fan-out where only the macOS partition is red, or ``[("gtk",
+    "windows")]`` for a combined leg. Empty (the default — every caller
+    that predates #4147) preserves the exact pre-#4147 ordering: original
+    machine first, then every other configured machine, with no capability
+    scoring at all. When non-empty, candidates are scored by how many of
+    these leg capability sets they FULLY cover (`Machine.
+    covers_capabilities`) — a machine covering MORE failing legs is tried
+    before one covering fewer, so a cross-backend fix (#2876: macos failing
+    alongside a passing gtk+windows leg) routes to the macOS-capable
+    machine instead of staying wherever the original work leg happened to
+    land. *original_machine_name* is still tried FIRST among the
+    best-covering tier (its build cache is warm, and nothing is gained by
+    moving it when it already covers the failing legs just as well as any
+    other candidate) — "prefer the original machine only when it already
+    has the failing capability" (#4147's own wording). When no candidate
+    covers every failing leg, the one covering the MOST is tried first; the
+    returned ``uncovered_failing_capabilities`` names what it still can't
+    verify, for the caller's briefing.
+
     *override_machine_name* — from ``coord fix --machine`` — restricts the
     candidate list to exactly that machine: the caller is asserting where
-    to send it, so no further fallback is attempted. An unreachable or
-    incapable override still comes back through ``.tried``, named, rather
-    than silently falling through to somewhere the caller didn't ask for.
+    to send it, so no further fallback (and no capability reordering) is
+    attempted. An unreachable or incapable override still comes back
+    through ``.tried``, named, rather than silently falling through to
+    somewhere the caller didn't ask for.
 
     *status_fetcher* defaults to :func:`coord.network.fetch_status` — the
     same liveness probe ``coord status`` already uses — and is injectable
@@ -3082,9 +3143,13 @@ def select_fix_machine(
 
     fetch = status_fetcher or _fetch_status
     paused = paused_set(machines)
+    failing_sets = [tuple(caps) for caps in failing_capability_sets if tuple(caps)]
 
     def _capable(m: Machine) -> bool:
         return m.can_work_on(repo_name) and m.repo_path(repo_name) is not None
+
+    def _coverage(m: Machine) -> int:
+        return sum(1 for caps in failing_sets if m.covers_capabilities(caps))
 
     tried: list[tuple[str, str]] = []
 
@@ -3100,9 +3165,38 @@ def select_fix_machine(
         )
         if original is None:
             tried.append((original_machine_name, "not configured in coordinator.yml"))
-        candidates = ([original] if original is not None else []) + [
-            m for m in machines if m.name != original_machine_name
-        ]
+
+        if failing_sets:
+            # #4147: order by capability coverage first, reachability
+            # second — the reachability probe loop below is unchanged,
+            # this only decides WHICH ORDER it tries candidates in. Compared
+            # by NAME throughout (never object identity/equality) so two
+            # machines with coincidentally identical config fields are
+            # never conflated.
+            best_score = max((_coverage(m) for m in machines), default=0)
+            best_tier_names = {m.name for m in machines if _coverage(m) == best_score}
+            original_covers_best = (
+                original is not None and original.name in best_tier_names
+            )
+            if original_covers_best:
+                # Original already covers the failing legs as well as any
+                # other candidate — keep it first (same as the capability-
+                # blind branch below), then the rest of the best-covering
+                # tier, then everyone else.
+                head = [original] + [
+                    m for m in machines
+                    if m.name in best_tier_names and m.name != original.name
+                ]
+            else:
+                head = [m for m in machines if m.name in best_tier_names]
+                if original is not None:
+                    head = head + [original]
+            head_names = {m.name for m in head}
+            candidates = head + [m for m in machines if m.name not in head_names]
+        else:
+            candidates = ([original] if original is not None else []) + [
+                m for m in machines if m.name != original_machine_name
+            ]
 
     for m in candidates:
         if m.name in paused:
@@ -3117,7 +3211,20 @@ def select_fix_machine(
         # machine up" identically — see that function's docstring.
         reachable, reason = probe_reachable(m, status_fetcher=fetch)
         if reachable:
-            return FixMachineSelection(m, tried)
+            uncovered = tuple(sorted({
+                cap for caps in failing_sets for cap in caps
+                if cap not in m.capabilities
+            }))
+            if uncovered:
+                _log.warning(
+                    "select_fix_machine: chose %r for repo %r but it does "
+                    "not cover every failing capability set %r — uncovered: "
+                    "%s (#4147, no fully-covering reachable machine was "
+                    "available; recorded on FixMachineSelection.uncovered_"
+                    "failing_capabilities rather than silently dropped)",
+                    m.name, repo_name, failing_sets, ", ".join(uncovered),
+                )
+            return FixMachineSelection(m, tried, uncovered_failing_capabilities=uncovered)
         tried.append((m.name, reason or "unreachable"))
 
     return FixMachineSelection(None, tried)

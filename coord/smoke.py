@@ -123,6 +123,7 @@ from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
     Board,
+    FanoutLegVerdict,
     Machine,
 )
 # #2170: the SAME marker/exit-code convention `scripts/coord-test-runner.sh`
@@ -1181,6 +1182,59 @@ def _write_fanout_failure_evidence(
         )
 
 
+def fanout_leg_verdicts(work_parent_id: str) -> list[FanoutLegVerdict]:
+    """Every capability-partition leg of *work_parent_id*'s #3182 fan-out,
+    with its own terminal verdict read back off the board (#4147).
+
+    `[]` when *work_parent_id* carries no fan-out manifest (an ordinary
+    single-leg row) — the same "not a fan-out row" signal
+    :func:`finalize_smoke_fanout` treats as a no-op. A leg still `running`/
+    unset reports `state=None`, same convention as everywhere else in this
+    module; callers that need to wait for every leg to report in (like
+    `finalize_smoke_fanout`) check for that themselves.
+
+    The ONE reader of the `[[smoke-fanout:...]]` manifest plus each named
+    leg's own `test_state`/`test_reason` — `finalize_smoke_fanout`'s own
+    verdict fold and `coord.dispatch.select_fix_machine`'s capability-aware
+    fix routing (#4147) both call this rather than each re-deriving the
+    same per-leg verdict independently (#2096, "one question, one answer").
+    """
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        load_assignment_test_state,
+    )
+
+    legs = _parse_fanout_manifest(load_assignment_test_reason(work_parent_id))
+    if not legs:
+        return []
+    return [
+        FanoutLegVerdict(
+            leg_id=leg_id,
+            capabilities=caps,
+            state=load_assignment_test_state(leg_id),
+            reason=load_assignment_test_reason(leg_id),
+            command=command,
+        )
+        for leg_id, caps, command in legs
+    ]
+
+
+def failing_capability_sets(work_parent_id: str) -> tuple[tuple[str, ...], ...]:
+    """Each FAILED leg's own capability set out of *work_parent_id*'s
+    #3182 fan-out (#4147) — e.g. ``(("macos",),)`` for the #2876 shape
+    (only the macOS leg failed), or ``(("macos",), ("windows",))`` when
+    two legs both failed. Empty when *work_parent_id* isn't a fan-out row,
+    or every leg that has reported in so far passed/skipped.
+
+    This is the input :func:`coord.dispatch.select_fix_machine` scores
+    candidate machines against — see that function's *failing_capability_
+    sets* parameter.
+    """
+    return tuple(
+        v.capabilities for v in fanout_leg_verdicts(work_parent_id) if v.state == "failed"
+    )
+
+
 def finalize_smoke_fanout(work_parent_id: str) -> None:
     """#3182: fold every fan-out leg's own terminal verdict into ONE
     aggregate verdict on the parent work row, once enough of them are in.
@@ -1244,22 +1298,23 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
             return  # already terminal — never clobber (human override or
             # our own prior aggregate write; recomputing changes nothing).
 
-        legs = _parse_fanout_manifest(load_assignment_test_reason(work_parent_id))
-        if not legs:
+        # #3298/#4147: `fanout_leg_verdicts` is the ONE reader of the
+        # manifest plus each named leg's own `test_state`/`test_reason` —
+        # carrying each leg's own resolved command forward from the
+        # manifest (never re-read from the leg's row — `_record_smoke_
+        # verdict` overwrites a leg's own `test_reason` with its terminal
+        # verdict text, so the command it ran is only ever recoverable from
+        # here) into the failure report, so two failing legs that ran
+        # DIFFERENT commands (possible now that command resolution is
+        # scoped per partition) read as distinguishable instead of two
+        # identically-shaped failures.
+        verdicts = fanout_leg_verdicts(work_parent_id)
+        if not verdicts:
             return  # not a fan-out row
 
-        # #3298: carry each leg's own resolved command forward from the
-        # manifest (never re-read from the leg's row — `_record_smoke_verdict`
-        # overwrites a leg's own `test_reason` with its terminal verdict text,
-        # so the command it ran is only ever recoverable from here) into the
-        # failure report, so two failing legs that ran DIFFERENT commands
-        # (possible now that command resolution is scoped per partition) read
-        # as distinguishable instead of two identically-shaped failures.
-        leg_states: list[tuple[str, tuple[str, ...], str | None, str | None, str | None]] = []
-        for leg_id, caps, command in legs:
-            state = load_assignment_test_state(leg_id)
-            reason = load_assignment_test_reason(leg_id)
-            leg_states.append((leg_id, caps, state, reason, command))
+        leg_states: list[tuple[str, tuple[str, ...], str | None, str | None, str | None]] = [
+            (v.leg_id, v.capabilities, v.state, v.reason, v.command) for v in verdicts
+        ]
         if any(state in (None, "running") for _, _, state, _, _ in leg_states):
             return  # not everyone has reported in yet
 
@@ -1273,7 +1328,7 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
             f"[{'+'.join(caps)}]={state}" for _, caps, state, _, _ in leg_states
         )
         manifest_line = _encode_fanout_manifest(
-            [(lid, caps, command) for lid, caps, command in legs]
+            [(lid, caps, command) for lid, caps, _, _, command in leg_states]
         )
 
         if worst == "failed":
