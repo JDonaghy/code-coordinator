@@ -1,6 +1,7 @@
 """Tests for #4187: stable ids on scoped re-review blocking findings, the
 structured resolved/unresolved/new_blocking_in_delta response, and the
-out-of-delta merge gate.
+out-of-delta merge gate. Also #4194: auto-dispatching the full review that
+gate requires.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from coord.merge_queue import (
     PENDING,
     QueuedMerge,
+    dispatch_full_review_for_out_of_delta_gate,
     out_of_delta_full_review_pending,
     process,
 )
@@ -529,6 +531,29 @@ class TestProcessOutOfDeltaGate:
         assert items[0].state == PENDING
         assert "one full review" in (items[0].error or "")
 
+    def test_process_wires_the_auto_dispatch_into_the_live_gate(self) -> None:
+        """#4194: `process()`'s live merge-gate check must actually CALL the
+        auto-dispatch helper for the entry/board/config it just evaluated
+        the gate against — not just report the gate's own verdict."""
+        from tests.test_merge_queue import FakeGh
+
+        cfg = self._config()
+        board, findings_by_id = self._flagged_board_and_findings()
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ), patch(
+            "coord.merge_queue.dispatch_full_review_for_out_of_delta_gate",
+            return_value=None,
+        ) as mock_dispatch:
+            process(items, gh, config=cfg, board=board)
+
+        mock_dispatch.assert_called_once_with(items[0], board, cfg)
+
     def test_process_dry_run_reports_full_review_required(self) -> None:
         from tests.test_merge_queue import FakeGh
 
@@ -567,8 +592,215 @@ class TestProcessOutOfDeltaGate:
         assert "full_review_required" not in kinds
         assert "merged" in kinds
 
+    def test_process_merges_once_a_full_review_approves_after_the_flag(self) -> None:
+        """#4194 acceptance: once the auto-dispatched full review APPROVES
+        on a round dispatched after the scoped round's flag, the gate
+        clears and the very next `process()` tick merges — no dispatch is
+        attempted at all, since the gate is no longer pending."""
+        from tests.test_merge_queue import FakeGh
+
+        cfg = self._config()
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done", branch="worker/w1",
+        )
+        scoped = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-scoped", type="review", status="done",
+            review_of_assignment_id="w1", review_verdict="approve",
+            review_scoped=True, dispatched_at=100.0,
+        )
+        full = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-full", type="review", status="done",
+            review_of_assignment_id="w1", review_verdict="approve",
+            review_scoped=False, dispatched_at=200.0,
+        )
+        board = Board(active=[], completed=[work, scoped, full])
+        findings_by_id = {
+            "rev-scoped": _findings(
+                "## Blocking findings\nNone.\n\n"
+                "## New non-blocking findings (out of delta)\n"
+                "- an unrelated file leaks a secret\n"
+            ),
+            "rev-full": _findings("## Blocking findings\nNone.\n"),
+        }
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ), patch(
+            "coord.merge_queue.dispatch_full_review_for_out_of_delta_gate",
+        ) as mock_dispatch:
+            events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "full_review_required" not in kinds
+        assert "merged" in kinds
+        mock_dispatch.assert_not_called()
+
 
 def _findings(body: str):
     from coord.review import ReviewFindings
 
     return ReviewFindings(verdict="approve", body=body)
+
+
+# ── dispatch_full_review_for_out_of_delta_gate (#4194) ──────────────────────
+
+class TestAutoDispatchFullReviewForOutOfDeltaGate:
+    """The out-of-delta gate (`_out_of_delta_review_gate`) only ever reports
+    a *verdict*; nothing dispatched the full review it requires until this.
+    These exercise `dispatch_full_review_for_out_of_delta_gate`'s real
+    wiring through `coord.review.dispatch_review` (a mocked HTTP agent, not
+    a stand-in for the function itself), covering the issue's three
+    acceptance shapes: exactly one dispatch for a flagged leg, no second
+    dispatch on a later tick while that review is still in flight, and a
+    fresh dispatch once a new work leg (a push) appears.
+    """
+
+    @staticmethod
+    def _config():
+        from coord.config import Config, ReviewsConfig
+        from coord.models import Machine, Repo
+
+        repo = Repo(name="api", github="acme/api", depends_on=[], default_branch="main")
+        return Config(
+            repos=[repo],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tail",
+                    capabilities=["python"], repos=["api"],
+                    repo_paths={"api": "/work/api"},
+                ),
+            ],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+        )
+
+    @staticmethod
+    def _dispatch_kwargs(client):
+        return dict(
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 42, "url": "https://github.com/acme/api/pull/42",
+                "existed": True,
+            },
+            claude_md_reader=lambda p: None,
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+        )
+
+    @staticmethod
+    def _flagged_board(work_id: str = "w1", scoped_id: str = "rev-scoped") -> Board:
+        # The WORK leg already carries `review_verdict="approve"` — exactly
+        # what `propagate_review_verdict` writes onto it once the scoped
+        # round below lands — so a test proving the override actually
+        # bypasses `dispatch_review`'s ordinary "one review per leg" guard
+        # starts from the state that guard would otherwise refuse.
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=work_id, type="work", status="done",
+            branch=f"worker/{work_id}", review_verdict="approve",
+        )
+        scoped = Assignment(
+            machine_name="reviewer", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=scoped_id, type="review", status="done",
+            review_of_assignment_id=work_id, review_verdict="approve",
+            review_scoped=True, dispatched_at=100.0,
+        )
+        return Board(active=[], completed=[work, scoped])
+
+    def test_dispatch_fires_once_for_the_flagged_leg(self) -> None:
+        from tests.test_review import _FakeHTTPClient
+
+        cfg = self._config()
+        board = self._flagged_board()
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        entry = _q("w1")
+
+        result = dispatch_full_review_for_out_of_delta_gate(
+            entry, board, cfg, **self._dispatch_kwargs(client),
+        )
+
+        assert result is not None
+        assert result.review_scoped is False
+        assert result.review_of_assignment_id == "w1"
+        assert len(client.calls) == 1
+        assert result in board.active
+
+    def test_second_tick_does_not_dispatch_again_while_in_flight(self) -> None:
+        from tests.test_review import _FakeHTTPClient
+
+        cfg = self._config()
+        board = self._flagged_board()
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        entry = _q("w1")
+
+        first = dispatch_full_review_for_out_of_delta_gate(
+            entry, board, cfg, **self._dispatch_kwargs(client),
+        )
+        assert first is not None
+        assert len(client.calls) == 1
+
+        second = dispatch_full_review_for_out_of_delta_gate(
+            entry, board, cfg, **self._dispatch_kwargs(client),
+        )
+        assert second is None
+        assert len(client.calls) == 1  # no second POST on the second tick
+
+    def test_a_new_push_re_arms_the_dispatch_for_the_new_head(self) -> None:
+        from coord.state import release_review_item_lease
+        from tests.test_review import _FakeHTTPClient
+
+        cfg = self._config()
+        board = self._flagged_board()
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        entry = _q("w1")
+
+        first = dispatch_full_review_for_out_of_delta_gate(
+            entry, board, cfg, **self._dispatch_kwargs(client),
+        )
+        assert first is not None
+        assert len(client.calls) == 1
+
+        # The first dispatch concludes (e.g. a `request-changes` verdict
+        # that sends the issue through the normal fix-round path) — the
+        # real terminal-status write path
+        # (`coord.state.release_review_claim_if_row_is_review`) releases
+        # BOTH the per-assignment claim and the #4002 per-(repo, issue)
+        # lease `dispatch_review` also holds for as long as a review leg is
+        # live. A fix round then lands a NEW work leg — a different
+        # `assignment_id` on the SAME branch/issue, which is what a push
+        # re-dispatch actually looks like — and the merge entry re-keys to
+        # it.
+        release_review_item_lease("api", 1)
+        first.status = "done"
+        first.review_verdict = "request-changes"
+        work2 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w2", type="work", status="done", branch="worker/w1",
+            review_of_assignment_id="w1",
+        )
+        board.completed.append(work2)
+        board.active.remove(first)
+        board.completed.append(first)
+        entry2 = _q("w2")
+
+        second = dispatch_full_review_for_out_of_delta_gate(
+            entry2, board, cfg, **self._dispatch_kwargs(client),
+        )
+        assert second is not None
+        assert second.review_of_assignment_id == "w2"
+        assert len(client.calls) == 2
+
+    def test_no_work_leg_resolves_to_no_dispatch(self) -> None:
+        board = Board(active=[], completed=[])
+        entry = _q("missing")
+        assert dispatch_full_review_for_out_of_delta_gate(entry, board, self._config()) is None
+
+    def test_board_none_means_no_dispatch(self) -> None:
+        entry = _q("w1")
+        assert dispatch_full_review_for_out_of_delta_gate(entry, None, self._config()) is None

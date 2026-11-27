@@ -3475,6 +3475,34 @@ def is_merge_gate_reserved_reason(reason: str | None) -> bool:
     return (reason or "").startswith(MERGE_GATE_RESERVED_PREFIX)
 
 
+# The out-of-delta merge gate (`_out_of_delta_review_gate`) is the SAME
+# self-refreshing shape as `MERGE_GATE_RESERVED_PREFIX` above: nothing about
+# retrying resolves it faster than real time — only the auto-dispatched full
+# review this gate triggers (`dispatch_full_review_for_out_of_delta_gate`)
+# landing a verdict does — so a live `coord drive` session re-checks it every
+# poll without spending `--max-merge-attempts`, exactly the treatment
+# `coord.drive._decide_merge` already gives the reservation case.
+# Deliberately NOT phrased "review required"/"review not approved" — either
+# substring would make `coord.drive._merge_gate_kind` misclassify this as
+# the ORDINARY review gate, which would then escalate to a human on first
+# encounter via `_merge_gate_divergence` (this driver's cached
+# `review_verdict` routinely already reads "approve" here, since that is
+# exactly what the preceding scoped round recorded) instead of getting the
+# self-refreshing retry treatment below.
+OUT_OF_DELTA_FULL_REVIEW_PREFIX = "full-review gate: "
+
+
+def is_out_of_delta_full_review_reason(reason: str | None) -> bool:
+    """True when *reason* names the out-of-delta gate's block — see
+    :data:`OUT_OF_DELTA_FULL_REVIEW_PREFIX`.
+
+    The single implementation of this classification: callers whose input is
+    a persisted `merge_reason`/`entry.error` string use this instead of
+    re-deriving it, mirroring :func:`is_merge_gate_reserved_reason`.
+    """
+    return (reason or "").startswith(OUT_OF_DELTA_FULL_REVIEW_PREFIX)
+
+
 def ci_rollup_all_clear(summary: Any) -> bool:
     """``True`` when a ``merge_plan`` row's ``ci_summary`` positively shows
     every check on that PR has finished and none of them failed (#2158,
@@ -8665,6 +8693,57 @@ def out_of_delta_full_review_pending(
     return _out_of_delta_review_gate(entry, board, gh_ops, config=config).pending
 
 
+def dispatch_full_review_for_out_of_delta_gate(
+    entry: "QueuedMerge", board, config, **dispatch_review_kwargs,
+) -> "Assignment | None":
+    """Auto-dispatch the one full (non-scoped) review the out-of-delta gate
+    (`_out_of_delta_review_gate`) requires before *entry* can merge.
+
+    Resolves the work leg the gate is blocked on (`_work_assignment_for_
+    entry`) and dispatches a review for it via
+    `coord.review.dispatch_review`, passing
+    `require_full_review_for_out_of_delta_gate=True` so that call's
+    ordinary "one review per leg" guard does not refuse the very review
+    this gate exists to require. Every OTHER guard inside `dispatch_review`
+    still applies — in particular its active-dispatch dedupe and atomic
+    claim, both keyed on the work leg's own `assignment_id` — so calling
+    this again while a review is already pending or in flight for the same
+    head is a safe no-op, and a new push (which lands as a new work leg
+    with a new `assignment_id`) re-arms it automatically.
+
+    *dispatch_review_kwargs* forwards straight through to
+    `coord.review.dispatch_review` (`http_client`, `pr_lookup`,
+    `claude_md_reader`, ... — the exact same injection points that
+    function's own callers use) rather than duplicating its parameter list
+    here; tests inject stubs the same way they do for a direct
+    `dispatch_review` call.
+
+    Returns the dispatched review `Assignment`, or `None` when no work leg
+    could be resolved on *board*, `dispatch_review` itself declined, or it
+    raised — either way check the resolved work leg's own
+    `review_dispatch_reason` for why; an unexpected exception is caught
+    here and recorded there too (mirroring `dispatch_review`'s own `_deny`
+    convention) rather than propagating and aborting the rest of this
+    merge-queue pass over an unrelated entry's dispatch failure.
+    """
+    if board is None:
+        return None
+    work = _work_assignment_for_entry(entry, board)
+    if work is None:
+        return None
+    from coord.review import dispatch_review  # noqa: PLC0415
+
+    try:
+        return dispatch_review(
+            work, board, config,
+            require_full_review_for_out_of_delta_gate=True,
+            **dispatch_review_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 — must not crash the merge pass
+        work.review_dispatch_reason = f"full-review auto-dispatch raised: {exc}"
+        return None
+
+
 def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None:
     """#2191: the child issue a ``type="test-author"`` merge entry's slice
     is actually FOR — resolved via ``coord.models.effective_issue_number``
@@ -10533,9 +10612,52 @@ def process(
                         entry, board, gh_ops, config=config,
                     )
                     if _ood_gate.pending:
-                        entry.error = _ood_gate.reason
+                        # The gate alone never gets the entry unstuck —
+                        # auto-dispatch the full review it requires.
+                        # Idempotent: `dispatch_full_review_for_out_of_
+                        # delta_gate` routes through `dispatch_review`'s own
+                        # active-dispatch dedupe and atomic claim (both keyed
+                        # on the work leg's assignment_id), so a review
+                        # already pending or in flight for this head makes
+                        # this a no-op; a new push lands as a new work leg
+                        # and re-arms it. The message carries
+                        # `OUT_OF_DELTA_FULL_REVIEW_PREFIX` so
+                        # `coord.drive`'s own merge-reason classifier can
+                        # give this the same self-refreshing, attempt-exempt
+                        # retry treatment it gives a CI-pending/merge-gate-
+                        # reserved reason.
+                        _full_review = dispatch_full_review_for_out_of_delta_gate(
+                            entry, board, config,
+                        )
+                        if _full_review is not None:
+                            msg = (
+                                f"{OUT_OF_DELTA_FULL_REVIEW_PREFIX}"
+                                f"{_ood_gate.reason} — dispatched full "
+                                f"review {_full_review.assignment_id} to "
+                                "satisfy it"
+                            )
+                        else:
+                            _ood_work = _work_assignment_for_entry(entry, board)
+                            _dispatch_reason = getattr(
+                                _ood_work, "review_dispatch_reason", None,
+                            )
+                            _manual_target = (
+                                getattr(_ood_work, "assignment_id", None)
+                                or entry.assignment_id
+                            )
+                            msg = (
+                                f"{OUT_OF_DELTA_FULL_REVIEW_PREFIX}{_ood_gate.reason}"
+                            ) + (
+                                f" (full-review auto-dispatch declined: "
+                                f"{_dispatch_reason})"
+                                if _dispatch_reason
+                                else " (full-review auto-dispatch declined "
+                                "— see logs; dispatch one manually for "
+                                f"{_manual_target})"
+                            )
+                        entry.error = msg
                         events.append(MergeEvent(
-                            entry, "full_review_required", _ood_gate.reason,
+                            entry, "full_review_required", msg,
                         ))
                         continue  # #292: skip this entry; try the next in the group
             # Smoke gate (#465/#821): refuse to merge when the interactive smoke

@@ -188,6 +188,7 @@ from coord.merge_queue import (
     is_ci_pending_reason,
     is_ci_unreadable_reason,
     is_merge_gate_reserved_reason,
+    is_out_of_delta_full_review_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
     stale_smoke_anchor as _mq_stale_smoke_anchor,
 )
@@ -5184,6 +5185,7 @@ def _effective_merge_gate_reason(
         or is_ci_flaky_reason(state.merge_reason)
         or is_ci_unreadable_reason(state.merge_reason)
         or is_merge_gate_reserved_reason(state.merge_reason)
+        or is_out_of_delta_full_review_reason(state.merge_reason)
     ):
         return state.merge_reason, False
     fallback = _extract_gate_refusal_reason(counters.last_merge_diagnostic)
@@ -6107,6 +6109,38 @@ def _decide_merge(
                 "coord merge returned non-zero (or the merge lock timed out) "
                 "while re-checking the merge-gate reservation — re-checking "
                 "next poll"
+            ),
+            serialize_merge=True,
+        )
+
+    # The out-of-delta merge gate (`coord.merge_queue.
+    # is_out_of_delta_full_review_reason`) is the identical self-refreshing
+    # shape as the merge-gate reservation just above: a scoped re-review
+    # chain flagged something outside its own delta (or approved without
+    # resolving a prior finding), and the merge-queue gate itself already
+    # auto-dispatches the one full review that clears it
+    # (`dispatch_full_review_for_out_of_delta_gate`) the moment this reason
+    # is produced. Nothing about retrying resolves it faster than that
+    # review landing a verdict — but nothing else on this driver's own path
+    # re-reads the board to notice it cleared either, so this re-checks
+    # every poll, attempt-exempt, the same as the reservation case. A
+    # retry that finds the review still pending/in flight is a no-op on the
+    # dispatch side (`dispatch_review`'s own dedupe), so repeating this does
+    # not risk a second dispatch.
+    if is_out_of_delta_full_review_reason(state.merge_reason):
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: out-of-delta gate requires a full review — "
+                f"re-checking, not spending an attempt: {state.merge_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed out) "
+                "while re-checking the out-of-delta full-review gate — "
+                "re-checking next poll"
             ),
             serialize_merge=True,
         )
