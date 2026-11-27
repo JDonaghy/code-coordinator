@@ -63,6 +63,7 @@ from coord.review import (
     CeilingModelDecision,
     ReviewFindings,
     authoritative_review_counts,
+    ceiling_continue_override_pending,
     ceiling_model_decision_enabled,
     classify_blocking_evidence,
     decide_ceiling_action,
@@ -74,6 +75,7 @@ from coord.review import (
     newest_done_work_leg,
     parse_review_from_agent,
     parse_review_from_log,
+    record_ceiling_continue_override_consumed,
     record_unparseable_treated_as_blocking,
     review_could_have_seen_head,
 )
@@ -1681,6 +1683,13 @@ def _dispatch_fix_for_review(
     next_iteration = next_fix_iteration(board, work)
     max_iter = config.pipeline.max_review_iterations
 
+    # Set when this fix round's dispatch, if it succeeds below, is spending
+    # a #4190 continue override — the per-issue grant is only actually
+    # "spent" once the dispatch it bought succeeds (see
+    # `coord.review.record_ceiling_continue_override_consumed`'s docstring
+    # for why counting any earlier than that discarded the grant for free).
+    override_pending_for = None
+
     if next_iteration > max_iter:
         completed_rounds = next_iteration - 1
         if not ceiling_model_decision_enabled():
@@ -1700,36 +1709,55 @@ def _dispatch_fix_for_review(
                     f"work assignment {work.assignment_id}"
                 ),
             )]
-        decision = decide_ceiling_action(
-            repo_name=work.repo_name, issue_number=work.issue_number,
-            assignment_id=work.assignment_id, branch=work.branch,
-            completed_rounds=completed_rounds, max_iter=max_iter,
-            findings_body=merged_findings.body, config=config,
-        )
-        log.warning(
-            "auto_loop: max_review_iterations (%d) reached for assignment %s "
-            "— #4190 bounded model decided action=%s (confidence=%.2f, "
-            "model=%s, fell_back=%s): %s",
-            max_iter, work.assignment_id, decision.action, decision.confidence,
-            decision.model_used, decision.fell_back, decision.reasoning,
-        )
-        if decision.action != "continue":
-            _post_ceiling_decision_notice(
-                work, config, decision, completed_rounds=completed_rounds,
+        # A "continue" grant for this issue may already be outstanding —
+        # granted by an earlier call to one of #4190's three ceiling-hit
+        # call sites but not yet used to dispatch anything (this function
+        # re-entering for the same issue, or a sibling site's own grant).
+        # Reuse it instead of consulting the model again: a second
+        # "continue" vote would be denied outright by the cap gate inside
+        # `decide_ceiling_action`, discarding the still-unused first grant
+        # for nothing — see `coord.review.ceiling_continue_override_pending`.
+        if ceiling_continue_override_pending(work.repo_name, work.issue_number):
+            log.info(
+                "auto_loop: max_review_iterations (%d) reached for "
+                "assignment %s, but issue #%s already has an outstanding "
+                "#4190 continue grant — reusing it rather than consulting "
+                "the model again",
+                max_iter, work.assignment_id, work.issue_number,
             )
-            return [LoopAction(
-                kind=f"max_iterations_{decision.action}",
-                assignment_id=review.assignment_id,
-                detail=(
-                    f"max_review_iterations={max_iter} reached for work "
-                    f"assignment {work.assignment_id} — #4190 bounded model "
-                    f"decided {decision.action}: {decision.reasoning}"
-                ),
-            )]
-        # action == "continue": the model granted a one-time override of
-        # this issue's own ceiling (capped — see
+        else:
+            decision = decide_ceiling_action(
+                repo_name=work.repo_name, issue_number=work.issue_number,
+                assignment_id=work.assignment_id, branch=work.branch,
+                completed_rounds=completed_rounds, max_iter=max_iter,
+                findings_body=merged_findings.body, config=config,
+            )
+            log.warning(
+                "auto_loop: max_review_iterations (%d) reached for assignment %s "
+                "— #4190 bounded model decided action=%s (confidence=%.2f, "
+                "model=%s, fell_back=%s): %s",
+                max_iter, work.assignment_id, decision.action, decision.confidence,
+                decision.model_used, decision.fell_back, decision.reasoning,
+            )
+            if decision.action != "continue":
+                _post_ceiling_decision_notice(
+                    work, config, decision, completed_rounds=completed_rounds,
+                )
+                return [LoopAction(
+                    kind=f"max_iterations_{decision.action}",
+                    assignment_id=review.assignment_id,
+                    detail=(
+                        f"max_review_iterations={max_iter} reached for work "
+                        f"assignment {work.assignment_id} — #4190 bounded model "
+                        f"decided {decision.action}: {decision.reasoning}"
+                    ),
+                )]
+        # action == "continue" (fresh or reused): the model granted a
+        # one-time override of this issue's own ceiling (capped — see
         # `coord.review.CEILING_MODEL_MAX_CONTINUE_OVERRIDES`); fall through
-        # and dispatch the next fix round exactly as if under budget.
+        # and dispatch the next fix round exactly as if under budget. Mark
+        # it for consumption once the dispatch below actually succeeds.
+        override_pending_for = (work.repo_name, work.issue_number)
 
     # Build briefing and dispatch.  The fix worker escalates the model per
     # iteration (when pipeline.escalate_fix_model is enabled); compute it here
@@ -1787,6 +1815,13 @@ def _dispatch_fix_for_review(
             assignment_id=review.assignment_id,
             detail=detail,
         )]
+
+    if override_pending_for is not None:
+        # The fix round the grant was for just dispatched successfully —
+        # spend the override now, not back when the model granted it.
+        record_ceiling_continue_override_consumed(
+            *override_pending_for, assignment_id=fix.assignment_id,
+        )
 
     # #3210: a request-changes review is itself evidence the branch is about
     # to be rewritten — same reasoning as the WORK-id door onto `coord fix`
@@ -2689,6 +2724,11 @@ def run_for_fix_transition(
         )]
 
     max_iter = config.pipeline.max_review_iterations
+    # Set when dispatching this fix's re-review, if it succeeds below, is
+    # spending a #4190 continue override — only actually spent once that
+    # dispatch succeeds (see `coord.review.record_ceiling_continue_override_
+    # consumed`'s docstring).
+    override_pending_for = None
     if fix.review_iteration >= max_iter:
         if not ceiling_model_decision_enabled():
             log.warning(
@@ -2713,48 +2753,66 @@ def run_for_fix_transition(
                     "not dispatching another review"
                 ),
             )]
-        decision = decide_ceiling_action(
-            repo_name=fix.repo_name, issue_number=fix.issue_number,
-            assignment_id=fix.assignment_id, branch=fix.branch,
-            completed_rounds=fix.review_iteration, max_iter=max_iter,
-            findings_body=_latest_blocking_findings_body(
-                fix.review_of_assignment_id or fix.assignment_id, board, config,
-                repo_name=fix.repo_name,
-            ),
-            config=config,
-        )
-        log.warning(
-            "auto_loop: fix %s has review_iteration=%d >= max_review_iterations=%d "
-            "— #4190 bounded model decided action=%s (confidence=%.2f, "
-            "model=%s, fell_back=%s): %s",
-            assignment_id, fix.review_iteration, max_iter, decision.action,
-            decision.confidence, decision.model_used, decision.fell_back,
-            decision.reasoning,
-        )
-        if decision.action == "continue":
-            # The model granted a one-time override (capped per issue); fall
-            # through and dispatch the re-review exactly as if under budget.
-            pass
-        else:
-            # Surface the cap-hit as a persisted blocker: post a GitHub
-            # notice so the operator sees it outside the TUI, mark the board
-            # entry with a distinct review_state so `coord status` shows an
-            # explicit blocker line, and save the board so the state
-            # survives a coordinator restart.
-            _post_ceiling_decision_notice(
-                fix, config, decision, completed_rounds=fix.review_iteration,
+        # A "continue" grant for this issue may already be outstanding from
+        # an earlier call to one of #4190's three ceiling-hit call sites but
+        # not yet used — reuse it rather than re-consulting the model, which
+        # would either answer differently or (more likely) have the cap gate
+        # inside `decide_ceiling_action` deny a second "continue" outright,
+        # discarding the still-unused first grant for nothing. See
+        # `coord.review.ceiling_continue_override_pending`.
+        if ceiling_continue_override_pending(fix.repo_name, fix.issue_number):
+            log.info(
+                "auto_loop: fix %s has review_iteration=%d >= "
+                "max_review_iterations=%d, but issue #%s already has an "
+                "outstanding #4190 continue grant — reusing it rather than "
+                "consulting the model again",
+                assignment_id, fix.review_iteration, max_iter, fix.issue_number,
             )
-            fix.review_state = "cap_hit"
-            write_board(board)
-            return [LoopAction(
-                kind=f"iteration_cap_hit_{decision.action}",
-                assignment_id=assignment_id,
-                detail=(
-                    f"fix iteration {fix.review_iteration} >= "
-                    f"max_review_iterations {max_iter}; #4190 bounded model "
-                    f"decided {decision.action}: {decision.reasoning}"
+        else:
+            decision = decide_ceiling_action(
+                repo_name=fix.repo_name, issue_number=fix.issue_number,
+                assignment_id=fix.assignment_id, branch=fix.branch,
+                completed_rounds=fix.review_iteration, max_iter=max_iter,
+                findings_body=_latest_blocking_findings_body(
+                    fix.review_of_assignment_id or fix.assignment_id, board, config,
+                    repo_name=fix.repo_name,
                 ),
-            )]
+                config=config,
+            )
+            log.warning(
+                "auto_loop: fix %s has review_iteration=%d >= max_review_iterations=%d "
+                "— #4190 bounded model decided action=%s (confidence=%.2f, "
+                "model=%s, fell_back=%s): %s",
+                assignment_id, fix.review_iteration, max_iter, decision.action,
+                decision.confidence, decision.model_used, decision.fell_back,
+                decision.reasoning,
+            )
+            if decision.action != "continue":
+                # Surface the cap-hit as a persisted blocker: post a GitHub
+                # notice so the operator sees it outside the TUI, mark the
+                # board entry with a distinct review_state so `coord status`
+                # shows an explicit blocker line, and save the board so the
+                # state survives a coordinator restart.
+                _post_ceiling_decision_notice(
+                    fix, config, decision, completed_rounds=fix.review_iteration,
+                )
+                fix.review_state = "cap_hit"
+                write_board(board)
+                return [LoopAction(
+                    kind=f"iteration_cap_hit_{decision.action}",
+                    assignment_id=assignment_id,
+                    detail=(
+                        f"fix iteration {fix.review_iteration} >= "
+                        f"max_review_iterations {max_iter}; #4190 bounded model "
+                        f"decided {decision.action}: {decision.reasoning}"
+                    ),
+                )]
+        # action == "continue" (fresh or reused): fall through and dispatch
+        # the re-review exactly as if under budget. Mark it for consumption
+        # once the dispatch below actually succeeds — NOT here, since this
+        # function may still defer to `dispatch_pending_reviews` (the #1612
+        # test-gate check immediately below) without dispatching anything.
+        override_pending_for = (fix.repo_name, fix.issue_number)
 
     # #1612: this is the *other* auto-dispatch path — `dispatch_pending_reviews`
     # (reached from reconcile()/`coord notify`) holds review dispatch until the
@@ -2819,6 +2877,12 @@ def run_for_fix_transition(
     # why stomping "dispatched" over that must be skipped here too.
     if review.status != "done":
         fix.review_state = "dispatched"
+    if override_pending_for is not None:
+        # The re-review the grant was for just dispatched successfully —
+        # spend the override now, not back when the model granted it.
+        record_ceiling_continue_override_consumed(
+            *override_pending_for, assignment_id=fix.assignment_id,
+        )
     write_board(board)
 
     log.info(
