@@ -2043,6 +2043,69 @@ class SplitProposal:
     chunks: list[SplitChunk] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class SealedAmendmentArtifact:
+    """A sealed-amendment patch, proposed as DATA by a worker or planner
+    session instead of edited directly (#4178, docs/ORACLE_LOOP.md's
+    "Sealed amendment as data" flow — the properly-typed path for the
+    quadraui#2876 shape: a deleted/changed symbol breaks a sealed call
+    site or struct literal under ``AcceptanceConfig.sealed_paths()``, see
+    :class:`coord.preflight_size.SealedAmendment`, the detector this
+    artifact's shape satisfies).
+
+    No model ever applies this diff to a real checkout. The flow is:
+    (1) a worker/planner session emits this artifact; (2)
+    ``coord acceptance verify-amendment`` applies it to a throwaway
+    scratch copy and re-runs the sealed suite there, read-only toward the
+    real checkout — see :func:`coord.commands.acceptance.
+    _verify_sealed_amendment`; (3) a human approves it; (4) a
+    ``test-author`` leg applies exactly the approved bytes as its own
+    commit (#4179 — the next slice in this flow).
+
+    ``repo_name``/``issue_number`` name the work-in-progress issue the
+    amendment unblocks. ``diff`` is a plain unified diff (``git
+    apply``-compatible, e.g. the output of ``git diff``). ``touched_paths``
+    is the repo-relative file(s) the diff edits, declared up front rather
+    than parsed out of the diff text, so a verify can reject an artifact
+    that reaches outside the sealed set it claims to amend before ever
+    shelling out to ``git apply``. ``rationale`` is the human-readable
+    "why" an approver reads before signing off. ``proposed_by`` records
+    which kind of session emitted it, for audit purposes only — it does
+    not change how the artifact is verified.
+    """
+
+    repo_name: str
+    issue_number: int
+    diff: str
+    touched_paths: tuple[str, ...]
+    rationale: str
+    proposed_by: str = "worker"
+
+
+@dataclass(frozen=True)
+class SealedAmendmentVerdict:
+    """The read-only result of ``coord acceptance verify-amendment``
+    (#4178) — never a mutation of the real checkout, and never itself an
+    approval (see :class:`SealedAmendmentArtifact`'s docstring for the
+    full propose/verify/approve/apply flow).
+
+    ``ok`` is ``True`` only when the artifact's ``touched_paths`` all
+    resolved inside the repo's declared sealed set, the diff applied
+    cleanly in the scratch copy, AND the sealed suite re-run there came
+    back green — each a real, independently-failing check (never a
+    default-permissive fallback). ``reason`` carries the first failure's
+    cause when ``ok`` is ``False``. ``acceptance_verdict`` is the raw
+    :func:`coord.acceptance.build_verdict` dict from the scratch-copy
+    re-run, present only once the suite actually ran — ``None`` when
+    verification failed earlier (out-of-scope path, or the diff didn't
+    apply).
+    """
+
+    ok: bool
+    reason: str | None
+    acceptance_verdict: dict | None = None
+
+
 @dataclass
 class Board:
     repos: list[Repo] = field(default_factory=list)

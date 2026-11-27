@@ -2363,3 +2363,276 @@ class TestAcceptanceMock:
             ])
         assert result.exit_code == 1
         assert "no milestone" in result.output
+
+
+def _git_diff_for_sealed_change(
+    repo_dir: Path, rel_path: str, new_content: str,
+) -> str:
+    """Modify *rel_path* in *repo_dir*'s working tree to *new_content*,
+    capture the resulting ``git diff`` text, then revert the working tree
+    change — so the caller gets a real, ``git apply``-compatible diff
+    without leaving the base checkout (the thing `verify-amendment` must
+    never touch) actually modified."""
+    target = repo_dir / rel_path
+    original = target.read_text()
+    target.write_text(new_content)
+    diff = subprocess.run(
+        ["git", "diff", "--", rel_path], cwd=repo_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    target.write_text(original)
+    return diff
+
+
+@pytest.fixture(autouse=True)
+def _amendment_worktrees_in_tmp(monkeypatch, tmp_path: Path):
+    """Mirror `_acceptance_worktrees_in_tmp` above, for
+    `coord acceptance verify-amendment`'s own scratch tree — must never
+    leak into the real user's `~/.coord/acceptance-amendment-worktrees/`
+    during tests."""
+    wt_root = tmp_path / "acceptance-amendment-worktrees"
+
+    def _fake_path(repo_name: str, issue_number: int) -> Path:
+        return wt_root / f"{repo_name}-{issue_number}"
+
+    monkeypatch.setattr(
+        "coord.commands.acceptance._amendment_scratch_path", _fake_path,
+    )
+
+
+class TestAcceptanceProposeAmendment:
+    def test_propose_amendment_writes_artifact_json(self, tmp_path: Path) -> None:
+        diff_file = tmp_path / "amend.diff"
+        diff_file.write_text("--- a/tests/acceptance/ms01/foo.txt\n"
+                              "+++ b/tests/acceptance/ms01/foo.txt\n"
+                              "@@ -1 +1 @@\n-OLD\n+NEW\n")
+        out_path = tmp_path / "artifact.json"
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "propose-amendment",
+            "--repo", "coord-tui", "--issue", "4178",
+            str(diff_file),
+            "--touches", "tests/acceptance/ms01/foo.txt",
+            "--rationale", "unblocks the Removes: Foo::bar deletion",
+            "--out", str(out_path),
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(out_path.read_text())
+        assert payload["repo_name"] == "coord-tui"
+        assert payload["issue_number"] == 4178
+        assert payload["touched_paths"] == ["tests/acceptance/ms01/foo.txt"]
+        assert payload["rationale"] == "unblocks the Removes: Foo::bar deletion"
+        assert payload["proposed_by"] == "worker"
+        assert "NEW" in payload["diff"]
+
+    def test_propose_amendment_defaults_to_stdout(self, tmp_path: Path) -> None:
+        diff_file = tmp_path / "amend.diff"
+        diff_file.write_text("diff text\n")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "propose-amendment",
+            "--repo", "coord-tui", "--issue", "4178",
+            str(diff_file),
+            "--touches", "tests/acceptance/ms01/foo.txt",
+            "--rationale", "r",
+            "--proposed-by", "planner",
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["proposed_by"] == "planner"
+
+
+class TestAcceptanceVerifyAmendment:
+    def _artifact_path(
+        self, tmp_path: Path, *, repo_dir: Path, diff: str, touches: list[str],
+        repo_name: str = "coord-tui", issue_number: int = 4178,
+    ) -> Path:
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(json.dumps({
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "diff": diff,
+            "touched_paths": touches,
+            "rationale": "r",
+            "proposed_by": "worker",
+        }))
+        return artifact
+
+    def test_verify_amendment_passes_when_diff_applies_and_suite_is_green(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_text("OLD\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+
+        diff = _git_diff_for_sealed_change(
+            repo_dir, "tests/acceptance/ms01/foo.txt", "NEW\n",
+        )
+
+        # A real script file (committed, non-sealed) rather than an inline
+        # one-liner: the JSON blobs below need literal double quotes, and
+        # nesting that through bash -c's OWN quoting (then through YAML,
+        # then through this test's f-string) is exactly the kind of
+        # quote-in-quote-in-quote mess a real file sidesteps entirely.
+        pass_blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        fail_blob = json.dumps({"tests": [{"id": "ms01::a", "status": "fail"}]})
+        (repo_dir / "run_check.sh").write_text(
+            "if grep -q NEW tests/acceptance/ms01/foo.txt; then\n"
+            f"  echo '{pass_blob}'\n"
+            "else\n"
+            f"  echo '{fail_blob}'\n"
+            "fi\n"
+        )
+        subprocess.run(["git", "add", "run_check.sh"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "check script"], cwd=repo_dir, check=True)
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="bash run_check.sh",
+        )
+
+        artifact = self._artifact_path(
+            tmp_path, repo_dir=repo_dir, diff=diff,
+            touches=["tests/acceptance/ms01/foo.txt"],
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        assert payload["reason"] is None
+        assert payload["acceptance_verdict"]["green"] is True
+
+        # #2096 "unconfirmed success is a defect": the real checkout must
+        # still read the ORIGINAL content — nothing in verify-amendment may
+        # touch it, only the scratch copy.
+        assert sealed.read_text() == "OLD\n"
+        assert subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip() == sha
+        # And the scratch worktree is cleaned up, not left behind.
+        assert not (tmp_path / "acceptance-amendment-worktrees").exists() or not any(
+            (tmp_path / "acceptance-amendment-worktrees").iterdir()
+        )
+
+    def test_verify_amendment_fails_when_suite_is_still_red_after_apply(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_text("OLD\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+
+        diff = _git_diff_for_sealed_change(
+            repo_dir, "tests/acceptance/ms01/foo.txt", "NEW\n",
+        )
+
+        fail_blob = json.dumps({"tests": [
+            {"id": "ms01::a", "status": "fail", "message": "still broken"},
+        ]})
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{fail_blob}'",
+        )
+        artifact = self._artifact_path(
+            tmp_path, repo_dir=repo_dir, diff=diff,
+            touches=["tests/acceptance/ms01/foo.txt"],
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["acceptance_verdict"]["green"] is False
+        assert "still broken" in payload["reason"]
+
+    def test_verify_amendment_rejects_out_of_scope_touched_path(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
+        )
+        artifact = self._artifact_path(
+            tmp_path, repo_dir=repo_dir, diff="irrelevant",
+            touches=["coord/some_module.py"],
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert "outside the repo's sealed set" in payload["reason"]
+        assert "coord/some_module.py" in payload["reason"]
+        assert payload["acceptance_verdict"] is None
+
+    def test_verify_amendment_rejects_diff_that_does_not_apply(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_text("OLD\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+
+        # A diff whose context no longer matches anything in the repo.
+        bogus_diff = (
+            "--- a/tests/acceptance/ms01/foo.txt\n"
+            "+++ b/tests/acceptance/ms01/foo.txt\n"
+            "@@ -1 +1 @@\n-NOT THERE AT ALL\n+NEW\n"
+        )
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
+        )
+        artifact = self._artifact_path(
+            tmp_path, repo_dir=repo_dir, diff=bogus_diff,
+            touches=["tests/acceptance/ms01/foo.txt"],
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert "does not apply cleanly" in payload["reason"]
+        assert payload["acceptance_verdict"] is None
+
+    def test_verify_amendment_errors_on_malformed_artifact(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
+        )
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(json.dumps({"repo_name": "coord-tui"}))  # missing required keys
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "malformed" in result.output
