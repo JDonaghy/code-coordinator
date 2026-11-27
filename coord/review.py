@@ -963,6 +963,52 @@ def extract_blocking_section(body: str) -> str:
     return joined
 
 
+# ── Epic tranche convention (#4189) ─────────────────────────────────────────
+# An epic/tracking issue can declare that part of its full scope is
+# deliberately deferred to a later issue (e.g. "deletion half deferred to
+# #4322") — CLAUDE.md's own `ISSUE_RESOLUTION: partial` allowance already
+# recognises "a tranche the issue defines" as a legitimate narrow partial.
+# Without surfacing that declaration to a reviewer scoped to ONE slice of the
+# epic, the reviewer has no way to tell "the epic explicitly deferred this"
+# apart from "the worker silently dropped scope" and would `request-changes`
+# for the former exactly as it should for the latter.
+_TRANCHE_CONVENTION_HEADING_RE = re.compile(
+    r"^#{1,6}\s*tranche convention\s*$", re.IGNORECASE
+)
+
+
+def extract_tranche_convention(body: str) -> str | None:
+    """Return the verbatim text of *body*'s ``## Tranche convention``
+    section, or ``None`` when there's no such heading or the section is
+    empty.
+
+    *body* is expected to be a milestone/epic tracking issue's own body —
+    callers resolve which issue that is (see
+    :func:`_fetch_tranche_convention_note`); this function only parses
+    whatever body it's handed. The heading match is exact (any ``#``-``##
+    ######`` level, case-insensitive, no trailing text) — same discipline
+    as every other section heading this repo parses
+    (:data:`coord.milestone_order._HEADING_RE` et al.) — so a loosely
+    worded aside that merely mentions a deferred issue number elsewhere in
+    the body is never mistaken for a deliberate declaration.
+    """
+    if not body:
+        return None
+    collected: list[str] = []
+    in_section = False
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        if line.lstrip().startswith("#"):
+            if in_section:
+                break
+            in_section = bool(_TRANCHE_CONVENTION_HEADING_RE.match(line.strip()))
+            continue
+        if in_section:
+            collected.append(line)
+    text = "\n".join(collected).strip()
+    return text or None
+
+
 # ── Stable finding ids for a scoped re-review (#4187) ───────────────────────
 # A scoped re-review responding to a fix round used to be handed the whole
 # `## Blocking findings` section as one opaque blob of prose, so the
@@ -2878,6 +2924,7 @@ def build_review_briefing(
     gate_a_exempt_warning: str | None = None,
     exempt_dependency_warnings: list[str] | None = None,
     oracle_contract_note: str | None = None,
+    tranche_convention_note: str | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -3031,6 +3078,20 @@ def build_review_briefing(
     mandatory ``request-changes``) posture: a stale dependency doesn't make
     THIS diff wrong, it means an earlier exemption's promise wasn't kept, so
     the reviewer is told rather than asked to act on it.
+
+    *tranche_convention_note* (#4189) is the pre-computed
+    :func:`extract_tranche_convention` text pulled from this issue's
+    milestone's tracking (epic) issue, when that issue's body declares a
+    ``## Tranche convention`` section (e.g. "deletion half deferred to
+    #4322") — or ``None`` when there's no milestone, no tracking issue, no
+    such section, or the fetch failed. Same pure-function,
+    pre-fetched-by-the-caller contract as *gate_a_exempt_warning* above.
+    Rendered right after the issue body, since — like *oracle_contract_note*
+    — it reframes what's in scope for the whole review: a reviewer with no
+    visibility into the epic's own deferred-scope declaration has no way to
+    tell "the epic explicitly deferred this to another issue" apart from
+    "the worker silently dropped scope", and would request changes for the
+    former exactly as it should for the latter.
     """
 
     lines: list[str] = []
@@ -3065,6 +3126,25 @@ def build_review_briefing(
         lines.append("")
         lines.append(issue_body.strip())
     lines.append("")
+
+    if tranche_convention_note:
+        # #4189: the epic's own declared scope deferral, surfaced BEFORE the
+        # generic checklist/diff — same "reframes what's in scope" priority
+        # as oracle_contract_note immediately below, not a footnote.
+        lines.append(
+            "## Epic tranche convention — read before judging scope (#4189)"
+        )
+        lines.append("")
+        lines.append(
+            f"This issue's milestone's tracking (epic) issue declares a "
+            "tranche convention — scope the epic itself already deferred "
+            "to another issue, and NOT something this PR silently dropped. "
+            "Do not `request-changes` for anything this convention already "
+            "covers:"
+        )
+        lines.append("")
+        lines.append(tranche_convention_note)
+        lines.append("")
 
     if oracle_contract_note:
         # #3212 "Related mitigation": the same contract/mocks pointer the
@@ -3800,6 +3880,65 @@ def _fetch_oracle_loop_contract_note(
     )
 
 
+def _fetch_tranche_convention_note(
+    repo: Repo,
+    milestone_number: int | None,
+    *,
+    open_issue_lister=None,
+    closed_epic_lister=None,
+) -> str | None:
+    """(#4189) Resolve *milestone_number*'s tracking (epic) issue and return
+    :func:`extract_tranche_convention` of its body — or ``None`` when there
+    is no milestone, no tracking issue is found under it, the section is
+    absent/empty, or the fetch failed.
+
+    Kept as a module-level name, sibling to :func:`_fetch_gate_a_exempt_warning`
+    / :func:`_fetch_oracle_loop_contract_note` above, same rationale: a test
+    can stub the two fetchers directly without reaching into
+    :mod:`coord.github_ops`. Takes *milestone_number* already resolved
+    rather than an *issue_number* it would re-resolve: its one caller
+    (:func:`dispatch_review`) reuses ``_gate_a_milestone_number`` — the
+    SAME fetch the Gate-A advisories immediately above already pay for,
+    gated by ``config.acceptance.has_driver`` so a repo with no acceptance
+    driver configured never pays an extra `gh` round-trip for this.
+
+    Resolves the tracking issue the SAME way :func:`coord.plans.
+    find_tracking_issue` already does everywhere else this fleet needs that
+    reverse lookup (milestone → epic) — open issues plus closed epics,
+    filtered to the one carrying :data:`coord.milestone_order.
+    TRACKING_ISSUE_LABEL` under this milestone — rather than re-deriving a
+    second, independent "which issue is the epic" rule here (CLAUDE.md:
+    "one question, one answer"). Both ``get_open_issues``/``get_closed_epics``
+    already request ``body`` on every item, so this needs no extra `gh`
+    call beyond the two list fetches to get the tracking issue's body too.
+
+    *open_issue_lister*/*closed_epic_lister* default to
+    :func:`coord.github_ops.get_open_issues` / :func:`~coord.github_ops.
+    get_closed_epics`; inject stubs in tests so this advisory lookup never
+    shells out live. Fail-open, same posture as every other best-effort
+    fetch ahead of a review briefing: a missing milestone, no tracking
+    issue, or a transient fetch failure all return ``None`` rather than
+    raise — advisory surfacing, never a gate.
+    """
+    if milestone_number is None:
+        return None
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.plans import find_tracking_issue  # noqa: PLC0415
+
+    list_open = open_issue_lister or github_ops.get_open_issues
+    list_closed = closed_epic_lister or github_ops.get_closed_epics
+    try:
+        candidates = list_open(repo.github) + list_closed(repo.github)
+    except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+        return None
+
+    tracking = find_tracking_issue(milestone_number, candidates)
+    if tracking is None:
+        return None
+    return extract_tranche_convention(tracking.get("body") or "")
+
+
 def open_pr_for_completed_work(
     completed: Assignment,
     config: Config,
@@ -4498,6 +4637,8 @@ def dispatch_review(
     compare_diff_fetcher=None,
     gate_a_manifest_fetcher=None,
     exempt_dependency_issue_is_closed_fetcher=None,
+    tranche_open_issue_lister=None,
+    tranche_closed_epic_lister=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -4592,6 +4733,14 @@ def dispatch_review(
     layer (a manifest/parse failure yields no warnings), but the dependency
     check itself is fail-CLOSED once a manifest is in hand — see
     :func:`coord.acceptance.verify_exempt_dependency`'s docstring.
+
+    *tranche_open_issue_lister*/*tranche_closed_epic_lister* are the
+    ``open_issue_lister``/``closed_epic_lister`` passed through to
+    :func:`_fetch_tranche_convention_note` (#4189). Default to
+    :func:`coord.github_ops.get_open_issues` / :func:`~coord.github_ops.
+    get_closed_epics`; inject stubs in tests so this advisory lookup never
+    shells out to a live ``gh``. Entirely fail-open — see that function's
+    docstring.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -5400,6 +5549,22 @@ def dispatch_review(
         except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
             oracle_contract_note_text = None
 
+        # #4189: does this issue's milestone's tracking (epic) issue declare
+        # a tranche convention? Reuses `_gate_a_milestone_number` (already
+        # fetched above, gated the same way) rather than a second
+        # unconditional fetch — cost discipline: a repo with no acceptance
+        # driver configured must pay zero extra `gh` calls for this, exactly
+        # like `gate_a_exempt_warning_text`/`exempt_dependency_warnings_text`
+        # /`oracle_contract_note_text` immediately above.
+        try:
+            tranche_convention_note_text = _fetch_tranche_convention_note(
+                repo, _gate_a_milestone_number,
+                open_issue_lister=tranche_open_issue_lister,
+                closed_epic_lister=tranche_closed_epic_lister,
+            )
+        except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+            tranche_convention_note_text = None
+
         # #3674: the pre-review mechanical gate runs FIRST, ahead of the
         # #3180 sealed-path/coordinator-doc check below — both are "mechanical,
         # before a review leg is spent" short-circuits, but this one's checks
@@ -5590,6 +5755,7 @@ def dispatch_review(
                 gate_a_exempt_warning=gate_a_exempt_warning_text,
                 exempt_dependency_warnings=exempt_dependency_warnings_text,
                 oracle_contract_note=oracle_contract_note_text,
+                tranche_convention_note=tranche_convention_note_text,
             )
 
             payload = {
