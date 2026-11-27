@@ -15,15 +15,19 @@ Covers:
 
 from __future__ import annotations
 
+import logging
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from coord.dispatch import (
     FixMachineSelection,
     describe_fix_machine_failure,
+    dispatch,
     fix_machine_capability_note,
     select_fix_machine,
 )
-from coord.models import Assignment, Machine, Repo
+from coord.models import Assignment, Machine, Proposal, Repo
 from coord.network import StatusResult
 
 
@@ -215,6 +219,48 @@ class TestFixMachineCapabilityNote:
         assert "macos" in note
         assert "coord smoke run-leg" in note
         assert "UNVERIFIED: macos" in note
+
+
+# ── dispatch(): the original-work-dispatch fallback is logged (#4147) ───────
+
+
+class TestDispatchLogsUnmetCapabilityFallback:
+    @patch("coord.dispatch.httpx.post")
+    def test_logs_a_warning_when_no_machine_fully_covers_the_diff(
+        self, mock_post: MagicMock, dell64: Machine, macmini: Machine, caplog,
+    ) -> None:
+        """#4147 acceptance: `route_work_by_capability`'s fallback (no
+        single configured machine covers every matched capability) must be
+        LOGGED, not silently folded into the briefing note alone."""
+        from coord.config import Config, SmokeRule, SmokeTestsConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        repo = Repo(name="quadraui", github="acme/quadraui", default_branch="main")
+        config = Config(
+            repos=[repo], machines=[dell64, macmini],
+            smoke_tests=SmokeTestsConfig(capability_rules=[
+                SmokeRule(files=["gtk/"], requires=["gtk"]),
+                SmokeRule(files=["macos/"], requires=["macos"]),
+            ]),
+        )
+        proposal = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=2876, issue_title="group-B cleanup",
+            rationale="best fit",
+            files_likely=["gtk/popup.c", "macos/backend.rs"],
+            briefing="do the thing",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="coord.dispatch"):
+            dispatch(proposal, config)
+
+        assert any(
+            "#4147" in r.message and "unmet" in r.message.lower()
+            for r in caplog.records
+        )
 
 
 # ── coord.smoke: reading a fan-out's per-leg verdicts (#4147) ───────────────

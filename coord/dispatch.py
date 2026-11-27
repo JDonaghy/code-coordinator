@@ -1206,6 +1206,25 @@ def dispatch(
                 raise ValueError(
                     f"Unknown machine: {capability_routing.machine_name!r}"
                 )
+        if capability_routing is not None and capability_routing.unmet_capabilities:
+            # #4147: this diff needs more than any single configured
+            # machine declares — `route_work_by_capability` already picked
+            # the best-covering one and the briefing note appended below
+            # tells the WORKER, but nothing told an operator/dashboard this
+            # fleet gap exists at all. Logged here (not inside
+            # `route_work_by_capability` itself, which is also called from
+            # test contexts that shouldn't need a caplog fixture for every
+            # assertion) so "fallback, never silent" holds for the
+            # dashboard/#4122-stats reader too, not just the worker.
+            _log.warning(
+                "dispatch: %s#%s routed to %r but %d required "
+                "capability(ies) are unmet by every configured machine: %s "
+                "(#4147 — no fleet machine fully covers this diff)",
+                proposal.repo_name, proposal.issue_number,
+                capability_routing.machine_name,
+                len(capability_routing.unmet_capabilities),
+                ", ".join(capability_routing.unmet_capabilities),
+            )
 
     # #3241 review: a rerouted machine can never fail this —
     # `route_work_by_capability`'s candidate filter already requires
