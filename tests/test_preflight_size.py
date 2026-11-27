@@ -4,13 +4,21 @@ size-scorer that gates the (paid) size-triage agent.
 
 from __future__ import annotations
 
+import re
 import socket
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from coord.config import PreflightGuardConfig, PreflightGuardRepoConfig, load
+from coord.config import (
+    AcceptanceConfig,
+    AcceptanceDriverConfig,
+    PreflightGuardConfig,
+    PreflightGuardRepoConfig,
+    grep_sealed_path_hits,
+    load,
+)
 from coord.milestone_order import parse_sub_issues
 from coord.models import SplitChunk, SplitProposal
 from coord.overlap_predict import parse_declared_files
@@ -683,6 +691,304 @@ class TestVerifySplitProposalRejectsUnedgedSymbolConsumption:
         )
         verification = verify_split_proposal(proposal)
         assert verification.ok is True
+
+
+class TestGrepSealedPathHits:
+    """#4176: the real-filesystem grep step, tested directly against
+    `tmp_path` so the rest of the suite doesn't need a real repo checkout."""
+
+    def test_hit_is_reported_with_the_sealed_relative_path(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+        hits = grep_sealed_path_hits(
+            ["tests/acceptance/"],
+            tmp_path,
+            {"k": re.compile(r"\bdraw_tooltip\b")},
+        )
+        assert hits == {"k": ["tests/acceptance/c0_paint_smoke.rs"]}
+
+    def test_no_hit_returns_empty_mapping(self, tmp_path: Path) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("nothing_relevant();\n")
+        hits = grep_sealed_path_hits(
+            ["tests/acceptance/"],
+            tmp_path,
+            {"k": re.compile(r"\bdraw_tooltip\b")},
+        )
+        assert hits == {}
+
+    def test_missing_repo_root_fails_open(self, tmp_path: Path) -> None:
+        hits = grep_sealed_path_hits(
+            ["tests/acceptance/"],
+            tmp_path / "does-not-exist",
+            {"k": re.compile(r"\bdraw_tooltip\b")},
+        )
+        assert hits == {}
+
+    def test_no_sealed_paths_or_patterns_fails_open(self, tmp_path: Path) -> None:
+        assert grep_sealed_path_hits([], tmp_path, {"k": re.compile(r"x")}) == {}
+        assert grep_sealed_path_hits(["tests/acceptance/"], tmp_path, {}) == {}
+
+    def test_exact_file_entry_is_resolved_too(self, tmp_path: Path) -> None:
+        (tmp_path / "tui").mkdir()
+        (tmp_path / "tui" / "tests").mkdir()
+        (tmp_path / "tui" / "tests" / "acceptance.rs").write_text(
+            "mod c0_paint_smoke; use draw_tooltip;\n"
+        )
+        hits = grep_sealed_path_hits(
+            ["tui/tests/acceptance.rs"],
+            tmp_path,
+            {"k": re.compile(r"\bdraw_tooltip\b")},
+        )
+        assert hits == {"k": ["tui/tests/acceptance.rs"]}
+
+    def test_acceptance_config_method_derives_sealed_paths_itself(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+        acceptance = AcceptanceConfig(
+            drivers={"acme/quadraui": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+        )
+        hits = acceptance.grep_sealed_path_hits(
+            "acme/quadraui", tmp_path, {"k": re.compile(r"\bdraw_tooltip\b")}
+        )
+        assert hits == {"k": ["tests/acceptance/c0_paint_smoke.rs"]}
+        # An unconfigured repo has no sealed set to grep against at all.
+        assert acceptance.grep_sealed_path_hits(
+            "acme/other", tmp_path, {"k": re.compile(r"\bdraw_tooltip\b")}
+        ) == {}
+
+
+class TestVerifySplitProposalInsertsSealedAmendmentStep:
+    """#4176 (the quadraui#2876 incident): a child that `Removes:` a symbol
+    still referenced inside the target repo's sealed acceptance paths does
+    not merge partial over the sealed literal — the gate still accepts the
+    proposal, but inserts a flagged `sealed-amendment` step immediately
+    ahead of the affected child in the computed work order, and reports the
+    hit on `SplitVerification.sealed_amendments`."""
+
+    def test_removed_symbol_still_referenced_in_sealed_path_inserts_a_step(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["quadraui/src/tui/tooltip.rs"],
+                    removes=("draw_tooltip",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal,
+            sealed_paths=["tests/acceptance/"],
+            sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        assert verification.work_order is not None
+        # 3 nodes: the synthetic amendment step plus the 2 real chunks.
+        nodes = verification.work_order.nodes
+        assert len(nodes) == 3
+        assert nodes[0].issue_number == 3  # the synthetic step, numbered past N
+        assert nodes[0].group == "sealed-amendment"
+        assert nodes[0].after == ()
+        # child 1 ("a", the affected child) now depends on the inserted step.
+        assert nodes[1].issue_number == 1
+        assert nodes[1].after == (3,)
+        assert nodes[2].issue_number == 2
+
+        assert len(verification.sealed_amendments) == 1
+        amendment = verification.sealed_amendments[0]
+        assert amendment.chunk_position == 1
+        assert amendment.symbol == "draw_tooltip"
+        assert amendment.declared_as == "removes"
+        assert amendment.sealed_paths == ("tests/acceptance/c0_paint_smoke.rs",)
+
+    def test_amendment_step_inherits_the_affected_childs_own_predecessors(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(title="a", scope="scope a", files_likely=["coord/a.py"]),
+                SplitChunk(
+                    title="b",
+                    scope="scope b",
+                    files_likely=["coord/a.py"],  # shares a/.py -> after=(1,)
+                    removes=("draw_tooltip",),
+                ),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal,
+            sealed_paths=["tests/acceptance/"],
+            sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        nodes = {n.issue_number: n for n in verification.work_order.nodes}
+        # The amendment step (#3) is ahead of child 2 and keeps child 2's
+        # own original predecessor (#1), not an extra edge to child 2 itself.
+        assert nodes[3].group == "sealed-amendment"
+        assert nodes[3].after == (1,)
+        assert nodes[2].after == (1, 3)
+
+    def test_removed_symbol_absent_from_sealed_paths_is_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("nothing_relevant();\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    removes=("draw_tooltip",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal,
+            sealed_paths=["tests/acceptance/"],
+            sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        assert verification.sealed_amendments == ()
+        assert len(verification.work_order.nodes) == 2
+
+    def test_no_sealed_paths_given_behaves_exactly_as_before(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    removes=("draw_tooltip",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        # Caller passes no sealed_paths/sealed_repo_root at all — a
+        # perfectly ordinary call, same fail-open posture as every other
+        # "no evidence available" signal in this module.
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+        assert verification.sealed_amendments == ()
+        assert len(verification.work_order.nodes) == 2
+
+    def test_newly_introduced_struct_field_against_a_sealed_struct_literal_is_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "structural_parity.rs").write_text(
+            "let t = Tooltip {\n    text: \"hi\".into(),\n};\n"
+        )
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["quadraui/src/tui/tooltip.rs"],
+                    introduces=("Tooltip.chrome",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal,
+            sealed_paths=["tests/acceptance/"],
+            sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        assert len(verification.sealed_amendments) == 1
+        amendment = verification.sealed_amendments[0]
+        assert amendment.symbol == "Tooltip.chrome"
+        assert amendment.declared_as == "introduces"
+        assert amendment.sealed_paths == (
+            "tests/acceptance/structural_parity.rs",
+        )
+
+    def test_bare_introduced_symbol_with_no_dot_is_never_a_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "structural_parity.rs").write_text("Tooltip { text: 1 }\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    introduces=("Tooltip",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal,
+            sealed_paths=["tests/acceptance/"],
+            sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        assert verification.sealed_amendments == ()
+
+    def test_caller_supplied_epic_body_still_reports_the_hit_but_cannot_insert(
+        self, tmp_path: Path
+    ) -> None:
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a",
+                    scope="scope a",
+                    files_likely=["coord/a.py"],
+                    removes=("draw_tooltip",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        epic_body = "## Sub-issues\n- [ ] #1\n- [ ] #2\n"
+        verification = verify_split_proposal(
+            proposal,
+            epic_body=epic_body,
+            sealed_paths=["tests/acceptance/"],
+            sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        assert verification.epic_body == epic_body
+        assert len(verification.work_order.nodes) == 2
+        assert len(verification.sealed_amendments) == 1
 
 
 class TestVerifySplitProposalLogsEveryRejection:

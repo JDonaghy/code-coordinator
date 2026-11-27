@@ -15,7 +15,7 @@ import time as time_module
 from dataclasses import dataclass, field, fields, replace
 from datetime import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -632,6 +632,75 @@ def entrypoint_sibling_acceptance_dir(entrypoint: str) -> str:
     return f"{prefix}acceptance/"
 
 
+def grep_sealed_path_hits(
+    sealed_paths: Sequence[str],
+    repo_root: str | Path,
+    patterns: Mapping[str, "re.Pattern[str]"],
+) -> dict[str, list[str]]:
+    """Search every real file under *sealed_paths* (the same shape
+    :meth:`AcceptanceConfig.sealed_paths` itself returns — a directory
+    prefix ending in ``/``, or an exact file) resolved against *repo_root*,
+    for each of *patterns*' compiled regexes.
+
+    #4176: the `coord.preflight_size.verify_split_proposal` sealed-amendment
+    check needs to know whether a child's removed/newly-introduced symbol
+    is still live in the target repo's own sealed acceptance suite — that
+    is a real filesystem read, deliberately kept OUT of
+    :meth:`AcceptanceConfig.sealed_paths` itself (that method, and its
+    siblings :meth:`~AcceptanceConfig.entrypoints` /
+    :meth:`~AcceptanceConfig.acceptance_search_roots`, are "path-independent
+    by design" per their own docstrings — pure path-string computation, no
+    I/O) and out of :mod:`coord.preflight_size` too (that module's own
+    docstring: "no I/O of any kind" on the hot path). This is a MODULE-level
+    function, not a method, for the same reason — :meth:`AcceptanceConfig.
+    grep_sealed_path_hits` is a thin convenience wrapper over it, not the
+    other way round.
+
+    Returns ``{pattern_key: [sealed_relative_path, ...]}`` — only keys that
+    hit at least once, each mapped to every sealed file (as a string,
+    relative to *repo_root*) whose content matched, in sorted order. Empty
+    input (no *sealed_paths*, no *patterns*) or a *repo_root* that doesn't
+    exist on this machine (not every machine has every repo checked out —
+    a normal, common case, not a fault) returns ``{}`` rather than raising,
+    the same fail-open posture every other "no evidence available" signal
+    in this fleet takes.
+    """
+    if not sealed_paths or not patterns:
+        return {}
+    root = Path(repo_root)
+    if not root.is_dir():
+        return {}
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for entry in sealed_paths:
+        target = root / entry
+        if entry.endswith("/"):
+            if not target.is_dir():
+                continue
+            candidates = sorted(p for p in target.rglob("*") if p.is_file())
+        else:
+            candidates = [target] if target.is_file() else []
+        for p in candidates:
+            if p not in seen:
+                seen.add(p)
+                files.append(p)
+
+    hits: dict[str, list[str]] = {}
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        rel = str(path.relative_to(root))
+        for key, pattern in patterns.items():
+            if pattern.search(text):
+                hits.setdefault(key, []).append(rel)
+    for matches in hits.values():
+        matches.sort()
+    return hits
+
+
 @dataclass
 class AcceptanceConfig:
     """``acceptance.drivers`` — repo name -> :class:`AcceptanceDriverConfig`."""
@@ -788,6 +857,27 @@ class AcceptanceConfig:
         exactly one of these; callers try each until one has it.
         """
         return [p for p in self.sealed_paths(repo_name) if p.endswith("/")]
+
+    def grep_sealed_path_hits(
+        self,
+        repo_name: str,
+        repo_root: str | Path,
+        patterns: Mapping[str, "re.Pattern[str]"],
+    ) -> dict[str, list[str]]:
+        """#4176: search real file content under :meth:`sealed_paths` for
+        each of *patterns*' compiled regexes, resolved against *repo_root*
+        (a local checkout — e.g. ``coord.repo_onboard.local_clone_path``'s
+        return value).
+
+        Returns ``{pattern_key: [sealed_relative_path, ...]}`` — only keys
+        that actually hit at least once, each mapped to every sealed file
+        (repo-root-relative, as a string) whose content matched. Thin
+        convenience wrapper over the module-level
+        :func:`grep_sealed_path_hits` so a caller that already has an
+        :class:`AcceptanceConfig` in hand doesn't have to re-derive
+        *repo_name*'s sealed set itself before calling it.
+        """
+        return grep_sealed_path_hits(self.sealed_paths(repo_name), repo_root, patterns)
 
     def driver_for(
         self, repo_name: str, path: str | None = None,

@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from coord.milestone_order import (
@@ -67,6 +68,7 @@ __all__ = [
     "DEFAULT_THRESHOLDS",
     "score_issue_size",
     "SplitVerification",
+    "SealedAmendment",
     "verify_split_proposal",
     "AUDIT_CATEGORY",
     "EVENT_SPLIT_REJECTED",
@@ -414,6 +416,30 @@ def _prose_dependency_positions(scope_text: str) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True)
+class SealedAmendment:
+    """One sealed-reference hit :func:`verify_split_proposal` found while
+    checking a chunk's ``removes``/``introduces`` symbols against the
+    target repo's sealed acceptance paths (#4176 — the quadraui#2876
+    incident: a deleted ``draw_tooltip`` and the newly-required
+    ``Tooltip.chrome``/``CommandLine.selection`` fields it implied both
+    broke sealed struct literals no worker was allowed to touch).
+
+    ``chunk_position`` is the proposal's own 1-based child position — not a
+    real GitHub issue number, which doesn't exist until the proposal is
+    filed, the same placeholder convention :class:`WorkOrderNode` itself
+    uses in the self-computed path below. ``sealed_paths`` is the
+    repo-relative file path(s) (resolved against the caller's
+    ``sealed_repo_root``) where ``symbol`` was actually found.
+    """
+
+    chunk_position: int
+    chunk_title: str
+    symbol: str
+    declared_as: str  # "removes" or "introduces" (derived struct/field hit)
+    sealed_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SplitVerification:
     """The gate's verdict on one :class:`~coord.models.SplitProposal`.
 
@@ -421,12 +447,22 @@ class SplitVerification:
     contract (#3816) is "reject with a reason, then fall back to dispatching
     the original issue as-is", so a rejection with nothing to show the
     operator defeats the point of rejecting at all.
+
+    ``sealed_amendments`` (#4176) is never itself a rejection reason — a hit
+    inserts a flagged sealed-amendment step ahead of the affected child in
+    ``work_order``/``epic_body`` instead (see
+    :func:`verify_split_proposal`'s check 7), so the proposal still verifies
+    ``ok=True`` with the extra step already in the computed order rather
+    than merging the affected child partial over the sealed literal. Empty
+    by default — the common case, and every call site that doesn't pass
+    ``sealed_paths=``/``sealed_repo_root=`` at all.
     """
 
     ok: bool
     reason: str | None
     epic_body: str | None = None
     work_order: WorkOrder | None = None
+    sealed_amendments: tuple[SealedAmendment, ...] = field(default_factory=tuple)
 
 
 def _reject(proposal: SplitProposal, reason: str) -> SplitVerification:
@@ -469,8 +505,82 @@ def _reject(proposal: SplitProposal, reason: str) -> SplitVerification:
     return SplitVerification(ok=False, reason=reason)
 
 
+# #4176: a child's declared `Removes:` symbol (or a `Introduces:` one shaped
+# like a struct/field access, the mechanical stand-in for "newly-required
+# struct/field name" this check also looks for — see
+# :func:`_sealed_amendment_candidates`'s docstring) can still be referenced
+# inside the target repo's own sealed acceptance suite
+# (`AcceptanceConfig.sealed_paths()`) — the quadraui#2876 shape: a deleted
+# `draw_tooltip` left 7 sealed call sites broken, and the new
+# `Tooltip.chrome` field it implied broke 2 more sealed struct literals that
+# construct `Tooltip` without it. Grepping for that BEFORE the split is filed
+# turns an unmergeable (or partial-merging) child into a flagged
+# sealed-amendment step ahead of it in the work order instead.
+_STRUCT_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _sealed_amendment_candidates(chunk: SplitChunk) -> list[tuple[str, str]]:
+    """``(symbol, declared_as)`` pairs *chunk* could break a sealed
+    reference for.
+
+    Every non-empty :attr:`~coord.models.SplitChunk.removes` symbol
+    outright (``declared_as="removes"``) — the child is deleting it, so any
+    sealed file still naming it would stop compiling/passing once this
+    child merges. Plus every :attr:`~coord.models.SplitChunk.introduces`
+    symbol SHAPED like a dotted struct/field access (``Type.field``,
+    ``declared_as="introduces"``) — the mechanical, "where derivable"
+    (#4176) stand-in for "newly-required struct/field name": a child that
+    declares ``Introduces: Tooltip.chrome`` is adding a field to an
+    existing type, and a sealed file that already constructs that type as a
+    struct literal would need amending to supply it. A bare function/type
+    name in ``introduces`` (no dot) is NOT a candidate here — there is no
+    mechanical way to tell "this is a wholly new symbol" from "this closes
+    over an existing sealed construction" without the dotted shape.
+    """
+    out = [
+        (s.strip(), "removes") for s in (chunk.removes or ()) if str(s).strip()
+    ]
+    out += [
+        (s.strip(), "introduces")
+        for s in (chunk.introduces or ())
+        if str(s).strip() and _STRUCT_FIELD_RE.match(s.strip())
+    ]
+    return out
+
+
+def _sealed_reference_pattern(symbol: str, declared_as: str) -> re.Pattern[str] | None:
+    """The regex a sealed file's content must match for *symbol* (declared
+    as *declared_as* — see :func:`_sealed_amendment_candidates`) to count
+    as a hit, or ``None`` when *symbol* isn't a shape either branch handles.
+
+    A plain ``removes`` symbol is matched verbatim, word-bounded — still
+    being CALLED is the breakage. An ``introduces`` struct/field candidate
+    (``Type.field``) instead matches its owning type name immediately
+    followed by a ``{`` (allowing whitespace/newlines in between) — a
+    sealed STRUCT LITERAL of that type, which is what would need the new
+    field, not a textual occurrence of the field name itself (which, being
+    new, cannot already appear in a sealed file that predates this split).
+    """
+    symbol = symbol.strip()
+    if not symbol:
+        return None
+    if declared_as == "removes":
+        return re.compile(rf"\b{re.escape(symbol)}\b")
+    if declared_as == "introduces":
+        match = _STRUCT_FIELD_RE.match(symbol)
+        if not match:
+            return None
+        type_name = match.group(1)
+        return re.compile(rf"\b{re.escape(type_name)}\b\s*\{{")
+    return None
+
+
 def verify_split_proposal(
-    proposal: SplitProposal, *, epic_body: str | None = None
+    proposal: SplitProposal,
+    *,
+    epic_body: str | None = None,
+    sealed_paths: Sequence[str] = (),
+    sealed_repo_root: str | Path | None = None,
 ) -> SplitVerification:
     """Mechanically verify *proposal* is safe to file as a real epic.
 
@@ -532,18 +642,48 @@ def verify_split_proposal(
        itself trip check 5's cycle/undeclared-target failure; those
        failure modes are reachable through the *epic_body* override
        instead — see the test suite.
+    7. (#4176) Every chunk's ``removes`` symbols, plus any ``introduces``
+       symbol shaped like a struct/field access
+       (:func:`_sealed_amendment_candidates`), are grepped against
+       *sealed_paths* (resolved against *sealed_repo_root*, when both are
+       given) — the target repo's own sealed acceptance paths
+       (``AcceptanceConfig.sealed_paths()``). A hit does NOT reject the
+       proposal; it is never reachable in the self-computed work order
+       above, only in the self-computed branch below (check 6), where it
+       inserts a flagged (``group: sealed-amendment``) step immediately
+       ahead of the affected child, inheriting that child's own
+       predecessors, with the child then also depending on the new step —
+       so the affected child can no longer be dispatched (or merge
+       partial) before the sealed reference is amended. Every hit is also
+       returned on :attr:`SplitVerification.sealed_amendments` regardless
+       of which branch built *epic_body*, so a caller handing in its own
+       real epic body still learns about the hit even though this gate
+       cannot rewrite that caller-owned text. No *sealed_paths* /
+       *sealed_repo_root* given (the common case — most callers have
+       neither a resolved driver nor a local checkout in hand) means this
+       check finds nothing, same fail-open posture as the rest of this
+       module toward evidence it doesn't have.
 
     *epic_body*, when given, is validated AS GIVEN — this lets a caller
     that already has real issue numbers (or a test asserting a specific
     failure mode) hand the gate the exact text about to be filed, rather
     than only ever checking this module's own self-computed convenience
     default. ``chunk.after`` plays no role in that path: a caller handing
-    over a real epic body has already decided what it says.
+    over a real epic body has already decided what it says — and so does
+    check 7's work-order insertion, which only ever happens in the
+    self-computed branch.
     """
     if not proposal.chunks:
         return _reject(proposal, "proposal has no chunks to split into")
 
     introduced_by: dict[str, int] = {}
+    # #4176: built up across the same per-chunk loop as every other check
+    # above — `candidate_patterns`/`candidate_meta` share one key per
+    # (chunk position, declared_as, symbol) so a symbol repeated across
+    # chunks (unusual, but not invalid) is still tracked per occurrence
+    # rather than collapsed into one.
+    candidate_patterns: dict[str, re.Pattern[str]] = {}
+    candidate_meta: dict[str, tuple[int, str, str, str]] = {}
     for i, chunk in enumerate(proposal.chunks, start=1):
         files = [f for f in (chunk.files_likely or []) if str(f).strip()]
         if not files:
@@ -612,7 +752,51 @@ def verify_split_proposal(
         for symbol in chunk.introduces or ():
             introduced_by.setdefault(symbol, i)
 
+        for symbol, declared_as in _sealed_amendment_candidates(chunk):
+            pattern = _sealed_reference_pattern(symbol, declared_as)
+            if pattern is None:
+                continue
+            key = f"{i}:{declared_as}:{symbol}"
+            candidate_patterns[key] = pattern
+            candidate_meta[key] = (i, chunk.title, symbol, declared_as)
+
+    # #4176: grep every candidate in ONE pass over the sealed tree — never
+    # once per symbol — before any work order is built, so the insertion
+    # below (self-computed branch only) has every hit in hand up front.
+    sealed_amendments: list[SealedAmendment] = []
+    if sealed_paths and sealed_repo_root and candidate_patterns:
+        from coord.config import grep_sealed_path_hits  # noqa: PLC0415
+
+        hits = grep_sealed_path_hits(
+            list(sealed_paths), sealed_repo_root, candidate_patterns
+        )
+        for key, hit_paths in hits.items():
+            position, title, symbol, declared_as = candidate_meta[key]
+            sealed_amendments.append(
+                SealedAmendment(
+                    chunk_position=position,
+                    chunk_title=title,
+                    symbol=symbol,
+                    declared_as=declared_as,
+                    sealed_paths=tuple(sorted(hit_paths)),
+                )
+            )
+    sealed_amendments.sort(key=lambda a: (a.chunk_position, a.symbol))
+    amendment_positions = sorted({a.chunk_position for a in sealed_amendments})
+
+    expected_node_count = len(proposal.chunks)
     if epic_body is None:
+        # #4176: one synthetic node per affected chunk position, numbered
+        # strictly after every real chunk position so it can never collide
+        # with (or be mistaken for) a real child — resolving that
+        # placeholder to a real filed issue number is a sibling slice's job
+        # (the propose/approve/apply artifact flow), not this gate's.
+        amendment_numbers: dict[int, int] = {}
+        next_amendment_number = len(proposal.chunks) + 1
+        for position in amendment_positions:
+            amendment_numbers[position] = next_amendment_number
+            next_amendment_number += 1
+
         nodes: list[WorkOrderNode] = []
         footprints_so_far: list[Footprint] = []
         for i, chunk in enumerate(proposal.chunks, start=1):
@@ -633,11 +817,28 @@ def verify_split_proposal(
             prediction = predict_overlap(files, footprints_so_far)
             predicted_after = {int(k) for k in prediction.after_keys}
             after = tuple(sorted(set(declared_after) | predicted_after))
+
+            amendment_number = amendment_numbers.get(i)
+            if amendment_number is not None:
+                # The amendment step inherits exactly the predecessors the
+                # affected child itself had — it must land at the same
+                # point in the DAG, just one step earlier — and the child
+                # then additionally depends on it.
+                nodes.append(
+                    WorkOrderNode(
+                        issue_number=amendment_number,
+                        group="sealed-amendment",
+                        after=after,
+                    )
+                )
+                after = tuple(sorted(set(after) | {amendment_number}))
+
             nodes.append(WorkOrderNode(issue_number=i, after=after))
             footprints_so_far.append(
                 Footprint(key=str(i), issue_number=i, files=files)
             )
         epic_body = "## Sub-issues\n" + render_sub_issues(WorkOrder(nodes=tuple(nodes)))
+        expected_node_count += len(amendment_positions)
 
     try:
         parsed = parse_sub_issues(epic_body)
@@ -647,15 +848,27 @@ def verify_split_proposal(
             f"proposed epic body failed the create-epic grammar: {exc}",
         )
 
-    if len(parsed.nodes) != len(proposal.chunks):
+    if len(parsed.nodes) != expected_node_count:
         return _reject(
             proposal,
             f"proposed epic body declares {len(parsed.nodes)} sub-issue(s), "
-            f"but the proposal has {len(proposal.chunks)} chunk(s) — not "
-            "every child would be visible once filed",
+            f"but expected {expected_node_count} (the proposal's "
+            f"{len(proposal.chunks)} chunk(s)"
+            + (
+                f" plus {len(amendment_positions)} sealed-amendment step(s)"
+                if amendment_positions
+                else ""
+            )
+            + ") — not every child would be visible once filed",
         )
 
-    return SplitVerification(ok=True, reason=None, epic_body=epic_body, work_order=parsed)
+    return SplitVerification(
+        ok=True,
+        reason=None,
+        epic_body=epic_body,
+        work_order=parsed,
+        sealed_amendments=tuple(sealed_amendments),
+    )
 
 
 # ── #3866: cross-backend decomposition-rule check ───────────────────────────
