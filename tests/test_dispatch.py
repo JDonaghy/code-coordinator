@@ -2233,6 +2233,53 @@ class TestPreflightGuard:
         mock_dispatch_triage.assert_called_once()
 
 
+class TestSealedVerifyKwargs:
+    """#4176: `_sealed_verify_kwargs` is what wires `enforce_preflight_
+    guard`'s two real `verify_split_proposal` call sites onto check 7's
+    sealed-reference detection — both already have `config` and `repo` in
+    scope, so there is no reason that check should stay unreachable
+    outside the test suite."""
+
+    def test_empty_when_repo_has_no_acceptance_driver(self) -> None:
+        from coord.dispatch import _sealed_verify_kwargs
+
+        cfg = Config(repos=[Repo(name="api", github="acme/api")], machines=[])
+        assert _sealed_verify_kwargs(cfg, cfg.repo("api")) == {}
+
+    def test_empty_when_no_local_clone_resolves(self) -> None:
+        from coord.dispatch import _sealed_verify_kwargs
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            ),
+        )
+        assert _sealed_verify_kwargs(cfg, cfg.repo("api")) == {}
+
+    def test_resolves_sealed_paths_and_root_when_clone_exists(self, tmp_path) -> None:
+        import socket
+
+        from coord.dispatch import _sealed_verify_kwargs
+
+        repo_root = tmp_path / "api"
+        (repo_root / "tests" / "acceptance").mkdir(parents=True)
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name=socket.gethostname(), host="x", repos=["api"],
+                repo_paths={"api": str(repo_root)},
+            )],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            ),
+        )
+        kwargs = _sealed_verify_kwargs(cfg, cfg.repo("api"))
+        assert kwargs["sealed_paths"] == ["tests/acceptance/"]
+        assert kwargs["sealed_repo_root"] == repo_root
+
+
 class TestPreflightGuardCrossBackendSplit:
     """#3866: the decomposition-rule check — a repo with a declared
     one-backend-per-issue rule (`PreflightGuardRepoConfig.backends`)

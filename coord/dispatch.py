@@ -288,6 +288,31 @@ def enforce_epic_dispatch_guard(
     )
 
 
+def _sealed_verify_kwargs(config: Config, repo: Repo) -> dict:
+    """``sealed_paths=``/``sealed_repo_root=`` kwargs for
+    :func:`coord.preflight_size.verify_split_proposal`'s check 7 (#4176),
+    resolved from what :func:`enforce_preflight_guard` already has in
+    scope — *config* and *repo* — rather than the common case that
+    function's own docstring describes ("most callers have neither a
+    resolved driver nor a local checkout in hand"), which does not hold
+    here.
+
+    ``{}`` (check 7 finds nothing, same fail-open posture as not passing
+    these at all) when the repo has no acceptance driver, or this machine
+    has no local clone of it (:func:`coord.repo_onboard.local_clone_path`
+    — not every machine running this gate has *repo* checked out).
+    """
+    sealed_paths = config.acceptance.sealed_paths(repo.name)
+    if not sealed_paths:
+        return {}
+    from coord.repo_onboard import local_clone_path  # noqa: PLC0415
+
+    repo_root = local_clone_path(config, repo.name)
+    if repo_root is None:
+        return {}
+    return {"sealed_paths": sealed_paths, "sealed_repo_root": repo_root}
+
+
 def enforce_preflight_guard(
     *,
     proposal_type: str,
@@ -422,7 +447,10 @@ def enforce_preflight_guard(
                 named_backends=named,
             )
             if cross_backend_proposal is not None:
-                cross_backend_verification = verify_split_proposal(cross_backend_proposal)
+                cross_backend_verification = verify_split_proposal(
+                    cross_backend_proposal,
+                    **_sealed_verify_kwargs(config, repo),
+                )
                 if cross_backend_verification.ok:
                     from coord.decomposition_chat import (  # noqa: PLC0415
                         file_and_queue_split_proposal,
@@ -528,7 +556,9 @@ def enforce_preflight_guard(
                         verify_split_proposal,
                     )
 
-                    verification = verify_split_proposal(proposal)
+                    verification = verify_split_proposal(
+                        proposal, **_sealed_verify_kwargs(config, repo),
+                    )
                     if verification.ok:
                         from coord.decomposition_chat import (  # noqa: PLC0415
                             file_and_queue_split_proposal,
