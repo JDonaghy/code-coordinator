@@ -3006,3 +3006,114 @@ class TestAcceptanceApplyAmendment:
             capture_output=True, text=True,
         ).stdout
         assert "Apply approved sealed amendment for #4178" in log
+
+    def test_apply_amendment_refuses_when_the_sealed_path_is_already_dirty(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pre-existing uncommitted edit to the SAME sealed file the
+        amendment touches (including a leg's own freehand edit) must not
+        ride along into the "exactly the approved bytes" commit — refuse
+        before applying anything, rather than silently sweeping it in."""
+        repo_dir, config_path, artifact_path, sealed = _green_amendment_fixture(tmp_path)
+        approved_path = self._approve(tmp_path, artifact_path, config_path)
+
+        # Dirty the sealed file AFTER approval, but BEFORE apply-amendment.
+        sealed.write_text("OLD\nFREEHAND EDIT\n")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(approved_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "already have uncommitted changes" in result.output
+
+        # Refused before the diff was ever applied — the freehand edit is
+        # left exactly as it was, and no commit was made.
+        assert sealed.read_text() == "OLD\nFREEHAND EDIT\n"
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        assert "Apply approved sealed amendment" not in log
+
+    def test_apply_amendment_commit_excludes_unrelated_staged_changes(
+        self, tmp_path: Path,
+    ) -> None:
+        """An unrelated file already staged in this checkout (e.g. JIT-
+        authored tests a `test-author` leg staged earlier in the same
+        session) must not be swept into the amendment's own commit — the
+        commit is scoped to exactly the diff's own files, never the whole
+        index."""
+        repo_dir, config_path, artifact_path, sealed = _green_amendment_fixture(tmp_path)
+        approved_path = self._approve(tmp_path, artifact_path, config_path)
+
+        unrelated = repo_dir / "unrelated.txt"
+        unrelated.write_text("not part of the amendment\n")
+        subprocess.run(["git", "add", "unrelated.txt"], cwd=repo_dir, check=True)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(approved_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["committed"] is True
+        commit_sha = payload["commit_sha"]
+
+        committed_paths = subprocess.run(
+            ["git", "show", "--name-only", "--format=", commit_sha], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.split()
+        assert committed_paths == ["tests/acceptance/ms01/foo.txt"]
+
+        # The unrelated file is still staged exactly as the leg left it —
+        # untouched by apply-amendment, never committed alongside the
+        # amendment.
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", "unrelated.txt"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        assert status.strip() == "A  unrelated.txt"
+
+    def test_apply_amendment_downgrades_closing_keyword_in_rationale(
+        self, tmp_path: Path,
+    ) -> None:
+        """`rationale` is untrusted input from the proposing session — a
+        closing keyword in it must be downgraded to `Refs #N`, the same way
+        `coord.merge_queue` already downgrades one found in a PR body, so
+        the amendment's own commit can never auto-close an issue on merge."""
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_text("OLD\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+
+        diff = _git_diff_for_sealed_change(
+            repo_dir, "tests/acceptance/ms01/foo.txt", "NEW\n",
+        )
+        pass_blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{pass_blob}'")
+        artifact_path = tmp_path / "artifact.json"
+        artifact_path.write_text(json.dumps({
+            "repo_name": "coord-tui", "issue_number": 4178, "diff": diff,
+            "touched_paths": ["tests/acceptance/ms01/foo.txt"],
+            "rationale": "Fixes #9999 and closes #9998 as a side effect",
+            "proposed_by": "worker",
+        }))
+        approved_path = self._approve(tmp_path, artifact_path, config_path)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(approved_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%B"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        assert "Fixes #9999" not in log
+        assert "closes #9998" not in log
+        assert "Refs #9999" in log
+        assert "Refs #9998" in log

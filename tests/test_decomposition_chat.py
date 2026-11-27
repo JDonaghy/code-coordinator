@@ -2431,6 +2431,13 @@ class TestFileAndQueueSplitProposal:
         assert "draw_tooltip" in amendment_kwargs["body"]
         assert "tests/acceptance/c0_paint_smoke.rs" in amendment_kwargs["body"]
 
+        # #4179: the filed issue names the actual commands a leg runs —
+        # the only surface today that tells one this flow exists at all.
+        assert "coord acceptance propose-amendment" in amendment_kwargs["body"]
+        assert "coord acceptance verify-amendment" in amendment_kwargs["body"]
+        assert "coord acceptance approve-amendment" in amendment_kwargs["body"]
+        assert "coord acceptance apply-amendment" in amendment_kwargs["body"]
+
         # The remapped work order spliced into the epic body carries the
         # amendment's real filed number (503), not the synthetic
         # placeholder (3), and child #502 still depends on it.

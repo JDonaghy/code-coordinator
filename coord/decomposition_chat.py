@@ -2120,7 +2120,20 @@ def file_and_queue_split_proposal(
             "",
             f"Blocks #{affected_real_number} until the sealed amendment "
             "above is proposed, approved by a human, and applied verbatim "
-            "— never edited by a worker or a model.",
+            "— never edited by a worker or a model. Sequence (see "
+            "docs/ORACLE_LOOP.md, 'Sealed amendment as data'):",
+            "",
+            "1. `coord acceptance propose-amendment --repo R --issue N "
+            "DIFF_FILE --touches PATH --rationale TEXT` — worker/planner, "
+            "in-session, writes the artifact.",
+            "2. `coord acceptance verify-amendment --repo R ARTIFACT_FILE` "
+            "— read-only, checks it in a scratch copy.",
+            "3. `coord acceptance approve-amendment --repo R ARTIFACT_FILE "
+            "--approved-by YOU` — a HUMAN only, never a model.",
+            "4. `coord acceptance apply-amendment --repo R "
+            "APPROVED_ARTIFACT_FILE` — a `test-author` leg, in its own "
+            "checkout, applies exactly the approved bytes as its own "
+            "commit and re-runs the sealed suite.",
         ]
         amendment_issue = github_ops.create_issue(
             repo.github,
