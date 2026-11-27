@@ -6414,8 +6414,14 @@ def _tranche_template_text() -> str:
     source checkout to read from (the same reasoning `pyproject.toml`'s
     `templates/*` package-data entry documents), so this must resolve
     against the installed package, not a repo-relative path.
+
+    Read as UTF-8 explicitly: the template's prose uses non-Latin-1
+    characters (em dashes, `→`), so relying on the platform default
+    encoding raises ``UnicodeDecodeError`` on Windows (#2682).
     """
-    return (Path(__file__).parent / "tranche_template.js").read_text()
+    return (Path(__file__).parent / "tranche_template.js").read_text(
+        encoding="utf-8"
+    )
 
 
 def _tranche_leg_system_prompt_suffix() -> str:

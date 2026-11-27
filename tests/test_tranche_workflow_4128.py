@@ -11,6 +11,10 @@ the embedded template text directly.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 from coord.agent import (
     TRANCHE_LEG_LABEL,
     ULTRACODE_LABEL,
@@ -54,6 +58,46 @@ class TestIsTrancheLeg:
 
     def test_tranche_label_constant(self) -> None:
         assert TRANCHE_LEG_LABEL == "coord:tranche"
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class TestTrancheTemplateEncoding:
+    """#2682: the template is read as UTF-8 regardless of the platform's
+    default text encoding."""
+
+    def test_template_contains_non_latin1_characters(self) -> None:
+        """Guard the premise of the UTF-8 read: if the template were pure
+        ASCII the encoding test below could never fail."""
+        text = _tranche_template_text()
+        assert any(ord(ch) > 127 for ch in text)
+
+    def test_reads_under_a_non_utf8_default_encoding(self) -> None:
+        """A C/ASCII locale stands in for Windows' cp1252 default: a bare
+        ``read_text()`` raises ``UnicodeDecodeError`` there, an explicit
+        ``encoding="utf-8"`` one does not."""
+        expected = len(_tranche_template_text())
+        probe = (
+            "from coord.agent import _tranche_template_text\n"
+            "print(len(_tranche_template_text()))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8=0", "-c", probe],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "LANG": "C",
+                "PYTHONUTF8": "0",
+                "PYTHONPATH": str(REPO_ROOT),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(expected)
 
 
 def _make_spec(*, workflow: bool, tranche: bool) -> AssignmentSpec:
