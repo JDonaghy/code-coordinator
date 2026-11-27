@@ -8510,66 +8510,130 @@ def _issue_resolution_for_entry(
     return effective_issue_resolution(worker_resolution, reviewer_resolution)
 
 
-def out_of_delta_full_review_pending(
+@dataclass(frozen=True)
+class OutOfDeltaReviewGate:
+    """Result of `_out_of_delta_review_gate` — see that function. `reason`
+    is only meaningful when `pending` is ``True``; it is what the merge
+    gate's `entry.error`/`MergeEvent` message surfaces to an operator, and
+    deliberately distinguishes "a round actually flagged something" from
+    "could not confirm nothing was flagged" (#4187 review) — the two have
+    different remediations (wait for the flag to clear vs. check why
+    GitHub is unreachable).
+    """
+
+    pending: bool
+    reason: str = ""
+
+
+def _out_of_delta_review_gate(
     entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None, config=None,
-) -> bool:
-    """True when a scoped re-review in *entry*'s chain raised a blocking
-    finding OUTSIDE the delta it was scoped to review, and no FULL
-    (non-scoped) approving review has run since (#4187).
+) -> OutOfDeltaReviewGate:
+    """True (`pending`) when *entry*'s chain needs one FULL (non-scoped)
+    approving review before merge, because a scoped round in it either (a)
+    raised a blocking finding OUTSIDE the delta it was scoped to review, or
+    (b) `approve`d while leaving a prior blocking finding it was asked to
+    classify `unresolved` (#4187).
 
     `build_scoped_review_briefing`'s fix-round path asks a scoped
-    re-reviewer to list any such finding under its own
-    `## New blocking findings (out of delta)` heading rather than
+    re-reviewer to list an out-of-delta finding under its own
+    `## New non-blocking findings (out of delta)` heading rather than
     `request-changes` for it — the round that raised it is recorded as
     non-blocking on ITS own verdict (that scoped round may still `approve`).
-    This gate is the other half of that deal: the PR as a whole may not
-    merge on the strength of scoped approvals alone once such a finding has
-    been raised, until one full review has actually looked at the whole
-    diff (and, implicitly, the out-of-delta concern) and approved it.
+    It also asks the re-reviewer to classify every prior id-tagged finding
+    `resolved`/`unresolved` in a `## Finding resolution` section
+    (`parse_scoped_rereview_classification`); an `approve` verdict that
+    still leaves an id `unresolved` is the same kind of self-contradiction
+    — the round's own structured response disagrees with its verdict. This
+    gate is the other half of both deals: the PR as a whole may not merge
+    on the strength of such a scoped approval alone until one full review
+    has actually looked at the whole diff and approved it.
 
     Walks the FULL review chain (`_review_chain_for_entry`), not just the
     round that happens to be the current approval — a later scoped round
-    could otherwise bury an earlier one's out-of-delta flag. Fetches every
-    round's findings body in a single batched call
+    could otherwise bury an earlier one's flag. Fetches every round's
+    findings body in a single batched call
     (`coord.review.fetch_review_findings_from_github_many`), mirroring
-    `_issue_resolution_for_entry`'s own fold; any round whose findings can't
-    be recovered (comment missing, fetch failed) simply doesn't contribute
-    — best-effort, same posture as that fold.
+    `_issue_resolution_for_entry`'s own fold. A round's *prior_ids* (what
+    `resolved:`/`unresolved:` must classify) is the set of blocking-finding
+    ids on the chain's PREVIOUS review round — ``_review_chain_for_entry``
+    already documents that only dispatch order, not an explicit parent
+    link, tells "this round" apart from "the one before it".
 
-    Returns ``False`` (no gate) when *board* is ``None``, when the chain has
-    no scoped rounds at all, or when every scoped round that raised an
-    out-of-delta finding is already followed by a qualifying full approval.
+    Unlike `_issue_resolution_for_entry`'s identical-shaped fetch, a failed
+    fetch here does NOT fall back to "nothing found" — #4187 review: that
+    would fail OPEN (merge proceeds) on exactly the condition — a `gh`
+    outage/rate-limit — that is this module's normal way of losing read
+    access, right next to a sibling review gate that fails closed on the
+    identical "can't confirm" case (see `process()`'s "#821: fail closed"
+    comment). A fetch failure is only reported, distinctly, when there is
+    at least one scoped round to be worried about in the first place; a
+    chain with none never needed the fetch, so a transient GitHub outage
+    elsewhere can't hold it hostage.
+
+    Returns ``pending=False`` when *board* is ``None``, when the chain has
+    no scoped rounds at all, or when every flagged round is already
+    followed by a qualifying full approval.
     """
     if board is None:
-        return False
+        return OutOfDeltaReviewGate(pending=False)
     chain = _review_chain_for_entry(entry, board)
     scoped_rounds = [a for a in chain if getattr(a, "review_scoped", False)]
     if not scoped_rounds:
-        return False
+        return OutOfDeltaReviewGate(pending=False)
     from coord.review import (  # noqa: PLC0415
         fetch_review_findings_from_github_many,
+        parse_blocking_findings,
         parse_scoped_rereview_classification,
     )
 
+    fetch_failed = False
     try:
         findings_by_id = fetch_review_findings_from_github_many(
             entry.repo_github, entry.issue_number, (a.assignment_id for a in chain),
         )
-    except Exception:  # noqa: BLE001 — best-effort; never blocks on a fetch failure
+    except Exception:  # noqa: BLE001 — distinguished below, not swallowed
         findings_by_id = {}
+        fetch_failed = True
 
     flagged_at: float | None = None
-    for a in scoped_rounds:
+    for idx, a in enumerate(chain):
+        if not getattr(a, "review_scoped", False):
+            continue
         findings = findings_by_id.get(a.assignment_id)
         if findings is None:
             continue
-        classification = parse_scoped_rereview_classification(findings.body)
-        if classification.new_blocking_out_of_delta:
+        prior_ids: frozenset[str] = frozenset()
+        if idx > 0:
+            prior_findings = findings_by_id.get(chain[idx - 1].assignment_id)
+            if prior_findings is not None:
+                prior_ids = frozenset(
+                    f.id for f in parse_blocking_findings(prior_findings.body)
+                )
+        classification = parse_scoped_rereview_classification(
+            findings.body, prior_ids=prior_ids,
+        )
+        flagged = bool(classification.new_blocking_out_of_delta) or (
+            bool(classification.unresolved_ids)
+            and getattr(a, "review_verdict", None) == "approve"
+        )
+        if flagged:
             dispatched_at = getattr(a, "dispatched_at", None) or 0.0
             flagged_at = dispatched_at if flagged_at is None else max(flagged_at, dispatched_at)
 
     if flagged_at is None:
-        return False  # no round ever raised an out-of-delta finding
+        if fetch_failed:
+            # #4187 review: fail CLOSED — a scoped round exists in this
+            # chain and its out-of-delta/unresolved-finding state could not
+            # be confirmed, not confirmed clean.
+            return OutOfDeltaReviewGate(
+                pending=True,
+                reason=(
+                    "cannot confirm out-of-delta review state (GitHub "
+                    "unreadable) — a scoped re-review exists in this "
+                    "chain and its findings could not be fetched"
+                ),
+            )
+        return OutOfDeltaReviewGate(pending=False)  # confirmed clean
 
     for a in chain:
         if getattr(a, "review_scoped", False):
@@ -8578,8 +8642,27 @@ def out_of_delta_full_review_pending(
             continue
         dispatched_at = getattr(a, "dispatched_at", None) or 0.0
         if dispatched_at >= flagged_at:
-            return False  # a qualifying full review has already run
-    return True
+            return OutOfDeltaReviewGate(pending=False)  # a qualifying full review already ran
+    return OutOfDeltaReviewGate(
+        pending=True,
+        reason=(
+            "a scoped re-review flagged a blocking finding outside its "
+            "delta, or approved without resolving a prior blocking "
+            "finding — one full review is required before merge"
+        ),
+    )
+
+
+def out_of_delta_full_review_pending(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None, config=None,
+) -> bool:
+    """Bool convenience wrapper over `_out_of_delta_review_gate` — see that
+    function for the full gate (and its fail-closed/fail-open distinction).
+    Prefer `_out_of_delta_review_gate` directly when the caller wants to
+    surface *why* the gate fired, e.g. in a `MergeEvent`/`entry.error`
+    message.
+    """
+    return _out_of_delta_review_gate(entry, board, gh_ops, config=config).pending
 
 
 def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None:
@@ -9941,20 +10024,21 @@ def process(
                         continue
                     # #4187: an approved scoped chain alone is not enough
                     # once some round in it flagged a blocking finding
-                    # OUTSIDE its own delta — merging waits for one full
-                    # (non-scoped) review regardless of what the scoped
-                    # chain approved.
-                    if board is not None and out_of_delta_full_review_pending(
-                        entry, board, gh_ops, config=config,
-                    ):
-                        events.append(MergeEvent(
-                            entry, "full_review_required",
-                            "(dry run) would be blocked: a scoped re-review "
-                            f"flagged a blocking finding outside its delta for "
-                            f"{entry.branch} — one full review is required "
-                            "before merge",
-                        ))
-                        continue
+                    # OUTSIDE its own delta (or approved without resolving
+                    # one it was asked to classify) — merging waits for one
+                    # full (non-scoped) review regardless of what the
+                    # scoped chain approved.
+                    if board is not None:
+                        _ood_gate = _out_of_delta_review_gate(
+                            entry, board, gh_ops, config=config,
+                        )
+                        if _ood_gate.pending:
+                            events.append(MergeEvent(
+                                entry, "full_review_required",
+                                f"(dry run) would be blocked: {_ood_gate.reason} "
+                                f"for {entry.branch}",
+                            ))
+                            continue
                 # #465/#821: smoke gate in dry-run — same fail-closed logic.
                 # #1640: when a verdict exists but failed the #1479 freshness
                 # binding, say so (and against which SHA) rather than
@@ -10440,20 +10524,20 @@ def process(
                     continue  # #292: skip this entry; try the next in the group
                 # #4187: an approved scoped chain alone is not enough once
                 # some round in it flagged a blocking finding OUTSIDE its
-                # own delta — see `out_of_delta_full_review_pending`'s
-                # docstring. Merging waits for one full (non-scoped) review
-                # regardless of what the scoped chain itself approved.
-                if board is not None and out_of_delta_full_review_pending(
-                    entry, board, gh_ops, config=config,
-                ):
-                    msg = (
-                        "a scoped re-review flagged a blocking finding "
-                        "outside its delta — one full review is required "
-                        "before merge"
+                # own delta, or approved without resolving one it was asked
+                # to classify — see `_out_of_delta_review_gate`'s docstring.
+                # Merging waits for one full (non-scoped) review regardless
+                # of what the scoped chain itself approved.
+                if board is not None:
+                    _ood_gate = _out_of_delta_review_gate(
+                        entry, board, gh_ops, config=config,
                     )
-                    entry.error = msg
-                    events.append(MergeEvent(entry, "full_review_required", msg))
-                    continue  # #292: skip this entry; try the next in the group
+                    if _ood_gate.pending:
+                        entry.error = _ood_gate.reason
+                        events.append(MergeEvent(
+                            entry, "full_review_required", _ood_gate.reason,
+                        ))
+                        continue  # #292: skip this entry; try the next in the group
             # Smoke gate (#465/#821): refuse to merge when the interactive smoke
             # is required by the pipeline policy but no passing/skipped verdict
             # is recorded on the work assignment.  Same skip-not-halt semantics
