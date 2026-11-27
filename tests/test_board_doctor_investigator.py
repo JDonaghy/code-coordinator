@@ -22,6 +22,7 @@ from coord.board_doctor_permissions import INVESTIGATOR_ACTIONS
 from coord.board_doctor_policy import (
     MODEL_DECISION_CAP_PER_REPO_DAILY,
     MODEL_DECISION_CAP_PER_ROW_24H,
+    MODEL_DECISION_CAPPED_EVENT_TYPE,
     MODEL_DECISION_EVENT_TYPE,
     MODEL_ELIGIBLE_ACTIONS,
     MODEL_INVESTIGATOR_ENV_VAR,
@@ -161,6 +162,148 @@ class TestModelInvestigatorCap:
         reason = _model_investigator_cap_reason("acme/widgets", 999)
         assert reason is not None
         assert "repo-wide" in reason
+
+    def test_a_capped_round_does_not_ratchet_its_own_cap(self, monkeypatch) -> None:
+        # Regression for the review finding: a row that legitimately spends
+        # its per-24h quota of REAL decisions must stay capped for 24h, not
+        # forever — the capped round itself must never count toward either
+        # cap. Drives `decide_with_model_investigator` through the real
+        # (unmocked) cap check, twice, rather than asserting on
+        # `_model_investigator_cap_reason` directly.
+        from coord.audit import query_audit_log
+
+        def fake_invoke(system, user, *, model, timeout=60.0):
+            return '{"action": "none", "confidence": 0.9, "reasoning": "clear"}'
+
+        row = _row(queue_diagnose.CAUSE_GATE_BLOCKED)
+        board, config = Board(active=[]), _config()
+        for _ in range(MODEL_DECISION_CAP_PER_ROW_24H):
+            decision = decide_with_model_investigator(
+                row, "acme/widgets", 40, board, config, invoke_model=fake_invoke,
+            )
+            assert decision.model_used  # a real model call happened
+
+        # The row is now capped.
+        assert _model_investigator_cap_reason("acme/widgets", 40) is not None
+
+        # A capped round (and a second one, simulating a later hourly
+        # sweep) must not itself get counted as a "real" decision.
+        for _ in range(2):
+            capped_decision = decide_with_model_investigator(
+                row, "acme/widgets", 40, board, config, invoke_model=fake_invoke,
+            )
+            assert capped_decision.acted is False
+            assert capped_decision.model_used == ""
+
+        real_decisions = query_audit_log(
+            event_type=MODEL_DECISION_EVENT_TYPE, repo="acme/widgets", issue=40,
+        )["entries"]
+        assert len(real_decisions) == MODEL_DECISION_CAP_PER_ROW_24H
+
+        capped_rows = query_audit_log(
+            event_type=MODEL_DECISION_CAPPED_EVENT_TYPE, repo="acme/widgets", issue=40,
+        )["entries"]
+        assert len(capped_rows) == 2
+
+        # The cap reason is still reported off the real-decision count only.
+        reason = _model_investigator_cap_reason("acme/widgets", 40)
+        assert reason is not None
+        assert str(MODEL_DECISION_CAP_PER_ROW_24H) in reason
+
+
+class TestLivePrSnapshot:
+    """Regression coverage: #4126's evidence bundle must read actual PR
+    lifecycle state (open/merged/closed), never the issue-only
+    open/closed vocabulary — and must say so distinctly when the live
+    read itself fails rather than silently rendering as "nothing wrong"."""
+
+    @staticmethod
+    def _queued_merge(**overrides):
+        from coord.merge_queue import QueuedMerge
+
+        fields = {
+            "assignment_id": "asn-1",
+            "repo_name": "acme/widgets",
+            "repo_github": "acme/widgets",
+            "branch": "issue-40-fix",
+            "target_branch": "main",
+            "issue_number": 40,
+            "issue_title": "x",
+            "pr_number": 7,
+        }
+        fields.update(overrides)
+        return QueuedMerge(**fields)
+
+    def test_reports_live_pr_state_not_issue_state(self, monkeypatch) -> None:
+        from coord import ci_store as ci_store_mod
+        from coord import github_ops
+        from coord import merge_queue
+
+        monkeypatch.setattr(merge_queue, "load_queue", lambda: [self._queued_merge()])
+        monkeypatch.setattr(
+            github_ops, "get_pr_state_for_branch", lambda repo, branch: "MERGED",
+        )
+        monkeypatch.setattr(
+            ci_store_mod, "build_ci_store", lambda *a, **k: ci_store_mod.NoOpCi(),
+        )
+
+        snapshot = board_doctor_policy._live_pr_snapshot("acme/widgets", 40, _config())
+        assert snapshot is not None
+        # #2096/review: `get_issue_state` can only ever answer "open" or
+        # "closed" for an issue — never "merged", the one state the
+        # `mark_done` verb this evidence feeds is defined around. The real
+        # `get_pr_state_for_branch` read must come through unmodified.
+        assert snapshot["pr_state"] == "MERGED"
+
+    def test_a_failed_live_read_is_unknown_not_none_or_open(self, monkeypatch) -> None:
+        from coord import ci_store as ci_store_mod
+        from coord import github_ops
+        from coord import merge_queue
+
+        monkeypatch.setattr(merge_queue, "load_queue", lambda: [self._queued_merge()])
+        monkeypatch.setattr(
+            github_ops, "get_pr_state_for_branch", lambda repo, branch: None,
+        )
+        monkeypatch.setattr(
+            ci_store_mod, "build_ci_store", lambda *a, **k: ci_store_mod.NoOpCi(),
+        )
+
+        snapshot = board_doctor_policy._live_pr_snapshot("acme/widgets", 40, _config())
+        assert snapshot is not None
+        assert snapshot["pr_state"] == "unknown"
+
+    def test_an_unavailable_ci_store_reports_unavailable_not_an_empty_all_clear(
+        self, monkeypatch,
+    ) -> None:
+        from coord import ci_store as ci_store_mod
+        from coord import github_ops
+        from coord import merge_queue
+
+        monkeypatch.setattr(merge_queue, "load_queue", lambda: [self._queued_merge()])
+        monkeypatch.setattr(
+            github_ops, "get_pr_state_for_branch", lambda repo, branch: "OPEN",
+        )
+        monkeypatch.setattr(
+            ci_store_mod, "build_ci_store", lambda *a, **k: ci_store_mod.NoOpCi(),
+        )
+
+        snapshot = board_doctor_policy._live_pr_snapshot("acme/widgets", 40, _config())
+        assert snapshot is not None
+        # NoOpCi.is_available is False — a blind read, never "all clear".
+        assert snapshot["failing_check_names"] == "unavailable"
+        assert snapshot["pending_check_names"] == "unavailable"
+
+    def test_rendered_evidence_uses_the_pr_state_field_not_issue_state(self) -> None:
+        row = _row(queue_diagnose.CAUSE_GATE_BLOCKED)
+        evidence = board_doctor_policy._render_model_evidence(
+            row, "acme/widgets", 40, stuck_hours=1.0,
+            pr_snapshot={
+                "pr_number": 7, "pr_state": "MERGED",
+                "failing_check_names": [], "pending_check_names": [],
+            },
+        )
+        assert "live_pr_state: MERGED" in evidence
+        assert "issue_state" not in evidence
 
 
 class TestDispatchModelEligibleAction:
