@@ -8098,7 +8098,7 @@ class TestMergedPartialDependentHolds:
 
         assert notes == [f"{dependent.key}: released: merged-partial remainder resolved"]
         assert released == [dependent.key]
-        assert recorded == [(dependent.key, "released", ())]
+        assert recorded == [(dependent.key, "released", (prereq.key,))]
 
     def test_a_blocked_entry_for_an_unrelated_reason_is_never_released(self) -> None:
         """A `blocked` row this module never held (no marker in
@@ -8168,6 +8168,58 @@ class TestMergedPartialDependentHolds:
 
         assert is_permanent_block_reason(reason)
 
+    def test_an_issue_open_resolver_that_raises_holds_rather_than_releases(
+        self,
+    ) -> None:
+        """An unreadable `gh` response must never release a hold: release
+        is the PERMISSIVE direction here (it resumes dispatch into the gap
+        this hold exists to prevent), so a resolver exception reads as
+        "still unresolved", the opposite of `_issue_open`'s own
+        fail-closed-on-uncertainty default used elsewhere in this module."""
+        prereq = QueueEntry(
+            repo="quadraui", issue=2984, state=STATE_MERGED_PARTIAL,
+        )
+        held_reason = queue_diagnose.partial_remainder_hold_reason((prereq.key,))
+        dependent = QueueEntry(
+            repo="quadraui", issue=2986, state=STATE_BLOCKED,
+            last_reason=held_reason, after=(prereq.key,),
+        )
+        released: list[str] = []
+
+        def _boom(repo: str, issue: int) -> bool:
+            raise RuntimeError("gh: rate limited")
+
+        notes = merged_partial_dependent_holds(
+            [prereq, dependent],
+            issue_open=_boom,
+            release=lambda e: released.append(e.key),
+        )
+
+        assert notes == []
+        assert released == []
+
+    def test_the_default_resolver_holds_on_an_unreadable_gh_response(
+        self,
+    ) -> None:
+        """`_dep_issue_still_unresolved` — the production default — must
+        read `get_issue_state`'s `None` ("couldn't tell") as unresolved,
+        not as a positive `"closed"` signal; only a confirmed `"closed"`
+        reading may release."""
+        from coord.board_doctor import _dep_issue_still_unresolved
+
+        with patch(
+            "coord.github_ops.get_issue_state", lambda repo, issue: None,
+        ):
+            assert _dep_issue_still_unresolved("quadraui", 2984) is True
+        with patch(
+            "coord.github_ops.get_issue_state", lambda repo, issue: "open",
+        ):
+            assert _dep_issue_still_unresolved("quadraui", 2984) is True
+        with patch(
+            "coord.github_ops.get_issue_state", lambda repo, issue: "closed",
+        ):
+            assert _dep_issue_still_unresolved("quadraui", 2984) is False
+
 
 class TestSweepMergedPartialDependentHoldsIntegration:
     """#4177: the production wiring, end-to-end through the real audit log
@@ -8183,7 +8235,7 @@ class TestSweepMergedPartialDependentHoldsIntegration:
         )
         enqueue_drive_queue("quadraui", 2986, after=["quadraui#2984"])
 
-        with patch("coord.board_doctor._issue_open", lambda repo, issue: True):
+        with patch("coord.board_doctor._dep_issue_still_unresolved", lambda repo, issue: True):
             notes = sweep_merged_partial_dependent_holds()
 
         assert notes == ["quadraui#2986: held: waiting on quadraui#2984"]
@@ -8205,7 +8257,7 @@ class TestSweepMergedPartialDependentHoldsIntegration:
         )
         enqueue_drive_queue("quadraui", 2990, after=["quadraui#2984"])
 
-        with patch("coord.board_doctor._issue_open", lambda repo, issue: True):
+        with patch("coord.board_doctor._dep_issue_still_unresolved", lambda repo, issue: True):
             sweep_merged_partial_dependent_holds()
 
         events = query_audit_log(
@@ -8231,7 +8283,7 @@ class TestSweepMergedPartialDependentHoldsIntegration:
             "quadraui", 2991, state=STATE_BLOCKED, last_reason=held_reason,
         )
 
-        with patch("coord.board_doctor._issue_open", lambda repo, issue: False):
+        with patch("coord.board_doctor._dep_issue_still_unresolved", lambda repo, issue: False):
             notes = sweep_merged_partial_dependent_holds()
 
         assert notes == [
@@ -8250,12 +8302,49 @@ class TestSweepMergedPartialDependentHoldsIntegration:
         )
         enqueue_drive_queue("quadraui", 2992, after=["quadraui#2984"])
 
-        with patch("coord.board_doctor._issue_open", lambda repo, issue: True):
+        with patch("coord.board_doctor._dep_issue_still_unresolved", lambda repo, issue: True):
             notes = sweep_merged_partial_dependent_holds(dry_run=True)
 
         assert notes == ["quadraui#2992: held: waiting on quadraui#2984"]
         [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2992]
         assert entry.state == STATE_WAITING
+
+    def test_a_dropped_audit_record_is_logged_not_silent(self, caplog) -> None:
+        """The hold/release row write still lands even when `record_audit`
+        itself raises — but the dropped record must be OBSERVABLE: #4177
+        requires an audit trail for every hold, so losing one with no
+        trace anywhere is itself a defect worth a human's attention."""
+        import logging
+
+        from coord.drive_queue import entries_from_rows
+        from coord.state import enqueue_drive_queue, list_drive_queue
+
+        enqueue_drive_queue("quadraui", 2984)
+        state.update_drive_queue_entry(
+            "quadraui", 2984, state=STATE_MERGED_PARTIAL,
+        )
+        enqueue_drive_queue("quadraui", 2993, after=["quadraui#2984"])
+
+        with (
+            patch(
+                "coord.board_doctor._dep_issue_still_unresolved",
+                lambda repo, issue: True,
+            ),
+            patch(
+                "coord.audit.record_audit",
+                side_effect=RuntimeError("db locked"),
+            ),
+            caplog.at_level(logging.WARNING, logger="coord.board_doctor"),
+        ):
+            notes = sweep_merged_partial_dependent_holds()
+
+        assert notes == ["quadraui#2993: held: waiting on quadraui#2984"]
+        [entry] = [e for e in entries_from_rows(list_drive_queue()) if e.issue == 2993]
+        assert entry.state == STATE_BLOCKED
+        assert any(
+            "merged-partial dependent hold audit record failed" in r.message
+            for r in caplog.records
+        )
 
 
 class TestRunSweepHoldsMergedPartialDependents:

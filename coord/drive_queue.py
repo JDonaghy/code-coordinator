@@ -210,11 +210,16 @@ STATE_MERGED_PARTIAL = "merged-partial"
 # "is this row's own work finished" (as opposed to "does `coord drive-queue
 # list` need to call out this row specially") must treat `done` and
 # `merged-partial` identically — the CODE landed either way, which is what
-# unblocks a dependent chained `--after` this entry or stops charging this
-# row an attempt; only the issue's own resolution differs, and that is a
-# property of the dependent's OWN eventual work, not of whether the dep's
-# branch merged. Kept as one frozenset (not a per-call-site `in (...)`) so
-# a future terminal-but-not-fully-done state only needs to be added here.
+# stops charging this row an attempt. Kept as one frozenset (not a
+# per-call-site `in (...)`) so a future terminal-but-not-fully-done state
+# only needs to be added here.
+#
+# `_resolve_prereqs` (#4177) is the one exception to "unblocks a dependent
+# chained `--after` this entry": a `merged-partial` dep's issue still being
+# OPEN means the remainder #3945's follow-through would file has not landed
+# yet, so the dependent's actual prerequisite — whatever the partial merge
+# skipped — does not exist, whatever this frozenset says about the dep's
+# own row. See `_resolve_prereqs`'s own handling of `facts.merged_partial`.
 STATE_DONE_LIKE: frozenset[str] = frozenset({STATE_DONE, STATE_MERGED_PARTIAL})
 # #1891: a drive that died while ITS OWN issue's merge was refused for
 # nothing stronger than "CI checks have not reported yet" (see
@@ -4624,6 +4629,27 @@ def _resolve_prereqs(
         if hold is not None:
             return _Verdict(False, False, _gate_defer_reason(dep, hold))
         facts = board.facts(dep)
+        # #4177: a `merged`, still-OPEN, `ISSUE_RESOLUTION: partial` dep is
+        # the one shape neither `landed` nor `STATE_DONE_LIKE` below may
+        # treat as satisfying this edge — #3945's follow-through is what
+        # eventually files the remainder and closes the original issue, and
+        # until that happens the dependent's actual prerequisite (whatever
+        # the partial merge skipped) does not exist yet. This is the
+        # `facts`-cache half of that check; the `dep_state == STATE_
+        # MERGED_PARTIAL` branch below is the SAME check against the
+        # queue's own row, for the tick where that row is ahead of this
+        # cache. This is the live-tick half of the hold `coord.board_doctor.
+        # sweep_merged_partial_dependent_holds` repairs/releases on an
+        # hourly cadence — by the time that sweep looks, a dependent this
+        # check did not stop here would normally already be dispatched.
+        if facts.merged_partial and facts.open:
+            return _Verdict(
+                False,
+                False,
+                f"waiting on {dep} (merged, but ISSUE_RESOLUTION: partial "
+                "and its own issue is still open — remainder not yet "
+                "filed, #4177)",
+            )
         if facts.landed or (facts.already_done and not facts.reopened):
             # #3931: `already_done` — *dep* parked `refused_premise` on the
             # specific "already implemented" finding (`IssueFacts.
@@ -4646,6 +4672,23 @@ def _resolve_prereqs(
             # `landed` already guards against.
             continue
         dep_state = states.get(dep)
+        if dep_state == STATE_MERGED_PARTIAL and facts.open:
+            # #4177: the queue's OWN row already reconciled *dep* to
+            # `merged-partial` — more trustworthy than `facts.merged_partial`
+            # above whenever the `issues` cache's merge witness has not
+            # caught up yet (the exact lag #2715 below documents for plain
+            # `STATE_DONE`) — but `facts.open` is a SEPARATE cache column,
+            # populated independently of the merge witness, so it still
+            # tells the truth about whether the remainder has closed this
+            # issue even while that lag is in effect. Same deferral as the
+            # `facts.merged_partial` check above, just reached by the OTHER
+            # signal.
+            return _Verdict(
+                False,
+                False,
+                f"waiting on {dep} (merged-partial, remainder not yet "
+                "filed, #4177)",
+            )
         if dep_state in STATE_DONE_LIKE:
             # #2715: the queue's OWN row for *dep* already knows it
             # landed — every `STATE_DONE` write in this module
@@ -4670,7 +4713,10 @@ def _resolve_prereqs(
             # positive signal as `facts.landed`/`already_done` above, so a
             # pre-req the queue itself confirmed `done` this tick must not
             # be shadowed by a live truth read whose OWN probe happens to
-            # fail against that same pre-req.
+            # fail against that same pre-req. (The `STATE_MERGED_PARTIAL`
+            # check just above already returned for the still-open case, so
+            # a `STATE_MERGED_PARTIAL` dep that reaches here is one whose
+            # issue is already closed.)
             continue
         dep_truth = (prereq_truth or {}).get(dep)
         if dep_truth is not None:

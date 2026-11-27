@@ -884,10 +884,14 @@ def branch_merged_guard_rows(entries: Sequence[Any]) -> list[StuckRow]:
 # row and closes the original. Until that lands, the issue's own `after=`
 # edge is a lie: the dependent's declared prerequisite merged, but the work
 # the dependent actually needs (the symbol/field the partial merge skipped)
-# still does not exist. `_resolve_prereqs` cannot see that distinction — a
-# merged PR reads `facts.landed` regardless of `ISSUE_RESOLUTION:` — so
-# without this, a dependent dispatches straight into the exact gap
-# quadraui#2985 cost $31.66 in fix rounds plus #2991/#2992 to close.
+# still does not exist. `coord.drive_queue._resolve_prereqs` is the actual
+# dispatch gate and already refuses to treat a still-open `merged-partial`
+# dep as satisfying the edge — this module's own pass below is the repair/
+# release layer on top of that: it makes an already-waiting hold visible
+# as a `blocked` row with a reason an operator can read, and records the
+# audit trail `_resolve_prereqs`'s own cheap, no-I/O check has no room to
+# write. quadraui#2985 cost $31.66 in fix rounds plus #2991/#2992 to close
+# for exactly this gap.
 #
 # See :mod:`coord.queue_diagnose`'s own "merged-partial dependent holds"
 # section for the marker vocabulary this writes/recognises, and
@@ -918,15 +922,22 @@ def merged_partial_dependent_holds(
     once none of its named prerequisites are unresolved any more (#4177).
 
     An ``after=`` dep is unresolved when its own queue row still reads
-    :data:`~coord.drive_queue.STATE_MERGED_PARTIAL` AND its issue is still
-    open (*issue_open*, defaulting to :func:`_issue_open` — the same
-    fail-closed-on-uncertainty default :func:`predicted_after_target_drop_
-    reason` uses). A dep absent from *entries* entirely (dequeued by an
-    operator, or by some other sweep) is treated as resolved rather than
-    held forever on a row that no longer exists — the same posture
-    :func:`drop_stale_predicted_after_edges` takes for a dequeued target.
-    Once the dep's issue closes — by the follow-through filing the
-    remainder, or by a human resolving it some other way — the hold
+    :data:`~coord.drive_queue.STATE_MERGED_PARTIAL` AND its issue is NOT
+    positively confirmed closed (*issue_open*, defaulting to
+    :func:`_dep_issue_still_unresolved`). Release is the PERMISSIVE
+    direction here — it resumes dispatch into the exact gap this hold
+    exists to prevent — so unlike most of this module's own
+    fail-closed-on-uncertainty defaults (e.g. :func:`predicted_after_
+    target_drop_reason`'s, which keeps a conservative edge on an uncertain
+    read), an unreadable ``gh`` response must read as "still unresolved",
+    not "resolved": only a positive ``"closed"`` reading releases. A dep
+    absent from *entries* entirely (dequeued by an operator, or by some
+    other sweep) is treated as resolved rather than held forever on a row
+    that no longer exists — the same posture :func:`drop_stale_predicted_
+    after_edges` takes for a dequeued target; that is the one place this
+    stays permissive, since there the row itself is gone, not merely
+    unreadable. Once the dep's issue closes — by the follow-through filing
+    the remainder, or by a human resolving it some other way — the hold
     releases regardless of which path closed it; this never re-derives
     *why* it closed, only *whether* it did.
 
@@ -964,7 +975,7 @@ def merged_partial_dependent_holds(
     from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
 
     entries_by_key = {e.key: e for e in entries}
-    opener = issue_open or _issue_open
+    opener = issue_open or _dep_issue_still_unresolved
     notes: list[str] = []
 
     def _dep_unresolved(dep_key: str) -> bool:
@@ -977,8 +988,13 @@ def merged_partial_dependent_holds(
         dep_repo, dep_issue = parsed
         try:
             return opener(_github_slug(dep_repo, config), dep_issue)
-        except Exception:  # noqa: BLE001 — uncertain reads as resolved, never held forever
-            return False
+        except Exception:  # noqa: BLE001 — uncertain reads as unresolved: release
+            # is the permissive direction here (it resumes dispatch into the
+            # gap this hold exists to prevent), so only a POSITIVE "closed"
+            # reading may release — an exception from *opener* itself must
+            # hold, the same as `_dep_issue_still_unresolved`'s own default
+            # handling of an unreadable `gh` response.
+            return True
 
     for entry in entries:
         if not entry.after:
@@ -999,7 +1015,11 @@ def merged_partial_dependent_holds(
             if release is not None:
                 release(entry)
             if record is not None:
-                record(entry, "released", ())
+                # (#4177 review) symmetric with the "held" record above:
+                # name the prerequisite(s) this release concerns, recovered
+                # from `entry.after` since nothing tracks which of them was
+                # actually named in the original hold reason.
+                record(entry, "released", entry.after)
             notes.append(f"{entry.key}: released: merged-partial remainder resolved")
     return notes
 
@@ -1058,7 +1078,17 @@ def sweep_merged_partial_dependent_holds(
                 details={"action": action, "after": list(dep_keys)},
             )
         except Exception:  # noqa: BLE001 — recording must never fail the sweep
-            pass
+            # (the row write above already landed) — but a dropped audit
+            # record must be OBSERVABLE, not silent: the issue this sweep
+            # exists for (#4177) explicitly requires "log an audit event
+            # explaining the hold", so losing one with no trace anywhere is
+            # itself a defect worth a human's attention, same posture as
+            # every other advisory failure path in `run_sweep` below.
+            _log.warning(
+                "board-doctor: merged-partial dependent hold audit record "
+                f"failed for {entry.key} ({action})",
+                exc_info=True,
+            )
 
     return merged_partial_dependent_holds(
         entries,
@@ -1579,6 +1609,26 @@ def _issue_open(repo_name: str, issue_number: int) -> bool:
     from coord import github_ops  # noqa: PLC0415
 
     return github_ops.get_issue_state(repo_name, issue_number) == "open"
+
+
+def _dep_issue_still_unresolved(repo_name: str, issue_number: int) -> bool:
+    """Default *issue_open* resolver for
+    :func:`merged_partial_dependent_holds` (#4177) — fail UNRESOLVED
+    (held), the opposite default from :func:`_issue_open` above.
+
+    Unlike :func:`_issue_open`'s callers, where "couldn't tell" safely
+    collapses to "not open" (the conservative, fail-closed direction for a
+    follow-through that must not act on an unconfirmed read), RELEASING a
+    held dependent is the permissive direction here — it resumes dispatch
+    into the exact gap this hold exists to prevent. So this only releases
+    (returns ``False``) on a POSITIVE ``"closed"`` reading from
+    :func:`coord.github_ops.get_issue_state`; an unreadable ``gh`` response
+    (``None``, same as a still-``"open"`` one) reads as "still unresolved"
+    and keeps holding.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    return github_ops.get_issue_state(repo_name, issue_number) != "closed"
 
 
 def _milestone_exists(repo_name: str, title: str) -> bool:
