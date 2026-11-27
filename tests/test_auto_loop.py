@@ -28,7 +28,13 @@ from coord.auto_loop import (
 from coord.config import Config, ModelsConfig, PipelineConfig, ReviewsConfig
 from coord.models import Assignment, Board, Machine, Repo
 from coord.network import StatusResult
-from coord.review import ReviewFindings
+from coord.review import (
+    CEILING_MODEL_ENV_VAR,
+    CeilingModelDecision,
+    ReviewFindings,
+    decide_ceiling_action,
+    dispatch_pending_reviews,
+)
 
 
 def _reachable_status_fetcher(machine: Machine) -> StatusResult:
@@ -3838,6 +3844,467 @@ class TestRunForFixTransition:
 
         assert len(actions) == 1
         assert actions[0].kind == "review_dispatched"
+
+
+# ── #4190: bounded model decision at the max_review_iterations ceiling ─────
+
+
+def _ceiling_decision(
+    *, action: str = "escalate", confidence: float = 0.9,
+    reasoning: str = "stub reasoning", remainder: str = "", fell_back: bool = False,
+    repo_name: str = "api", issue_number: int = 1, assignment_id: str = "work-abc",
+) -> CeilingModelDecision:
+    return CeilingModelDecision(
+        repo_name=repo_name, issue_number=issue_number, assignment_id=assignment_id,
+        action=action, confidence=confidence, reasoning=reasoning,
+        remainder=remainder, model_used="sonnet-stub", fell_back=fell_back,
+    )
+
+
+class TestDecideCeilingAction:
+    """Pure-logic tests for `coord.review.decide_ceiling_action` (#4190) —
+    the bounded sonnet call every auto-loop ceiling-hit site now consults
+    once `coord.review.ceiling_model_decision_enabled()` is armed."""
+
+    def _config(self, repo: Repo, machine: Machine) -> Config:
+        return Config(
+            repos=[repo], machines=[machine],
+            pipeline=PipelineConfig(auto_loop=True, max_review_iterations=3),
+        )
+
+    def test_escalates_on_unparseable_model_response(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        config = self._config(repo, machine)
+        decision = decide_ceiling_action(
+            repo_name="api", issue_number=1, assignment_id="work-abc",
+            branch="issue-1-fix", completed_rounds=3, max_iter=3,
+            findings_body="still broken", config=config,
+            invoke_model=lambda *a, **k: "not json at all",
+        )
+        assert decision.action == "escalate"
+        assert decision.fell_back is True
+
+    def test_escalates_when_model_call_raises(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        config = self._config(repo, machine)
+
+        def _boom(*a, **k):
+            raise RuntimeError("subprocess timed out")
+
+        decision = decide_ceiling_action(
+            repo_name="api", issue_number=1, assignment_id="work-abc",
+            branch="issue-1-fix", completed_rounds=3, max_iter=3,
+            findings_body="still broken", config=config, invoke_model=_boom,
+        )
+        assert decision.action == "escalate"
+        assert decision.fell_back is True
+        assert "subprocess timed out" in decision.reasoning
+
+    def test_continue_granted_when_under_cap(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        config = self._config(repo, machine)
+        raw = (
+            '{"action": "continue", "confidence": 0.7, '
+            '"reasoning": "one more round should close it", "remainder": ""}'
+        )
+        with patch(
+            "coord.review._ceiling_continue_override_count", return_value=0,
+        ), patch("coord.audit.record_audit"):
+            decision = decide_ceiling_action(
+                repo_name="api", issue_number=1, assignment_id="work-abc",
+                branch="issue-1-fix", completed_rounds=3, max_iter=3,
+                findings_body="narrow nit", config=config,
+                invoke_model=lambda *a, **k: raw,
+            )
+        assert decision.action == "continue"
+        assert decision.fell_back is False
+
+    def test_continue_denied_once_override_cap_already_spent(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        """A second 'continue' for the same issue must fall back to
+        escalate — `CEILING_MODEL_MAX_CONTINUE_OVERRIDES` is 1."""
+        config = self._config(repo, machine)
+        raw = (
+            '{"action": "continue", "confidence": 0.7, '
+            '"reasoning": "just one more", "remainder": ""}'
+        )
+        with patch(
+            "coord.review._ceiling_continue_override_count", return_value=1,
+        ), patch("coord.audit.record_audit"):
+            decision = decide_ceiling_action(
+                repo_name="api", issue_number=1, assignment_id="work-abc",
+                branch="issue-1-fix", completed_rounds=5, max_iter=3,
+                findings_body="still not fixed", config=config,
+                invoke_model=lambda *a, **k: raw,
+            )
+        assert decision.action == "escalate"
+        assert decision.fell_back is True
+        assert "continue" in decision.reasoning
+
+    def test_rescope_without_remainder_falls_back_to_escalate(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        config = self._config(repo, machine)
+        raw = (
+            '{"action": "rescope", "confidence": 0.8, '
+            '"reasoning": "scope creep", "remainder": ""}'
+        )
+        with patch("coord.audit.record_audit"):
+            decision = decide_ceiling_action(
+                repo_name="api", issue_number=1, assignment_id="work-abc",
+                branch="issue-1-fix", completed_rounds=3, max_iter=3,
+                findings_body="out-of-scope ask", config=config,
+                invoke_model=lambda *a, **k: raw,
+            )
+        assert decision.action == "escalate"
+        assert decision.fell_back is True
+
+    def test_rescope_with_remainder_is_honored(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        config = self._config(repo, machine)
+        raw = (
+            '{"action": "rescope", "confidence": 0.85, '
+            '"reasoning": "delivered part is solid", '
+            '"remainder": "add the admin-only variant"}'
+        )
+        with patch("coord.audit.record_audit"):
+            decision = decide_ceiling_action(
+                repo_name="api", issue_number=1, assignment_id="work-abc",
+                branch="issue-1-fix", completed_rounds=3, max_iter=3,
+                findings_body="admin variant missing", config=config,
+                invoke_model=lambda *a, **k: raw,
+            )
+        assert decision.action == "rescope"
+        assert decision.fell_back is False
+        assert decision.remainder == "add the admin-only variant"
+
+    def test_every_consulted_decision_is_audited(
+        self, repo: Repo, machine: Machine,
+    ) -> None:
+        config = self._config(repo, machine)
+        raw = (
+            '{"action": "escalate", "confidence": 0.9, '
+            '"reasoning": "unclear", "remainder": ""}'
+        )
+        with patch("coord.audit.record_audit") as mock_audit:
+            decide_ceiling_action(
+                repo_name="api", issue_number=1, assignment_id="work-abc",
+                branch="issue-1-fix", completed_rounds=3, max_iter=3,
+                findings_body="confusing findings", config=config,
+                invoke_model=lambda *a, **k: raw,
+            )
+        mock_audit.assert_called_once()
+        assert mock_audit.call_args.kwargs["event_type"] == "ceiling_model_decision"
+
+
+class TestCeilingModelDecisionWiring:
+    """`coord.review.ceiling_model_decision_enabled()` gates the #4190
+    bounded-model path at all three ceiling-hit call sites — unset (the
+    default), every site must keep the ORIGINAL blind-stop behavior
+    byte-for-byte; set, each site must act on whatever
+    `decide_ceiling_action` returns."""
+
+    def test_default_off_never_consults_the_model(
+        self, config: Config, tmp_path, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv(CEILING_MODEL_ENV_VAR, raising=False)
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\nREVIEW_BODY:\nStill broken.\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=3)  # already at max
+        board = _board_with(work, review)
+
+        with (
+            patch("coord.auto_loop._post_max_iterations_notice") as mock_notice,
+            patch("coord.auto_loop.decide_ceiling_action") as mock_decide,
+        ):
+            actions = process_review_completion(
+                review, board, config, log_path=str(log_file)
+            )
+
+        assert actions[0].kind == "max_iterations"
+        mock_notice.assert_called_once()
+        mock_decide.assert_not_called()
+
+    def test_continue_action_lets_dispatch_fix_for_review_proceed(
+        self, config: Config, tmp_path, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(CEILING_MODEL_ENV_VAR, "1")
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\nREVIEW_BODY:\nAlmost there.\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=3)  # already at max
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-override"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with (
+            patch(
+                "coord.auto_loop.decide_ceiling_action",
+                return_value=_ceiling_decision(action="continue"),
+            ) as mock_decide,
+            patch("coord.auto_loop._post_ceiling_decision_notice") as mock_post,
+            patch("coord.auto_loop.record_dispatched_assignment"),
+        ):
+            actions = process_review_completion(
+                review, board, config, log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        mock_decide.assert_called_once()
+        mock_post.assert_not_called()
+        assert actions[0].kind == "fix_dispatched"
+
+    def test_rescope_action_posts_notice_instead_of_dispatching(
+        self, config: Config, tmp_path, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(CEILING_MODEL_ENV_VAR, "1")
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\nREVIEW_BODY:\nScope creep.\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=3)  # already at max
+        board = _board_with(work, review)
+
+        with (
+            patch(
+                "coord.auto_loop.decide_ceiling_action",
+                return_value=_ceiling_decision(
+                    action="rescope", remainder="ship the admin variant separately",
+                ),
+            ),
+            patch("coord.auto_loop._post_ceiling_decision_notice") as mock_post,
+        ):
+            actions = process_review_completion(
+                review, board, config, log_path=str(log_file),
+            )
+
+        assert actions[0].kind == "max_iterations_rescope"
+        mock_post.assert_called_once()
+        assert len(board.active) == 0  # no fix dispatched
+
+    def test_run_for_fix_transition_default_off_never_consults_the_model(
+        self, config: Config, coord_db, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv(CEILING_MODEL_ENV_VAR, raising=False)
+        from coord.state import save_board
+
+        fix = _fix_assignment(assignment_id="fix-3", review_iteration=3)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with (
+            patch("coord.auto_loop.dispatch_review") as mock_dispatch,
+            patch("coord.auto_loop._post_max_iterations_notice") as mock_notice,
+            patch("coord.auto_loop.decide_ceiling_action") as mock_decide,
+        ):
+            actions = run_for_fix_transition("fix-3", config)
+
+        assert actions[0].kind == "iteration_cap_hit"
+        mock_dispatch.assert_not_called()
+        mock_notice.assert_called_once()
+        mock_decide.assert_not_called()
+
+    def test_run_for_fix_transition_continue_action_dispatches_review(
+        self, config: Config, coord_db, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(CEILING_MODEL_ENV_VAR, "1")
+        from coord.state import save_board
+
+        fix = _fix_assignment(assignment_id="fix-3", review_iteration=3)
+        board = Board(completed=[fix])
+        save_board(board)
+        stub_review = _stub_review_assignment()
+
+        with (
+            patch(
+                "coord.auto_loop.decide_ceiling_action",
+                return_value=_ceiling_decision(action="continue"),
+            ),
+            patch("coord.auto_loop.dispatch_review", return_value=stub_review) as mock_dispatch,
+            patch("coord.auto_loop._post_ceiling_decision_notice") as mock_post,
+        ):
+            actions = run_for_fix_transition("fix-3", config)
+
+        mock_dispatch.assert_called_once()
+        mock_post.assert_not_called()
+        assert actions[0].kind == "review_dispatched"
+
+    def test_run_for_fix_transition_split_action_marks_cap_hit(
+        self, config: Config, coord_db, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(CEILING_MODEL_ENV_VAR, "1")
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment(assignment_id="fix-3", review_iteration=3)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with (
+            patch(
+                "coord.auto_loop.decide_ceiling_action",
+                return_value=_ceiling_decision(
+                    action="split", remainder="split auth from billing",
+                ),
+            ),
+            patch("coord.auto_loop.dispatch_review") as mock_dispatch,
+            patch("coord.auto_loop._post_ceiling_decision_notice") as mock_post,
+        ):
+            actions = run_for_fix_transition("fix-3", config)
+
+        mock_dispatch.assert_not_called()
+        mock_post.assert_called_once()
+        assert actions[0].kind == "iteration_cap_hit_split"
+        loaded = load_board()
+        assert loaded.find_by_id("fix-3").review_state == "cap_hit"
+
+    def test_dispatch_pending_reviews_cap_guard_default_off(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv(CEILING_MODEL_ENV_VAR, raising=False)
+        capped = _work_assignment(
+            assignment_id="fix-capped", review_iteration=2,
+        )
+        capped.review_state = None
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            pipeline=PipelineConfig(auto_loop=True, max_review_iterations=2),
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+        )
+        board = Board(completed=[capped])
+
+        with (
+            patch("coord.auto_loop._post_max_iterations_notice") as mock_notice,
+            patch("coord.review.decide_ceiling_action") as mock_decide,
+        ):
+            dispatch_pending_reviews(board, config)
+
+        mock_notice.assert_called_once()
+        mock_decide.assert_not_called()
+        assert capped.review_state == "cap_hit"
+
+    def test_dispatch_pending_reviews_cap_guard_continue_leaves_row_eligible(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(CEILING_MODEL_ENV_VAR, "1")
+        capped = _work_assignment(
+            assignment_id="fix-capped", review_iteration=2,
+        )
+        capped.review_state = None
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            pipeline=PipelineConfig(auto_loop=True, max_review_iterations=2),
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+        )
+        board = Board(completed=[capped])
+
+        with (
+            patch(
+                "coord.review.decide_ceiling_action",
+                return_value=_ceiling_decision(
+                    action="continue", assignment_id="fix-capped",
+                ),
+            ),
+            patch("coord.auto_loop._post_ceiling_decision_notice") as mock_post,
+            patch("coord.review.dispatch_review", return_value=None),
+        ):
+            dispatch_pending_reviews(board, config)
+
+        mock_post.assert_not_called()
+        # Left eligible (review_state untouched) rather than parked cap_hit.
+        assert capped.review_state is None
+
+
+class TestPostCeilingDecisionNotice:
+    """`coord.auto_loop._post_ceiling_decision_notice` — the action half of
+    a #4190 decision, once a call site has decided to stop rather than
+    dispatch again."""
+
+    def test_escalate_delegates_to_post_max_iterations_notice(
+        self, config: Config,
+    ) -> None:
+        from coord.auto_loop import _post_ceiling_decision_notice
+
+        work = _work_assignment()
+        decision = _ceiling_decision(action="escalate")
+        with patch("coord.auto_loop._post_max_iterations_notice") as mock_notice:
+            _post_ceiling_decision_notice(work, config, decision, completed_rounds=3)
+        mock_notice.assert_called_once_with(work, config, completed_rounds=3)
+
+    def test_rescope_files_followup_issue_and_comments(
+        self, config: Config,
+    ) -> None:
+        from coord.auto_loop import _post_ceiling_decision_notice
+
+        work = _work_assignment()
+        decision = _ceiling_decision(
+            action="rescope", remainder="ship the admin-only variant separately",
+        )
+        with (
+            patch(
+                "coord.github_ops.create_issue",
+                return_value={"number": 999, "url": "https://x/999"},
+            ) as mock_create,
+            patch("coord.github_ops.post_issue_comment") as mock_comment,
+        ):
+            _post_ceiling_decision_notice(work, config, decision, completed_rounds=3)
+
+        mock_create.assert_called_once()
+        mock_comment.assert_called_once()
+        posted_body = mock_comment.call_args[0][2]
+        assert "999" in posted_body
+        assert "ship the admin-only variant separately" in posted_body
+
+    def test_rescope_followup_filing_failure_still_posts_notice(
+        self, config: Config,
+    ) -> None:
+        from coord.auto_loop import _post_ceiling_decision_notice
+
+        work = _work_assignment()
+        decision = _ceiling_decision(action="rescope", remainder="leftover scope")
+        with (
+            patch(
+                "coord.github_ops.create_issue", side_effect=RuntimeError("gh down"),
+            ),
+            patch("coord.github_ops.post_issue_comment") as mock_comment,
+        ):
+            _post_ceiling_decision_notice(work, config, decision, completed_rounds=3)
+
+        mock_comment.assert_called_once()
+        posted_body = mock_comment.call_args[0][2]
+        assert "file it manually" in posted_body
+
+    def test_split_posts_notice_without_filing_an_issue(
+        self, config: Config,
+    ) -> None:
+        from coord.auto_loop import _post_ceiling_decision_notice
+
+        work = _work_assignment()
+        decision = _ceiling_decision(action="split", remainder="split auth from billing")
+        with (
+            patch("coord.github_ops.create_issue") as mock_create,
+            patch("coord.github_ops.post_issue_comment") as mock_comment,
+        ):
+            _post_ceiling_decision_notice(work, config, decision, completed_rounds=3)
+
+        mock_create.assert_not_called()
+        mock_comment.assert_called_once()
+        posted_body = mock_comment.call_args[0][2]
+        assert "split auth from billing" in posted_body
 
 
 # ── #586: branch-not-on-remote guard in _dispatch_fix ───────────────────────
