@@ -99,6 +99,71 @@ class TestInfraRule:
         assert verdict.bucket != BUCKET_INFRA
 
 
+# ── deterministic tier 1b: timeout-under-load (#4130) ───────────────────────
+
+
+class TestTimeoutUnderLoadRule:
+    def test_timed_out_with_load_reading_is_infra_with_no_model_call(self) -> None:
+        with patch("subprocess.run") as mock_run:
+            verdict = triage_failure(
+                evidence=_evidence(),
+                failure_reason=(
+                    "headless smoke: timed out, exit=-1 (host load at kill: "
+                    "1m=33.20, cores=8)"
+                ),
+            )
+        mock_run.assert_not_called()
+        assert verdict.bucket == BUCKET_INFRA
+        assert verdict.confidence == 1.0
+        assert verdict.via == "deterministic:infra:timeout"
+        assert "33.2" in verdict.diagnosis
+        assert verdict.proposed_scope == ProposedScope()
+
+    def test_timed_out_with_unknown_load_is_still_infra(self) -> None:
+        """A host whose own `os.getloadavg()` is unavailable (e.g. Windows)
+        still renders the marker (`format_timeout_load_note`'s "unknown"
+        branch) — the timeout shape alone is the signal, not the number."""
+        with patch("subprocess.run") as mock_run:
+            verdict = triage_failure(
+                evidence=_evidence(),
+                failure_reason="headless smoke: timed out, exit=-1 (host load at kill: unknown)",
+            )
+        mock_run.assert_not_called()
+        assert verdict.bucket == BUCKET_INFRA
+        assert verdict.via == "deterministic:infra:timeout"
+
+    def test_timed_out_signal_also_recognised_via_terminal_reason(self) -> None:
+        with patch("subprocess.run") as mock_run:
+            verdict = triage_failure(
+                evidence=_evidence(),
+                terminal_reason=(
+                    "timed out, exit=-1 (host load at kill: 1m=9.1, cores=4)"
+                ),
+            )
+        mock_run.assert_not_called()
+        assert verdict.bucket == BUCKET_INFRA
+
+    def test_compile_error_with_no_timeout_text_is_not_timeout_infra(self) -> None:
+        """A genuine compile error must still classify mechanical/model —
+        the timeout rule must not fire on unrelated failure text."""
+        log = (
+            "error[E0308]: mismatched types\n"
+            "  --> src/foo.rs:10:1\n"
+            "   |\n"
+            "10 |     let x: i32 = \"oops\";\n"
+            "   |                  ^^^^^^ expected `i32`, found `&str`\n"
+        )
+        evidence = extract_failure_evidence(log)
+        with patch("subprocess.run") as mock_run:
+            verdict = triage_failure(
+                evidence=evidence,
+                failure_reason="error[E0063]: missing field `foo`",
+                diff_stat=DiffStat(files=("src/foo.rs",)),
+            )
+        mock_run.assert_not_called()
+        assert verdict.bucket == BUCKET_MECHANICAL
+
+
 # ── deterministic tier 2: mechanical ────────────────────────────────────────
 
 

@@ -2341,7 +2341,16 @@ class GitMergeVerifier:
 
         Evidence is built from ``state.work_test_reason`` alone — the one
         failure text `coord drive` already has on hand for this issue,
-        without a second log fetch. ``diff_stat``/``declared_files``/
+        without a second log fetch — and that SAME text is also forwarded
+        as ``failure_reason`` (#4130), so :func:`~coord.failure_triage.
+        triage_failure`'s deterministic infra/timeout-under-load tiers (which
+        scan ``failure_reason``/``terminal_reason`` directly, never
+        pre-extracted evidence) can actually fire for the Test stage — a
+        killed-at-timeout leg's own short, coordinator-authored marker
+        (``coord.agent.format_timeout_load_note``) carries no rustc/pytest
+        shape for `extract_failure_evidence` to pattern-match, so without
+        this it would silently fall through to the model tier instead.
+        ``diff_stat``/``declared_files``/
         ``machine_capabilities`` are each a best-effort fetch —
         :meth:`_diff_stat_for_test_state`/:meth:`_declared_files_for_test_state`/
         :meth:`_machine_capabilities_for_state`. ``diff_stat``/
@@ -2382,6 +2391,11 @@ class GitMergeVerifier:
                 diff_stat=self._diff_stat_for_test_state(state),
                 declared_files=self._declared_files_for_test_state(state),
                 machine_capabilities=self._machine_capabilities_for_state(state),
+                # #4130: lets the deterministic infra/timeout-under-load
+                # tiers see the same short, coordinator-authored text
+                # `evidence` was built from — see this method's own
+                # docstring for why `evidence` alone can't carry it.
+                failure_reason=reason,
             )
         except Exception:  # noqa: BLE001 — classifier trouble must never block drive
             return None

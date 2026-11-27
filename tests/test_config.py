@@ -3137,6 +3137,85 @@ def test_native_execution_capabilities_rejects_non_string_entries(tmp_path: Path
         load(p)
 
 
+# ── smoke_tests.max_load_per_core / reserve_sole_capability_hosts (#4130) ──
+
+
+def test_max_load_per_core_defaults_to_none(tmp_path: Path) -> None:
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n      requires: [windows]\n",
+        )
+    )
+    assert cfg.smoke_tests.max_load_per_core is None
+
+
+def test_max_load_per_core_round_trips(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  max_load_per_core: 1.5\n"
+    )
+    cfg = load(p)
+    assert cfg.smoke_tests.max_load_per_core == 1.5
+
+
+def test_max_load_per_core_rejects_non_positive(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  max_load_per_core: 0\n"
+    )
+    with pytest.raises(ConfigError, match="max_load_per_core must be a positive number"):
+        load(p)
+
+
+def test_reserve_sole_capability_hosts_defaults_to_true(tmp_path: Path) -> None:
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n      requires: [windows]\n",
+        )
+    )
+    assert cfg.smoke_tests.reserve_sole_capability_hosts is True
+
+
+def test_reserve_sole_capability_hosts_round_trips_false(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  reserve_sole_capability_hosts: false\n"
+    )
+    cfg = load(p)
+    assert cfg.smoke_tests.reserve_sole_capability_hosts is False
+
+
+def test_reserve_sole_capability_hosts_rejects_non_bool(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  reserve_sole_capability_hosts: yes-please\n"
+    )
+    with pytest.raises(ConfigError, match="reserve_sole_capability_hosts must be a boolean"):
+        load(p)
+
+
 # ── smoke_tests.command_stages (#3696) ──────────────────────────────────────
 
 

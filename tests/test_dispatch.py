@@ -5367,6 +5367,268 @@ class TestRouteWorkByLiveness:
         assert result.machine_name == "macmini"
 
 
+# ── #4130: sole-capability Test-host reservation ────────────────────────────
+
+
+def _sole_cap_machines() -> list[Machine]:
+    return [
+        Machine(
+            name="macmini", host="macmini.tailnet", repos=["quadraui"],
+            repo_paths={"quadraui": "/home/user/src/quadraui"},
+            capabilities=["macos"],
+        ),
+        Machine(
+            name="dell64", host="dell64.tailnet", repos=["quadraui"],
+            repo_paths={"quadraui": "/home/user/src/quadraui"},
+            capabilities=["linux"],
+        ),
+    ]
+
+
+def _test_leg(machine_name: str, *, status: str = "running") -> Assignment:
+    return Assignment(
+        machine_name=machine_name, repo_name="quadraui", issue_number=2875,
+        issue_title="macOS test leg", type="smoke", status=status,
+    )
+
+
+class TestSoleTestCapabilities:
+    def test_capability_no_other_machine_declares_is_sole(self) -> None:
+        from coord.dispatch import sole_test_capabilities
+
+        machines = _sole_cap_machines()
+        assert sole_test_capabilities(machines[0], machines) == {"macos"}
+
+    def test_capability_shared_by_another_machine_is_not_sole(self) -> None:
+        from coord.dispatch import sole_test_capabilities
+
+        machines = _sole_cap_machines() + [
+            Machine(
+                name="macmini2", host="macmini2.tailnet", repos=["quadraui"],
+                capabilities=["macos"],
+            ),
+        ]
+        assert sole_test_capabilities(machines[0], machines) == frozenset()
+
+    def test_no_capabilities_at_all_is_empty(self) -> None:
+        from coord.dispatch import sole_test_capabilities
+
+        machines = [
+            Machine(name="plain", host="plain.tailnet", repos=["quadraui"]),
+        ]
+        assert sole_test_capabilities(machines[0], machines) == frozenset()
+
+
+class TestMachineReservedForTest:
+    def test_sole_capability_host_with_running_test_leg_is_reserved(self) -> None:
+        from coord.dispatch import machine_reserved_for_test
+
+        machines = _sole_cap_machines()
+        board = Board(active=[_test_leg("macmini")])
+        assert machine_reserved_for_test(machines[0], machines, board) is True
+
+    def test_sole_capability_host_with_pending_test_leg_is_reserved(self) -> None:
+        from coord.dispatch import machine_reserved_for_test
+
+        machines = _sole_cap_machines()
+        board = Board(active=[_test_leg("macmini", status="pending")])
+        assert machine_reserved_for_test(machines[0], machines, board) is True
+
+    def test_sole_capability_host_with_no_test_leg_is_not_reserved(self) -> None:
+        from coord.dispatch import machine_reserved_for_test
+
+        machines = _sole_cap_machines()
+        board = Board(active=[])
+        assert machine_reserved_for_test(machines[0], machines, board) is False
+
+    def test_non_sole_capability_host_is_never_reserved(self) -> None:
+        """`dell64` declares no capability at all here — a Test leg
+        running there (even `type="smoke"`, `pending`/`running`) reserves
+        nothing, since `sole_test_capabilities` is vacuously empty."""
+        from coord.dispatch import machine_reserved_for_test
+
+        machines = [
+            _sole_cap_machines()[0],
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        board = Board(active=[_test_leg("dell64")])
+        assert machine_reserved_for_test(machines[1], machines, board) is False
+
+    def test_a_done_test_leg_no_longer_reserves(self) -> None:
+        from coord.dispatch import machine_reserved_for_test
+
+        machines = _sole_cap_machines()
+        board = Board(active=[_test_leg("macmini", status="done")])
+        assert machine_reserved_for_test(machines[0], machines, board) is False
+
+    def test_a_work_leg_on_the_sole_capability_host_does_not_reserve_it(self) -> None:
+        """Only a `type="smoke"` leg reserves — a Work leg already running
+        there is not itself "the Test leg only this host can run"."""
+        from coord.dispatch import machine_reserved_for_test
+
+        machines = _sole_cap_machines()
+        work = Assignment(
+            machine_name="macmini", repo_name="quadraui", issue_number=1,
+            issue_title="some work", type="work", status="running",
+        )
+        board = Board(active=[work])
+        assert machine_reserved_for_test(machines[0], machines, board) is False
+
+
+class TestRouteWorkByTestReservation:
+    def test_no_board_returns_none(self) -> None:
+        from coord.dispatch import route_work_by_test_reservation
+
+        machines = _sole_cap_machines()
+        result = route_work_by_test_reservation(
+            proposed_machine_name="macmini", repo_name="quadraui",
+            machines=machines, board=None,
+        )
+        assert result is None
+
+    def test_unreserved_proposed_machine_returns_none(self) -> None:
+        from coord.dispatch import route_work_by_test_reservation
+
+        machines = _sole_cap_machines()
+        board = Board(active=[])
+        result = route_work_by_test_reservation(
+            proposed_machine_name="macmini", repo_name="quadraui",
+            machines=machines, board=board,
+        )
+        assert result is None
+
+    def test_reserved_proposed_machine_reroutes_to_an_unreserved_fallback(self) -> None:
+        from coord.dispatch import route_work_by_test_reservation
+
+        machines = _sole_cap_machines()
+        board = Board(active=[_test_leg("macmini")])
+        result = route_work_by_test_reservation(
+            proposed_machine_name="macmini", repo_name="quadraui",
+            machines=machines, board=board,
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.rerouted is True
+        assert any("reserved" in why for _, why in result.tried)
+
+    def test_every_candidate_reserved_signals_none_machine_name(self) -> None:
+        from coord.dispatch import route_work_by_test_reservation
+
+        machines = _sole_cap_machines() + [
+            Machine(
+                name="dell64b", host="dell64b.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["windows"],
+            ),
+        ]
+        board = Board(active=[
+            _test_leg("macmini"),
+            _test_leg("dell64"),
+            Assignment(
+                machine_name="dell64b", repo_name="quadraui", issue_number=99,
+                issue_title="windows test leg", type="smoke", status="running",
+            ),
+        ])
+        result = route_work_by_test_reservation(
+            proposed_machine_name="macmini", repo_name="quadraui",
+            machines=machines, board=board,
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+
+
+class TestDispatchTestReservationRouting:
+    """#4130 end-to-end: `dispatch()` itself reroutes a `type="work"`
+    dispatch away from a reserved sole-capability Test host when *board*
+    is wired in, and refuses outright when every candidate is reserved."""
+
+    def _cfg(self) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", depends_on=[])],
+            machines=_sole_cap_machines(),
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_reroutes_around_a_reserved_host(self, mock_post) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "assigned"}
+        mock_post.return_value = mock_resp
+
+        cfg = self._cfg()
+        board = Board(
+            repos=cfg.repos, machines=cfg.machines, active=[_test_leg("macmini")],
+        )
+        p = Proposal(
+            id=1, machine_name="macmini", repo_name="quadraui", issue_number=42,
+            issue_title="Fix a bug", rationale="", type="work",
+        )
+        dispatch(p, cfg, board=board)
+        assert p.machine_name == "dell64"
+        mock_post.assert_called_once()
+        assert "dell64.tailnet" in mock_post.call_args.args[0]
+
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_when_every_machine_is_reserved(self, mock_post) -> None:
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", depends_on=[])],
+            machines=[_sole_cap_machines()[0]],
+        )
+        board = Board(
+            repos=cfg.repos, machines=cfg.machines, active=[_test_leg("macmini")],
+        )
+        p = Proposal(
+            id=1, machine_name="macmini", repo_name="quadraui", issue_number=42,
+            issue_title="Fix a bug", rationale="", type="work",
+        )
+        with pytest.raises(ValueError, match="reserved for a sole-capability Test leg"):
+            dispatch(p, cfg, board=board)
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_opt_out_config_flag_disables_the_gate(self, mock_post) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "assigned"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", depends_on=[])],
+            machines=[_sole_cap_machines()[0]],
+            smoke_tests=SmokeTestsConfig(reserve_sole_capability_hosts=False),
+        )
+        board = Board(
+            repos=cfg.repos, machines=cfg.machines, active=[_test_leg("macmini")],
+        )
+        p = Proposal(
+            id=1, machine_name="macmini", repo_name="quadraui", issue_number=42,
+            issue_title="Fix a bug", rationale="", type="work",
+        )
+        dispatch(p, cfg, board=board)
+        assert p.machine_name == "macmini"
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_board_performs_no_check_at_all(self, mock_post) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "assigned"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", depends_on=[])],
+            machines=[_sole_cap_machines()[0]],
+        )
+        p = Proposal(
+            id=1, machine_name="macmini", repo_name="quadraui", issue_number=42,
+            issue_title="Fix a bug", rationale="", type="work",
+        )
+        dispatch(p, cfg)
+        assert p.machine_name == "macmini"
+        mock_post.assert_called_once()
+
+
 class TestDispatchLivenessRouting:
     """#3353 end-to-end: `dispatch()` itself reroutes a `type="work"`
     dispatch around an unreachable proposed machine when a caller opts in
