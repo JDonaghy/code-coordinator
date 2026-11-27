@@ -7,7 +7,12 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from coord.merge_queue import QueuedMerge, out_of_delta_full_review_pending
+from coord.merge_queue import (
+    PENDING,
+    QueuedMerge,
+    out_of_delta_full_review_pending,
+    process,
+)
 from coord.models import Assignment, Board
 from coord.review import (
     BlockingFinding,
@@ -105,7 +110,7 @@ class TestFormatFindingsWithIds:
 # ── build_scoped_review_briefing: ids + structured-response instructions ───
 
 class TestBuildScopedReviewBriefingFindingIds:
-    def _briefing(self, prior_findings_body: str) -> str:
+    def _briefing(self) -> str:
         return build_scoped_review_briefing(
             pr_number=42,
             pr_url="https://github.com/acme/api/pull/42",
@@ -123,20 +128,26 @@ class TestBuildScopedReviewBriefingFindingIds:
         )
 
     def test_includes_id_tagged_findings(self) -> None:
-        briefing = self._briefing("unused")
+        briefing = self._briefing()
         fid = finding_id("the worktree leaks a tempdir on failure")
         assert f"finding#{fid}" in briefing
 
     def test_instructs_finding_resolution_section(self) -> None:
-        briefing = self._briefing("unused")
+        briefing = self._briefing()
         assert "## Finding resolution" in briefing
         assert "resolved:" in briefing
         assert "unresolved:" in briefing
 
     def test_instructs_in_delta_and_out_of_delta_headings(self) -> None:
-        briefing = self._briefing("unused")
+        briefing = self._briefing()
         assert "## New blocking findings (in delta)" in briefing
-        assert "## New blocking findings (out of delta)" in briefing
+        # #4187 review: the out-of-delta heading's own text must NOT
+        # contain "blocking" — see `_bucket_for_heading`'s "blocking"
+        # substring match, which every existing reader (
+        # `extract_blocking_section`, `classify_blocking_evidence`, ...)
+        # goes through. "New non-blocking findings" buckets correctly.
+        assert "## New non-blocking findings (out of delta)" in briefing
+        assert "## New blocking findings (out of delta)" not in briefing
         # The out-of-delta heading must explain the non-blocking-but-gated
         # contract, not just name itself.
         assert "non-blocking" in briefing.lower()
@@ -203,7 +214,7 @@ class TestParseScopedRereviewClassification:
         body = (
             "## New blocking findings (in delta)\n"
             "- the fix itself introduces a null deref\n"
-            "## New blocking findings (out of delta)\nNone.\n"
+            "## New non-blocking findings (out of delta)\nNone.\n"
         )
         result = parse_scoped_rereview_classification(body)
         assert result.new_blocking_in_delta == (
@@ -214,7 +225,7 @@ class TestParseScopedRereviewClassification:
     def test_new_blocking_out_of_delta_bullets(self) -> None:
         body = (
             "## New blocking findings (in delta)\nNone.\n"
-            "## New blocking findings (out of delta)\n"
+            "## New non-blocking findings (out of delta)\n"
             "- an unrelated file leaks a secret\n"
         )
         result = parse_scoped_rereview_classification(body)
@@ -255,7 +266,7 @@ class TestOutOfDeltaFullReviewPending:
         findings_by_id = {
             "rev-scoped": _findings(
                 "## Blocking findings\nNone.\n\n"
-                "## New blocking findings (out of delta)\n"
+                "## New non-blocking findings (out of delta)\n"
                 + (f"- {out_of_delta_text}\n" if out_of_delta_text else "None.\n")
             ),
         }
@@ -325,6 +336,236 @@ class TestOutOfDeltaFullReviewPending:
             },
         ):
             assert out_of_delta_full_review_pending(entry, board) is True
+
+    def test_fetch_failure_fails_closed_when_a_scoped_round_exists(self) -> None:
+        # #4187 review: a `gh` outage/rate-limit must not read the same as
+        # "confirmed nothing was flagged" -- there's a scoped round in this
+        # chain whose out-of-delta state simply couldn't be checked.
+        board, _findings_by_id = self._chain(None, None)
+        entry = _q("a")
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=RuntimeError("gh: rate limited"),
+        ):
+            assert out_of_delta_full_review_pending(entry, board) is True
+
+    def test_fetch_failure_with_no_scoped_round_still_no_gate(self) -> None:
+        # The fail-closed branch above only applies once there's something
+        # to be worried about -- a chain with no scoped round at all never
+        # even attempts the fetch, so an unrelated GitHub outage can't hold
+        # it hostage.
+        board = Board(active=[], completed=[])
+        entry = _q("a")
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=RuntimeError("gh: rate limited"),
+        ):
+            assert out_of_delta_full_review_pending(entry, board) is False
+
+    def test_scoped_approval_with_unresolved_prior_finding_gates(self) -> None:
+        # #4187 review: `resolved_ids`/`unresolved_ids` must actually be
+        # consulted somewhere real. A scoped round that `approve`s without
+        # ever classifying the prior round's blocking finding fails closed
+        # to "unresolved" (`parse_scoped_rereview_classification`) -- an
+        # approval that contradicts its own structured response is treated
+        # the same as an out-of-delta flag: one full review required.
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+        )
+        prior_full = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="request-changes",
+            review_scoped=False, dispatched_at=50.0,
+        )
+        scoped = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-scoped", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            review_scoped=True, dispatched_at=100.0,
+        )
+        board = Board(active=[], completed=[work, prior_full, scoped])
+        findings_by_id = {
+            "rev-1": _findings(
+                "## Blocking findings\n- the worktree leaks a tempdir\n"
+            ),
+            # Approves, but never classifies the prior finding at all (no
+            # `## Finding resolution` section) -- fails closed to
+            # unresolved.
+            "rev-scoped": _findings(
+                "## Blocking findings\nNone.\n\n"
+                "## New non-blocking findings (out of delta)\nNone.\n"
+            ),
+        }
+        entry = _q("a")
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ):
+            assert out_of_delta_full_review_pending(entry, board) is True
+
+    def test_scoped_approval_with_explicitly_resolved_prior_finding_no_gate(
+        self,
+    ) -> None:
+        # Same shape as above, but the scoped round DOES classify the
+        # prior finding as resolved -- no contradiction, no gate.
+        fid = finding_id("the worktree leaks a tempdir")
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+        )
+        prior_full = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-1", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="request-changes",
+            review_scoped=False, dispatched_at=50.0,
+        )
+        scoped = Assignment(
+            machine_name="m3", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-scoped", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+            review_scoped=True, dispatched_at=100.0,
+        )
+        board = Board(active=[], completed=[work, prior_full, scoped])
+        findings_by_id = {
+            "rev-1": _findings(
+                "## Blocking findings\n- the worktree leaks a tempdir\n"
+            ),
+            "rev-scoped": _findings(
+                "## Blocking findings\nNone.\n\n"
+                "## Finding resolution\n"
+                f"resolved: finding#{fid}\n"
+                "unresolved: (none)\n\n"
+                "## New non-blocking findings (out of delta)\nNone.\n"
+            ),
+        }
+        entry = _q("a")
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ):
+            assert out_of_delta_full_review_pending(entry, board) is False
+
+
+# ── process(): the two real call sites of the out-of-delta gate ────────────
+
+class TestProcessOutOfDeltaGate:
+    """#4187 review: the pure-function tests above exercise the gate's
+    logic, but nothing asserted it is actually WIRED into `process()` at
+    either of its two call sites (the live merge-gate check and the
+    `dry_run` preview). Mirrors `tests.test_merge_queue`'s own
+    `test_process_emits_review_required_event_and_halts_merge` /
+    `test_process_fails_closed_when_board_none_and_review_required` shape
+    for the sibling review gate.
+    """
+
+    @staticmethod
+    def _config():
+        from dataclasses import dataclass as _dc, field as _dc_field
+
+        @_dc
+        class _Reviews:
+            enabled: bool = True
+
+        @_dc
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @_dc
+        class _Cfg:
+            reviews: _Reviews = _dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = _dc_field(default_factory=_Pipeline)
+
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = ["review", "merge"]
+        return cfg
+
+    @staticmethod
+    def _flagged_board_and_findings():
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done", branch="worker/w1",
+        )
+        scoped = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-scoped", type="review", status="done",
+            review_of_assignment_id="w1", review_verdict="approve",
+            review_scoped=True, dispatched_at=100.0,
+        )
+        board = Board(active=[], completed=[work, scoped])
+        findings_by_id = {
+            "rev-scoped": _findings(
+                "## Blocking findings\nNone.\n\n"
+                "## New non-blocking findings (out of delta)\n"
+                "- an unrelated file leaks a secret\n"
+            ),
+        }
+        return board, findings_by_id
+
+    def test_process_emits_full_review_required_event_and_halts_merge(self) -> None:
+        from tests.test_merge_queue import FakeGh
+
+        cfg = self._config()
+        board, findings_by_id = self._flagged_board_and_findings()
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ):
+            events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "full_review_required" in kinds
+        assert "merged" not in kinds
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        assert "one full review" in (items[0].error or "")
+
+    def test_process_dry_run_reports_full_review_required(self) -> None:
+        from tests.test_merge_queue import FakeGh
+
+        cfg = self._config()
+        board, findings_by_id = self._flagged_board_and_findings()
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ):
+            events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "full_review_required" in kinds
+        assert "merged" not in kinds
+
+    def test_process_skip_review_bypasses_the_gate(self) -> None:
+        from tests.test_merge_queue import FakeGh
+
+        cfg = self._config()
+        board, findings_by_id = self._flagged_board_and_findings()
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        with patch(
+            "coord.review.fetch_review_findings_from_github_many",
+            side_effect=lambda repo, issue, ids: {
+                i: findings_by_id[i] for i in ids if i in findings_by_id
+            },
+        ):
+            events = process(items, gh, config=cfg, board=board, skip_review=True)
+
+        kinds = [e.kind for e in events]
+        assert "full_review_required" not in kinds
+        assert "merged" in kinds
 
 
 def _findings(body: str):

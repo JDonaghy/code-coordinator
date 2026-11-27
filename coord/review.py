@@ -1048,7 +1048,14 @@ def format_findings_with_ids(findings: list[BlockingFinding]) -> str:
     for f in findings:
         lines = f.text.splitlines() or [""]
         first = f"- `finding#{f.id}`: {lines[0]}"
-        rest = [f"  {line}" for line in lines[1:]]
+        # A continuation line that already carries its own leading
+        # whitespace (a nested sub-bullet `parse_blocking_findings`
+        # preserved verbatim from the original review body) is already
+        # indented relative to the top-level bullet it came from — adding
+        # another 2 spaces on top would double-indent it. Only flat prose
+        # with no indentation of its own (e.g. a wrapped paragraph) needs
+        # the 2-space nudge to render as part of this bullet.
+        rest = [line if line[:1].isspace() else f"  {line}" for line in lines[1:]]
         rendered.append("\n".join([first, *rest]))
     return "\n".join(rendered)
 
@@ -1062,10 +1069,13 @@ class ScopedRereviewClassification:
     `resolved_ids`/`unresolved_ids` cover the PRIOR findings only, keyed by
     `finding_id`. Every prior id not explicitly listed under `resolved:`
     counts as unresolved (fail-closed — see that function's docstring).
-    `new_blocking_in_delta` and `new_blocking_out_of_delta` are freeform
-    finding texts (no prior id — these are NEW), kept apart because only the
-    latter triggers the out-of-delta full-review gate
-    (`coord.merge_queue.out_of_delta_full_review_pending`).
+    A nonempty `unresolved_ids` on a round whose own verdict is `approve`
+    is a contradiction (the round approved without confirming it resolved
+    everything it was asked to) and, like `new_blocking_out_of_delta`,
+    triggers `coord.merge_queue.out_of_delta_full_review_pending`'s
+    full-review gate. `new_blocking_in_delta` and `new_blocking_out_of_delta`
+    are freeform finding texts (no prior id — these are NEW), kept apart
+    because only the latter triggers that same gate.
     """
 
     resolved_ids: frozenset[str]
@@ -1079,6 +1089,21 @@ _UNRESOLVED_LINE_RE = re.compile(r"(?im)^[ \t]*unresolved:[ \t]*(.*)$")
 
 
 def _split_finding_ids(text: str) -> frozenset[str]:
+    """Parse a `resolved:`/`unresolved:` line's comma/whitespace-separated
+    ``finding#<id>`` tokens into a set of bare ids.
+
+    An explicit "nothing here" value (`_is_no_findings_line` — "none",
+    "n/a", "(none)", ...) returns the empty set rather than minting a
+    bogus id out of the punctuation: without this, a reviewer who
+    legitimately writes ``unresolved: none`` would get a phantom id in
+    `ScopedRereviewClassification.unresolved_ids` that matches no real
+    prior finding but still reads as nonempty — exactly the "approved
+    despite an unresolved id" condition `out_of_delta_full_review_pending`
+    (`coord.merge_queue`) treats as a contradiction requiring a full
+    review, firing on a response that was actually clean.
+    """
+    if _is_no_findings_line(text.strip()):
+        return frozenset()
     out: set[str] = set()
     for tok in re.split(r"[,\s]+", text.strip()):
         cleaned = tok.strip().strip("`").strip()
@@ -1126,18 +1151,32 @@ def parse_scoped_rereview_classification(
     all (an un-upgraded or malformed response carries every prior finding
     forward as still outstanding).
     """
-    resolved = frozenset()
-    m = _RESOLVED_LINE_RE.search(body or "")
-    if m:
-        resolved = _split_finding_ids(m.group(1))
-    m = _UNRESOLVED_LINE_RE.search(body or "")
-    explicit_unresolved = _split_finding_ids(m.group(1)) if m else frozenset()
+    # `finditer`, not `search`: a reviewer who wraps a long id list across
+    # two `resolved:`/`unresolved:` lines must have BOTH folded in, not
+    # just the first match (#4187 review) — silently dropping the
+    # remainder would still be fail-closed-safe (an id only ever falls OUT
+    # of `resolved` that way, never falsely INTO it), but there's no
+    # reason to lose real data when every match is free to fold together.
+    resolved = frozenset().union(
+        *(_split_finding_ids(m.group(1)) for m in _RESOLVED_LINE_RE.finditer(body or "")),
+    )
+    explicit_unresolved = frozenset().union(
+        *(_split_finding_ids(m.group(1)) for m in _UNRESOLVED_LINE_RE.finditer(body or "")),
+    )
     prior = frozenset(prior_ids)
     unresolved = explicit_unresolved | (prior - resolved)
     resolved = resolved - unresolved  # a conflicting id is never "resolved"
     new_in_delta = _bullets_under_heading(body or "", "new blocking findings (in delta)")
+    # #4187 review: this heading's own text must NOT contain "blocking" —
+    # `_bucket_for_heading` (used by `extract_blocking_section` and every
+    # downstream consumer of it) maps any heading containing that substring
+    # into the `blocking` bucket, which would make an out-of-delta finding
+    # (deliberately non-blocking for THIS round) read as blocking to every
+    # other reader. "non-blocking" matches the `nonblocking` bucket instead
+    # (checked first in `_ORDERED_BUCKETS`), which is the correct bucket for
+    # it.
     new_out_of_delta = _bullets_under_heading(
-        body or "", "new blocking findings (out of delta)",
+        body or "", "new non-blocking findings (out of delta)",
     )
     return ScopedRereviewClassification(
         resolved_ids=resolved,
@@ -6945,11 +6984,14 @@ def build_scoped_review_briefing(
             lines.append("")
             lines.append("```")
             lines.append("## Finding resolution")
-            lines.append(
-                "resolved: " + ", ".join(f"finding#{f.id}" for f in prior_findings[:1])
-                + (", ..." if len(prior_findings) > 1 else "")
-            )
-            lines.append("unresolved: (none, or finding#... likewise)")
+            # #4187 review: a PLACEHOLDER id, never one of the real ids
+            # above — a reviewer who copies this block verbatim without
+            # actually checking must not end up marking a real finding
+            # resolved by accident (the fail-closed design's entire point
+            # is that an unchecked finding reads as unresolved, not the
+            # reverse).
+            lines.append("resolved: finding#abc123 (replace with real ids, or `(none)`)")
+            lines.append("unresolved: finding#def456 (likewise, or `(none)`)")
             lines.append("```")
             lines.append("")
             lines.append(
@@ -6971,13 +7013,15 @@ def build_scoped_review_briefing(
                 "blocking finding: `request-changes`."
             )
             lines.append(
-                "- `## New blocking findings (out of delta)` — something you "
-                "noticed OUTSIDE the delta you were scoped to review (code "
-                "this round never touched). Do **not** `request-changes` for "
-                "this alone — list it here instead; the coordinator records "
-                "it as non-blocking for THIS round but will require one "
-                "full, non-scoped review of the whole PR before it can "
-                "merge."
+                "- `## New non-blocking findings (out of delta)` — something "
+                "you noticed OUTSIDE the delta you were scoped to review "
+                "(code this round never touched). Do **not** "
+                "`request-changes` for this alone — list it here instead; "
+                "the coordinator records it as non-blocking for THIS round "
+                "but will require one full, non-scoped review of the whole "
+                "PR before it can merge. Use this exact heading text — not "
+                "'blocking', which is reserved for a finding that blocks "
+                "THIS round's own verdict."
             )
             lines.append(
                 "Write `None.` under a heading that doesn't apply — same "
@@ -7049,7 +7093,7 @@ def build_scoped_review_briefing(
         + (
             " PLUS, for this fix round, the three additional headings "
             "from step 2a/2b above: `## Finding resolution`, "
-            "`## New blocking findings (in delta)`, `## New blocking "
+            "`## New blocking findings (in delta)`, `## New non-blocking "
             "findings (out of delta)`."
             if is_fix_round and prior_findings
             else ""
