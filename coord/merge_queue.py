@@ -8510,6 +8510,78 @@ def _issue_resolution_for_entry(
     return effective_issue_resolution(worker_resolution, reviewer_resolution)
 
 
+def out_of_delta_full_review_pending(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None, config=None,
+) -> bool:
+    """True when a scoped re-review in *entry*'s chain raised a blocking
+    finding OUTSIDE the delta it was scoped to review, and no FULL
+    (non-scoped) approving review has run since (#4187).
+
+    `build_scoped_review_briefing`'s fix-round path asks a scoped
+    re-reviewer to list any such finding under its own
+    `## New blocking findings (out of delta)` heading rather than
+    `request-changes` for it — the round that raised it is recorded as
+    non-blocking on ITS own verdict (that scoped round may still `approve`).
+    This gate is the other half of that deal: the PR as a whole may not
+    merge on the strength of scoped approvals alone once such a finding has
+    been raised, until one full review has actually looked at the whole
+    diff (and, implicitly, the out-of-delta concern) and approved it.
+
+    Walks the FULL review chain (`_review_chain_for_entry`), not just the
+    round that happens to be the current approval — a later scoped round
+    could otherwise bury an earlier one's out-of-delta flag. Fetches every
+    round's findings body in a single batched call
+    (`coord.review.fetch_review_findings_from_github_many`), mirroring
+    `_issue_resolution_for_entry`'s own fold; any round whose findings can't
+    be recovered (comment missing, fetch failed) simply doesn't contribute
+    — best-effort, same posture as that fold.
+
+    Returns ``False`` (no gate) when *board* is ``None``, when the chain has
+    no scoped rounds at all, or when every scoped round that raised an
+    out-of-delta finding is already followed by a qualifying full approval.
+    """
+    if board is None:
+        return False
+    chain = _review_chain_for_entry(entry, board)
+    scoped_rounds = [a for a in chain if getattr(a, "review_scoped", False)]
+    if not scoped_rounds:
+        return False
+    from coord.review import (  # noqa: PLC0415
+        fetch_review_findings_from_github_many,
+        parse_scoped_rereview_classification,
+    )
+
+    try:
+        findings_by_id = fetch_review_findings_from_github_many(
+            entry.repo_github, entry.issue_number, (a.assignment_id for a in chain),
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never blocks on a fetch failure
+        findings_by_id = {}
+
+    flagged_at: float | None = None
+    for a in scoped_rounds:
+        findings = findings_by_id.get(a.assignment_id)
+        if findings is None:
+            continue
+        classification = parse_scoped_rereview_classification(findings.body)
+        if classification.new_blocking_out_of_delta:
+            dispatched_at = getattr(a, "dispatched_at", None) or 0.0
+            flagged_at = dispatched_at if flagged_at is None else max(flagged_at, dispatched_at)
+
+    if flagged_at is None:
+        return False  # no round ever raised an out-of-delta finding
+
+    for a in chain:
+        if getattr(a, "review_scoped", False):
+            continue  # must be a FULL (non-scoped) review
+        if getattr(a, "review_verdict", None) != "approve":
+            continue
+        dispatched_at = getattr(a, "dispatched_at", None) or 0.0
+        if dispatched_at >= flagged_at:
+            return False  # a qualifying full review has already run
+    return True
+
+
 def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None:
     """#2191: the child issue a ``type="test-author"`` merge entry's slice
     is actually FOR — resolved via ``coord.models.effective_issue_number``
@@ -9867,6 +9939,22 @@ def process(
                             f"(dry run) would be blocked: {_why} for {entry.branch}",
                         ))
                         continue
+                    # #4187: an approved scoped chain alone is not enough
+                    # once some round in it flagged a blocking finding
+                    # OUTSIDE its own delta — merging waits for one full
+                    # (non-scoped) review regardless of what the scoped
+                    # chain approved.
+                    if board is not None and out_of_delta_full_review_pending(
+                        entry, board, gh_ops, config=config,
+                    ):
+                        events.append(MergeEvent(
+                            entry, "full_review_required",
+                            "(dry run) would be blocked: a scoped re-review "
+                            f"flagged a blocking finding outside its delta for "
+                            f"{entry.branch} — one full review is required "
+                            "before merge",
+                        ))
+                        continue
                 # #465/#821: smoke gate in dry-run — same fail-closed logic.
                 # #1640: when a verdict exists but failed the #1479 freshness
                 # binding, say so (and against which SHA) rather than
@@ -10349,6 +10437,22 @@ def process(
                     )
                     entry.error = msg
                     events.append(MergeEvent(entry, "review_required", msg))
+                    continue  # #292: skip this entry; try the next in the group
+                # #4187: an approved scoped chain alone is not enough once
+                # some round in it flagged a blocking finding OUTSIDE its
+                # own delta — see `out_of_delta_full_review_pending`'s
+                # docstring. Merging waits for one full (non-scoped) review
+                # regardless of what the scoped chain itself approved.
+                if board is not None and out_of_delta_full_review_pending(
+                    entry, board, gh_ops, config=config,
+                ):
+                    msg = (
+                        "a scoped re-review flagged a blocking finding "
+                        "outside its delta — one full review is required "
+                        "before merge"
+                    )
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "full_review_required", msg))
                     continue  # #292: skip this entry; try the next in the group
             # Smoke gate (#465/#821): refuse to merge when the interactive smoke
             # is required by the pipeline policy but no passing/skipped verdict
