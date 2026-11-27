@@ -1858,9 +1858,13 @@ class Assignment:
     premise_rechecked_at: float | None = None
     premise_rechecked_reason: str | None = None
     # #3681/#3686: "single" or "workflow" — whether this Work leg ran as a
-    # plain single-agent `claude -p` session or an opted-in (`coord:workflow`
-    # issue label) Claude Code workflow (implement -> adversarial review ->
-    # fix, several agent turns). Set once, at dispatch time, by
+    # plain single-agent `claude -p` session or an opted-in (`coord:workflow`,
+    # `ultracode`, or #4128's `coord:tranche` issue label) Claude Code
+    # workflow (implement -> adversarial review -> fix, several agent
+    # turns). A tranche leg (#4128) is a workflow leg running a canned
+    # template and still records "workflow" here, not a third value — see
+    # `coord.agent.AssignmentSpec.tranche` for the separate flag that
+    # distinguishes it. Set once, at dispatch time, by
     # `coord.state._record_dispatched_local` from
     # `coord.agent.WORKFLOW_LEG_LABEL`; never updated afterwards. `None` for
     # a row predating the `mode` column (#3681) — every caller must read

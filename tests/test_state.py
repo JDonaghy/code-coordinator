@@ -1777,6 +1777,35 @@ class TestRecordDispatchedMode:
 
         assert load_assignment_mode(assignment_id) == "workflow"
 
+    def test_tranche_work_leg_records_workflow_not_a_third_value(
+        self, coord_db
+    ) -> None:
+        """#4128: `coord:tranche` implies the `coord:workflow` opt-in, and
+        still records "workflow" here — the `mode` column answers "single
+        vs multi-agent", not "which template"; `AssignmentSpec.tranche`
+        (the wire field) is the separate question."""
+        from coord.state import load_assignment_mode, record_dispatched
+
+        proposal = Proposal(
+            id=15,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=4128,
+            issue_title="Pilot the tranche template",
+            rationale="test",
+            briefing="run the tranche workflow",
+            type="work",
+            issue_labels=["coord:tranche"],
+        )
+        assignment_id = "aid-4128-tranche"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        assert load_assignment_mode(assignment_id) == "workflow"
+
     def test_normal_work_leg_records_single(self, coord_db) -> None:
         from coord.state import load_assignment_mode, record_dispatched
 
