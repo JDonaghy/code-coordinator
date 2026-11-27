@@ -2366,6 +2366,79 @@ class TestFileAndQueueSplitProposal:
             )
         mock_close_issue.assert_not_called()
 
+    @patch("coord.github_ops.get_issue_comments", return_value=[])
+    @patch("coord.github_ops.get_open_issues")
+    @patch("coord.github_ops.get_issue")
+    @patch("coord.state.get_drive_queue_entry")
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_sealed_amendment_node_gets_a_real_filed_issue(
+        self, mock_create_issue, mock_update_body, mock_close_issue,
+        mock_get_issue_state, mock_enqueue, mock_get_entry,
+        mock_get_issue, mock_get_open_issues, mock_get_issue_comments,
+    ) -> None:
+        """#4176: a `group: sealed-amendment` node in `work_order` is a
+        synthetic placeholder (#3 — strictly above the 2 real chunk
+        positions) `verify_split_proposal` inserted ahead of child 2
+        because it found child 2's `removes`/`introduces` symbol still
+        referenced in a sealed path. The filer must file a real tracking
+        issue for it and remap the DAG onto real numbers — not KeyError
+        trying to look up a position no `proposal.chunks` loop ever
+        touches."""
+        from coord.milestone_order import WorkOrder, WorkOrderNode
+        from coord.models import Repo
+        from coord.preflight_size import SealedAmendment, SplitVerification
+
+        verification = SplitVerification(
+            ok=True, reason=None, epic_body="rationale text",
+            work_order=WorkOrder(nodes=(
+                WorkOrderNode(issue_number=1, after=()),
+                WorkOrderNode(issue_number=3, group="sealed-amendment", after=()),
+                WorkOrderNode(issue_number=2, after=(1, 3)),
+            )),
+            sealed_amendments=(
+                SealedAmendment(
+                    chunk_position=2, chunk_title="Part 2", symbol="draw_tooltip",
+                    declared_as="removes",
+                    sealed_paths=("tests/acceptance/c0_paint_smoke.rs",),
+                ),
+            ),
+        )
+
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},  # epic
+            {"number": 501, "url": "https://x/501"},  # Part 1
+            {"number": 502, "url": "https://x/502"},  # Part 2
+            {"number": 503, "url": "https://x/503"},  # sealed-amendment step
+        ]
+        mock_get_entry.return_value = {"after_json": []}
+        mock_get_issue_state.return_value = "closed"
+        mock_get_issue.return_value = {"milestone": None}
+        mock_get_open_issues.return_value = []
+        repo = Repo(name="api", github="acme/api")
+
+        epic_number = decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=verification, repo=repo,
+        )
+
+        assert epic_number == 500
+        assert mock_create_issue.call_count == 4
+        amendment_kwargs = mock_create_issue.call_args_list[3].kwargs
+        assert "#502" in amendment_kwargs["title"]
+        assert "draw_tooltip" in amendment_kwargs["body"]
+        assert "tests/acceptance/c0_paint_smoke.rs" in amendment_kwargs["body"]
+
+        # The remapped work order spliced into the epic body carries the
+        # amendment's real filed number (503), not the synthetic
+        # placeholder (3), and child #502 still depends on it.
+        new_body = mock_update_body.call_args.args[2]
+        assert "#503" in new_body
+        assert "#501" in new_body
+        assert "#502" in new_body
+
 
 class TestFileAndQueueSplitProposalCrossBackendOrderingAndBody:
     """#4081 acceptance: a seam+per-backend split's children are chained

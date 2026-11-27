@@ -25,11 +25,13 @@ from coord.overlap_predict import parse_declared_files
 from coord.preflight_size import (
     DEFAULT_THRESHOLDS,
     NO_BACKEND_SPLIT_MARKER,
+    SealedAmendment,
     SizeThresholds,
     build_cross_backend_split_proposal,
     build_slice_child_body,
     detect_cross_backend_scope,
     score_issue_size,
+    sealed_amendment_numbers,
     substitute_slice_tokens,
     verify_split_proposal,
 )
@@ -733,6 +735,30 @@ class TestGrepSealedPathHits:
         assert grep_sealed_path_hits([], tmp_path, {"k": re.compile(r"x")}) == {}
         assert grep_sealed_path_hits(["tests/acceptance/"], tmp_path, {}) == {}
 
+    def test_entry_escaping_repo_root_fails_open_rather_than_raising(
+        self, tmp_path: Path
+    ) -> None:
+        """An absolute entry (or one containing a `..` segment) would put
+        `root / entry` — and the `path.relative_to(root)` below it —
+        outside *repo_root* (`Path("/repo") / "/etc/"` is `/etc/`, not
+        `/repo/etc/`), contradicting this function's own documented
+        "returns {} rather than raising" contract. `sealed_paths()`
+        entries are repo-relative in practice, but this must still fail
+        open rather than raise `ValueError` if one isn't."""
+        outside = tmp_path.parent / "outside-sealed-escape"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.rs").write_text("draw_tooltip(ctx);\n")
+        try:
+            hits = grep_sealed_path_hits(
+                [str(outside) + "/", "../outside-sealed-escape/"],
+                tmp_path,
+                {"k": re.compile(r"\bdraw_tooltip\b")},
+            )
+            assert hits == {}
+        finally:
+            (outside / "secret.rs").unlink()
+            outside.rmdir()
+
     def test_exact_file_entry_is_resolved_too(self, tmp_path: Path) -> None:
         (tmp_path / "tui").mkdir()
         (tmp_path / "tui" / "tests").mkdir()
@@ -763,6 +789,36 @@ class TestGrepSealedPathHits:
         assert acceptance.grep_sealed_path_hits(
             "acme/other", tmp_path, {"k": re.compile(r"\bdraw_tooltip\b")}
         ) == {}
+
+
+class TestSealedAmendmentNumbers:
+    """#4176: `sealed_amendment_numbers` is the ONE place the synthetic
+    placeholder numbering scheme is defined — both `verify_split_proposal`
+    (building the work order) and `coord.decomposition_chat
+    .file_and_queue_split_proposal` (the sole filer, remapping it onto
+    real issue numbers) call this, so neither can drift from the other."""
+
+    def _amendment(self, position: int, symbol: str = "x") -> SealedAmendment:
+        return SealedAmendment(
+            chunk_position=position, chunk_title="t", symbol=symbol,
+            declared_as="removes", sealed_paths=("tests/acceptance/f.rs",),
+        )
+
+    def test_empty_when_no_amendments(self) -> None:
+        assert sealed_amendment_numbers(3, ()) == {}
+
+    def test_one_amendment_numbered_past_every_real_chunk(self) -> None:
+        assert sealed_amendment_numbers(2, (self._amendment(1),)) == {1: 3}
+
+    def test_multiple_positions_numbered_in_ascending_order(self) -> None:
+        assert sealed_amendment_numbers(
+            3, (self._amendment(2), self._amendment(1))
+        ) == {1: 4, 2: 5}
+
+    def test_same_position_hit_twice_dedupes_to_one_number(self) -> None:
+        assert sealed_amendment_numbers(
+            2, (self._amendment(1, "a"), self._amendment(1, "b"))
+        ) == {1: 3}
 
 
 class TestVerifySplitProposalInsertsSealedAmendmentStep:
@@ -989,6 +1045,108 @@ class TestVerifySplitProposalInsertsSealedAmendmentStep:
         assert verification.epic_body == epic_body
         assert len(verification.work_order.nodes) == 2
         assert len(verification.sealed_amendments) == 1
+
+    def test_two_affected_chunks_get_two_distinct_synthetic_numbers(
+        self, tmp_path: Path
+    ) -> None:
+        """Two DIFFERENT chunks each hitting a sealed reference must each
+        get their own inserted step, numbered N+1/N+2 in increasing chunk-
+        position order — not collapsed into one, and not colliding."""
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text(
+            "draw_tooltip(ctx); draw_command_line(ctx);\n"
+        )
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a", scope="scope a", files_likely=["coord/a.py"],
+                    removes=("draw_tooltip",),
+                ),
+                SplitChunk(
+                    title="b", scope="scope b", files_likely=["coord/b.py"],
+                    removes=("draw_command_line",),
+                ),
+                SplitChunk(title="c", scope="scope c", files_likely=["coord/c.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal, sealed_paths=["tests/acceptance/"], sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        nodes = verification.work_order.nodes
+        # 5 nodes: 3 real chunks + 2 synthetic amendment steps.
+        assert len(nodes) == 5
+        by_number = {n.issue_number: n for n in nodes}
+        assert by_number[4].group == "sealed-amendment"
+        assert by_number[5].group == "sealed-amendment"
+        assert by_number[1].after == (4,)
+        assert by_number[2].after == (5,)
+        assert len(verification.sealed_amendments) == 2
+        assert {a.chunk_position for a in verification.sealed_amendments} == {1, 2}
+
+    def test_one_chunk_hitting_two_symbols_still_yields_one_node(
+        self, tmp_path: Path
+    ) -> None:
+        """`amendment_positions` dedupes by chunk position — a chunk whose
+        `removes` names two symbols both found in sealed paths still gets
+        exactly ONE inserted step, not two."""
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text(
+            "draw_tooltip(ctx); draw_command_line(ctx);\n"
+        )
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a", scope="scope a", files_likely=["coord/a.py"],
+                    removes=("draw_tooltip", "draw_command_line"),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal, sealed_paths=["tests/acceptance/"], sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        # 3 nodes: the ONE synthetic step plus the 2 real chunks.
+        nodes = verification.work_order.nodes
+        assert len(nodes) == 3
+        amendment_nodes = [n for n in nodes if n.group == "sealed-amendment"]
+        assert len(amendment_nodes) == 1
+        # Both symbol hits are still individually reported.
+        assert len(verification.sealed_amendments) == 2
+        assert {a.symbol for a in verification.sealed_amendments} == {
+            "draw_tooltip", "draw_command_line",
+        }
+
+    def test_rendered_epic_body_carries_the_amendment_line(
+        self, tmp_path: Path
+    ) -> None:
+        """The self-computed `epic_body` — not just `work_order` — must
+        actually render the inserted step, since that text is what would
+        be filed to a real epic."""
+        sealed_dir = tmp_path / "tests" / "acceptance"
+        sealed_dir.mkdir(parents=True)
+        (sealed_dir / "c0_paint_smoke.rs").write_text("draw_tooltip(ctx);\n")
+
+        proposal = _proposal(
+            [
+                SplitChunk(
+                    title="a", scope="scope a", files_likely=["coord/a.py"],
+                    removes=("draw_tooltip",),
+                ),
+                SplitChunk(title="b", scope="scope b", files_likely=["coord/b.py"]),
+            ]
+        )
+        verification = verify_split_proposal(
+            proposal, sealed_paths=["tests/acceptance/"], sealed_repo_root=tmp_path,
+        )
+        assert verification.ok is True
+        assert "#3" in verification.epic_body
+        assert "sealed-amendment" in verification.epic_body
 
 
 class TestVerifySplitProposalLogsEveryRejection:

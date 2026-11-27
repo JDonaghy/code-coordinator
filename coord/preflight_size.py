@@ -69,6 +69,7 @@ __all__ = [
     "score_issue_size",
     "SplitVerification",
     "SealedAmendment",
+    "sealed_amendment_numbers",
     "verify_split_proposal",
     "AUDIT_CATEGORY",
     "EVENT_SPLIT_REJECTED",
@@ -439,6 +440,35 @@ class SealedAmendment:
     sealed_paths: tuple[str, ...]
 
 
+def sealed_amendment_numbers(
+    chunk_count: int, sealed_amendments: Sequence[SealedAmendment],
+) -> dict[int, int]:
+    """The synthetic, placeholder ``WorkOrderNode.issue_number`` a sealed-
+    amendment step gets in :func:`verify_split_proposal`'s self-computed
+    work order (#4176) — one entry per DISTINCT ``chunk_position`` in
+    *sealed_amendments* (a chunk hitting more than one sealed symbol still
+    gets exactly one inserted node, same dedupe both callers rely on),
+    numbered strictly after every one of *chunk_count* real chunk
+    positions, in ascending chunk-position order.
+
+    The ONLY place this numbering scheme is defined. Both
+    :func:`verify_split_proposal` (building the work order in the first
+    place) and :func:`coord.decomposition_chat.file_and_queue_split_proposal`
+    (the sole filer of that work order — it has to know which synthetic
+    number corresponds to which chunk so it can file a real amendment
+    issue for it and remap the DAG) call this, so the two can never drift
+    apart (#2096: one question, "what synthetic number did this chunk's
+    amendment get", one answer).
+    """
+    amendment_positions = sorted({a.chunk_position for a in sealed_amendments})
+    next_number = chunk_count + 1
+    numbers: dict[int, int] = {}
+    for position in amendment_positions:
+        numbers[position] = next_number
+        next_number += 1
+    return numbers
+
+
 @dataclass(frozen=True)
 class SplitVerification:
     """The gate's verdict on one :class:`~coord.models.SplitProposal`.
@@ -648,9 +678,10 @@ def verify_split_proposal(
        *sealed_paths* (resolved against *sealed_repo_root*, when both are
        given) — the target repo's own sealed acceptance paths
        (``AcceptanceConfig.sealed_paths()``). A hit does NOT reject the
-       proposal; it is never reachable in the self-computed work order
-       above, only in the self-computed branch below (check 6), where it
-       inserts a flagged (``group: sealed-amendment``) step immediately
+       proposal; the insertion described below is never reachable when
+       the caller hands in its own real *epic_body* — only in check 6's
+       self-computed branch, where it inserts a flagged
+       (``group: sealed-amendment``) step immediately
        ahead of the affected child, inheriting that child's own
        predecessors, with the child then also depending on the new step —
        so the affected child can no longer be dispatched (or merge
@@ -782,21 +813,23 @@ def verify_split_proposal(
                 )
             )
     sealed_amendments.sort(key=lambda a: (a.chunk_position, a.symbol))
-    amendment_positions = sorted({a.chunk_position for a in sealed_amendments})
+    # #4176: the numbering scheme itself lives in
+    # :func:`sealed_amendment_numbers`, not inline here, because
+    # :func:`coord.decomposition_chat.file_and_queue_split_proposal` — the
+    # sole filer of this work order — has to reproduce the exact same
+    # mapping from placeholder number back to "which chunk position is
+    # this the amendment for" when it files a real amendment issue and
+    # remaps the DAG (#2096: one question, one answer).
+    amendment_numbers = sealed_amendment_numbers(
+        len(proposal.chunks), sealed_amendments
+    )
+    amendment_positions = sorted(amendment_numbers)
 
     expected_node_count = len(proposal.chunks)
     if epic_body is None:
-        # #4176: one synthetic node per affected chunk position, numbered
-        # strictly after every real chunk position so it can never collide
-        # with (or be mistaken for) a real child — resolving that
-        # placeholder to a real filed issue number is a sibling slice's job
-        # (the propose/approve/apply artifact flow), not this gate's.
-        amendment_numbers: dict[int, int] = {}
-        next_amendment_number = len(proposal.chunks) + 1
-        for position in amendment_positions:
-            amendment_numbers[position] = next_amendment_number
-            next_amendment_number += 1
-
+        # One synthetic node per affected chunk position, numbered
+        # strictly after every real chunk position so it can never
+        # collide with (or be mistaken for) a real child.
         nodes: list[WorkOrderNode] = []
         footprints_so_far: list[Footprint] = []
         for i, chunk in enumerate(proposal.chunks, start=1):

@@ -1896,11 +1896,17 @@ def file_and_queue_split_proposal(
     Called only after :func:`coord.preflight_size.verify_split_proposal` has
     returned ``ok=True`` for *verification* — this function trusts
     ``verification.work_order`` and ``verification.epic_body`` without
-    re-validating them. ``work_order``'s nodes carry placeholder, 1-based
-    positions (both as ``issue_number`` and inside each node's ``after``
-    tuple) matching ``proposal.chunks``' order, not real GitHub issue
-    numbers — filing each child in order and remapping those positions to
-    the real numbers it gets back is this function's own job.
+    re-validating them. ``work_order``'s nodes carry placeholder positions
+    (both as ``issue_number`` and inside each node's ``after`` tuple), not
+    real GitHub issue numbers — filing each child in order and remapping
+    those positions to the real numbers it gets back is this function's
+    own job. Positions ``1..len(proposal.chunks)`` match ``proposal.
+    chunks``' order 1-for-1; a node with ``group == "sealed-amendment"``
+    (#4176) carries a synthetic position strictly above that range instead
+    — :func:`coord.preflight_size.sealed_amendment_numbers` is the one
+    place both this function and the verifier derive that numbering from,
+    so a real tracking issue gets filed for it here too, same as any
+    other node.
 
     Order of operations: resolve the original's own milestone (#4064 —
     every child, and a new tracker if one is filed, inherits it so none of
@@ -1978,7 +1984,11 @@ def file_and_queue_split_proposal(
         render_sub_issues,
         replace_sub_issues_section,
     )
-    from coord.preflight_size import build_slice_child_body, substitute_slice_tokens
+    from coord.preflight_size import (
+        build_slice_child_body,
+        sealed_amendment_numbers,
+        substitute_slice_tokens,
+    )
     from coord.state import enqueue_drive_queue, get_drive_queue_entry
 
     original = github_ops.get_issue(repo.github, proposal.issue_number)
@@ -2070,6 +2080,55 @@ def file_and_queue_split_proposal(
         github_ops.update_issue_body(
             repo.github, position_to_real[position], resolved_body,
         )
+
+    # #4176: `verification.work_order` may also carry synthetic
+    # `group: sealed-amendment` nodes — one ahead of any child whose
+    # `removes`/`introduces` symbol(s) `verify_split_proposal` found still
+    # referenced in the target repo's sealed acceptance paths. Those
+    # placeholder numbers aren't proposal chunk positions, so the loop
+    # above never files them; `sealed_amendment_numbers` (the same scheme
+    # `verify_split_proposal` used to build `verification.work_order` in
+    # the first place) maps each affected chunk's position back to its
+    # synthetic number, so a real tracking issue can be filed for it here
+    # and folded into `position_to_real` alongside every real child —
+    # `remapped_nodes` below looks both kinds of number up in that same
+    # dict, with no way to tell which is which once resolved.
+    amendment_numbers = sealed_amendment_numbers(
+        len(proposal.chunks), verification.sealed_amendments
+    )
+    for position, synthetic_number in amendment_numbers.items():
+        affected_real_number = position_to_real[position]
+        hits = [
+            a for a in verification.sealed_amendments
+            if a.chunk_position == position
+        ]
+        body_lines = [
+            f"Filed by the {origin}: splitting #{proposal.issue_number} "
+            f"found that #{affected_real_number} "
+            f"({proposal.chunks[position - 1].title!r}) removes or newly "
+            "requires symbol(s) still referenced in this repo's sealed "
+            "acceptance paths. Merging that child before these references "
+            "are amended would merge it partial over a sealed literal:",
+            "",
+        ]
+        for hit in hits:
+            body_lines.append(
+                f"- `{hit.symbol}` ({hit.declared_as}) referenced in: "
+                + ", ".join(hit.sealed_paths)
+            )
+        body_lines += [
+            "",
+            f"Blocks #{affected_real_number} until the sealed amendment "
+            "above is proposed, approved by a human, and applied verbatim "
+            "— never edited by a worker or a model.",
+        ]
+        amendment_issue = github_ops.create_issue(
+            repo.github,
+            title=f"Sealed amendment needed before #{affected_real_number}",
+            body="\n".join(body_lines),
+            milestone=milestone_title,
+        )
+        position_to_real[synthetic_number] = amendment_issue["number"]
 
     remapped_nodes = tuple(
         WorkOrderNode(

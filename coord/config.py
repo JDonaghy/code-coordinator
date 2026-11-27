@@ -635,7 +635,7 @@ def entrypoint_sibling_acceptance_dir(entrypoint: str) -> str:
 def grep_sealed_path_hits(
     sealed_paths: Sequence[str],
     repo_root: str | Path,
-    patterns: Mapping[str, "re.Pattern[str]"],
+    patterns: Mapping[str, re.Pattern[str]],
 ) -> dict[str, list[str]]:
     """Search every real file under *sealed_paths* (the same shape
     :meth:`AcceptanceConfig.sealed_paths` itself returns — a directory
@@ -674,6 +674,16 @@ def grep_sealed_path_hits(
     files: list[Path] = []
     seen: set[Path] = set()
     for entry in sealed_paths:
+        # An absolute entry, or one containing a `..` segment, would place
+        # `target` (and the `path.relative_to(root)` below) outside *root*
+        # — `Path("/repo") / "/etc/"` is `/etc/`, not `/repo/etc/` — which
+        # contradicts this function's own "returns {} rather than raising"
+        # contract. `sealed_paths()` entries are repo-relative in practice
+        # (derived from configured `entrypoint:` values), but skip rather
+        # than trust that here, same fail-open posture as the rest of this
+        # function toward evidence it doesn't have.
+        if Path(entry).is_absolute() or ".." in Path(entry).parts:
+            continue
         target = root / entry
         if entry.endswith("/"):
             if not target.is_dir():
@@ -862,7 +872,7 @@ class AcceptanceConfig:
         self,
         repo_name: str,
         repo_root: str | Path,
-        patterns: Mapping[str, "re.Pattern[str]"],
+        patterns: Mapping[str, re.Pattern[str]],
     ) -> dict[str, list[str]]:
         """#4176: search real file content under :meth:`sealed_paths` for
         each of *patterns*' compiled regexes, resolved against *repo_root*
