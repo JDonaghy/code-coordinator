@@ -78,18 +78,29 @@ def _regen(path: Path) -> None:
 
 def _build_tranche_fleet(
     tmp_path: Path, *, row_id: int = 1, uncovered_conflict: bool = False,
+    surface_conflict: bool = False,
 ) -> tuple[Path, str]:
     """Bare ``origin`` plus a local checkout, with a base commit and two
-    child branches (``tranche-{row_id}-child-101``/``-102``) each editing a
-    DIFFERENT line of ``source.txt`` and independently regenerating
-    ``derived.json`` — so merging both onto the base conflicts only in the
-    mechanically-derived ``derived.json`` (every child regenerates it from
-    its own source edit, so each child's `derived.json` differs from the
-    other's). Returns ``(checkout, base_sha)``.
+    child branches (``tranche-{row_id}-child-101``/``-102``) editing
+    ``source.txt`` and independently regenerating ``derived.json``.
+    Returns ``(checkout, base_sha)``.
+
+    By default (no flag set) child 101 and 102 edit DIFFERENT lines of
+    ``source.txt`` with edits of the SAME length, so ``source.txt`` merges
+    cleanly on both sides and the two children's ``derived.json`` outputs
+    (a byte count) land on the identical value too — no conflict anywhere,
+    just a stale-but-matching artifact.
 
     ``uncovered_conflict=True`` makes child 102 edit the SAME line of
     ``source.txt`` child 101 already touched, so the conflict spills
     outside the one declared surface path.
+
+    ``surface_conflict=True`` makes child 102 edit a DIFFERENT line of
+    ``source.txt`` (so ``source.txt`` itself still merges cleanly) but with
+    an edit of a DIFFERENT length than child 101's — so the two children's
+    ``derived.json`` (``COUNT=<len>``) disagree on the same line and git
+    reports a genuine conflict confined entirely to the declared
+    ``derived.json`` surface.
     """
     seed = tmp_path / "seed"
     origin = tmp_path / "origin.git"
@@ -113,6 +124,8 @@ def _build_tranche_fleet(
     _git(["checkout", "-qb", f"tranche-{row_id}-child-102"], seed)
     if uncovered_conflict:
         (seed / "source.txt").write_text("alpha-B\nbeta\ngamma\n")
+    elif surface_conflict:
+        (seed / "source.txt").write_text("alpha\nbeta\ngamma-BB\n")
     else:
         (seed / "source.txt").write_text("alpha\nbeta\ngamma-B\n")
     _regen(seed)
@@ -233,6 +246,75 @@ class TestMergeTrancheChildren:
         # No leftover in-progress merge state in the base checkout.
         status = _git(["status", "--porcelain"], checkout).stdout
         assert status == ""
+
+    def test_resolves_surface_only_conflict_via_ours_and_regen(
+        self, tmp_path: Path,
+    ) -> None:
+        """A conflict confined to a declared `integration_surfaces` path
+        (`derived.json`) is resolved mechanically via `git checkout --ours`
+        + stage + placeholder commit, then the declared surface is
+        regenerated once across the merged tree — so the pushed result
+        both merges successfully AND ends up with a correct, non-stale
+        `derived.json` (not just whatever the placeholder commit left)."""
+        checkout, base_sha = _build_tranche_fleet(tmp_path, surface_conflict=True)
+        config = _tranche_config(checkout, surfaces=_surfaces())
+        row = _row(base_sha)
+
+        result = merge_tranche_children(row, config)
+
+        assert result.ok, result.detail
+        assert not result.needs_integrator
+        assert result.unresolved_conflicts == ()
+        assert result.integrated_sha
+
+        _git(["fetch", "origin"], checkout)
+        remote_sha = _git(
+            ["rev-parse", "origin/tranche-1-integrated"], checkout,
+        ).stdout.strip()
+        assert remote_sha == result.integrated_sha
+        source = _git(
+            ["show", f"{remote_sha}:source.txt"], checkout,
+        ).stdout
+        assert source == "alpha-A\nbeta\ngamma-BB\n"
+        derived = _git(["show", f"{remote_sha}:derived.json"], checkout).stdout
+        assert derived == f"COUNT={len(source)}\n"
+
+    def test_dirty_check_failure_after_regen_falls_back_to_pre_regen_push(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed `git status --porcelain` observation after regen must
+        decline (push the pre-regen `merged_sha`, report `needs_integrator`)
+        rather than be read as "tree is clean" and pushed as `ok=True`
+        (#2096: a failed observation is not a permissive default)."""
+        from coord import merge_queue as merge_queue_module
+
+        real_run = merge_queue_module._tranche_merge_run
+
+        def _flaky_run(args, **kwargs):
+            if args[:3] == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(
+                    args, 1, stdout="", stderr="simulated git status failure",
+                )
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(merge_queue_module, "_tranche_merge_run", _flaky_run)
+
+        checkout, base_sha = _build_tranche_fleet(tmp_path)
+        config = _tranche_config(checkout, surfaces=_surfaces())
+        row = _row(base_sha)
+
+        result = merge_tranche_children(row, config)
+
+        assert not result.ok
+        assert result.needs_integrator
+        assert result.integrated_sha is None
+        assert "could not observe working-tree state" in result.detail
+
+        _git(["fetch", "origin"], checkout)
+        remote = _git(
+            ["ls-remote", "origin", "refs/heads/tranche-1-integrated"], checkout,
+        ).stdout
+        assert remote.strip(), "partial (pre-regen) progress must still be pushed"
 
     def test_regen_check_failure_falls_back_to_pre_regen_push(
         self, tmp_path: Path,

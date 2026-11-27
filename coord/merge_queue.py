@@ -12137,7 +12137,15 @@ def _tranche_worktree_path(row: "TrancheRow") -> Path:
     `coord.conflict_fix`'s `conflict-fix-surface-worktrees` and
     `coord.revalidate`'s revalidation worktrees, namespaced by repo/row so
     two rows (or a retried attempt on the same row) never collide.
+
+    Imports `COORD_DIR` lazily, mirroring
+    `coord.conflict_fix._surface_worktree_path` and
+    `coord.revalidate.revalidation_worktree_path` — so a test's
+    `monkeypatch.setattr("coord.state.COORD_DIR", ...)` actually takes
+    effect here instead of reading this module's own import-time binding.
     """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
     name = f"{row.repo_name}-{row.id}".replace("/", "-")
     return COORD_DIR / "tranche-integration-worktrees" / name
 
@@ -12197,9 +12205,10 @@ def merge_tranche_children(
     (#4129/#4201).
 
     Declines immediately (``ok=False, needs_integrator=False``) when: *row*
-    has no children, any child is not yet terminal
-    (`coord.drive.tranche_row_all_children_terminal` is the caller's own
-    pre-check — this function trusts it was already run), any child is
+    has no children, any child is not yet terminal (checked via
+    `coord.drive.tranche_row_all_children_terminal`, imported lazily to
+    avoid a module cycle — the single implementation of "has every child
+    reached a terminal state", not a re-derived copy), any child is
     `"failed"` (nothing sensible to integrate — a tranche's children can
     consume each other's new APIs, so a partial merge of only the survivors
     is not attempted), *config* is ``None``, or no local checkout for the
@@ -12246,9 +12255,11 @@ def merge_tranche_children(
 
         local_repo_dir = _default_local_repo_dir
 
+    from coord.drive import tranche_row_all_children_terminal  # noqa: PLC0415
+
     if not row.children:
         return TrancheMergeResult(False, False, None, (), "row has no children")
-    if any(c.state not in ("done", "failed") for c in row.children):
+    if not tranche_row_all_children_terminal(row):
         return TrancheMergeResult(
             False, False, None, (),
             "not every child has reached a terminal state yet",
@@ -12421,7 +12432,14 @@ def merge_tranche_children(
         dirty = _tranche_merge_run(
             ["git", "status", "--porcelain"], cwd=wt_path, timeout=60,
         )
-        if dirty.returncode == 0 and dirty.stdout.strip():
+        if dirty.returncode != 0:
+            ok, push_detail = _push_tranche_integration_branch(
+                wt_path, integration_branch, merged_sha,
+            )
+            detail = f"could not observe working-tree state after regen: {_tranche_merge_tail(dirty.stderr)}"
+            detail += f"; {push_detail}" if ok else f"; partial progress not pushed: {push_detail}"
+            return TrancheMergeResult(False, True, None, (), detail)
+        if dirty.stdout.strip():
             committed = _tranche_merge_run(
                 ["git", "commit", "-am", "Regenerate declared integration_surfaces"],
                 cwd=wt_path, timeout=120,
