@@ -2570,8 +2570,17 @@ class TestAcceptanceVerifyAmendment:
         config_path = _write_config(
             tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
         )
+        # A real diff (not just a declared path) touching a non-sealed
+        # file — the scope check is graded against the diff's own paths,
+        # not the artifact's self-declared touched_paths.
+        diff = (
+            "diff --git a/coord/some_module.py b/coord/some_module.py\n"
+            "--- a/coord/some_module.py\n"
+            "+++ b/coord/some_module.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
         artifact = self._artifact_path(
-            tmp_path, repo_dir=repo_dir, diff="irrelevant",
+            tmp_path, repo_dir=repo_dir, diff=diff,
             touches=["coord/some_module.py"],
         )
 
@@ -2585,6 +2594,94 @@ class TestAcceptanceVerifyAmendment:
         assert "outside the repo's sealed set" in payload["reason"]
         assert "coord/some_module.py" in payload["reason"]
         assert payload["acceptance_verdict"] is None
+
+    def test_verify_amendment_rejects_touched_paths_mismatch(
+        self, tmp_path: Path,
+    ) -> None:
+        """A diff that really only edits a sealed path, but whose artifact
+        declares a DIFFERENT (also-sealed) path, must be rejected — the
+        declared ``touched_paths`` is untrusted input and is cross-checked
+        against the diff's real paths, not trusted on its own."""
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
+        )
+        diff = (
+            "diff --git a/tests/acceptance/ms01/foo.txt "
+            "b/tests/acceptance/ms01/foo.txt\n"
+            "--- a/tests/acceptance/ms01/foo.txt\n"
+            "+++ b/tests/acceptance/ms01/foo.txt\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        artifact = self._artifact_path(
+            tmp_path, repo_dir=repo_dir, diff=diff,
+            touches=["tests/acceptance/ms01/bar.txt"],
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert "does not match the diff's actual file paths" in payload["reason"]
+        assert "foo.txt" in payload["reason"]
+        assert "bar.txt" in payload["reason"]
+        assert payload["acceptance_verdict"] is None
+
+    def test_verify_amendment_errors_on_empty_touched_paths(
+        self, tmp_path: Path,
+    ) -> None:
+        """A missing/empty ``touched_paths`` must be a clear error, never
+        a silent default that makes the scope check pass vacuously."""
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
+        )
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(json.dumps({
+            "repo_name": "coord-tui",
+            "issue_number": 4178,
+            "diff": "diff --git a/x b/x\n",
+            "touched_paths": [],
+            "rationale": "r",
+            "proposed_by": "worker",
+        }))
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "malformed" in result.output
+        assert "touched_paths" in result.output
+
+    def test_verify_amendment_errors_on_missing_rationale(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo {}",
+        )
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(json.dumps({
+            "repo_name": "coord-tui",
+            "issue_number": 4178,
+            "diff": "diff --git a/x b/x\n",
+            "touched_paths": ["tests/acceptance/ms01/foo.txt"],
+            "proposed_by": "worker",
+        }))
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "verify-amendment", "--repo", "coord-tui",
+            str(artifact), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "malformed" in result.output
 
     def test_verify_amendment_rejects_diff_that_does_not_apply(
         self, tmp_path: Path,
