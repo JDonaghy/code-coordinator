@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 import httpx
 
@@ -14,7 +16,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from coord.milestone_dispatch import OracleReadiness
-    from coord.models import Board
+    from coord.models import Board, TrancheChild, TrancheRow
 
 from coord import github_ops
 from coord.comments import (
@@ -3548,3 +3550,324 @@ def post_needs_decomposition(
         reason=reason,
     )
     github_ops.post_issue_comment(repo_github, issue_number, body)
+
+
+# ── Native tranche rows: parallel child dispatch + result contract ─────────
+# (#4129 Phase 1, this slice #4200)
+#
+# `coord.models.TrancheRow`/`TrancheChild` (#4199) only persist the row
+# shape — nothing reads one yet. This section is the first reader: given a
+# saved row, fan its pending children out in parallel, each branched off
+# the row's single shared `base_sha` rather than whatever the repo's
+# default branch happens to be at dispatch time, with NO per-child PR or
+# review. A child is dispatched via the same `dispatch()`/`/assign` POST
+# every other `type="work"` leg uses, but its response is never passed to
+# `coord.state.record_dispatched` — it never becomes a board `Assignment`,
+# which is what keeps it invisible to auto_loop/review/merge_queue (no
+# per-child PR or review "by construction": nothing board-driven ever
+# looks at it). Collecting each child's completion and deciding what the
+# ROW does next (merge, integrate, re-dispatch) is the sibling slices'
+# job (#4201/#4202) — this module only defines the wire contract and does
+# the fan-out.
+
+
+def tranche_child_branch_name(row: "TrancheRow", child: "TrancheChild") -> str:
+    """The deterministic per-child branch name a tranche child's worker
+    checks out (#4200).
+
+    Derived from `row.id` (stable once the row is saved) and the child's
+    own issue number — never stored on `TrancheChild` itself, since it is
+    always recomputable from the two and storing it would just be a second
+    place the two could drift (#2096: one question, one answer).
+
+    Raises ValueError if `row.id` is None — a row must be saved (and so
+    carry a stable id) before anything branches off it.
+    """
+    if row.id is None:
+        raise ValueError(
+            "tranche_child_branch_name: row.id is None — save the row "
+            "(coord.state.save_tranche_row) before dispatching its children"
+        )
+    return f"tranche-{row.id}-child-{child.issue_number}"
+
+
+#: Injected into `coord.github_ops.branch_exists_on_remote`/
+#: `create_remote_branch`'s call signature so tests can substitute fakes —
+#: the exact same dependency-injection shape
+#: `coord.branch_model.ensure_feature_branch_exists` already uses for its
+#: own idempotent remote-branch creation.
+TrancheBranchExistsFetch = Callable[[str, str], bool]
+TrancheBranchCreate = Callable[[str, str, str], bool]
+
+
+def ensure_tranche_child_branch(
+    repo_github: str,
+    branch: str,
+    base_sha: str,
+    *,
+    exists: TrancheBranchExistsFetch = github_ops.branch_exists_on_remote,
+    create: TrancheBranchCreate = github_ops.create_remote_branch,
+) -> None:
+    """Idempotently create *branch* at *base_sha* on *repo_github* (#4200).
+
+    A no-op when *branch* already exists — safe to call on every dispatch
+    attempt (retries, re-ticks) without re-creating the ref. `base_sha` is
+    fixed for the lifetime of a `TrancheRow` and the branch name is
+    deterministic (:func:`tranche_child_branch_name`), so an existing
+    branch of that name for this row can only ever already point at the
+    same `base_sha` — there is nothing to reconcile.
+
+    Raises RuntimeError if *create* reports failure (permissions, a
+    transient API error, branch protection). A tranche child must never be
+    dispatched against an unconfirmed base — fail closed rather than let
+    the agent silently branch off whatever the repo's default branch
+    happens to be instead.
+    """
+    if exists(repo_github, branch):
+        return
+    if not create(repo_github, branch, base_sha):
+        raise RuntimeError(
+            f"ensure_tranche_child_branch: failed to create {branch!r} at "
+            f"{base_sha!r} on {repo_github!r}"
+        )
+
+
+#: The structured result marker every tranche child's final message must
+#: carry (#4200) — the one-line, line-anchored contract
+#: `parse_tranche_child_result` validates against, mirroring the
+#: `WORK_OUTCOME:`/`SMOKE_TESTS:` marker convention this repo's own worker
+#: briefing (see this session's own system prompt) already uses elsewhere.
+TRANCHE_CHILD_RESULT_MARKER = "TRANCHE_CHILD_RESULT:"
+
+#: Appended to a tranche child's briefing (#4200) — tells the worker there
+#: is no PR/review for this leg and exactly what to report instead.
+TRANCHE_CHILD_RESULT_CONTRACT = f"""
+
+## Tranche child — no PR, no review (#4129/#4200)
+
+This is one of several children dispatched in parallel off the same base
+commit, as part of a native tranche row. Do NOT open a pull request and do
+NOT wait for a review for this leg — the coordinator merges every child's
+branch itself once all of them finish, then runs one Test and one review
+set against the merged whole.
+
+Push your branch when you are done (`git push origin HEAD`). Before your
+final message, report your result with exactly one line, with a JSON
+object after the marker:
+
+{TRANCHE_CHILD_RESULT_MARKER} {{"outcome": "done", "summary": "<one sentence>", "files": ["path/a.py"]}}
+
+Use `"outcome": "failed"` instead if you could not complete the work. A
+missing or unparseable marker is treated as failed, never as done.
+"""
+
+#: The only values `parse_tranche_child_result` accepts for `"outcome"`.
+TRANCHE_CHILD_OUTCOMES = ("done", "failed")
+
+_TRANCHE_CHILD_RESULT_RE = re.compile(
+    r"^[ \t>*_`]*TRANCHE_CHILD_RESULT:[ \t]*(\{.*\})[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def _unparseable_tranche_child_result(reason: str) -> dict:
+    """The one shape every fail-closed exit of
+    :func:`parse_tranche_child_result` returns — see that function's
+    docstring for why `fail_closed_unparseable` exists as its own field
+    rather than overloading `outcome`.
+    """
+    return {
+        "outcome": "failed",
+        "summary": f"unparseable {TRANCHE_CHILD_RESULT_MARKER} marker: {reason}",
+        "files": [],
+        "fail_closed_unparseable": True,
+    }
+
+
+def parse_tranche_child_result(text: str | None) -> dict:
+    """Extract and validate a tranche child's self-reported result (#4200).
+
+    Returns a dict shaped ``{"outcome": "done"|"failed", "summary": str,
+    "files": list[str], "fail_closed_unparseable": bool}`` — this is
+    exactly what :class:`coord.models.TrancheChild`'s ``result`` field
+    stores (its own round-trip is already covered by
+    ``tests/test_tranche_row_4199.py``). Never raises.
+
+    When *text* carries more than one `TRANCHE_CHILD_RESULT:` marker, the
+    LAST one wins — the same "last marker, not first" rule
+    `coord.worker_events.parse_work_outcome` uses, so a worker's own
+    earlier draft embedded in a thinking block or a quoted example can't
+    masquerade as the final word.
+
+    Fails closed (#2096 "a gate must be able to fail", #3931-style
+    unparseable handling): a missing marker, invalid JSON, a non-object
+    payload, a missing/invalid ``outcome``, a non-string ``summary``, or a
+    ``files`` that isn't a list of strings are ALL reported as
+    ``outcome="failed"`` with ``fail_closed_unparseable=True`` — an
+    unparseable result is never silently treated as success.
+    """
+    if not text:
+        return _unparseable_tranche_child_result("no completion text")
+
+    matches = list(_TRANCHE_CHILD_RESULT_RE.finditer(text))
+    if not matches:
+        return _unparseable_tranche_child_result(
+            f"no {TRANCHE_CHILD_RESULT_MARKER} marker found"
+        )
+
+    raw_json = matches[-1].group(1)
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        return _unparseable_tranche_child_result(f"invalid JSON ({exc})")
+
+    if not isinstance(payload, dict):
+        return _unparseable_tranche_child_result("marker payload is not a JSON object")
+
+    outcome = payload.get("outcome")
+    if outcome not in TRANCHE_CHILD_OUTCOMES:
+        return _unparseable_tranche_child_result(
+            f"outcome {outcome!r} is not one of {TRANCHE_CHILD_OUTCOMES}"
+        )
+
+    summary = payload.get("summary", "")
+    if not isinstance(summary, str):
+        return _unparseable_tranche_child_result("summary is not a string")
+
+    files = payload.get("files", [])
+    if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+        return _unparseable_tranche_child_result("files is not a list of strings")
+
+    return {
+        "outcome": outcome,
+        "summary": summary,
+        "files": files,
+        "fail_closed_unparseable": False,
+    }
+
+
+def build_tranche_child_proposal(
+    row: "TrancheRow",
+    child: "TrancheChild",
+    machine_name: str,
+) -> Proposal:
+    """Build the :class:`Proposal` for one tranche child (#4200).
+
+    `target_branch` pins the worker to :func:`tranche_child_branch_name`
+    (which `ensure_tranche_child_branch` must already have created at
+    `row.base_sha` — this function does not create it). `type="work"`
+    reuses every bit of the existing worktree/routing plumbing
+    `dispatch()` already has for a normal work leg; what keeps this child
+    OUT of the normal Work → Test → Review → Merge pipeline is that the
+    caller never records the resulting agent assignment on the board (see
+    this section's module-level comment) — nothing about the `Proposal`
+    itself needs to differ for that.
+    """
+    briefing = (
+        child.title or f"Tranche child of {row.repo_name}#{row.issue_number}"
+    ) + TRANCHE_CHILD_RESULT_CONTRACT
+    return Proposal(
+        id=row.id or 0,
+        machine_name=machine_name,
+        repo_name=child.repo_name,
+        issue_number=child.issue_number,
+        issue_title=child.title,
+        rationale=f"tranche row {row.id} child",
+        briefing=briefing,
+        type="work",
+        target_branch=tranche_child_branch_name(row, child),
+    )
+
+
+def dispatch_tranche_row_children(
+    row: "TrancheRow",
+    config: Config,
+    machine_names: Sequence[str],
+    *,
+    dispatcher: Callable[..., dict] = dispatch,
+    branch_exists: TrancheBranchExistsFetch = github_ops.branch_exists_on_remote,
+    create_branch: TrancheBranchCreate = github_ops.create_remote_branch,
+    max_workers: int = 8,
+) -> "TrancheRow":
+    """Dispatch every `"pending"` child of *row* IN PARALLEL (#4129/#4200),
+    each branched off the row's single shared ``base_sha``, with no
+    per-child PR or review.
+
+    *machine_names* assigns one machine per child, round-robin if there
+    are fewer machines than children — placement itself is a caller
+    decision (a sibling queue-tick integration); this function only fans
+    the dispatch out once it is told where.
+
+    The fan-out itself runs on a thread pool (true wall-clock parallelism,
+    not just "queued one after another") because each `dispatch()` call
+    blocks on the agent's synchronous worktree setup
+    (`ASSIGN_POST_TIMEOUT_SECS`) — serial dispatch would make N children
+    take N times as long to even START.
+
+    Mutates *row* in place and returns it:
+    - a child whose branch-create or POST raised becomes `"failed"`
+      (fail closed — never left `"pending"` with no record of why), with
+      `child.result` set to a `parse_tranche_child_result`-shaped dict
+      describing the dispatch failure (`fail_closed_unparseable=False`,
+      since this is a known dispatch error, not an unparseable worker
+      report);
+    - every other pending child becomes `"dispatched"`.
+    `row.state` becomes `"dispatched"` once the fan-out completes,
+    regardless of whether every child's own POST succeeded — a partially
+    failed fan-out still needs the integration slice (#4201) to see which
+    children actually started. Persisting the mutated row is the caller's
+    job (`coord.state.save_tranche_row`); this function does no I/O against
+    `coord.state` itself.
+
+    Raises ValueError if `row.id` is None, if *row* has no `"pending"`
+    children, or if *machine_names* is empty — there is nothing sensible to
+    fan out in any of those cases, so this refuses rather than silently
+    no-oping.
+    """
+    if row.id is None:
+        raise ValueError(
+            "dispatch_tranche_row_children: row.id is None — save the row "
+            "first (coord.state.save_tranche_row)"
+        )
+    pending = [c for c in row.children if c.state == "pending"]
+    if not pending:
+        raise ValueError(
+            "dispatch_tranche_row_children: row has no pending children to dispatch"
+        )
+    if not machine_names:
+        raise ValueError("dispatch_tranche_row_children: machine_names is empty")
+
+    repo_cfg = config.repo(row.repo_name)
+    repo_github = repo_cfg.github if repo_cfg is not None else None
+
+    def _dispatch_one(indexed_child: tuple[int, "TrancheChild"]) -> tuple["TrancheChild", str, str]:
+        index, child = indexed_child
+        machine_name = machine_names[index % len(machine_names)]
+        try:
+            branch = tranche_child_branch_name(row, child)
+            if repo_github:
+                ensure_tranche_child_branch(
+                    repo_github, branch, row.base_sha,
+                    exists=branch_exists, create=create_branch,
+                )
+            proposal = build_tranche_child_proposal(row, child, machine_name)
+            dispatcher(proposal, config)
+        except Exception as exc:  # noqa: BLE001 — fail closed: an undispatchable child is `failed`, never silently stuck `pending`
+            return child, "failed", str(exc)
+        return child, "dispatched", ""
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
+        results = list(pool.map(_dispatch_one, enumerate(pending)))
+
+    for child, state, error in results:
+        child.state = state
+        if state == "failed":
+            child.result = {
+                "outcome": "failed",
+                "summary": f"dispatch failed: {error}",
+                "files": [],
+                "fail_closed_unparseable": False,
+            }
+
+    row.state = "dispatched"
+    return row
