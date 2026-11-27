@@ -52,6 +52,12 @@ import httpx
 
 from coord import github_ops
 from coord.claim import review_covers
+# #4179: the single spelling of a sealed-amendment-apply commit's subject —
+# `acceptance_apply_amendment` is the only writer of a commit starting with
+# this; this module only ever reads it (see the SEALED_PATH_AUTHOR_TYPES
+# branch of `build_review_briefing` below). One shared constant instead of
+# a second copy of the same literal that could silently drift from it.
+from coord.commands.acceptance import SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord.prereview_gate import GateResult, run_prereview_gate
@@ -3035,6 +3041,33 @@ def build_review_briefing(
                     "violation. Do **not** request-changes solely because this "
                     "diff touches the sealed acceptance tree — only flag it if the "
                     "diff also touches anything outside that tree."
+                )
+            if any(
+                SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX in msg
+                for msg in (commit_messages or [])
+            ):
+                # #4179, docs/ORACLE_LOOP.md "Sealed amendment as data" step
+                # 4: a commit with this subject is `coord acceptance
+                # apply-amendment` applying bytes a HUMAN already approved
+                # (never a model) — expected, not something this diff
+                # invented. Scope/tamper (anything outside sealed_paths) is
+                # already covered above; the one thing left for the
+                # reviewer to judge is the amendment's OWN effect, which
+                # this note keeps separate from "is this diff OK".
+                lines.append("")
+                lines.append("### Sealed-amendment apply commit")
+                lines.append("")
+                lines.append(
+                    "One of the commits above applies a sealed-amendment "
+                    "artifact a human approved outside this session "
+                    "(`coord acceptance approve-amendment` → "
+                    "`apply-amendment`) — its own commit message carries "
+                    "`Approved-by:`/`Approved-at:`/`Refs #N` for the issue "
+                    "the amendment unblocks. If the sealed suite is red "
+                    "after that commit, that is a finding on the issue it "
+                    "names, not a defect in this diff: do not request-"
+                    "changes asking for the amendment or the sealed suite "
+                    "itself to be edited further to make it pass."
                 )
             if sealed_entrypoints:
                 # #1552: the entry point is sealed, but the allowance on it is

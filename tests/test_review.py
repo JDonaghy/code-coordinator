@@ -1536,6 +1536,50 @@ def test_briefing_test_author_touching_outside_sealed_path_trips_tamper() -> Non
     assert "request-changes is mandatory" in briefing
 
 
+def test_briefing_notes_sealed_amendment_apply_commit_as_expected() -> None:
+    """#4179: a `test-author` diff whose commit list includes a
+    `coord acceptance apply-amendment`-style subject gets the dedicated
+    guidance telling the reviewer a red sealed suite after that commit is a
+    finding on the issue it names, not a defect in this diff."""
+    from coord.commands.acceptance import SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX
+
+    diff = "diff --git a/tests/acceptance/ms37/foo.rs b/tests/acceptance/ms37/foo.rs\n"
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="test-author",
+        commit_messages=[
+            f"{SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX}4178\n\nRationale.\n\nRefs #4178",
+        ],
+    )
+    assert "SCOPE VIOLATION" not in briefing
+    assert "TAMPER DETECTED" not in briefing
+    assert "Sealed-amendment apply commit" in briefing
+    assert "finding on the issue it names" in briefing
+
+
+def test_briefing_omits_sealed_amendment_note_without_a_matching_commit() -> None:
+    """The new guidance is scoped to diffs that actually carry a
+    sealed-amendment-apply commit — an ordinary test-author PR with no such
+    commit must not see it (it would be noise, not guidance)."""
+    diff = "diff --git a/tests/acceptance/ms37/foo.rs b/tests/acceptance/ms37/foo.rs\n"
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="test-author",
+        commit_messages=["authored ms37 slice from the gate-a contract"],
+    )
+    assert "Sealed-amendment apply commit" not in briefing
+
+
 def test_briefing_mock_author_touching_only_sealed_path_no_tamper() -> None:
     """#1175: mock-author gets the same exemption as test-author (contract.md
     + mocks under the same sealed tree)."""

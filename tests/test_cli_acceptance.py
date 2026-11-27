@@ -2733,3 +2733,276 @@ class TestAcceptanceVerifyAmendment:
         ])
         assert result.exit_code != 0
         assert "malformed" in result.output
+
+
+def _green_amendment_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """A repo + sealed-amendment diff that `verify-amendment` (and thus
+    `approve-amendment`, which re-runs it) finds green — the common setup
+    `TestAcceptanceApproveAmendment`/`TestAcceptanceApplyAmendment` both
+    build on. Returns ``(repo_dir, config_path, artifact_path, sealed)``.
+    """
+    repo_dir = tmp_path / "repo"
+    _init_git_repo(repo_dir)
+    sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+    sealed.parent.mkdir(parents=True, exist_ok=True)
+    sealed.write_text("OLD\n")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+
+    diff = _git_diff_for_sealed_change(
+        repo_dir, "tests/acceptance/ms01/foo.txt", "NEW\n",
+    )
+
+    pass_blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+    fail_blob = json.dumps({"tests": [{"id": "ms01::a", "status": "fail", "message": "still broken"}]})
+    (repo_dir / "run_check.sh").write_text(
+        "if grep -q NEW tests/acceptance/ms01/foo.txt; then\n"
+        f"  echo '{pass_blob}'\n"
+        "else\n"
+        f"  echo '{fail_blob}'\n"
+        "fi\n"
+    )
+    subprocess.run(["git", "add", "run_check.sh"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "check script"], cwd=repo_dir, check=True)
+
+    config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="bash run_check.sh")
+    artifact_path = tmp_path / "artifact.json"
+    artifact_path.write_text(json.dumps({
+        "repo_name": "coord-tui",
+        "issue_number": 4178,
+        "diff": diff,
+        "touched_paths": ["tests/acceptance/ms01/foo.txt"],
+        "rationale": "unblocks the Removes: Foo::bar deletion",
+        "proposed_by": "worker",
+    }))
+    return repo_dir, config_path, artifact_path, sealed
+
+
+class TestAcceptanceApproveAmendment:
+    def test_approve_amendment_stamps_when_fresh_verify_is_green(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir, config_path, artifact_path, sealed = _green_amendment_fixture(tmp_path)
+        out_path = tmp_path / "approved.json"
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "approve-amendment", "--repo", "coord-tui",
+            str(artifact_path), "--approved-by", "jane",
+            "--config", str(config_path), "--out", str(out_path),
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(out_path.read_text())
+        assert payload["approved_by"] == "jane"
+        assert payload["approved_at"]
+        assert payload["fingerprint"]
+        assert payload["diff"] == json.loads(artifact_path.read_text())["diff"]
+
+        # #2096 "unconfirmed success is a defect": approve-amendment is a
+        # read-only check just like verify-amendment — it must never touch
+        # the real checkout itself, only stamp the artifact file.
+        assert sealed.read_text() == "OLD\n"
+
+    def test_approve_amendment_refuses_when_suite_is_red(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_text("OLD\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+        diff = _git_diff_for_sealed_change(
+            repo_dir, "tests/acceptance/ms01/foo.txt", "NEW\n",
+        )
+        fail_blob = json.dumps({"tests": [
+            {"id": "ms01::a", "status": "fail", "message": "still broken"},
+        ]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{fail_blob}'")
+        artifact_path = tmp_path / "artifact.json"
+        artifact_path.write_text(json.dumps({
+            "repo_name": "coord-tui", "issue_number": 4178, "diff": diff,
+            "touched_paths": ["tests/acceptance/ms01/foo.txt"],
+            "rationale": "r", "proposed_by": "worker",
+        }))
+        out_path = tmp_path / "approved.json"
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "approve-amendment", "--repo", "coord-tui",
+            str(artifact_path), "--approved-by", "jane",
+            "--config", str(config_path), "--out", str(out_path),
+        ])
+        assert result.exit_code == 1
+        assert "not green" in result.output
+        assert not out_path.exists()
+
+    def test_approve_amendment_errors_on_malformed_artifact(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="echo {}")
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(json.dumps({"repo_name": "coord-tui"}))
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "approve-amendment", "--repo", "coord-tui",
+            str(artifact), "--approved-by", "jane", "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "malformed" in result.output
+
+
+class TestAcceptanceApplyAmendment:
+    def _approve(self, tmp_path: Path, artifact_path: Path, config_path: Path) -> Path:
+        approved_path = tmp_path / "approved.json"
+        result = CliRunner().invoke(main, [
+            "acceptance", "approve-amendment", "--repo", "coord-tui",
+            str(artifact_path), "--approved-by", "jane",
+            "--config", str(config_path), "--out", str(approved_path),
+        ])
+        assert result.exit_code == 0, result.output
+        return approved_path
+
+    def test_apply_amendment_commits_exactly_approved_bytes_and_suite_goes_green(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir, config_path, artifact_path, sealed = _green_amendment_fixture(tmp_path)
+        approved_path = self._approve(tmp_path, artifact_path, config_path)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(approved_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["committed"] is True
+        assert payload["ok"] is True
+        assert payload["finding"] is None
+        assert payload["acceptance_verdict"]["green"] is True
+
+        # Unlike verify/approve-amendment, apply-amendment's whole job is
+        # to mutate the REAL checkout.
+        assert sealed.read_text() == "NEW\n"
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s%n%b"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        assert "Apply approved sealed amendment for #4178" in log
+        assert "Approved-by: jane" in log
+        assert "Refs #4178" in log
+        # Never a closing keyword — this commit must not auto-close the
+        # issue the amendment merely unblocks.
+        assert "Fixes #4178" not in log
+        assert "Closes #4178" not in log
+
+    def test_apply_amendment_refuses_an_unapproved_artifact(self, tmp_path: Path) -> None:
+        repo_dir, config_path, artifact_path, sealed = _green_amendment_fixture(tmp_path)
+        sha_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(artifact_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "has not been approved" in result.output
+
+        # Refused before touching anything — no commit, no working-tree edit.
+        sha_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert sha_before == sha_after
+        assert sealed.read_text() == "OLD\n"
+
+    def test_apply_amendment_refuses_when_fingerprint_no_longer_matches(
+        self, tmp_path: Path,
+    ) -> None:
+        repo_dir, config_path, artifact_path, _sealed = _green_amendment_fixture(tmp_path)
+        approved_path = self._approve(tmp_path, artifact_path, config_path)
+
+        # Tamper with the approved artifact's diff AFTER approval — this
+        # must be caught, not silently applied as if a human had approved
+        # these exact bytes.
+        approved = json.loads(approved_path.read_text())
+        approved["diff"] = approved["diff"].replace("NEW", "TAMPERED")
+        approved_path.write_text(json.dumps(approved))
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(approved_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "fingerprint does not match" in result.output
+
+    def test_apply_amendment_reports_red_suite_as_a_finding_on_the_work(
+        self, tmp_path: Path,
+    ) -> None:
+        """quadraui#2876 shape: the diff applies cleanly, but the sealed
+        suite is STILL red once it runs for real — apply-amendment must
+        still commit exactly the approved bytes (never silently drop or
+        rewrite them) and report the red result as a finding on the
+        underlying work, not a defect in the amendment it just applied."""
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        sealed = repo_dir / "tests" / "acceptance" / "ms01" / "foo.txt"
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed.write_text("OLD\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "sealed file"], cwd=repo_dir, check=True)
+
+        diff = _git_diff_for_sealed_change(
+            repo_dir, "tests/acceptance/ms01/foo.txt", "NEW\n",
+        )
+
+        # Green the FIRST time this runs (the fresh verify approve-amendment
+        # does), red every time after (the real re-run apply-amendment does
+        # post-commit) — modelling a regression the amendment exposes only
+        # once it's really applied, not something content-grep alone would
+        # catch in a throwaway scratch copy.
+        counter_file = tmp_path / "counter.txt"
+        pass_blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        fail_blob = json.dumps({"tests": [
+            {"id": "ms01::a", "status": "fail", "message": "tooltip register_zone regression"},
+        ]})
+        (repo_dir / "run_check.sh").write_text(
+            f'COUNTER="{counter_file}"\n'
+            'if [ ! -f "$COUNTER" ]; then\n'
+            '  echo 0 > "$COUNTER"\n'
+            f"  echo '{pass_blob}'\n"
+            "else\n"
+            f"  echo '{fail_blob}'\n"
+            "fi\n"
+        )
+        subprocess.run(["git", "add", "run_check.sh"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "check script"], cwd=repo_dir, check=True)
+
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="bash run_check.sh")
+        artifact_path = tmp_path / "artifact.json"
+        artifact_path.write_text(json.dumps({
+            "repo_name": "coord-tui", "issue_number": 4178, "diff": diff,
+            "touched_paths": ["tests/acceptance/ms01/foo.txt"],
+            "rationale": "r", "proposed_by": "worker",
+        }))
+        approved_path = self._approve(tmp_path, artifact_path, config_path)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "apply-amendment", "--repo", "coord-tui",
+            str(approved_path), "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["committed"] is True
+        assert payload["ok"] is False
+        assert payload["acceptance_verdict"]["green"] is False
+        assert "finding on the underlying work" in payload["finding"]
+        assert "tooltip register_zone regression" in payload["finding"]
+
+        # The approved bytes are STILL committed even though the suite is
+        # red afterward — a finding is never grounds to drop the commit or
+        # rewrite the amendment.
+        assert sealed.read_text() == "NEW\n"
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"], cwd=repo_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        assert "Apply approved sealed amendment for #4178" in log

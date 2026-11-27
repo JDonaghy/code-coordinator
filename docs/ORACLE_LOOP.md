@@ -129,6 +129,10 @@ One command, framework-agnostic above the driver:
 | `coord acceptance record --issue N --sha <sha>` | coordinator, **external** | Re-run the sealed slice against the pushed SHA; **write the verdict to the board** (the Acceptance box). The trust gate. Does **not** touch `expected_red:` itself (#2164 — see below for why and where that clear actually happens). |
 | `coord acceptance stall --issue N --tried … --stuck …` | worker, on non-convergence | Emit the structured stall report + push a WIP snapshot → raises `needs-attention` (#846). |
 | `coord acceptance expected-red <repo>` | anyone, read-only | List every live `expected_red:` entry on the default branch, via the GitHub API — no checkout needed. Flags an issue that's closed on GitHub but still carries entries as `STUCK` (#2164 acceptance criterion 4 — a long-lived entry is not invisible debt). |
+| `coord acceptance propose-amendment --repo R --issue N DIFF_FILE --touches PATH --rationale TEXT` | worker/planner, in-session | Write a **sealed-amendment artifact** (JSON) from a plain unified diff — see "Sealed amendment as data" below. Never applies anything. |
+| `coord acceptance verify-amendment --repo R ARTIFACT_FILE` | anyone, read-only | Apply the artifact's diff in a throwaway scratch copy and re-run the sealed suite there; print pass/fail. Never touches the real checkout. |
+| `coord acceptance approve-amendment --repo R ARTIFACT_FILE --approved-by NAME` | **human, never a model** | Re-run `verify-amendment` fresh and, only if still green, stamp the artifact approved (who/when/a content fingerprint). |
+| `coord acceptance apply-amendment --repo R APPROVED_ARTIFACT_FILE` | `test-author`, in-session | Apply exactly the approved bytes to this checkout as its own commit, then re-run the sealed suite there. |
 
 **Sealing — climb the ladder:**
 - **v1 (policy):** the acceptance dir is checked out in the worktree but listed in `files_forbidden`;
@@ -174,6 +178,51 @@ under `mocks/`, it needs no special-casing anywhere downstream:
 round, so `index.html` rides along into the portal bundle for free. It is
 also what the local-view TUI action (#2501) should open instead of a single
 mock file, once that lands.
+
+## Sealed amendment as data (#4178/#4179)
+
+A sealed slice is sometimes *wrong*, not just not-yet-fixed — a deletion a
+work issue makes breaks a sealed call site or struct literal
+(quadraui#2876's shape: 7 sealed call sites and 2 struct literals broke
+when a `Backend` method group was removed; the sealed suite itself needed
+new fields it had never heard of). The verifier (#4176) catches this
+*ahead* of dispatch by grepping removed/changed symbols against
+`AcceptanceConfig.sealed_paths()`, but catching it isn't enough — fixing it
+means **editing the sealed suite**, and no worker, test-author included,
+may ever freehand that edit; "writing under `sealed_paths` is the job" only
+covers a test-author's own JIT authoring, not an on-the-fly patch nobody
+reviewed. The amendment flows as **data**, not as a model's own edit,
+through four steps:
+
+1. **Propose.** A worker or planner session that hits a sealed break never
+   edits the sealed path itself. It emits a `SealedAmendmentArtifact` (a
+   plain unified diff + the paths it touches + a rationale) via
+   `coord acceptance propose-amendment`.
+2. **Verify.** `coord acceptance verify-amendment` applies that diff in a
+   throwaway scratch copy — never the real checkout, never the sealed
+   suite's actual source — and re-runs the sealed suite there, reporting a
+   structured pass/fail. Anyone can run this; it mutates nothing durable.
+3. **Approve.** A **human**, never a model, runs
+   `coord acceptance approve-amendment`. It re-runs verify-amendment fresh
+   (an approval must never rest on a stale verdict) and, only if still
+   green, stamps the artifact with who approved it, when, and a content
+   fingerprint binding the approval to those exact bytes — editing the
+   diff, rationale, or touched paths after approval invalidates the stamp.
+4. **Apply.** A `test-author` leg — the one assignment type whose job
+   already includes writing under `sealed_paths` — runs
+   `coord acceptance apply-amendment` to apply exactly the approved bytes
+   to its own checkout, as its own commit (never a closing keyword for the
+   issue the amendment unblocks — `Refs #N`, so GitHub never auto-closes
+   work that isn't actually done), then re-runs the sealed suite there.
+
+A red suite after step 4's apply is evidence about the *issue the
+amendment unblocks* (quadraui#2876's own aftermath: 7 sites repainted, but
+4 structural-parity tests still failed because the contract path had
+dropped a `register_zone` call — a real library regression the amendment
+exposed, not a defect in the amendment) — a **finding**, reported as such,
+never grounds to edit the amendment or the sealed suite further to make it
+pass. The approved bytes land regardless; the red result routes back to
+the work the amendment was unblocking.
 
 ## A sealed slice is red by design — the `expected_red` registry (#2164)
 
