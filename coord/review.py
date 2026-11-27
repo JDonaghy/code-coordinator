@@ -4759,10 +4759,14 @@ def dispatch_review(
     review per leg" guard below for a leg that already carries an approved
     *scoped* verdict. That gate's whole point is to require a SECOND,
     full-diff review on top of a scoped approval, so the ordinary single-
-    review invariant does not apply here; every other guard (the active-
-    dispatch dedupe, the atomic claim, the terminal-work/TOS checks) still
-    runs unchanged, so this still dispatches at most once per leg while a
-    review is pending or in flight for it.
+    review invariant does not apply here. It also disables the #4002
+    `check_already_approved` SHA-match at the per-item gate below for the
+    same reason: that leg's current head IS the one the scoped approval
+    covers, so leaving the check on would deny the exact dispatch this
+    flag exists to make. Every other guard (the active-dispatch dedupe,
+    the atomic claim, the terminal-work/TOS checks) still runs unchanged,
+    so this still dispatches at most once per leg while a review is
+    pending or in flight for it.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -5002,9 +5006,50 @@ def dispatch_review(
         except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
             pass
 
+        if require_full_review_for_out_of_delta_gate:
+            # The out-of-delta gate's whole point is a SECOND, full review
+            # on top of a head a *scoped* round already approved — but
+            # once a FULL (non-scoped) review has itself approved this
+            # exact head, the gate has already cleared (see
+            # `_out_of_delta_review_gate`) and nothing should dispatch
+            # another metered review for it. This is the "more rigorous
+            # check than a bare SHA match" that justifies bypassing the
+            # #4002 check below for a scoped-only approval, without
+            # reopening it for a head a full review already cleared.
+            from coord import merge_queue as mq  # noqa: PLC0415
+
+            if mq.full_review_already_approves_head(
+                board,
+                assignment_id=completed.assignment_id,
+                branch=completed.branch,
+                branch_head_sha=review_head_sha,
+            ):
+                return _deny(
+                    f"{completed.repo_name}#{completed.issue_number}'s "
+                    f"current head {(review_head_sha or '?')[:12]} already "
+                    "has a full (non-scoped) approving review in its work "
+                    "chain — the out-of-delta gate should already be "
+                    "clear; refusing a redundant dispatch"
+                )
+
         # #4002: the per-item gate — one review per (repo, issue) in flight
         # at a time, and never against a head already approved in this
         # work's chain. See `claim_review_item_dispatch_gate`'s docstring.
+        #
+        # *require_full_review_for_out_of_delta_gate* skips the SHA-match
+        # half of this gate (`check_already_approved=False`) for exactly
+        # the same reason it skips the #3670 checks above: the caller's own
+        # out-of-delta verdict already established that this exact head —
+        # approved only by a scoped round — still needs a full review, so
+        # the #4002 "head already approved" refusal would otherwise deny
+        # the very dispatch this gate exists to make (mirrors
+        # `dispatch_scoped_review`'s `is_base_move` use of the same
+        # parameter, for the same kind of already-verified-elsewhere head).
+        # The check immediately above already ruled out the one case this
+        # bypass would otherwise wrongly let through — a head a full review
+        # has already approved — so disabling it here is safe; the
+        # in-flight/dedupe half of the gate (one lease per (repo, issue))
+        # still applies unchanged.
         _item_allowed, _item_deny_reason = claim_review_item_dispatch_gate(
             repo_name=completed.repo_name,
             issue_number=effective_issue_number(completed),
@@ -5014,6 +5059,7 @@ def dispatch_review(
             board=board,
             branch_sha_fetcher=branch_sha_fetcher,
             head_sha=review_head_sha,
+            check_already_approved=not require_full_review_for_out_of_delta_gate,
         )
         if not _item_allowed:
             return _deny(_item_deny_reason)

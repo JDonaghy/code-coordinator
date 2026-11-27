@@ -660,7 +660,21 @@ class TestAutoDispatchFullReviewForOutOfDeltaGate:
     acceptance shapes: exactly one dispatch for a flagged leg, no second
     dispatch on a later tick while that review is still in flight, and a
     fresh dispatch once a new work leg (a push) appears.
+
+    Every board here stamps a real `review_head_sha` on the scoped review
+    AND injects a `branch_sha_fetcher` that resolves the SAME sha for the
+    entry's branch (`HEAD_SHA`/`_dispatch_kwargs` below) — without both of
+    those, `dispatch_review`'s #4002 `head_already_approved` check never
+    resolves a head at all (`if not branch or not branch_head_sha: return
+    False`), so these tests would pass even if the
+    `require_full_review_for_out_of_delta_gate` override never reached that
+    check. Resolving a real, matching head is what proves the override
+    actually bypasses it (and, separately, that a FULL review already
+    covering that head still blocks a redundant redispatch — see
+    `test_does_not_redispatch_once_a_full_review_already_covers_the_head`).
     """
+
+    HEAD_SHA = "sha-w1"
 
     @staticmethod
     def _config():
@@ -680,8 +694,9 @@ class TestAutoDispatchFullReviewForOutOfDeltaGate:
             reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
         )
 
-    @staticmethod
-    def _dispatch_kwargs(client):
+    @classmethod
+    def _dispatch_kwargs(cls, client, *, branch: str = "worker/w1", head_sha: str | None = None):
+        head_sha = cls.HEAD_SHA if head_sha is None else head_sha
         return dict(
             http_client=client,
             pr_lookup=lambda repo_github, **kw: {
@@ -691,15 +706,24 @@ class TestAutoDispatchFullReviewForOutOfDeltaGate:
             claude_md_reader=lambda p: None,
             issue_body_fetcher=lambda repo, num: "",
             remote_branch_checker=lambda repo, branch: True,
+            # Resolves the SAME head sha `_flagged_board` stamped on the
+            # scoped review's `review_head_sha` — the production shape
+            # `head_already_approved`'s SHA-match gate needs to actually
+            # be reachable (see class docstring).
+            branch_sha_fetcher=lambda repo_github, br: head_sha if br == branch else None,
         )
 
-    @staticmethod
-    def _flagged_board(work_id: str = "w1", scoped_id: str = "rev-scoped") -> Board:
+    @classmethod
+    def _flagged_board(
+        cls, work_id: str = "w1", scoped_id: str = "rev-scoped",
+        head_sha: str | None = None,
+    ) -> Board:
         # The WORK leg already carries `review_verdict="approve"` — exactly
         # what `propagate_review_verdict` writes onto it once the scoped
         # round below lands — so a test proving the override actually
         # bypasses `dispatch_review`'s ordinary "one review per leg" guard
         # starts from the state that guard would otherwise refuse.
+        head_sha = cls.HEAD_SHA if head_sha is None else head_sha
         work = Assignment(
             machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
             assignment_id=work_id, type="work", status="done",
@@ -709,7 +733,7 @@ class TestAutoDispatchFullReviewForOutOfDeltaGate:
             machine_name="reviewer", repo_name="api", issue_number=1, issue_title="t",
             assignment_id=scoped_id, type="review", status="done",
             review_of_assignment_id=work_id, review_verdict="approve",
-            review_scoped=True, dispatched_at=100.0,
+            review_scoped=True, dispatched_at=100.0, review_head_sha=head_sha,
         )
         return Board(active=[], completed=[work, scoped])
 
@@ -721,6 +745,14 @@ class TestAutoDispatchFullReviewForOutOfDeltaGate:
         client = _FakeHTTPClient({"id": "review-id-1"})
         entry = _q("w1")
 
+        # The scoped review above already carries an `approve` whose
+        # `review_head_sha` matches the SAME head `_dispatch_kwargs`
+        # resolves for this branch — exactly the state #4002's
+        # `head_already_approved` would otherwise refuse a fresh dispatch
+        # against (`claim_review_item_dispatch_gate`'s `check_already_
+        # approved`). This only passes because `dispatch_review`'s
+        # `require_full_review_for_out_of_delta_gate` override actually
+        # disables that check for this caller.
         result = dispatch_full_review_for_out_of_delta_gate(
             entry, board, cfg, **self._dispatch_kwargs(client),
         )
@@ -730,6 +762,36 @@ class TestAutoDispatchFullReviewForOutOfDeltaGate:
         assert result.review_of_assignment_id == "w1"
         assert len(client.calls) == 1
         assert result in board.active
+
+    def test_does_not_redispatch_once_a_full_review_already_covers_the_head(
+        self,
+    ) -> None:
+        # A FULL (non-scoped) review already approved this exact head --
+        # the out-of-delta gate would already read as clear
+        # (`_out_of_delta_review_gate`) -- so a later, independent call to
+        # the auto-dispatch helper (e.g. a stale/duplicate merge-queue
+        # tick) must not fire a second, redundant metered review for it.
+        from tests.test_review import _FakeHTTPClient
+
+        cfg = self._config()
+        board = self._flagged_board()
+        full = Assignment(
+            machine_name="reviewer2", repo_name="api", issue_number=1,
+            issue_title="t", assignment_id="rev-full", type="review",
+            status="done", review_of_assignment_id="w1",
+            review_verdict="approve", review_scoped=False,
+            dispatched_at=200.0, review_head_sha=self.HEAD_SHA,
+        )
+        board.completed.append(full)
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        entry = _q("w1")
+
+        result = dispatch_full_review_for_out_of_delta_gate(
+            entry, board, cfg, **self._dispatch_kwargs(client),
+        )
+
+        assert result is None
+        assert client.calls == []
 
     def test_second_tick_does_not_dispatch_again_while_in_flight(self) -> None:
         from tests.test_review import _FakeHTTPClient
