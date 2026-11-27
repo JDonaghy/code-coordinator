@@ -5082,6 +5082,18 @@ def dispatch_review(
         # uses at merge time to fingerprint `branch_patch_id` — so the two
         # sides of the "did the content change" question are always computed
         # the same way, whether or not a PR happens to exist yet.
+        #
+        # Diffs against the already-resolved `review_head_sha` (fetched
+        # live above, before this branch opened), not the bare
+        # `completed.branch` ref name, whenever that resolution succeeded —
+        # same reasoning as `dispatch_scoped_review`'s own live-head
+        # resolution: two separate live reads of a ref name can each
+        # observe a different commit if a push lands in between, so diffing
+        # against the sha already recorded as `review_head_sha` is the only
+        # way to guarantee the diff shown here and the sha this review is
+        # recorded against can't end up naming two different commits. Falls
+        # back to the ref name when the sha resolution failed, same
+        # fail-open posture as everywhere else in this function.
         _diff = diff_fetcher or github_ops.pr_diff
         if pr:
             full_diff_text = _diff(repo.github, pr["number"], max_chars=None)
@@ -5089,7 +5101,7 @@ def dispatch_review(
             _compare_diff_pre_pr = compare_diff_fetcher or github_ops.get_compare_diff
             try:
                 full_diff_text = _compare_diff_pre_pr(
-                    repo.github, base_branch, completed.branch
+                    repo.github, base_branch, review_head_sha or completed.branch
                 )
             except Exception:  # noqa: BLE001 — fail-safe: missing diff is not blocking
                 full_diff_text = None
@@ -7149,15 +7161,22 @@ def dispatch_scoped_review(
     ``coord.merge_queue.QueuedMerge``.
 
     *diff_fetcher* defaults to :func:`coord.github_ops.get_compare_diff`
-    (``(repo, base, ref) -> str | None``); inject a stub in tests. Fetches
-    the diff *prior_review* covered (``target_branch...prior_review.
-    review_head_sha``) and the branch's current diff (``target_branch...
-    entry.branch``), computes the resolution delta between them, and — only
-    when that delta is non-empty — dispatches a review briefed on just the
-    delta. Returns ``None`` (caller falls back to a full :func:`dispatch_review`)
-    when either diff can't be fetched, the delta comes back empty, no
-    reviewer machine is available, or every candidate agent rejects the
-    dispatch — never guesses at scope from partial information.
+    (``(repo, base, ref) -> str | None``); inject a stub in tests. Resolves
+    ``entry.branch``'s live head sha first — the same resolution this
+    dispatch records as ``review_head_sha`` — and fetches the branch's
+    current diff against that resolved sha rather than against the bare
+    ref name whenever the resolution succeeds, so the diff shown to the
+    reviewer and the sha this dispatch records can't name two different
+    commits (falls back to the ref name on a sha-fetch failure, same as a
+    diff fetch failure further down — fail-open, never blocking). Also
+    fetches the diff *prior_review* covered (``target_branch...
+    prior_review.review_head_sha``), computes the resolution delta between
+    the two, and — only when that delta is non-empty — dispatches a review
+    briefed on just the delta. Returns ``None`` (caller falls back to a
+    full :func:`dispatch_review`) when either diff can't be fetched, the
+    delta comes back empty, no reviewer machine is available, or every
+    candidate agent rejects the dispatch — never guesses at scope from
+    partial information.
 
     Returns the new review Assignment (already appended to ``board.active``,
     with ``review_scoped=True`` and ``review_scope_base_sha=prior_review.
@@ -7301,9 +7320,33 @@ def dispatch_scoped_review(
 
     base_branch = entry.target_branch or repo.default_branch
 
+    # Resolve the branch's live head sha ONCE, before fetching any diff, and
+    # fetch every diff against that exact commit rather than against
+    # `entry.branch`'s ref name. `get_compare_diff` always resolves a ref
+    # name to whatever is current at the moment of that call — two separate
+    # calls against the ref name (one for the diff, a later one for
+    # `review_head_sha`) could each observe a different commit if a push
+    # lands in between, so the sha this review is recorded against could
+    # end up naming a commit whose content the reviewer was never actually
+    # shown. Resolving first and diffing against the resolved sha closes
+    # that window: whatever gets diffed and whatever gets recorded as
+    # `review_head_sha` are provably the same commit.
+    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+    review_head_sha: str | None = None
+    try:
+        review_head_sha = _get_sha(repo.github, entry.branch)
+    except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
+        pass
+
+    # Diff against the resolved sha itself whenever it's available, rather
+    # than the bare ref name, so the diff just fetched and `review_head_sha`
+    # below can never name two different commits. Falls back to the ref
+    # name on the (rare) sha-fetch failure — same as before this sha was
+    # ever resolved up front — so a transient `branch_sha_fetcher` failure
+    # still gets a diff, just without the same-commit guarantee.
     _diff = diff_fetcher or github_ops.get_compare_diff
     try:
-        new_diff = _diff(repo.github, base_branch, entry.branch)
+        new_diff = _diff(repo.github, base_branch, review_head_sha or entry.branch)
     except Exception:  # noqa: BLE001
         new_diff = None
 
@@ -7428,13 +7471,6 @@ def dispatch_scoped_review(
         issue_labels=cached_issue_labels(entry.repo_name, entry.issue_number),
     )
     review_model_wire = config.models.resolve(review_model_alias)
-
-    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
-    review_head_sha: str | None = None
-    try:
-        review_head_sha = _get_sha(repo.github, entry.branch)
-    except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
-        pass
 
     # #3787 review round 2 (blocking): this scoped path reaches the same
     # request-changes -> fix -> re-review bounce chain `dispatch_review`

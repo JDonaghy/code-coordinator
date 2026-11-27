@@ -3799,8 +3799,50 @@ def test_dispatch_review_captures_patch_id_without_pr(
     assert result.review_patch_id == "patchid-no-pr"
     # The compare diff must be fetched against the branch's own base/head —
     # the same shape `github_ops.get_branch_patch_id` uses at merge time —
-    # not `gh pr diff` (which has no PR number to call with).
-    assert compare_calls and compare_calls[0][2] == completed.branch
+    # not `gh pr diff` (which has no PR number to call with). The "head" is
+    # the already-resolved live sha (`review_head_sha`, from
+    # `branch_sha_fetcher`), not the bare branch ref name — so this diff
+    # and the sha this review is recorded against can't name two different
+    # commits.
+    assert compare_calls and compare_calls[0][2] == "deadbeef1234"
+    assert result.review_head_sha == "deadbeef1234"
+
+
+def test_dispatch_review_without_pr_diffs_resolved_sha_not_branch_ref(
+    two_machine_config: Config,
+) -> None:
+    """The pre-PR compare-diff branch (#2364) must diff against the
+    already-resolved `review_head_sha`, not the bare branch ref name, so a
+    push landing between the sha resolution and the diff fetch can't make
+    the briefed diff disagree with the sha this review is recorded
+    against. A `compare_diff_fetcher` that returns different content for
+    the ref name than for the resolved sha stands in for that race."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "no-pr-livehead-1"})
+
+    def _compare_diff(repo_github: str, base: str, head: str) -> str | None:
+        if head == "live-head-sha":
+            return "diff --git a/f.py b/f.py\n+resolved-sha-content\n"
+        # The bare ref name must never be queried once a live sha resolves.
+        return "diff --git a/f.py b/f.py\n+STALE-REF-NAME-CONTENT\n"
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: None,  # no PR open yet
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "live-head-sha",
+        compare_diff_fetcher=_compare_diff,
+    )
+
+    assert result is not None
+    assert result.review_head_sha == "live-head-sha"
+    _, payload = client.calls[0]
+    assert "resolved-sha-content" in payload["briefing"]
+    assert "STALE-REF-NAME-CONTENT" not in payload["briefing"]
 
 
 def test_dispatch_review_tolerates_patch_id_fetch_failure(
@@ -5144,6 +5186,71 @@ def test_dispatch_scoped_review_dispatches_with_delta_in_briefing(
     assert payload["model"] == "sonnet"
     assert "conflict-fix-resolution" in payload["briefing"]
     assert "kept-from-before" in payload["briefing"]
+
+
+def test_dispatch_scoped_review_diffs_the_resolved_sha_not_the_branch_ref(
+    two_machine_config: Config,
+) -> None:
+    """`dispatch_scoped_review` must diff against the branch's resolved live
+    head sha, not the bare ref name, so a push landing between the sha
+    resolution and the diff fetch can never make the diff shown to the
+    reviewer disagree with the sha recorded as `review_head_sha` on the
+    dispatched row. A `diff_fetcher` that returns different content for the
+    ref name than for the resolved sha stands in for that race: if the diff
+    fetch were still keyed on the ref name, the briefing would show the
+    ref-name content and `review_head_sha` would record a different commit
+    entirely — a stale-SHA review with no way to detect it after the fact."""
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+    client = _FakeHTTPClient({"id": "scoped-livehead"})
+
+    def _diff_fetcher(repo: str, base: str, ref: str) -> str:
+        if ref == "oldsha":
+            return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+kept-from-before\n"
+        if ref == "live-head-sha":
+            return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+resolved-sha-content\n"
+        # The bare ref name must never be queried once a live sha resolves.
+        return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+STALE-REF-NAME-CONTENT\n"
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, diff_fetcher=_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "live-head-sha",
+    )
+
+    assert result is not None
+    assert result.review_head_sha == "live-head-sha"
+    _, payload = client.calls[0]
+    assert "resolved-sha-content" in payload["briefing"]
+    assert "STALE-REF-NAME-CONTENT" not in payload["briefing"]
+
+
+def test_dispatch_scoped_review_falls_back_to_ref_name_when_sha_unresolvable(
+    two_machine_config: Config,
+) -> None:
+    """A `branch_sha_fetcher` failure must stay fail-open — the scoped
+    review still dispatches, diffing against the bare ref name (the
+    pre-existing behaviour), just without the same-commit guarantee a
+    resolved sha would have given it."""
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+    client = _FakeHTTPClient({"id": "scoped-nosha"})
+
+    def _branch_sha_fetcher(repo: str, branch: str) -> str | None:
+        raise RuntimeError("gh api failure")
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=_branch_sha_fetcher,
+    )
+
+    assert result is not None
+    assert result.review_head_sha is None
+    _, payload = client.calls[0]
+    assert "conflict-fix-resolution" in payload["briefing"]
 
 
 def test_dispatch_scoped_review_request_changes_prior_embeds_findings(
