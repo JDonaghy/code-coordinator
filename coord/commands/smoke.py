@@ -20,6 +20,9 @@ import click
 from coord.commands._common import _CONFIG_OPTION, _load_config
 
 if TYPE_CHECKING:  # pragma: no cover - import-cycle-avoidance only
+    import httpx
+
+    from coord.models import Assignment
     from coord.nightly_runner import NightlyRunReport
     from coord.nightly_smoke import NightlyStepOutcome
 
@@ -275,6 +278,220 @@ def smoke_nightly_sweep_cmd(config_path: Path, dry_run: bool, as_json: bool) -> 
     # filing/acting step itself, not in the app or the environment).
     if any_dropped:
         sys.exit(1)
+
+
+@smoke_group.command(
+    "run-leg",
+    help=(
+        "Dispatch ONE capability-partition Test-stage leg for an existing "
+        "branch to a machine that declares --capability (#4147). This is "
+        "the remote re-run a fix worker landed on a host that cannot "
+        "reproduce one of a #3182 fan-out's failing legs needs to verify "
+        "it before finishing, instead of self-recording an UNCONFIRMED "
+        "pass/fail for a stage it never actually ran. Deliberately NOT "
+        "part of the automatic fan-out/claim/dedup machinery "
+        "(`coord.smoke.dispatch_smoke`) — a one-off diagnostic dispatch "
+        "with no retry bookkeeping of its own, same spirit as `coord "
+        "smoke nightly`'s on-demand single-spec run."
+    ),
+)
+@_CONFIG_OPTION
+@click.option("--repo", "repo", required=True, help="Repo name (coordinator.yml).")
+@click.option("--branch", "branch", required=True, help="Existing branch to check out and test.")
+@click.option(
+    "--capability", "capability", required=True,
+    help="e.g. macos, windows, gtk — must match a machines[].capabilities entry.",
+)
+@click.option(
+    "--wait", is_flag=True,
+    help="Poll until the leg reaches a terminal verdict before returning.",
+)
+@click.option(
+    "--timeout", "timeout_s", default=1800, type=int,
+    help="Seconds to wait when --wait is set (default 1800).",
+)
+@click.option(
+    "--poll-interval", "poll_interval_s", default=15, type=int,
+    help="Seconds between polls when --wait is set (default 15).",
+)
+def smoke_run_leg_cmd(
+    config_path: Path, repo: str, branch: str, capability: str,
+    wait: bool, timeout_s: int, poll_interval_s: int,
+) -> None:
+    config = _load_config(config_path)
+    leg, error = dispatch_capability_leg(config, repo_name=repo, branch=branch, capability=capability)
+    if leg is None:
+        click.echo(f"error: {error}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"dispatched {leg.assignment_id} on {leg.machine_name} for "
+        f"capability {capability!r} on {repo}@{branch}"
+    )
+    if error is not None:
+        # The leg is really running on the agent (`leg` is non-None) but
+        # `record_dispatched_assignment` itself failed — say so rather
+        # than silently losing the board row a `--wait` poll needs.
+        click.echo(f"warning: {error}", err=True)
+    if not wait:
+        return
+
+    state, reason = wait_for_leg_verdict(
+        leg.assignment_id or "", timeout_s=timeout_s, poll_interval_s=poll_interval_s,
+    )
+    if state is None:
+        click.echo(
+            f"error: leg {leg.assignment_id} did not reach a terminal "
+            f"verdict within {timeout_s}s",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(f"verdict: {state} — {reason or ''}")
+    if state == "failed":
+        sys.exit(1)
+
+
+def dispatch_capability_leg(
+    config,
+    *,
+    repo_name: str,
+    branch: str,
+    capability: str,
+    http_client: "httpx.Client | None" = None,
+) -> "tuple[Assignment | None, str | None]":
+    """Dispatch one standalone Test-stage leg for *capability* on *branch*
+    (#4147) — the production body behind ``coord smoke run-leg``, factored
+    out so it is unit-testable against an injected *http_client* exactly
+    like every other agent-POSTing seam in this package.
+
+    Machine selection reuses :func:`coord.dispatch.select_fix_machine`'s
+    new capability-aware scoring (`original_machine_name=""` so nothing
+    is ever "already there" to prefer — the caller named a capability, not
+    a machine) rather than a second "which machine can run this" search
+    (#2096, "one question, one answer"). Returns ``(None, reason)`` when
+    nothing capable is reachable, or ``(assignment, None)`` once the leg
+    is POSTed and recorded on the board.
+    """
+    import time as _time
+    import uuid as _uuid
+
+    import httpx as _httpx
+
+    from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS, select_fix_machine
+    from coord.models import Assignment
+    from coord.smoke import SMOKE_SYSTEM_PROMPT, resolve_smoke_command
+    from coord.state import record_dispatched_assignment
+
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None:
+        return None, f"repo {repo_name!r} not in coordinator.yml"
+
+    selection = select_fix_machine(
+        original_machine_name="",
+        repo_name=repo_name,
+        machines=config.machines,
+        failing_capability_sets=[(capability,)],
+    )
+    machine = selection.machine
+    if machine is None:
+        from coord.dispatch import describe_fix_machine_failure  # noqa: PLC0415
+
+        return None, describe_fix_machine_failure("", selection)
+    if capability not in machine.capabilities:
+        # select_fix_machine still names the BEST-covering reachable
+        # machine even when none fully covers the failing set (#4147) — for
+        # a single-capability request that means nothing in the fleet
+        # declares it at all.
+        return None, (
+            f"no configured, reachable machine declares capability "
+            f"{capability!r} for {repo_name!r} (closest: {machine.name})"
+        )
+
+    repo_path = machine.repo_path(repo_name)
+    command = resolve_smoke_command(repo_cfg, config.smoke_tests).command
+
+    from coord.smoke_tags import smoke_leg_issue_title  # noqa: PLC0415
+
+    issue_title = smoke_leg_issue_title(f"manual leg on {branch}", (capability,))
+    briefing = (
+        f"Run exactly this command against the current checkout of "
+        f"{branch!r} and report the result:\n\n    {command}\n\n"
+        "This is a one-off diagnostic re-run (#4147) dispatched by `coord "
+        "smoke run-leg`, not a normal work leg — do not modify any files."
+    )
+    payload = {
+        "repo_name": repo_name,
+        "repo_path": repo_path,
+        "issue_number": 0,
+        "issue_title": issue_title,
+        "briefing": briefing,
+        "files_allowed": [],
+        "files_forbidden": [],
+        "pull_repos": [],
+        "type": "smoke",
+        "system_prompt": SMOKE_SYSTEM_PROMPT,
+        "review_target": branch,
+        "branch": repo_cfg.default_branch or "main",
+        "target_branch": branch,
+        "plain_runner": True,
+        "smoke_command": command,
+        "smoke_needs_judgement": False,
+    }
+    client = http_client or _httpx
+    url = f"http://{machine.host}:{AGENT_PORT}/assign"
+    try:
+        resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
+        resp.raise_for_status()
+        agent_response = resp.json()
+    except (_httpx.HTTPError, _httpx.TimeoutException) as exc:
+        return None, f"POST /assign to {machine.name} failed: {exc}"
+
+    leg = Assignment(
+        machine_name=machine.name,
+        repo_name=repo_name,
+        issue_number=0,
+        issue_title=issue_title,
+        briefing=briefing,
+        assignment_id=agent_response.get("id") or _uuid.uuid4().hex[:12],
+        status="running",
+        branch=branch,
+        dispatched_at=_time.time(),
+        type="smoke",
+    )
+    try:
+        record_dispatched_assignment(assignment=leg, repo_github=repo_cfg.github)
+    except Exception as exc:  # noqa: BLE001 — the leg is already running on
+        # the agent; a board-record failure must not read as "nothing
+        # happened" (it would, e.g., leave `--wait` polling an id the board
+        # never heard of) but it also must not crash this command outright.
+        return leg, f"dispatched but failed to record on the board: {exc}"
+    return leg, None
+
+
+def wait_for_leg_verdict(
+    assignment_id: str, *, timeout_s: int, poll_interval_s: int, sleep=None,
+) -> "tuple[str | None, str | None]":
+    """Poll :func:`coord.state.load_assignment_test_state` for
+    *assignment_id* until it reaches a terminal verdict or *timeout_s*
+    elapses (#4147). ``(None, None)`` on timeout; otherwise ``(state,
+    reason)``, same shape `coord fix`'s own briefing already echoes.
+
+    *sleep* is injectable (defaults to `time.sleep`) so a test can advance
+    through several poll iterations without a real wall-clock wait.
+    """
+    import time as _time
+
+    from coord.state import load_assignment_test_reason, load_assignment_test_state
+
+    _sleep = sleep or _time.sleep
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        state = load_assignment_test_state(assignment_id)
+        if state not in (None, "running"):
+            return state, load_assignment_test_reason(assignment_id)
+        if _time.monotonic() >= deadline:
+            return None, None
+        _sleep(poll_interval_s)
 
 
 def _report_to_dict(report: "NightlyRunReport") -> dict:

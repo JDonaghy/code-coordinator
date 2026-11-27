@@ -1296,6 +1296,43 @@ def fix(
         f"- Commit your fixes and push with git push origin HEAD"
     )
 
+    # #4147: when this door fired on a #3182 Test-stage fan-out failure
+    # (quadraui#2876's own shape — a cross-backend diff where only ONE
+    # capability partition went red), name which leg(s) actually failed so
+    # machine selection below routes to hardware that can reproduce them,
+    # and tell the fix worker which sibling legs already passed so it
+    # doesn't waste a round re-verifying green platforms. `[]` for every
+    # other door onto this command (CI/acceptance/UAT failures, or a
+    # single-leg Test row) — `fanout_leg_verdicts` itself already reports
+    # `[]` for a non-fan-out row.
+    failing_capability_sets: list[tuple[str, ...]] = []
+    if test_failed:
+        from coord.smoke import fanout_leg_verdicts  # noqa: PLC0415
+
+        leg_verdicts = fanout_leg_verdicts(assignment_id)
+        failing_capability_sets = [
+            v.capabilities for v in leg_verdicts if v.state == "failed"
+        ]
+        passing = [
+            v for v in leg_verdicts if v.state in ("passed", "skipped")
+        ]
+        if passing:
+            passing_lines = []
+            for v in passing:
+                leg_row = board.find_by_id(v.leg_id)
+                sha = (leg_row.test_head_sha if leg_row else None) or "unknown SHA"
+                passing_lines.append(
+                    f"- [{'+'.join(v.capabilities)}] passed at {sha}"
+                )
+            briefing = (
+                briefing
+                + "\n\n## Capability sets already passing (#4147)\n\n"
+                + "These Test-stage legs already passed on this branch — "
+                "don't re-verify them or change anything that would "
+                "regress them:\n"
+                + "\n".join(passing_lines)
+            )
+
     # #3208: pick a machine to run the fix on BEFORE ever POSTing — same
     # selector the review-verdict door uses (`coord.dispatch.
     # select_fix_machine`), so the two doors onto `coord fix` can never
@@ -1304,14 +1341,22 @@ def fix(
     # skips it — and falls through to another capable, reachable machine —
     # the moment it's asleep/offline, instead of the previous unconditional
     # re-aim that surfaced only as a bare `dispatch failed: timed out` with
-    # no named cause (format-converter#6 / #3208).
-    from coord.dispatch import describe_fix_machine_failure, select_fix_machine
+    # no named cause (format-converter#6 / #3208). #4147: also capability-
+    # aware — a fan-out's failing leg(s) route to whichever machine best
+    # covers them (see this call's own docstring), not just "wherever the
+    # original worker was".
+    from coord.dispatch import (  # noqa: PLC0415
+        describe_fix_machine_failure,
+        fix_machine_capability_note,
+        select_fix_machine,
+    )
 
     selection = select_fix_machine(
         original_machine_name=assignment.machine_name,
         repo_name=assignment.repo_name,
         machines=cfg.machines,
         override_machine_name=machine_override,
+        failing_capability_sets=failing_capability_sets,
     )
     if selection.machine is None:
         click.echo(
@@ -1323,6 +1368,10 @@ def fix(
             err=True,
         )
         sys.exit(1)
+    if selection.uncovered_failing_capabilities:
+        briefing = briefing + fix_machine_capability_note(
+            selection.machine.name, selection.uncovered_failing_capabilities,
+        )
     if selection.machine.name != assignment.machine_name:
         # #586 (mirrored from `coord.auto_loop._dispatch_fix`): routing to a
         # DIFFERENT machine than the original worker only works if the

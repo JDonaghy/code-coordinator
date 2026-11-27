@@ -716,6 +716,42 @@ class Machine:
     def repo_path(self, repo_name: str) -> str | None:
         return self.repo_paths.get(repo_name)
 
+    def covers_capabilities(self, capabilities: "Iterable[str]") -> bool:
+        """Whether this machine declares EVERY capability in *capabilities*
+        (#4147). Used to score a machine against one failing Test-fan-out
+        leg's own capability set (e.g. ``("gtk", "windows")`` for a
+        combined leg) — a partial match does not count as covering that
+        leg, since the leg's own suite needs all of them together to run
+        at all. An empty *capabilities* is trivially covered by every
+        machine (vacuous truth), matching `all()`'s own behaviour.
+        """
+        return all(cap in self.capabilities for cap in capabilities)
+
+
+@dataclass(frozen=True)
+class FanoutLegVerdict:
+    """One capability-partition leg of a #3182 Test-stage fan-out, as read
+    back off the board (#4147).
+
+    Shared shape between `coord.smoke.fanout_leg_verdicts` (the one reader)
+    and its two callers — `coord.smoke.finalize_smoke_fanout`'s own verdict
+    fold, and `coord.dispatch`'s fix-leg capability routing — so a fan-out
+    leg's identity (``leg_id``), the capability set it ran
+    (``capabilities``, e.g. ``("macos",)`` or ``("gtk", "windows")`` for a
+    combined partition), its own terminal verdict (``state``: ``"passed"``
+    / ``"failed"`` / ``"skipped"`` / `coord.state.TEST_STATE_BLOCKED` /
+    `None` if still running), the one-line reason recorded alongside it,
+    and the Test-stage command it ran, are read exactly once rather than
+    reconstructed independently by each caller (#2096, "one question, one
+    answer").
+    """
+
+    leg_id: str
+    capabilities: tuple[str, ...]
+    state: str | None
+    reason: str | None
+    command: str | None
+
 
 # #930 review fix: assignment ``type`` values that should flow through the
 # normal Work → Test → Review → Merge pipeline like any other "work" — i.e.

@@ -2057,7 +2057,34 @@ def _dispatch_fix(
                 failure_detail.append(reason)
             return None
 
-    from coord.dispatch import describe_fix_machine_failure, select_fix_machine
+    from coord.dispatch import (  # noqa: PLC0415
+        backend_capability_from_title,
+        describe_fix_machine_failure,
+        fix_machine_capability_note,
+        select_fix_machine,
+    )
+
+    # #4147: a request-changes fix must still land on a machine that can
+    # verify the WHOLE diff, not just whichever machine the original
+    # worker happened to be dispatched to — `select_fix_machine` used to
+    # be entirely capability-blind, so a cross-backend diff's fix round
+    # could silently stay on a machine that could never run part of its
+    # own Test stage. Reuses `coord.smoke.required_capabilities` — the
+    # SAME function `route_work_by_capability`'s original-dispatch routing
+    # calls — rather than a second "what does this diff need" computation
+    # (#2096, "one question, one answer").
+    from coord.smoke import required_capabilities  # noqa: PLC0415
+
+    repo_for_routing = config.repo(work.repo_name)
+    required = list(required_capabilities(
+        repo_for_routing.requires if repo_for_routing else (),
+        work.files_allowed,
+        config.smoke_tests.capability_rules,
+    ))
+    backend_cap = backend_capability_from_title(work.issue_title)
+    if backend_cap and backend_cap not in required:
+        required.append(backend_cap)
+    failing_capability_sets = [tuple(required)] if required else []
 
     selection = select_fix_machine(
         original_machine_name=work.machine_name,
@@ -2065,6 +2092,7 @@ def _dispatch_fix(
         machines=config.machines,
         override_machine_name=override_machine,
         status_fetcher=status_fetcher,
+        failing_capability_sets=failing_capability_sets,
     )
     machine = selection.machine
     if machine is None:
@@ -2078,6 +2106,10 @@ def _dispatch_fix(
         if failure_detail is not None:
             failure_detail.append(reason)
         return None
+    if selection.uncovered_failing_capabilities:
+        briefing = briefing + fix_machine_capability_note(
+            machine.name, selection.uncovered_failing_capabilities,
+        )
 
     # #586: if we ended up routing to a different machine than the original
     # worker, the branch must exist on the remote so the fix worker can fetch
