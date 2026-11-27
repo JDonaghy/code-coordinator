@@ -30,10 +30,16 @@ from __future__ import annotations
 
 import json as _json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from collections.abc import Sequence
+
+    from coord.board_doctor_policy import ModelDecisionOutcome
 
 # Audit log is paginated at audit.MAX_LIMIT (500) per page, newest-first —
 # same bound as coord.commands.scorecard's own cross-check query, for the
@@ -166,7 +172,7 @@ def format_heal_stall_signals(
     return "\n".join(lines)
 
 
-def format_model_investigator_decisions(outcomes) -> str:
+def format_model_investigator_decisions(outcomes: "Sequence[ModelDecisionOutcome]") -> str:
     """Human-readable rendering of the #4126 model-investigator decision
     section — see :func:`coord.board_doctor_policy.
     score_model_investigator_decisions`."""

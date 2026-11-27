@@ -1809,9 +1809,10 @@ MODEL_DECISION_CAP_PER_ROW_24H = 3
 MODEL_DECISION_CAP_PER_REPO_DAILY = 10
 _MODEL_DECISION_WINDOW_HOURS = 24.0
 
-#: Every #4126 model decision — acted or not — is audited under this event
-#: type, with ``actor="board_doctor_investigator_model"`` (distinct from
-#: both ``"board_doctor_investigator"``, the human `doctor-act` CLI's own
+#: Every #4126 decision that actually CONSULTED a model — acted, declined,
+#: or an unparseable/failed call — is audited under this event type, with
+#: ``actor="board_doctor_investigator_model"`` (distinct from both
+#: ``"board_doctor_investigator"``, the human `doctor-act` CLI's own
 #: default, and ``"sweep"``, the deterministic mechanical tier's). This is
 #: NOT a second answer to "did the action land" — that question is asked
 #: and answered exactly once, by :func:`coord.board_doctor_permissions.
@@ -1820,7 +1821,26 @@ _MODEL_DECISION_WINDOW_HOURS = 24.0
 #: metadata (confidence, model used, escalation) the underlying primitive's
 #: own audit row has no field for, so :func:`score_model_investigator_decisions`
 #: and the per-row/per-repo cap checks have one place to read from.
+#:
+#: Deliberately excludes the capped branch (see
+#: :data:`MODEL_DECISION_CAPPED_EVENT_TYPE`) — a decision this type's own
+#: cap check (:func:`_model_investigator_cap_reason`) refused BEFORE any
+#: model call happened must never itself count toward that same cap, or
+#: toward :func:`score_model_investigator_decisions`'s ``"declined"``
+#: bucket. Counting cap refusals here would make the cap a one-way
+#: ratchet: once a row's per-24h quota of real decisions is spent, the
+#: hourly sweep (`coord-board-doctor.timer`) would audit one more "capped"
+#: row every pass, forever topping the window back up and never letting it
+#: drain — and the same phantom rows would inflate the per-repo daily cap
+#: toward disabling the whole repo's model path permanently.
 MODEL_DECISION_EVENT_TYPE = "investigator_model_decision"
+
+#: A #4126 decision refused by :func:`_model_investigator_cap_reason`
+#: BEFORE any model call was made — audited for visibility, but under a
+#: type the cap counters and :func:`score_model_investigator_decisions`
+#: never query, so a capped round can never feed its own cap (see
+#: :data:`MODEL_DECISION_EVENT_TYPE`'s docstring).
+MODEL_DECISION_CAPPED_EVENT_TYPE = "investigator_model_decision_capped"
 
 
 def _check_model_eligible_actions_are_in_the_closed_set() -> None:
@@ -1840,7 +1860,7 @@ def _model_investigator_enabled() -> bool:
     return bool(os.environ.get(MODEL_INVESTIGATOR_ENV_VAR))
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelInvestigatorDecision:
     """One #4126 model-chosen decision against a stuck row — the unit both
     :func:`decide_with_model_investigator` returns and the test suite
@@ -1862,8 +1882,12 @@ def _model_decision_window_count(
 ) -> int:
     """How many :data:`MODEL_DECISION_EVENT_TYPE` events exist for
     *repo_name* (and, when given, *issue_number*) in the last *hours* — the
-    cap counter for both the per-row and the per-repo-daily check. Fails
-    open to 0 on an unreadable audit log (same posture as
+    cap counter for both the per-row and the per-repo-daily check. Counts
+    only decisions that actually consulted a model: a row refused by the
+    cap itself is audited under :data:`MODEL_DECISION_CAPPED_EVENT_TYPE`,
+    a different event type this query never matches, so a capped round
+    can never count toward its own (or the repo's) cap. Fails open to 0 on
+    an unreadable audit log (same posture as
     :func:`_fixit_leg_in_flight_count`): a cap that can never be read is
     worse than a cap occasionally under-counted by a transient DB error.
     """
@@ -1919,10 +1943,17 @@ def _row_stuck_hours(repo_name: str, issue_number: int) -> float | None:
     """How long *repo_name*#*issue_number*'s drive-queue row has sat in its
     current shape, in hours — the escalation clock's input. ``None`` when
     there is no drive-queue row (a merge-queue-only row, or one this read
-    can't resolve) rather than guessed as either "just now" or "ages ago" —
-    the caller treats unknown the same conservative way
-    :func:`coord.board_doctor._no_progress_age_seconds` documents its own
-    unknown case: never escalate on a guess.
+    can't resolve) rather than guessed as either "just now" or "ages ago".
+
+    The caller (:func:`decide_with_model_investigator`) only escalates to
+    the sonnet second opinion when *stuck_hours* is a known value above
+    :data:`_MODEL_ESCALATE_STUCK_HOURS` — an unknown age never escalates,
+    so a low-confidence haiku read on an unresolvable row is acted on (or
+    declined) as-is, with no second call. This is a narrower case than
+    :func:`coord.board_doctor._no_progress_age_seconds`'s own unknown-age
+    handling, which escalates in the OPPOSITE direction (unknown reads as
+    past the grace window, not exempt from it) — the two functions answer
+    different questions and should not be read as mirroring each other.
     """
     import time as _time  # noqa: PLC0415
 
@@ -1951,6 +1982,22 @@ def _live_pr_snapshot(
     evidence" rather than raised, the same posture as every other
     enrichment in this module (e.g. :func:`_merge_ref_instruction`).
 
+    ``pr_state`` is read with :func:`coord.github_ops.get_pr_state_for_branch`
+    (``"OPEN"``/``"MERGED"``/``"CLOSED"``, resolved directly off the PR's
+    head branch) rather than :func:`coord.github_ops.get_issue_state` — that
+    accessor shells `gh issue view` against the *issue* vocabulary
+    (``"open"``/``"closed"`` only) and, by its own docstring, is scoped to
+    issues; handed a PR number it can never report ``"merged"``, which is
+    exactly the state the ``mark_done`` verb this evidence feeds is defined
+    around ("the PR already merged ... out of band"). A failed/absent read
+    is reported as the explicit string ``"unknown"`` here, never folded into
+    ``None``/``"open"``, so the model is never told "nothing's wrong" about a
+    read that simply didn't happen.
+
+    ``checks`` is likewise reported as the explicit string ``"unavailable"``
+    (not an empty list) when the CI store itself has no live read, so a
+    blind read never renders as "nothing failing, nothing pending" to the
+    model — distinguishing "I checked, all clear" from "I could not check".
     Reuses the SAME `coord.ci_store` read :func:`_live_ci_red_only`
     (`coord.board_doctor_permissions`) already makes for the identical
     question "what does this PR's CI say right now" — one live-CI
@@ -1974,19 +2021,26 @@ def _live_pr_snapshot(
         from coord import github_ops  # noqa: PLC0415
         from coord.ci_store import build_ci_store, failed_checks, in_flight_checks  # noqa: PLC0415
 
+        pr_state = github_ops.get_pr_state_for_branch(entry.repo_github, entry.branch)
+
         ci_store = build_ci_store(
             config.ci_store.type, host=config.ci_store.host, token_env=config.ci_store.token_env,
         )
+        checks_available = ci_store.is_available
         checks = (
             ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
-            if ci_store.is_available
+            if checks_available
             else []
         )
         return {
             "pr_number": entry.pr_number,
-            "issue_state": github_ops.get_issue_state(entry.repo_github, entry.pr_number),
-            "failing_check_names": [c.name for c in failed_checks(checks)],
-            "pending_check_names": [c.name for c in in_flight_checks(checks)],
+            "pr_state": pr_state if pr_state is not None else "unknown",
+            "failing_check_names": (
+                [c.name for c in failed_checks(checks)] if checks_available else "unavailable"
+            ),
+            "pending_check_names": (
+                [c.name for c in in_flight_checks(checks)] if checks_available else "unavailable"
+            ),
         }
     except Exception:  # noqa: BLE001 — best-effort live enrichment only
         return None
@@ -2002,7 +2056,18 @@ def _render_model_evidence(
 ) -> str:
     """The evidence bundle text handed to the #4126 model call — every
     field a human running `coord drive-queue diagnose` would already see,
-    plus the live PR snapshot a stored diagnosis can't carry."""
+    plus the live PR snapshot a stored diagnosis can't carry.
+
+    Diagnosis ``evidence`` lines and live check names are untrusted text
+    (whatever a gate/CI check/commit happened to say) interpolated
+    straight into this prompt, so a prompt-injected reply is reachable in
+    principle. The blast radius stays bounded by construction, not by
+    this function: the call is argv/stdin (no shell), the model may only
+    name a verb in the closed :data:`MODEL_ELIGIBLE_ACTIONS` vocabulary
+    (:func:`_parse_model_response` rejects anything else), and every verb
+    still re-runs through `dispatch_investigator_action`'s own
+    precondition checks before it mutates anything.
+    """
     lines = [
         f"repo: {repo_name}",
         f"issue: {issue_number}",
@@ -2017,11 +2082,13 @@ def _render_model_evidence(
         lines.extend(f"  - {line}" for line in row.evidence)
     if pr_snapshot is not None:
         lines.append(f"live_pr_number: {pr_snapshot['pr_number']}")
-        lines.append(f"live_pr_issue_state: {pr_snapshot['issue_state']}")
+        lines.append(f"live_pr_state: {pr_snapshot['pr_state']}")
         lines.append(f"live_pr_failing_checks: {pr_snapshot['failing_check_names']}")
         lines.append(f"live_pr_pending_checks: {pr_snapshot['pending_check_names']}")
     else:
-        lines.append("live_pr_number: none (no merge-queue entry/PR found)")
+        lines.append(
+            "live_pr_number: unknown (no merge-queue entry/PR found, or the live read failed)"
+        )
     return "\n".join(lines)
 
 
@@ -2186,11 +2253,14 @@ def decide_with_model_investigator(
     *invoke_model* defaults to :func:`_invoke_investigator_model`; tests
     inject a stub so this never shells out to a real ``claude -p``.
 
-    Always audits a :data:`MODEL_DECISION_EVENT_TYPE` row — capped,
-    declined, failed-to-parse and acted decisions alike — so
-    :func:`_model_investigator_cap_reason`'s own counters and
-    :func:`score_model_investigator_decisions` have one consistent trail to
-    read, regardless of outcome. Never raises: every failure mode (a
+    Audits a :data:`MODEL_DECISION_EVENT_TYPE` row for every outcome that
+    actually consulted a model — declined, failed-to-parse and acted
+    decisions alike — so :func:`_model_investigator_cap_reason`'s own
+    counters and :func:`score_model_investigator_decisions` have one
+    consistent trail to read. The capped branch is audited separately
+    under :data:`MODEL_DECISION_CAPPED_EVENT_TYPE` instead (see that
+    constant's docstring for why counting it under the same type would
+    make the cap a one-way ratchet). Never raises: every failure mode (a
     capped row, an unparseable model reply, a subprocess timeout) resolves
     to ``action=None, acted=False``, the same "gate fails, nothing
     mutates" direction `dispatch_investigator_action`'s own preconditions
@@ -2198,13 +2268,15 @@ def decide_with_model_investigator(
     """
     call = invoke_model if invoke_model is not None else _invoke_investigator_model
 
-    def _audit(decision: ModelInvestigatorDecision) -> ModelInvestigatorDecision:
+    def _audit(
+        decision: ModelInvestigatorDecision, *, event_type: str = MODEL_DECISION_EVENT_TYPE,
+    ) -> ModelInvestigatorDecision:
         from coord.audit import record_audit  # noqa: PLC0415
 
         record_audit(
             tier="business",
             category="board_doctor_investigator",
-            event_type=MODEL_DECISION_EVENT_TYPE,
+            event_type=event_type,
             actor="board_doctor_investigator_model",
             summary=(
                 f"model investigator decided {decision.action or 'none'} for "
@@ -2239,7 +2311,8 @@ def decide_with_model_investigator(
                 escalated=False,
                 acted=False,
                 detail=cap_reason,
-            )
+            ),
+            event_type=MODEL_DECISION_CAPPED_EVENT_TYPE,
         )
 
     stuck_hours = _row_stuck_hours(repo_name, issue_number)
@@ -2248,8 +2321,14 @@ def decide_with_model_investigator(
         row, repo_name, issue_number, stuck_hours=stuck_hours, pr_snapshot=pr_snapshot,
     )
 
-    haiku_model = config.models.resolve("haiku") or "haiku"
-    sonnet_model = config.models.resolve("sonnet") or "sonnet"
+    # resolve() only returns None for a None alias (preserves the "omit
+    # --model" code path) — passing a literal alias always gets a str back
+    # (the pinned override, or the alias unchanged), so there is no `or`
+    # fallback to write here.
+    haiku_model = config.models.resolve("haiku")
+    sonnet_model = config.models.resolve("sonnet")
+    assert haiku_model is not None  # resolve("haiku") never returns None
+    assert sonnet_model is not None  # resolve("sonnet") never returns None
 
     def _call(model: str) -> tuple[str | None, float, str]:
         try:
