@@ -69,9 +69,10 @@ class TestEnsureTrancheChildBranch:
     def test_noop_when_branch_already_exists(self) -> None:
         exists = MagicMock(return_value=True)
         create = MagicMock(return_value=True)
+        get_sha = MagicMock(return_value="deadbeef")
         ensure_tranche_child_branch(
             "acme/api", "tranche-7-child-101", "deadbeef",
-            exists=exists, create=create,
+            exists=exists, create=create, get_sha=get_sha,
         )
         exists.assert_called_once_with("acme/api", "tranche-7-child-101")
         create.assert_not_called()
@@ -79,19 +80,46 @@ class TestEnsureTrancheChildBranch:
     def test_creates_branch_at_base_sha_when_missing(self) -> None:
         exists = MagicMock(return_value=False)
         create = MagicMock(return_value=True)
+        get_sha = MagicMock(return_value="deadbeef")
         ensure_tranche_child_branch(
             "acme/api", "tranche-7-child-101", "deadbeef",
-            exists=exists, create=create,
+            exists=exists, create=create, get_sha=get_sha,
         )
         create.assert_called_once_with("acme/api", "tranche-7-child-101", "deadbeef")
 
     def test_fails_closed_when_create_reports_failure(self) -> None:
         exists = MagicMock(return_value=False)
         create = MagicMock(return_value=False)
+        get_sha = MagicMock(return_value="deadbeef")
         with pytest.raises(RuntimeError, match="failed to create"):
             ensure_tranche_child_branch(
                 "acme/api", "tranche-7-child-101", "deadbeef",
-                exists=exists, create=create,
+                exists=exists, create=create, get_sha=get_sha,
+            )
+
+    def test_fails_closed_when_existing_branch_sha_does_not_match_base(self) -> None:
+        # `exists` fails OPEN on any `gh` hiccup, so it alone cannot prove
+        # the branch is really at `base_sha` — a stale branch from a
+        # previous attempt, or a reused row id after a DB restore, must
+        # still be caught here.
+        exists = MagicMock(return_value=True)
+        create = MagicMock(return_value=True)
+        get_sha = MagicMock(return_value="stale-sha")
+        with pytest.raises(RuntimeError, match="not the expected base"):
+            ensure_tranche_child_branch(
+                "acme/api", "tranche-7-child-101", "deadbeef",
+                exists=exists, create=create, get_sha=get_sha,
+            )
+        create.assert_not_called()
+
+    def test_fails_closed_when_newly_created_branch_sha_is_unreadable(self) -> None:
+        exists = MagicMock(return_value=False)
+        create = MagicMock(return_value=True)
+        get_sha = MagicMock(return_value=None)
+        with pytest.raises(RuntimeError, match="not the expected base"):
+            ensure_tranche_child_branch(
+                "acme/api", "tranche-7-child-101", "deadbeef",
+                exists=exists, create=create, get_sha=get_sha,
             )
 
 
@@ -185,10 +213,12 @@ class TestDispatchTrancheRowChildren:
         dispatcher = MagicMock(return_value={"id": "agent-assignment-1"})
         exists = MagicMock(return_value=True)
         create = MagicMock(return_value=True)
+        sha = MagicMock(return_value="deadbeef")
 
         result_row = dispatch_tranche_row_children(
             row, config, ["laptop", "desktop"],
             dispatcher=dispatcher, branch_exists=exists, create_branch=create,
+            branch_sha=sha,
         )
 
         assert result_row is row
@@ -199,6 +229,15 @@ class TestDispatchTrancheRowChildren:
             call.args[0].machine_name for call in dispatcher.call_args_list
         }
         assert dispatched_machines == {"laptop", "desktop"}
+        # Each child's result carries the handle (#4200) a later poll
+        # needs to go collect its completion — the agent assignment id
+        # and the machine it actually landed on.
+        for child in row.children:
+            assert child.result == {
+                "assignment_id": "agent-assignment-1",
+                "machine_name": child.result["machine_name"],
+            }
+            assert child.result["machine_name"] in {"laptop", "desktop"}
 
     def test_round_robins_machines_when_fewer_than_children(self, config: Config) -> None:
         row = _row(children=[
@@ -212,6 +251,7 @@ class TestDispatchTrancheRowChildren:
             dispatcher=dispatcher,
             branch_exists=MagicMock(return_value=True),
             create_branch=MagicMock(return_value=True),
+            branch_sha=MagicMock(return_value="deadbeef"),
         )
         assert dispatcher.call_count == 3
         assert all(
@@ -223,7 +263,7 @@ class TestDispatchTrancheRowChildren:
     ) -> None:
         row = _row()
 
-        def _flaky_dispatch(proposal, _config):
+        def _flaky_dispatch(proposal, _config, **_kwargs):
             if proposal.issue_number == 101:
                 raise RuntimeError("agent unreachable")
             return {"id": "ok"}
@@ -233,6 +273,7 @@ class TestDispatchTrancheRowChildren:
             dispatcher=_flaky_dispatch,
             branch_exists=MagicMock(return_value=True),
             create_branch=MagicMock(return_value=True),
+            branch_sha=MagicMock(return_value="deadbeef"),
         )
 
         failed = next(c for c in row.children if c.issue_number == 101)
@@ -242,9 +283,111 @@ class TestDispatchTrancheRowChildren:
         assert failed.result["outcome"] == "failed"
         assert "agent unreachable" in failed.result["summary"]
         assert ok.state == "dispatched"
+        assert ok.result == {"assignment_id": "ok", "machine_name": "laptop"}
         # The row still advances — #4201 needs to see which children
         # actually started, not have the whole row stuck "pending".
         assert row.state == "dispatched"
+
+    def test_fails_closed_when_agent_response_reports_failure(
+        self, config: Config,
+    ) -> None:
+        # `/assign` returns HTTP 202 even when the agent's own worktree
+        # setup failed — `dispatch()`'s `raise_for_status()` is happy with
+        # that, so a 2xx response alone proves nothing. The child must be
+        # read as `"failed"`, not `"dispatched"`, when the agent already
+        # said so.
+        row = _row()
+        dispatcher = MagicMock(return_value={
+            "id": "agent-assignment-1", "status": "failed",
+            "error": "worktree not writable: disk full",
+        })
+
+        dispatch_tranche_row_children(
+            row, config, ["laptop"],
+            dispatcher=dispatcher,
+            branch_exists=MagicMock(return_value=True),
+            create_branch=MagicMock(return_value=True),
+            branch_sha=MagicMock(return_value="deadbeef"),
+        )
+
+        assert {c.state for c in row.children} == {"failed"}
+        for child in row.children:
+            assert "worktree not writable" in child.result["summary"]
+
+    def test_fails_closed_when_agent_response_carries_no_id(
+        self, config: Config,
+    ) -> None:
+        row = _row()
+        dispatcher = MagicMock(return_value={})
+
+        dispatch_tranche_row_children(
+            row, config, ["laptop"],
+            dispatcher=dispatcher,
+            branch_exists=MagicMock(return_value=True),
+            create_branch=MagicMock(return_value=True),
+            branch_sha=MagicMock(return_value="deadbeef"),
+        )
+
+        assert {c.state for c in row.children} == {"failed"}
+
+    def test_fails_closed_when_branch_cannot_be_confirmed_at_base_sha(
+        self, config: Config,
+    ) -> None:
+        # `branch_exists_on_remote` fails OPEN on a `gh` hiccup, so a
+        # stale/foreign branch reading as "exists" must still block
+        # dispatch rather than let the agent's worker start from whatever
+        # that ref actually points at.
+        row = _row()
+        dispatcher = MagicMock(return_value={"id": "agent-assignment-1"})
+
+        dispatch_tranche_row_children(
+            row, config, ["laptop"],
+            dispatcher=dispatcher,
+            branch_exists=MagicMock(return_value=True),
+            create_branch=MagicMock(return_value=True),
+            branch_sha=MagicMock(return_value="some-other-sha"),
+        )
+
+        assert {c.state for c in row.children} == {"failed"}
+        dispatcher.assert_not_called()
+
+    def test_raises_when_repo_is_not_configured(self) -> None:
+        # `Repo.github` is a mandatory field, so the only way
+        # `config.repo(row.repo_name)` yields a falsy slug is when the
+        # row's repo is absent from `coordinator.yml` entirely.
+        row = _row()
+        config = Config(
+            repos=[Repo(name="other", github="acme/other")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
+                               repo_paths={"api": "/home/user/src/api"})],
+        )
+        with pytest.raises(ValueError, match="no `github` slug configured"):
+            dispatch_tranche_row_children(row, config, ["laptop"])
+
+    def test_forwards_routing_fetchers_and_board_to_dispatcher(
+        self, config: Config,
+    ) -> None:
+        row = _row()
+        dispatcher = MagicMock(return_value={"id": "agent-assignment-1"})
+        status_fetcher = MagicMock()
+        credential_fetcher = MagicMock()
+        board = MagicMock()
+
+        dispatch_tranche_row_children(
+            row, config, ["laptop"],
+            dispatcher=dispatcher,
+            branch_exists=MagicMock(return_value=True),
+            create_branch=MagicMock(return_value=True),
+            branch_sha=MagicMock(return_value="deadbeef"),
+            status_fetcher=status_fetcher,
+            credential_fetcher=credential_fetcher,
+            board=board,
+        )
+
+        for call in dispatcher.call_args_list:
+            assert call.kwargs["status_fetcher"] is status_fetcher
+            assert call.kwargs["credential_fetcher"] is credential_fetcher
+            assert call.kwargs["board"] is board
 
     def test_raises_when_row_has_no_id(self, config: Config) -> None:
         row = _row(id=None)

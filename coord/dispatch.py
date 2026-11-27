@@ -3592,12 +3592,13 @@ def tranche_child_branch_name(row: "TrancheRow", child: "TrancheChild") -> str:
 
 
 #: Injected into `coord.github_ops.branch_exists_on_remote`/
-#: `create_remote_branch`'s call signature so tests can substitute fakes —
-#: the exact same dependency-injection shape
+#: `create_remote_branch`/`get_branch_sha`'s call signatures so tests can
+#: substitute fakes — the exact same dependency-injection shape
 #: `coord.branch_model.ensure_feature_branch_exists` already uses for its
 #: own idempotent remote-branch creation.
 TrancheBranchExistsFetch = Callable[[str, str], bool]
 TrancheBranchCreate = Callable[[str, str, str], bool]
+TrancheBranchShaFetch = Callable[[str, str], "str | None"]
 
 
 def ensure_tranche_child_branch(
@@ -3607,28 +3608,44 @@ def ensure_tranche_child_branch(
     *,
     exists: TrancheBranchExistsFetch = github_ops.branch_exists_on_remote,
     create: TrancheBranchCreate = github_ops.create_remote_branch,
+    get_sha: TrancheBranchShaFetch = github_ops.get_branch_sha,
 ) -> None:
     """Idempotently create *branch* at *base_sha* on *repo_github* (#4200).
 
     A no-op when *branch* already exists — safe to call on every dispatch
-    attempt (retries, re-ticks) without re-creating the ref. `base_sha` is
-    fixed for the lifetime of a `TrancheRow` and the branch name is
-    deterministic (:func:`tranche_child_branch_name`), so an existing
-    branch of that name for this row can only ever already point at the
-    same `base_sha` — there is nothing to reconcile.
+    attempt (retries, re-ticks) without re-creating the ref.
+
+    *exists* (`branch_exists_on_remote` by default) fails OPEN on any
+    infrastructure problem — an unresponsive `gh`, a network glitch, an
+    auth hiccup all read back as "already exists". That is fine for the
+    idempotent-retry case this guards against, but it means *exists*
+    alone cannot prove the branch is actually at *base_sha*: a worker
+    that already pushed commits onto a re-dispatched branch, or a reused
+    row id after a DB restore colliding with a different base, would
+    both read as "exists" with no further check. So after either branch
+    of the create-or-skip above, this reads the ref back with *get_sha*
+    and REQUIRES it equal *base_sha* byte-for-byte — the one check that
+    cannot fail open, since a `None`/mismatched read raises exactly like
+    a confirmed wrong sha.
 
     Raises RuntimeError if *create* reports failure (permissions, a
-    transient API error, branch protection). A tranche child must never be
-    dispatched against an unconfirmed base — fail closed rather than let
-    the agent silently branch off whatever the repo's default branch
-    happens to be instead.
+    transient API error, branch protection), or if the post-create/post-
+    exists read of *branch*'s sha is not exactly *base_sha*. A tranche
+    child must never be dispatched against an unconfirmed base — fail
+    closed rather than trust a probe that cannot itself report failure.
     """
-    if exists(repo_github, branch):
-        return
-    if not create(repo_github, branch, base_sha):
+    if not exists(repo_github, branch):
+        if not create(repo_github, branch, base_sha):
+            raise RuntimeError(
+                f"ensure_tranche_child_branch: failed to create {branch!r} at "
+                f"{base_sha!r} on {repo_github!r}"
+            )
+    actual_sha = get_sha(repo_github, branch)
+    if actual_sha != base_sha:
         raise RuntimeError(
-            f"ensure_tranche_child_branch: failed to create {branch!r} at "
-            f"{base_sha!r} on {repo_github!r}"
+            f"ensure_tranche_child_branch: {branch!r} on {repo_github!r} is "
+            f"at {actual_sha!r}, not the expected base {base_sha!r} — "
+            "refusing to dispatch a child against an unconfirmed base"
         )
 
 
@@ -3638,6 +3655,11 @@ def ensure_tranche_child_branch(
 #: `WORK_OUTCOME:`/`SMOKE_TESTS:` marker convention this repo's own worker
 #: briefing (see this session's own system prompt) already uses elsewhere.
 TRANCHE_CHILD_RESULT_MARKER = "TRANCHE_CHILD_RESULT:"
+
+#: Cap on how much of a dispatch failure's `str(exc)` lands in
+#: `child.result["summary"]` — an `httpx` error can carry a full HTTP
+#: response body, and this is persisted as JSON on every failed dispatch.
+_TRANCHE_DISPATCH_ERROR_MAX_CHARS = 500
 
 #: Appended to a tranche child's briefing (#4200) — tells the worker there
 #: is no PR/review for this leg and exactly what to report instead.
@@ -3787,6 +3809,10 @@ def dispatch_tranche_row_children(
     dispatcher: Callable[..., dict] = dispatch,
     branch_exists: TrancheBranchExistsFetch = github_ops.branch_exists_on_remote,
     create_branch: TrancheBranchCreate = github_ops.create_remote_branch,
+    branch_sha: TrancheBranchShaFetch = github_ops.get_branch_sha,
+    status_fetcher=None,
+    credential_fetcher=None,
+    board: "Board | None" = None,
     max_workers: int = 8,
 ) -> "TrancheRow":
     """Dispatch every `"pending"` child of *row* IN PARALLEL (#4129/#4200),
@@ -3798,6 +3824,15 @@ def dispatch_tranche_row_children(
     decision (a sibling queue-tick integration); this function only fans
     the dispatch out once it is told where.
 
+    *status_fetcher* / *credential_fetcher* / *board* are forwarded
+    verbatim to the underlying `dispatcher` (`dispatch()` by default) so
+    this fan-out keeps the SAME structural liveness-routing, credential-
+    health and Test-host reservation gates every other `type="work"`
+    dispatch site wires — `None` (the default) performs no probe at all,
+    same opt-in shape as `dispatch()` itself. Without these a child can
+    land on an unreachable machine or pile onto the sole `macos`/
+    `windows` Test host alongside every other child in the same row.
+
     The fan-out itself runs on a thread pool (true wall-clock parallelism,
     not just "queued one after another") because each `dispatch()` call
     blocks on the agent's synchronous worktree setup
@@ -3805,13 +3840,22 @@ def dispatch_tranche_row_children(
     take N times as long to even START.
 
     Mutates *row* in place and returns it:
-    - a child whose branch-create or POST raised becomes `"failed"`
-      (fail closed — never left `"pending"` with no record of why), with
-      `child.result` set to a `parse_tranche_child_result`-shaped dict
-      describing the dispatch failure (`fail_closed_unparseable=False`,
-      since this is a known dispatch error, not an unparseable worker
-      report);
-    - every other pending child becomes `"dispatched"`.
+    - a child whose branch-create/confirm, dispatch POST, or whose agent
+      response itself reports failure (no `id`, or `status` already
+      `"failed"` — `/assign` returns HTTP 202 even when the agent's own
+      worktree setup failed, so a 2xx alone proves nothing) becomes
+      `"failed"` (fail closed — never left `"pending"` with no record of
+      why), with `child.result` set to a `parse_tranche_child_result`-
+      shaped dict describing the dispatch failure
+      (`fail_closed_unparseable=False`, since this is a known dispatch
+      error, not an unparseable worker report);
+    - every other pending child becomes `"dispatched"`, with
+      `child.result` set to `{"assignment_id": ..., "machine_name": ...}`
+      — the only surviving handle on the agent-assigned id and the
+      POST-REROUTE machine (routing above may move `proposal.machine_name`
+      away from what was requested), which is what a later poll needs to
+      go collect this child's completion text. `apply_tranche_child_result`
+      overwrites this dict wholesale once that completion lands.
     `row.state` becomes `"dispatched"` once the fan-out completes,
     regardless of whether every child's own POST succeeded — a partially
     failed fan-out still needs the integration slice (#4201) to see which
@@ -3820,9 +3864,10 @@ def dispatch_tranche_row_children(
     `coord.state` itself.
 
     Raises ValueError if `row.id` is None, if *row* has no `"pending"`
-    children, or if *machine_names* is empty — there is nothing sensible to
-    fan out in any of those cases, so this refuses rather than silently
-    no-oping.
+    children, if *machine_names* is empty, or if the row's repo has no
+    `github` slug configured — there is nothing sensible to fan out, or no
+    way to confirm a child's base, in any of those cases, so this refuses
+    rather than silently no-oping.
     """
     if row.id is None:
         raise ValueError(
@@ -3839,35 +3884,63 @@ def dispatch_tranche_row_children(
 
     repo_cfg = config.repo(row.repo_name)
     repo_github = repo_cfg.github if repo_cfg is not None else None
+    if not repo_github:
+        raise ValueError(
+            f"dispatch_tranche_row_children: repo {row.repo_name!r} has no "
+            "`github` slug configured — cannot confirm a child's base_sha "
+            "pin, so refusing to dispatch against an unverified branch"
+        )
 
-    def _dispatch_one(indexed_child: tuple[int, "TrancheChild"]) -> tuple["TrancheChild", str, str]:
+    def _dispatch_one(
+        indexed_child: tuple[int, "TrancheChild"],
+    ) -> tuple["TrancheChild", str, str, dict]:
+        from coord.agent import FAILED as AGENT_ASSIGNMENT_FAILED  # noqa: PLC0415
+
         index, child = indexed_child
         machine_name = machine_names[index % len(machine_names)]
         try:
             branch = tranche_child_branch_name(row, child)
-            if repo_github:
-                ensure_tranche_child_branch(
-                    repo_github, branch, row.base_sha,
-                    exists=branch_exists, create=create_branch,
-                )
+            ensure_tranche_child_branch(
+                repo_github, branch, row.base_sha,
+                exists=branch_exists, create=create_branch, get_sha=branch_sha,
+            )
             proposal = build_tranche_child_proposal(row, child, machine_name)
-            dispatcher(proposal, config)
-        except Exception as exc:  # noqa: BLE001 — fail closed: an undispatchable child is `failed`, never silently stuck `pending`
-            return child, "failed", str(exc)
-        return child, "dispatched", ""
+            response = dispatcher(
+                proposal, config,
+                status_fetcher=status_fetcher,
+                credential_fetcher=credential_fetcher,
+                board=board,
+            )
+            if not isinstance(response, dict) or not response.get("id"):
+                raise RuntimeError(
+                    f"dispatch response carried no assignment id: {response!r}"
+                )
+            if response.get("status") == AGENT_ASSIGNMENT_FAILED:
+                raise RuntimeError(
+                    "agent reported dispatch failure: "
+                    f"{response.get('error') or 'unknown error'}"
+                )
+        except Exception as exc:  # noqa: BLE001 — fail closed, never stuck "pending"
+            return child, "failed", str(exc), {}
+        return (
+            child, "dispatched", "",
+            {"assignment_id": response["id"], "machine_name": proposal.machine_name},
+        )
 
     with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
         results = list(pool.map(_dispatch_one, enumerate(pending)))
 
-    for child, state, error in results:
+    for child, state, error, handle in results:
         child.state = state
         if state == "failed":
             child.result = {
                 "outcome": "failed",
-                "summary": f"dispatch failed: {error}",
+                "summary": f"dispatch failed: {error[:_TRANCHE_DISPATCH_ERROR_MAX_CHARS]}",
                 "files": [],
                 "fail_closed_unparseable": False,
             }
+        else:
+            child.result = handle
 
     row.state = "dispatched"
     return row
