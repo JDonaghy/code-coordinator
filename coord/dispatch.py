@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
@@ -33,6 +34,7 @@ from coord.config import Config, SmokeRule
 from coord.dispatch_liveness import check_dispatch_liveness, record_dispatch_refusal
 from coord.models import (
     EPIC_DECOMPOSE_TYPE,
+    Assignment,
     Machine,
     Proposal,
     Repo,
@@ -4191,3 +4193,215 @@ def dispatch_tranche_integrator(
         "assignment_id": response["id"],
         "machine_name": proposal.machine_name,
     }
+
+
+# ── Native tranche rows: capability-routed Test leg (#4129 Phase 1, this
+# slice #4202) ───────────────────────────────────────────────────────────
+#
+# Once `coord.merge_queue.merge_tranche_children` has pushed a clean
+# integrated tree (`row.state == "done"` — see `coord.drive.
+# integrate_tranche_row`'s own docstring: "Nothing more to do; the Test/
+# review/PR slice (#4202) picks up from here"), #4129 names ONE Test leg
+# against that tree — never one per child. Routed exactly like a
+# `type="work"` diff would be (`route_work_by_capability`, reusing the
+# SAME `coord.smoke.required_capabilities` the Test stage's own routing
+# uses — #2096, one question one answer), from the union of every done
+# child's own self-reported touched files (`TrancheChild.result["files"]`,
+# #4200's contract) rather than a fresh diff this module would otherwise
+# have to compute a second way.
+#
+# Dispatched as a standalone `type="smoke"` leg via a raw `/assign` POST,
+# mirroring `coord.gate_b.dispatch_gate_b_review`'s posture for the same
+# reason that function states: this is not keyed off one completed
+# `type="work"` assignment the way `coord.smoke.dispatch_smoke` is, so that
+# machinery's own PR-diff/candidate-ranking plumbing doesn't apply here.
+# Collecting this leg's own pass/fail verdict reuses the existing generic
+# Test-stage verdict machinery already wired through `coord.notify` for
+# every `type="smoke"` row — nothing new to parse.
+
+
+def tranche_test_files_likely(row: "TrancheRow") -> list[str]:
+    """Union of every `"done"` child's self-reported touched files (#4202)
+    — the `files_likely` capability routing needs to pick the right
+    machine for the ONE Test leg run against the integrated tree, mirroring
+    how a `type="work"` diff's own declared `## Files` drives
+    `route_work_by_capability`. Reuses each child's own `result["files"]`
+    (the structured contract `parse_tranche_child_result` already
+    validated, #4200) instead of re-deriving the touched-file set from a
+    fresh diff a second way (#2096).
+
+    `row.children` order, de-duplicated; empty when no child carries a
+    `result` yet — the caller's own capability routing then falls through
+    to plain, uncapped availability, same as a `type="work"` diff whose
+    `## Files` matches nothing.
+    """
+    files: list[str] = []
+    seen: set[str] = set()
+    for child in row.children:
+        for f in (child.result or {}).get("files") or []:
+            if f not in seen:
+                seen.add(f)
+                files.append(f)
+    return files
+
+
+def tranche_test_machine_name(
+    row: "TrancheRow",
+    config: Config,
+    machine_names: Sequence[str],
+    *,
+    now: "datetime | None" = None,
+) -> str:
+    """Pick the machine for the tranche's ONE capability-routed Test leg
+    (#4129/#4202).
+
+    Reuses `route_work_by_capability` — the SAME capability-matching
+    primitive a `type="work"` dispatch reroutes through — rather than a
+    second copy of "what capability does this diff need" (#2096). The
+    proposed machine is `machine_names[0]`; `route_work_by_capability`
+    returns `None` (meaning "nothing required, leave it alone") whenever
+    neither the repo's unconditional `requires` nor
+    `tranche_test_files_likely(row)` needs anything, so this falls back to
+    `machine_names[0]` in that case too — the same "no capability needed,
+    no reroute" posture that function's own callers already apply.
+
+    Raises ValueError if *machine_names* is empty.
+    """
+    if not machine_names:
+        raise ValueError("tranche_test_machine_name: machine_names is empty")
+    repo_cfg = config.repo(row.repo_name)
+    routing = route_work_by_capability(
+        proposed_machine_name=machine_names[0],
+        repo_name=row.repo_name,
+        files_likely=tranche_test_files_likely(row),
+        machines=config.machines,
+        capability_rules=config.smoke_tests.capability_rules,
+        repo_requires=repo_cfg.requires if repo_cfg is not None else (),
+        issue_title=row.issue_title,
+        now=now,
+    )
+    return routing.machine_name if routing is not None else machine_names[0]
+
+
+def build_tranche_test_briefing(row: "TrancheRow", integrated_sha: str) -> str:
+    """Briefing text for the tranche's ONE Test leg (#4129/#4202) — tells
+    the worker exactly what tree it's testing and why there's no PR to
+    check out from, mirroring `build_tranche_integrator_briefing`'s own
+    "start with the same information the coordinator had" posture.
+    """
+    done_children = sorted(
+        (c for c in row.children if c.state == "done"), key=lambda c: c.issue_number,
+    )
+    children_lines = "\n".join(
+        f"- #{c.issue_number} ({c.title or 'untitled'})" for c in done_children
+    ) or "(none)"
+    return (
+        f"Run this repo's Test-stage suite against the INTEGRATED tree for "
+        f"tranche row {row.id}, {row.repo_name}#{row.issue_number} "
+        f"({row.issue_title}) — #4129's ONE-Test-per-row requirement, not "
+        f"a per-child rerun.\n\n"
+        f"This tree merges the following child issue(s) onto `{row.base_sha}` "
+        f"(no PR exists for this branch yet — the coordinator merged these "
+        f"itself):\n{children_lines}\n\n"
+        f"Current tree sha: `{integrated_sha}`.\n\n"
+        f"Report your result through the normal Test-stage verdict "
+        f"contract (`coord report-result --verdict pass|fail`, or the "
+        f"printed fallback marker) exactly as any other Test leg would."
+    )
+
+
+def dispatch_tranche_test(
+    row: "TrancheRow",
+    integrated_sha: str,
+    config: Config,
+    machine_names: Sequence[str],
+    board: "Board",
+    *,
+    http_client: httpx.Client | None = None,
+    now: float | None = None,
+) -> dict:
+    """Dispatch the ONE capability-routed Test leg for *row*'s integrated
+    tree (#4129/#4202) — only ever called once `row.state == "done"` (see
+    `coord.drive.integrate_tranche_row`).
+
+    Standalone raw `/assign` POST (mirrors `coord.gate_b.
+    dispatch_gate_b_review`'s posture, not `coord.smoke.dispatch_smoke`'s —
+    see this section's own module comment for why). Appends the new
+    `type="smoke"` `Assignment` to `board.active` and records it via
+    `coord.state.record_dispatched_assignment` on success. Never raises on
+    a dispatch failure — returns ``{"ok": True, "assignment_id": ...,
+    "machine_name": ...}`` on a confirmed dispatch, else ``{"ok": False,
+    "error": ...}`` (an unroutable machine, no configured `repo_path`, or
+    the agent itself rejecting/being unreachable for the POST).
+
+    Raises ValueError if *machine_names* is empty — there is nowhere to
+    route the single Test leg to.
+    """
+    if not machine_names:
+        raise ValueError("dispatch_tranche_test: machine_names is empty")
+
+    machine_name = tranche_test_machine_name(row, config, machine_names)
+    machine = next((m for m in config.machines if m.name == machine_name), None)
+    if machine is None:
+        return {"ok": False, "error": f"unknown machine {machine_name!r}"}
+    repo_path = machine.repo_path(row.repo_name)
+    if repo_path is None:
+        return {
+            "ok": False,
+            "error": f"machine {machine_name!r} has no repo_path for {row.repo_name!r}",
+        }
+
+    from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
+
+    target_branch = tranche_integration_branch_name(row)
+    briefing = build_tranche_test_briefing(row, integrated_sha)
+    payload = {
+        "repo_name": row.repo_name,
+        "repo_path": repo_path,
+        "issue_number": row.issue_number,
+        "issue_title": f"[test] {row.issue_title}",
+        "briefing": briefing,
+        "files_allowed": [],
+        "files_forbidden": [],
+        "pull_repos": [],
+        "type": "smoke",
+        "model": config.models.default,
+        "review_target": target_branch,
+        "branch": target_branch,
+    }
+
+    client = http_client or httpx
+    url = f"http://{machine.host}:{AGENT_PORT}/assign"
+    try:
+        resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
+        resp.raise_for_status()
+        agent_response = resp.json()
+    except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        return {"ok": False, "error": f"agent {machine_name!r} rejected dispatch: {exc}"}
+
+    assignment_id = agent_response.get("id") or uuid.uuid4().hex[:12]
+    assignment = Assignment(
+        machine_name=machine_name,
+        repo_name=row.repo_name,
+        issue_number=row.issue_number,
+        issue_title=f"[test] {row.issue_title}",
+        files_allowed=[],
+        files_forbidden=[],
+        briefing=briefing,
+        assignment_id=assignment_id,
+        status="running",
+        branch=target_branch,
+        dispatched_at=now if now is not None else time.time(),
+        type="smoke",
+        review_target=target_branch,
+    )
+    board.active.append(assignment)
+
+    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+    repo_cfg = config.repo(row.repo_name)
+    record_dispatched_assignment(
+        assignment=assignment, repo_github=repo_cfg.github if repo_cfg else "",
+    )
+
+    return {"ok": True, "assignment_id": assignment_id, "machine_name": machine_name}
