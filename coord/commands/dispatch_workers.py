@@ -5120,6 +5120,10 @@ def _dispatch_headless(
         proposal=proposal,
         repo_github=repo_cfg.github,
         provider_name=response.get("_provider_name"),
+        # #4147: `dispatch()` only sets this when `route_work_by_capability`
+        # could not satisfy every required capability on any configured
+        # machine — see `coord.dispatch.dispatch`'s matching comment.
+        unsatisfied_capabilities=response.get("_unsatisfied_capabilities"),
     )
 
     # Update board (read now so the briefing can see the full in-flight picture).

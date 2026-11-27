@@ -2039,6 +2039,12 @@ def dispatch(
     # that record the dispatched assignment (cli.py, dashboard/server.py) can
     # persist it without re-resolving the config precedence chain.
     result["_provider_name"] = effective_provider_name
+    # #4147: same "attach to the response, let the caller persist it"
+    # discipline as `_provider_name` above — `capability_routing` is only
+    # ever set for `proposal.type == "work"`, so this is `None`/empty for
+    # every other dispatch kind.
+    if capability_routing is not None and capability_routing.unmet_capabilities:
+        result["_unsatisfied_capabilities"] = list(capability_routing.unmet_capabilities)
     return result
 
 

@@ -208,6 +208,11 @@ def row_to_assignment(row: object) -> Assignment:
         # collapsing None here would make this the second place that
         # decision lives.
         mode=d.get("mode"),
+        # #4147: capabilities no configured machine fully satisfied at
+        # dispatch time; [] for rows predating this column and for the
+        # common case (nothing unmet) — see coord.models.Assignment.
+        # unsatisfied_capabilities.
+        unsatisfied_capabilities=json_loads(d.get("unsatisfied_capabilities")) or [],
     )
 
 

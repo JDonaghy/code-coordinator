@@ -3273,6 +3273,10 @@ def openapi_spec() -> dict:
                                     "repo_github": {"type": "string"},
                                     "provider_name": {"type": "string", "nullable": True},
                                     "model_reason": {"type": "string", "nullable": True},
+                                    "unsatisfied_capabilities": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
                                 },
                                 "required": ["assignment_id", "repo_github"],
                             }
@@ -7668,6 +7672,9 @@ def build_app(
                 # #1649 review: thin-client parity for the usage-gate
                 # reroute reason — see state.record_dispatched's docstring.
                 model_reason=body.get("model_reason"),
+                # #4147: thin-client parity for the capability-routing
+                # fallback — see state.record_dispatched's docstring.
+                unsatisfied_capabilities=body.get("unsatisfied_capabilities"),
                 # #2087 review, non-blocking finding 1: validate against the
                 # daemon's own already-loaded config, not an independent
                 # reload — see state._validate_dispatch_target's docstring.

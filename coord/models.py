@@ -1870,6 +1870,17 @@ class Assignment:
     # between workflow and single legs before anyone relaxes Test/Review for
     # workflow legs.
     mode: str | None = None
+    # #4147: capabilities `coord.dispatch.route_work_by_capability` could
+    # not satisfy on ANY configured machine for this `type="work"`
+    # dispatch — the leg still dispatched to the best-covering machine
+    # (routing never refuses), this just names what that machine can't
+    # verify. Empty for every row predating this column and for the
+    # overwhelming common case (every machine, or the one actually chosen,
+    # already covers the diff's required capabilities). Set once, at
+    # dispatch time, from `route_work_by_capability`'s own
+    # `CapabilityRouting.unmet_capabilities` — see
+    # `coord.state._record_dispatched_local`.
+    unsatisfied_capabilities: list[str] = field(default_factory=list)
 
 
 def effective_issue_number(assignment: "Assignment | dict") -> int:

@@ -263,6 +263,82 @@ class TestDispatchLogsUnmetCapabilityFallback:
         )
 
 
+class TestUnsatisfiedCapabilitiesRecorded:
+    """#4147 review: a log line alone is not readable by the dashboard or
+    #4122's stats — the fallback must be RECORDED on the assignment too."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_dispatch_attaches_it_and_record_dispatched_persists_it(
+        self, mock_post: MagicMock, dell64: Machine, macmini: Machine, coord_db,
+    ) -> None:
+        from coord.config import Config, SmokeRule, SmokeTestsConfig
+        from coord.state import build_board, record_dispatched
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "work-2876"}
+        mock_post.return_value = mock_resp
+
+        repo = Repo(name="quadraui", github="acme/quadraui", default_branch="main")
+        config = Config(
+            repos=[repo], machines=[dell64, macmini],
+            smoke_tests=SmokeTestsConfig(capability_rules=[
+                SmokeRule(files=["gtk/"], requires=["gtk"]),
+                SmokeRule(files=["macos/"], requires=["macos"]),
+            ]),
+        )
+        proposal = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=2876, issue_title="group-B cleanup",
+            rationale="best fit",
+            files_likely=["gtk/popup.c", "macos/backend.rs"],
+            briefing="do the thing",
+        )
+
+        # `dispatch()` attaches the gap to its own response dict (same
+        # "attach, let the caller persist" discipline as `_provider_name`
+        # for #324) — never silently dropped.
+        response = dispatch(proposal, config)
+        assert response.get("_unsatisfied_capabilities") == ["macos"]
+
+        # `coord approve`/`coord assign`'s own call thread it straight into
+        # `record_dispatched` — verify the WRITE path end to end rather than
+        # constructing an `Assignment` by hand.
+        record_dispatched(
+            assignment_id="work-2876",
+            proposal=proposal,
+            repo_github=repo.github,
+            unsatisfied_capabilities=response.get("_unsatisfied_capabilities"),
+        )
+
+        recorded = build_board().find_by_id("work-2876")
+        assert recorded is not None
+        assert recorded.unsatisfied_capabilities == ["macos"]
+
+    def test_defaults_to_empty_when_nothing_is_unmet(
+        self, dell64: Machine, coord_db,
+    ) -> None:
+        """Every dispatch that predates #4147, and every dispatch where the
+        chosen machine covers everything, must round-trip to `[]` — never
+        `None`, which would read as a missing/unknown value rather than
+        "nothing unmet"."""
+        from coord.state import build_board, record_dispatched
+
+        repo = Repo(name="quadraui", github="acme/quadraui", default_branch="main")
+        proposal = Proposal(
+            id=2, machine_name="dell64", repo_name="quadraui",
+            issue_number=11, issue_title="plain fix",
+            rationale="best fit", files_likely=["gtk/popup.c"],
+            briefing="do the thing",
+        )
+        record_dispatched(
+            assignment_id="work-plain", proposal=proposal, repo_github=repo.github,
+        )
+
+        recorded = build_board().find_by_id("work-plain")
+        assert recorded is not None
+        assert recorded.unsatisfied_capabilities == []
+
+
 # ── coord.smoke: reading a fan-out's per-leg verdicts (#4147) ───────────────
 
 
@@ -411,18 +487,44 @@ class TestDispatchCapabilityLeg:
 
 
 class TestWaitForLegVerdict:
-    def test_returns_terminal_state_once_recorded(self, coord_db) -> None:
+    def test_returns_terminal_state_once_recorded_by_the_real_notify_path(
+        self, coord_db, tmp_path,
+    ) -> None:
+        """A `--wait` poll must resolve against whatever `coord.notify.
+        post_transition` ACTUALLY writes for this leg's completion — not a
+        hand-seeded `record_test_verdict` call standing in for it. See
+        `TestStandaloneSmokeLegVerdictRecording` for the dedicated coverage
+        of that recording path itself; this only proves the two are wired
+        together end to end."""
+        from coord.comments import EVENT_COMPLETION
         from coord.commands.smoke import wait_for_leg_verdict
-        from coord.state import _record_dispatched_assignment_local, record_test_verdict
+        from coord.notify import Transition, post_transition
+        from coord.state import _record_dispatched_assignment_local
 
         leg = Assignment(
             assignment_id="leg-wait", machine_name="macmini", repo_name="quadraui",
             issue_number=0, issue_title="manual leg", type="smoke", status="running",
         )
         _record_dispatched_assignment_local(assignment=leg, repo_github="acme/quadraui")
-        record_test_verdict(
-            assignment_id="leg-wait", test_state="failed", test_reason="clipped focus ring",
+
+        log_path = tmp_path / "leg-wait.log"
+        log_path.write_text("SMOKE: fail — clipped focus ring\n", encoding="utf-8")
+        transition = Transition(
+            assignment_id="leg-wait", machine_name="macmini", repo_name="quadraui",
+            issue_number=0, event=EVENT_COMPLETION, exit_code=0,
         )
+        record = {"repo_github": "acme/quadraui", "type": "smoke"}
+        entry = {
+            "started_at": 1000.0, "finished_at": 1010.0,
+            "branch": "issue-2876", "log_path": str(log_path),
+        }
+        with (
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
 
         calls: list[int] = []
         state, reason = wait_for_leg_verdict(
@@ -430,10 +532,10 @@ class TestWaitForLegVerdict:
             sleep=lambda s: calls.append(s),
         )
         assert state == "failed"
-        assert reason == "clipped focus ring"
+        assert reason is not None and "clipped focus ring" in reason
         assert calls == []  # already terminal on the first read, never slept
 
-    def test_times_out_when_never_terminal(self, coord_db) -> None:
+    def test_times_out_when_never_terminal(self, coord_db, monkeypatch) -> None:
         from coord.commands.smoke import wait_for_leg_verdict
         from coord.state import _record_dispatched_assignment_local
 
@@ -448,10 +550,125 @@ class TestWaitForLegVerdict:
         def fake_sleep(_s):
             ticks["n"] += 1
 
-        # Use a monotonic-looking fake clock via a tiny poll budget instead
-        # of real wall-clock sleeps.
+        # A fake, monotonically-increasing clock (one tick per call) so the
+        # poll loop genuinely runs several iterations before the deadline —
+        # `timeout_s=0` (the pre-fix version of this test) never calls
+        # `sleep` at all and proves nothing about multi-poll behaviour.
+        clock = {"t": 0.0}
+
+        def fake_monotonic() -> float:
+            clock["t"] += 1.0
+            return clock["t"]
+
+        monkeypatch.setattr("time.monotonic", fake_monotonic)
         state, reason = wait_for_leg_verdict(
-            "leg-stuck", timeout_s=0, poll_interval_s=1, sleep=fake_sleep,
+            "leg-stuck", timeout_s=5, poll_interval_s=1, sleep=fake_sleep,
         )
         assert state is None
         assert reason is None
+        # Several polls happened (not zero, not merely one) before the fake
+        # clock crossed the deadline — proves the loop actually polls
+        # repeatedly rather than just checking once.
+        assert ticks["n"] >= 2
+
+
+# ── _record_standalone_smoke_leg_verdict / post_transition wiring (#4147) ────
+
+
+def _standalone_leg(assignment_id: str) -> Assignment:
+    return Assignment(
+        assignment_id=assignment_id, machine_name="macmini", repo_name="quadraui",
+        issue_number=0, issue_title="manual leg", type="smoke", status="running",
+    )
+
+
+def _post_standalone_transition(
+    *, assignment_id: str, event: str, exit_code: int | None,
+    log_text: str | None, tmp_path,
+) -> None:
+    from coord.notify import Transition, post_transition
+    from coord.state import _record_dispatched_assignment_local
+
+    _record_dispatched_assignment_local(
+        assignment=_standalone_leg(assignment_id), repo_github="acme/quadraui",
+    )
+    entry = {"started_at": 1000.0, "finished_at": 1010.0, "branch": "issue-2876"}
+    if log_text is not None:
+        log_path = tmp_path / f"{assignment_id}.log"
+        log_path.write_text(log_text, encoding="utf-8")
+        entry["log_path"] = str(log_path)
+    else:
+        entry["log_path"] = None
+        entry["error"] = "worker crashed unexpectedly (no classifiable reason)"
+    transition = Transition(
+        assignment_id=assignment_id, machine_name="macmini", repo_name="quadraui",
+        issue_number=0, event=event, exit_code=exit_code,
+    )
+    # `review_of_assignment_id` deliberately absent — this is the one thing
+    # that marks a `type="smoke"` row as a `coord smoke run-leg` standalone
+    # leg rather than a #3182 fan-out child.
+    record = {"repo_github": "acme/quadraui", "type": "smoke"}
+    with (
+        patch("coord.notify._capture_cost"),
+        patch("coord.notify._capture_smoke_tests"),
+        patch("coord.notify._capture_completion_summary"),
+        patch("coord.notify._capture_claude_session_id"),
+    ):
+        post_transition(transition, record, entry)
+
+
+class TestStandaloneSmokeLegVerdictRecording:
+    """`coord smoke run-leg` dispatches a `type="smoke"` leg with no GitHub
+    issue (`issue_number=0`) and no `review_of_assignment_id` parent — the
+    `issue_number == 0` short-circuit in `coord.notify.post_transition`
+    would otherwise return before any `smoke` branch runs, and the ordinary
+    `smoke` branches further down both require a `review_of_assignment_id`
+    this leg doesn't have, so `coord smoke run-leg --wait` depends entirely
+    on `post_transition` recognizing this shape and recording a verdict onto
+    the leg's own row. These drive the real recording path (`post_
+    transition` itself), not a hand-seeded `record_test_verdict`."""
+
+    def test_completion_with_pass_marker_records_passed(self, coord_db, tmp_path) -> None:
+        from coord.state import load_assignment_test_state
+
+        _post_standalone_transition(
+            assignment_id="leg-pass", event="completion", exit_code=0,
+            log_text="SMOKE: pass\n", tmp_path=tmp_path,
+        )
+        assert load_assignment_test_state("leg-pass") == "passed"
+
+    def test_completion_with_fail_marker_records_failed_with_reason(
+        self, coord_db, tmp_path,
+    ) -> None:
+        from coord.state import load_assignment_test_reason, load_assignment_test_state
+
+        _post_standalone_transition(
+            assignment_id="leg-fail", event="completion", exit_code=0,
+            log_text="SMOKE: fail — macOS pixel test clipped\n", tmp_path=tmp_path,
+        )
+        assert load_assignment_test_state("leg-fail") == "failed"
+        assert "macOS pixel test clipped" in (load_assignment_test_reason("leg-fail") or "")
+
+    def test_completion_mute_clean_exit_records_no_verdict(self, coord_db, tmp_path) -> None:
+        """A clean exit with no `SMOKE:` marker at all must never be read as
+        a pass — the row is left with no terminal verdict so `--wait` times
+        out instead of fabricating one."""
+        from coord.state import load_assignment_test_state
+
+        _post_standalone_transition(
+            assignment_id="leg-mute", event="completion", exit_code=0,
+            log_text="(worker said nothing resembling a verdict)\n", tmp_path=tmp_path,
+        )
+        assert load_assignment_test_state("leg-mute") in (None, "running")
+
+    def test_worker_crash_with_nonzero_exit_records_failed(self, coord_db, tmp_path) -> None:
+        """#1605 shape for a standalone leg: the WORKER died (EVENT_FAILURE)
+        before ever printing a `SMOKE:` marker — still a `failed` verdict,
+        never left `running` forever."""
+        from coord.state import load_assignment_test_state
+
+        _post_standalone_transition(
+            assignment_id="leg-crash", event="failure", exit_code=1,
+            log_text=None, tmp_path=tmp_path,
+        )
+        assert load_assignment_test_state("leg-crash") == "failed"

@@ -3795,6 +3795,104 @@ def _record_smoke_verdict(
     )
 
 
+def _record_standalone_smoke_leg_verdict(transition: Transition, entry: dict) -> None:
+    """Record a ``coord smoke run-leg`` diagnostic leg's verdict onto its OWN
+    row (``transition.assignment_id``).
+
+    ``dispatch_capability_leg`` dispatches this leg directly, bypassing
+    ``coord.smoke.dispatch_smoke``'s fan-out machinery entirely: it has no
+    GitHub issue (``issue_number=0``, there is nothing to comment on) and no
+    ``review_of_assignment_id`` parent to fold a verdict into. Neither this
+    module's ``issue_number == 0`` short-circuit nor ``_record_smoke_verdict``
+    (which requires a ``parent_id``) ever sees it. ``coord smoke run-leg
+    --wait`` polls exactly this row's ``test_state`` via
+    ``coord.state.load_assignment_test_state``, so writing it here is the
+    only way that poll ever resolves.
+
+    Same marker precedence as ``_record_smoke_verdict`` (the worker's
+    ``SMOKE:`` line first, then a non-zero exit with no marker, fail-closed
+    throughout) but with no out-of-band re-confirmation of a claimed pass
+    (#2464's reason for re-running is "don't trust a worker grading its own
+    diff" — this run's only job is to BE that out-of-band confirmation, so
+    there is nothing left to re-run) and no retry tally (a one-off leg has
+    no further legs to count against a budget).
+    """
+    from coord.confirm_test import (  # noqa: PLC0415
+        BASELINE_RED_REASON_PREFIX,
+        TEST_CONFIRMATION_BASELINE_RED,
+        write_test_output_file,
+    )
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    assignment_id = transition.assignment_id
+    verdict = _smoke_worker_verdict(transition, entry)
+    exit_code = transition.exit_code or 0
+
+    if verdict is not None and verdict.kind == "harness-crash":
+        record_test_verdict(
+            assignment_id=assignment_id,
+            test_state="failed",
+            test_reason=(
+                f"{_HARNESS_CRASH_REASON}: {verdict.reason}"
+                if verdict.reason else _HARNESS_CRASH_REASON
+            ),
+        )
+        return
+
+    if verdict is not None and verdict.kind == "baseline-red":
+        record_test_verdict(
+            assignment_id=assignment_id,
+            test_state="skipped",
+            test_reason=(
+                f"{BASELINE_RED_REASON_PREFIX}: {verdict.reason}"
+                if verdict.reason
+                else f"{BASELINE_RED_REASON_PREFIX}: every failure reproduces "
+                "identically on the merge-base"
+            ),
+            test_confirmation=TEST_CONFIRMATION_BASELINE_RED,
+        )
+        return
+
+    if verdict is not None and verdict.kind == "fail":
+        write_test_output_file(assignment_id, verdict.context)
+        headline = (
+            f"headless smoke: {verdict.reason}"
+            if verdict.reason else "headless smoke reported SMOKE: fail"
+        )
+        record_test_verdict(
+            assignment_id=assignment_id, test_state="failed", test_reason=headline,
+        )
+        return
+
+    if verdict is not None and verdict.kind == "pass":
+        record_test_verdict(
+            assignment_id=assignment_id,
+            test_state="passed",
+            test_reason=(
+                f"headless smoke: {verdict.reason}"
+                if verdict.reason else "headless smoke reported SMOKE: pass"
+            ),
+        )
+        return
+
+    if exit_code != 0:
+        record_test_verdict(
+            assignment_id=assignment_id, test_state="failed", test_reason="headless smoke",
+        )
+        return
+
+    # No verdict line, clean session exit — not a pass. Record no verdict at
+    # all (leave `test_state` NULL) rather than fabricate one: `wait_for_leg_
+    # verdict` then correctly times out instead of reporting a fake terminal
+    # state, same "never guess a pass" rule `_record_smoke_verdict` applies.
+    log.warning(
+        "smoke %s: standalone leg (coord smoke run-leg) ended mute — no "
+        "SMOKE: marker and a clean exit. Recording no verdict; `coord smoke "
+        "run-leg --wait` will time out rather than report a fabricated pass.",
+        assignment_id,
+    )
+
+
 def _capture_cost(transition: Transition, entry: dict, record: dict | None = None) -> None:
     """#208/#546: parse the worker's final cost+tokens and persist them.
 
@@ -4575,6 +4673,35 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         log_path=entry.get("log_path"),
     )
     assignment_type = record.get("type", "work")
+    if assignment_type == "smoke" and not record.get("review_of_assignment_id"):
+        # `coord smoke run-leg` (#4147): a standalone diagnostic Test-stage
+        # leg with no GitHub issue and no parent work row — every normal
+        # `type="smoke"` row carries a `review_of_assignment_id` (it is a
+        # fan-out child of `dispatch_smoke`); this is the one case that
+        # doesn't, so it must be recognized and recorded here, before the
+        # `issue_number == 0` branch below sends it down the generic
+        # "no real issue" path with no verdict ever written, and before the
+        # ordinary `assignment_type == "smoke"` branches further down (both
+        # gated on a `review_of_assignment_id` parent this leg doesn't have).
+        if transition.event in (EVENT_COMPLETION, EVENT_FAILURE):
+            _record_standalone_smoke_leg_verdict(transition, entry)
+        _failure_reason = (
+            entry.get("usage_limit_reason")
+            or entry.get("api_error_reason")
+            or entry.get("push_failure_reason")
+            or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
+            or entry.get("runtime_ceiling_reason")
+            or entry.get("host_sleep_reason")
+        )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+            failure_reason=_failure_reason,
+            exit_code=transition.exit_code,
+        )
+        return
     if transition.issue_number == 0:
         # #3039: issue_number=0 is the established "no GitHub issue" sentinel
         # (see coord/milestone_chat.py:524, coord/refine_chat.py:439,

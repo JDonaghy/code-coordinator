@@ -2656,7 +2656,9 @@ class TestUatStateAndReasonColumns:
 # `review_post_claims` bumps above. Closes the race where two overlapping
 # deliveries of the same `needs_decomposition` transition for one work
 # assignment both file a split for the same original issue.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (30, 103)
+# #4147 bumped this to (31, 104): one new `assignments.
+# unsatisfied_capabilities` COLUMN, so both the count and the version moved.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (31, 104)
 
 
 class TestMigrateAddColumnsVersionGuard:
