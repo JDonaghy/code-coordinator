@@ -42,10 +42,11 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import os
 import re
 import time
 import uuid
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -4522,6 +4523,357 @@ def needs_redesign_escalation(
     return reason
 
 
+# ── #4190: bounded model decision at the max_review_iterations ceiling ──────
+#
+# Three independent call sites hit the SAME "the review -> fix loop has
+# spent its whole iteration budget without an approval" question —
+# `coord.auto_loop._dispatch_fix_for_review` (about to dispatch another fix
+# round), `coord.auto_loop.run_for_fix_transition` (about to dispatch
+# another review), and this module's own `dispatch_pending_reviews` #1612
+# defense-in-depth duplicate guard. All three used to answer it the same
+# blind way: stop and post a notice (`_post_max_iterations_notice`). This
+# section gives them one shared, bounded `claude -p` call to consult first
+# — mirroring `coord.board_doctor_policy.decide_with_model_investigator`
+# (#4126) — so a ceiling that is actually one small fix away from green, or
+# one whose remaining findings name scope that was never built, does not
+# have to wait for a human to notice the GitHub comment.
+
+#: The closed vocabulary the #4190 model may choose from. ``continue`` and
+#: ``escalate`` need no extra payload; ``rescope``/``split`` carry the
+#: model's own description of the remaining scope in ``remainder`` (see
+#: :class:`CeilingModelDecision`).
+CEILING_MODEL_ACTIONS: frozenset[str] = frozenset({"continue", "rescope", "split", "escalate"})
+
+#: A ceiling hit may be granted a "continue" override (one extra fix round
+#: past the configured ceiling) at most this many times per issue, ever —
+#: counted off the audit trail this module writes (see
+#: :func:`_ceiling_continue_override_count`), the same "count audited
+#: events, not an in-memory counter that resets on daemon restart" shape
+#: `coord.board_doctor_policy._model_decision_window_count` already uses.
+#: Without this cap a model that keeps reading "just one more round" as
+#: plausible could extend the loop indefinitely at metered-worker cost.
+CEILING_MODEL_MAX_CONTINUE_OVERRIDES = 1
+
+#: Every #4190 decision that actually consulted the model — granted or
+#: declined, parsed or not — is audited under this event type, with
+#: ``actor="auto_loop_ceiling_model"``. Mirrors
+#: `coord.board_doctor_policy.MODEL_DECISION_EVENT_TYPE`'s own shape/reason
+#: for existing (one event type for both `score_model_investigator_decisions`-
+#: style trails AND the override cap count to read from).
+CEILING_MODEL_DECISION_EVENT_TYPE = "ceiling_model_decision"
+
+#: Opt-in switch for the whole #4190 ceiling-model path (default off,
+#: mirroring `coord.board_doctor_policy.MODEL_INVESTIGATOR_ENV_VAR`/
+#: `_model_investigator_enabled`): when unset, every ceiling-hit call site
+#: keeps the ORIGINAL blind-stop behavior (``_post_max_iterations_notice``)
+#: unchanged, and :func:`decide_ceiling_action` is never called.
+CEILING_MODEL_ENV_VAR = "COORD_AUTO_LOOP_CEILING_MODEL"
+
+
+def ceiling_model_decision_enabled() -> bool:
+    """Whether the #4190 bounded ceiling-model decision path is armed for
+    this process."""
+    return bool(os.environ.get(CEILING_MODEL_ENV_VAR))
+
+
+@dataclass(frozen=True)
+class CeilingModelDecision:
+    """One #4190 bounded-model decision at the ``max_review_iterations``
+    ceiling — the unit :func:`decide_ceiling_action` returns and
+    `coord.auto_loop`'s three call sites act on.
+
+    ``fell_back`` is True whenever *action* is ``"escalate"`` NOT because
+    the model chose it, but because the model call/parse failed, or chose
+    ``continue``/``rescope``/``split`` without satisfying that action's own
+    precondition (continue-override cap spent; rescope/split named no
+    remainder) — the same "a gate that cannot fail is not a gate" (#2096)
+    posture `coord.board_doctor_policy.ModelInvestigatorDecision` applies by
+    always defaulting an unparseable/refused call to ``action=None``. This
+    module has no silent "none" — a ceiling hit must always resolve to one
+    of the four actions, so the safe default is ``escalate`` (the ORIGINAL
+    blind-stop behavior), never a guess.
+    """
+
+    repo_name: str
+    issue_number: int
+    assignment_id: str
+    action: str
+    confidence: float
+    reasoning: str
+    remainder: str
+    model_used: str
+    fell_back: bool
+
+
+_CEILING_MODEL_SYSTEM_PROMPT = """\
+You are deciding what happens when an automated review -> fix loop in a \
+Claude Code fleet coordinator has reached its configured iteration ceiling \
+without the branch receiving an approval. Choose exactly ONE action from \
+this closed list: continue, rescope, split, escalate.
+
+- continue: the remaining blocking finding(s) read as narrow and one more \
+fix round is likely to resolve them. This grants one extra iteration past \
+the ceiling and is capped fleet-wide per issue — if the evidence says the \
+override has already been used for this issue, do not choose it again.
+- rescope: the branch has already delivered real, mergeable value, but a \
+blocking finding names scope that was never really part of a tight fix for \
+this issue. Choose this to file that remainder as a follow-up issue —
+describe exactly what remains in "remainder" (it will be filed verbatim as \
+a new issue's body) and let a human decide whether to merge the delivered \
+part as-is.
+- split: the issue itself reads as too large or tangled from the start, and \
+several rounds of churn have not converged. Describe the split you would \
+make in "remainder" (it will not be filed automatically — a human decides \
+how to divide it) rather than recommending another bounce.
+- escalate: none of the above clearly fits the evidence — defer to a \
+human rather than guess. Prefer escalate over a wrong guess.
+
+Respond with ONLY a single JSON object, no prose, no code fences:
+{"action": "<one of the four names above>", "confidence": <float 0.0-1.0>, \
+"reasoning": "<one sentence>", "remainder": "<only for rescope/split, else \
+empty string>"}
+"""
+
+
+def _render_ceiling_evidence(
+    *,
+    repo_name: str,
+    issue_number: int,
+    branch: str | None,
+    completed_rounds: int,
+    max_iter: int,
+    findings_body: str,
+    continue_overrides_used: int,
+) -> str:
+    """The evidence bundle handed to the #4190 ceiling model call."""
+    body = (findings_body or "").strip()
+    return "\n".join([
+        f"repo: {repo_name}",
+        f"issue: {issue_number}",
+        f"branch: {branch or 'unknown'}",
+        f"completed_fix_rounds: {completed_rounds}",
+        f"max_review_iterations: {max_iter}",
+        f"continue_overrides_already_used_for_this_issue: "
+        f"{continue_overrides_used} (cap {CEILING_MODEL_MAX_CONTINUE_OVERRIDES})",
+        "latest_blocking_review_findings:",
+        body if body else "(none recorded for this evidence bundle)",
+    ])
+
+
+def _invoke_ceiling_model(
+    system_prompt: str, user_prompt: str, *, model: str, timeout: float = 60.0,
+) -> str:
+    """One bounded ``claude -p`` call with an explicit ``--model`` (#4190).
+
+    Mirrors `coord.board_doctor_policy._invoke_investigator_model`'s own
+    oneshot shape rather than going through `coord.brain.call_claude` /
+    `coord.providers.claude.ClaudeProvider.oneshot_command` — that method's
+    own docstring says it never threads ``self._model`` through a oneshot
+    call (#1706), and this is the second caller (after #4126) that genuinely
+    needs per-call model selection.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from coord.agent import DEFAULT_WORKER_BINARY  # noqa: PLC0415
+
+    cmd = [
+        DEFAULT_WORKER_BINARY, "-p", "--system-prompt", system_prompt,
+        "--model", model, "--output-format", "json",
+    ]
+    result = subprocess.run(
+        cmd, input=user_prompt, capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ceiling model decision call failed (exit "
+            f"{result.returncode}): {result.stderr.strip()}"
+        )
+    try:
+        outer = _json.loads(result.stdout)
+        if isinstance(outer, dict) and "result" in outer:
+            return outer["result"]
+    except (_json.JSONDecodeError, ValueError):
+        pass
+    return result.stdout
+
+
+def _parse_ceiling_model_response(text: str) -> tuple[str | None, float, str, str]:
+    """Parse the #4190 model's JSON reply into ``(action, confidence,
+    reasoning, remainder)``.
+
+    Never raises on malformed input — unparseable JSON, a non-dict, an
+    ``action`` outside :data:`CEILING_MODEL_ACTIONS`, or a ``confidence``
+    outside ``[0, 1]`` all read as ``(None, 0.0, "<why>", "")``: a refusal
+    to act, never a guessed action (#2096 — the gate that follows must be
+    able to fail).
+    """
+    import json as _json  # noqa: PLC0415
+    import re as _re  # noqa: PLC0415
+
+    cleaned = text.strip()
+    fence = _re.match(r"^```(?:json)?\s*\n(.*?)```\s*$", cleaned, _re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+    try:
+        data = _json.loads(cleaned)
+    except (_json.JSONDecodeError, ValueError) as exc:
+        return None, 0.0, f"unparseable model response: {exc}", ""
+    if not isinstance(data, dict):
+        return None, 0.0, "model response was not a JSON object", ""
+
+    action = data.get("action")
+    if action not in CEILING_MODEL_ACTIONS:
+        return None, 0.0, f"model returned unrecognized action {action!r}", ""
+
+    confidence = data.get("confidence")
+    if not isinstance(confidence, (int, float)) or not (0.0 <= float(confidence) <= 1.0):
+        return None, 0.0, f"model returned invalid confidence {confidence!r}", ""
+
+    reasoning = data.get("reasoning")
+    reasoning = str(reasoning) if reasoning is not None else ""
+    remainder = data.get("remainder")
+    remainder = str(remainder) if remainder is not None else ""
+    return action, float(confidence), reasoning, remainder
+
+
+def _ceiling_continue_override_count(repo_name: str, issue_number: int) -> int:
+    """How many #4190 ``"continue"`` overrides *repo_name*#*issue_number*
+    has already spent, ever — the cap counter for
+    :data:`CEILING_MODEL_MAX_CONTINUE_OVERRIDES`. Fails open to 0 on an
+    unreadable audit log (same posture as
+    `coord.board_doctor_policy._model_decision_window_count`): a cap that
+    can never be read is worse than a cap occasionally under-counted by a
+    transient DB error.
+    """
+    from coord.audit import query_audit_log  # noqa: PLC0415
+
+    try:
+        result = query_audit_log(
+            event_type=CEILING_MODEL_DECISION_EVENT_TYPE,
+            repo=repo_name, issue=issue_number, limit=500,
+        )
+    except Exception:  # noqa: BLE001 — fails open, see docstring
+        log.warning(
+            "auto_loop ceiling: could not read %s audit log for %s#%s — "
+            "continue-override cap check fails open to 0",
+            CEILING_MODEL_DECISION_EVENT_TYPE, repo_name, issue_number,
+            exc_info=True,
+        )
+        return 0
+    entries = result.get("entries") or []
+    return sum(
+        1
+        for e in entries
+        if (e.get("details") or {}).get("action") == "continue"
+        and not (e.get("details") or {}).get("fell_back")
+    )
+
+
+def decide_ceiling_action(
+    *,
+    repo_name: str,
+    issue_number: int,
+    assignment_id: str,
+    branch: str | None,
+    completed_rounds: int,
+    max_iter: int,
+    findings_body: str,
+    config: Config,
+    invoke_model: Callable[..., str] | None = None,
+) -> CeilingModelDecision:
+    """The #4190 entry point: one bounded sonnet call deciding what to do
+    about a ``max_review_iterations`` ceiling hit, in place of a blind
+    stop.
+
+    *invoke_model* defaults to :func:`_invoke_ceiling_model`; tests inject a
+    stub so this never shells out to a real ``claude -p``.
+
+    Never raises: every failure mode (an unparseable reply, a subprocess
+    timeout, a spent continue-override cap, a rescope/split with no named
+    remainder) resolves to ``action="escalate", fell_back=True`` — the same
+    direction the ORIGINAL blind stop already pointed, so a model outage
+    degrades to today's behavior rather than to a stuck loop.
+    """
+    call = invoke_model if invoke_model is not None else _invoke_ceiling_model
+
+    def _audit(decision: CeilingModelDecision) -> CeilingModelDecision:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category="auto_loop_ceiling",
+            event_type=CEILING_MODEL_DECISION_EVENT_TYPE,
+            actor="auto_loop_ceiling_model",
+            summary=(
+                f"ceiling model decided {decision.action} for "
+                f"{repo_name}#{issue_number} (confidence={decision.confidence:.2f}, "
+                f"model={decision.model_used}, fell_back={decision.fell_back})"
+            ),
+            repo=repo_name,
+            issue=issue_number,
+            assignment_id=assignment_id,
+            details={
+                "action": decision.action,
+                "confidence": decision.confidence,
+                "reasoning": decision.reasoning,
+                "remainder": decision.remainder,
+                "model_used": decision.model_used,
+                "fell_back": decision.fell_back,
+            },
+        )
+        return decision
+
+    def _escalate(reasoning: str, *, model_used: str = "") -> CeilingModelDecision:
+        return _audit(CeilingModelDecision(
+            repo_name=repo_name, issue_number=issue_number,
+            assignment_id=assignment_id, action="escalate", confidence=0.0,
+            reasoning=reasoning, remainder="", model_used=model_used,
+            fell_back=True,
+        ))
+
+    continue_overrides_used = _ceiling_continue_override_count(repo_name, issue_number)
+    evidence = _render_ceiling_evidence(
+        repo_name=repo_name, issue_number=issue_number, branch=branch,
+        completed_rounds=completed_rounds, max_iter=max_iter,
+        findings_body=findings_body, continue_overrides_used=continue_overrides_used,
+    )
+
+    sonnet_model = config.models.resolve("sonnet")
+    assert sonnet_model is not None  # resolve("sonnet") never returns None
+
+    try:
+        raw = call(_CEILING_MODEL_SYSTEM_PROMPT, evidence, model=sonnet_model, timeout=60.0)
+    except Exception as exc:  # noqa: BLE001 — a model-call failure is a refusal, not a crash
+        return _escalate(f"model call failed: {exc}", model_used=sonnet_model)
+
+    action, confidence, reasoning, remainder = _parse_ceiling_model_response(raw)
+    if action is None:
+        return _escalate(reasoning, model_used=sonnet_model)
+
+    if action == "continue" and continue_overrides_used >= CEILING_MODEL_MAX_CONTINUE_OVERRIDES:
+        return _escalate(
+            f"model chose 'continue' but {repo_name}#{issue_number} already "
+            f"spent its {CEILING_MODEL_MAX_CONTINUE_OVERRIDES} continue-"
+            "override budget — escalating instead",
+            model_used=sonnet_model,
+        )
+
+    if action in ("rescope", "split") and not remainder.strip():
+        return _escalate(
+            f"model chose {action!r} without naming the remainder scope — "
+            "escalating instead",
+            model_used=sonnet_model,
+        )
+
+    return _audit(CeilingModelDecision(
+        repo_name=repo_name, issue_number=issue_number,
+        assignment_id=assignment_id, action=action, confidence=confidence,
+        reasoning=reasoning, remainder=remainder, model_used=sonnet_model,
+        fell_back=False,
+    ))
+
+
 def claim_review_item_dispatch_gate(
     *,
     repo_name: str,
@@ -6494,16 +6846,51 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             and c.status == "done"
             and (c.review_iteration or 0) >= _max_review_iter
         ):
+            if not ceiling_model_decision_enabled():
+                from coord.auto_loop import _post_max_iterations_notice  # noqa: PLC0415
+
+                logger.warning(
+                    "dispatch_pending_reviews cap guard (#1612): %s (%s #%s) "
+                    "has review_iteration=%d >= max_review_iterations=%d — "
+                    "not dispatching another review.",
+                    c.assignment_id, c.repo_name, c.issue_number,
+                    c.review_iteration or 0, _max_review_iter,
+                )
+                _post_max_iterations_notice(c, config)
+                c.review_state = "cap_hit"
+                continue
+
+            from coord.auto_loop import (  # noqa: PLC0415
+                _latest_blocking_findings_body,
+                _post_ceiling_decision_notice,
+            )
+
+            decision = decide_ceiling_action(
+                repo_name=c.repo_name, issue_number=c.issue_number,
+                assignment_id=c.assignment_id, branch=c.branch,
+                completed_rounds=c.review_iteration or 0, max_iter=_max_review_iter,
+                findings_body=_latest_blocking_findings_body(
+                    c.assignment_id, board, config, repo_name=c.repo_name,
+                ),
+                config=config,
+            )
             logger.warning(
                 "dispatch_pending_reviews cap guard (#1612): %s (%s #%s) has "
-                "review_iteration=%d >= max_review_iterations=%d — not "
-                "dispatching another review.",
+                "review_iteration=%d >= max_review_iterations=%d — #4190 "
+                "bounded model decided action=%s (confidence=%.2f, "
+                "model=%s, fell_back=%s): %s",
                 c.assignment_id, c.repo_name, c.issue_number,
-                c.review_iteration or 0, _max_review_iter,
+                c.review_iteration or 0, _max_review_iter, decision.action,
+                decision.confidence, decision.model_used, decision.fell_back,
+                decision.reasoning,
             )
-            from coord.auto_loop import _post_max_iterations_notice
-
-            _post_max_iterations_notice(c, config)
+            if decision.action == "continue":
+                # The model granted a one-time override (capped per issue) —
+                # leave `review_state` as-is so this row stays eligible below.
+                continue
+            _post_ceiling_decision_notice(
+                c, config, decision, completed_rounds=c.review_iteration or 0,
+            )
             c.review_state = "cap_hit"
 
     # #3668: the predicate lives in `bulk_review_eligibility_blockers` so
