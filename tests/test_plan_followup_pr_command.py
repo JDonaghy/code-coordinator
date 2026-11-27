@@ -75,7 +75,9 @@ class TestPrBriefingKeyword:
         briefing = disp.call_args[0][2]
         assert 'Closes #42' in briefing
         assert 'Refs #42' not in briefing
-        get_issue.assert_called_once_with("acme/api", 42)
+        # The keyword decision reads the issue's labels; the review dispatch
+        # that follows may fetch the same issue again for its milestone.
+        assert get_issue.call_args_list[0] == (("acme/api", 42),)
 
     def test_uses_refs_for_work_assignment_against_epic_issue(
         self, config_file: Path, coord_db
