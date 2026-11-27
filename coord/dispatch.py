@@ -15,6 +15,7 @@ import httpx
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from coord.merge_queue import TrancheMergeResult
     from coord.milestone_dispatch import OracleReadiness
     from coord.models import Board, TrancheChild, TrancheRow
 
@@ -3944,3 +3945,249 @@ def dispatch_tranche_row_children(
 
     row.state = "dispatched"
     return row
+
+
+# ── Native tranche rows: LLM integrator fallback (#4129 Phase 1, this slice
+# #4201) ─────────────────────────────────────────────────────────────────────
+#
+# `coord.merge_queue.merge_tranche_children` does the coord-side merge and
+# the declared `integration_surfaces` regen itself, with no `claude -p`
+# worker, exactly like `coord.conflict_fix.attempt_mechanical_surface_
+# resolution` does for an ordinary merge-queue conflict. It only reports
+# `needs_integrator=True` (see `TrancheMergeResult`'s docstring) when a real
+# conflict touches a path outside every declared surface, or a surface's own
+# `regen`/`check` fails — the two shapes no mechanical step can resolve.
+# This section is the fallback for exactly that case: dispatch ONE ordinary
+# `type="work"` leg (same `/assign` POST every other leg in this module
+# uses), briefed with the row's children and the merge's own failure detail,
+# to finish the merge by hand and push the result to
+# `coord.merge_queue.tranche_integration_branch_name`. Collecting that leg's
+# completion is a later slice's job, mirroring `dispatch_tranche_row_children`
+# vs. `coord.drive.apply_tranche_child_result` — this only defines the wire
+# contract and does the dispatch.
+
+
+#: The structured result marker a tranche integrator leg's final message
+#: must carry (#4201) — mirrors `TRANCHE_CHILD_RESULT_MARKER`'s shape and
+#: fail-closed contract, but named distinctly since it answers a different
+#: question (did the WHOLE integration finish, not one child).
+TRANCHE_INTEGRATOR_RESULT_MARKER = "TRANCHE_INTEGRATOR_RESULT:"
+
+_TRANCHE_INTEGRATOR_RESULT_RE = re.compile(
+    r"^[ \t>*_`]*TRANCHE_INTEGRATOR_RESULT:[ \t]*(\{.*\})[ \t]*$",
+    re.MULTILINE,
+)
+
+#: Appended to a tranche integrator leg's briefing (#4201) — tells the
+#: worker there is no PR/review for this leg either, and exactly what to
+#: report instead.
+TRANCHE_INTEGRATOR_RESULT_CONTRACT = f"""
+
+## Tranche integrator — no PR, no review (#4129/#4201)
+
+This leg exists because the coordinator's own mechanical merge of this
+tranche's children could not finish on its own (see the conflict detail
+above). Finish merging every child branch listed above onto the target
+branch you were assigned, resolving the conflict(s) by hand. Do NOT open a
+pull request and do NOT wait for a review — the coordinator runs one Test
+and one review set against the branch you push.
+
+Push your branch when you are done (`git push origin HEAD`). Before your
+final message, report your result with exactly one line, with a JSON
+object after the marker:
+
+{TRANCHE_INTEGRATOR_RESULT_MARKER} {{"outcome": "done", "summary": "<one sentence>", "files": ["path/a.py"]}}
+
+Use `"outcome": "failed"` instead if you could not finish. A missing or
+unparseable marker is treated as failed, never as done.
+"""
+
+
+def _unparseable_tranche_integrator_result(reason: str) -> dict:
+    """The one shape every fail-closed exit of
+    :func:`parse_tranche_integrator_result` returns — mirrors
+    `_unparseable_tranche_child_result`'s shape for the child contract.
+    """
+    return {
+        "outcome": "failed",
+        "summary": f"unparseable {TRANCHE_INTEGRATOR_RESULT_MARKER} marker: {reason}",
+        "files": [],
+        "fail_closed_unparseable": True,
+    }
+
+
+def parse_tranche_integrator_result(text: str | None) -> dict:
+    """Extract and validate a tranche integrator leg's self-reported result
+    (#4201).
+
+    Identical validation/shape/fail-closed contract to
+    :func:`parse_tranche_child_result` — the two are kept as separate
+    functions (rather than one parameterized by marker) only because they
+    grade two DIFFERENT questions ("is this one child done" vs. "is the
+    whole integration done") and must be able to evolve independently
+    without a shared signature coupling them (#2096 is about one function
+    per QUESTION, not merging every structurally-similar parser into one).
+    """
+    if not text:
+        return _unparseable_tranche_integrator_result("no completion text")
+
+    matches = list(_TRANCHE_INTEGRATOR_RESULT_RE.finditer(text))
+    if not matches:
+        return _unparseable_tranche_integrator_result(
+            f"no {TRANCHE_INTEGRATOR_RESULT_MARKER} marker found"
+        )
+
+    raw_json = matches[-1].group(1)
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        return _unparseable_tranche_integrator_result(f"invalid JSON ({exc})")
+
+    if not isinstance(payload, dict):
+        return _unparseable_tranche_integrator_result("marker payload is not a JSON object")
+
+    outcome = payload.get("outcome")
+    if outcome not in TRANCHE_CHILD_OUTCOMES:
+        return _unparseable_tranche_integrator_result(
+            f"outcome {outcome!r} is not one of {TRANCHE_CHILD_OUTCOMES}"
+        )
+
+    summary = payload.get("summary", "")
+    if not isinstance(summary, str):
+        return _unparseable_tranche_integrator_result("summary is not a string")
+
+    files = payload.get("files", [])
+    if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+        return _unparseable_tranche_integrator_result("files is not a list of strings")
+
+    return {
+        "outcome": outcome,
+        "summary": summary,
+        "files": files,
+        "fail_closed_unparseable": False,
+    }
+
+
+def build_tranche_integrator_briefing(
+    row: "TrancheRow", merge_result: "TrancheMergeResult",
+) -> str:
+    """The briefing text for one tranche integrator leg (#4201).
+
+    Lists every `"done"` child's branch (so the integrator knows exactly
+    what to merge — it never has to rediscover the row), the target
+    integration branch it must push to, and *merge_result.detail* verbatim
+    (the coordinator's own mechanical attempt's failure reason — the
+    conflicted paths or the failing regen/check command) so the integrator
+    starts with the SAME information the coordinator had, not a rediscovery
+    of the same conflict from scratch.
+    """
+    from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
+
+    done_children = sorted(
+        (c for c in row.children if c.state == "done"), key=lambda c: c.issue_number,
+    )
+    children_lines = "\n".join(
+        f"- #{c.issue_number} ({c.title or 'untitled'}): branch "
+        f"`{tranche_child_branch_name(row, c)}`"
+        for c in done_children
+    )
+    target_branch = tranche_integration_branch_name(row)
+    return (
+        f"Integrate tranche row {row.id} for {row.repo_name}#{row.issue_number} "
+        f"({row.issue_title}).\n\n"
+        f"Base commit: `{row.base_sha}`\n"
+        f"Target branch (already checked out, may carry partial progress): "
+        f"`{target_branch}`\n\n"
+        f"Children to merge onto the target branch:\n{children_lines}\n\n"
+        f"The coordinator's own mechanical merge attempt reported:\n"
+        f"{merge_result.detail}\n"
+        + TRANCHE_INTEGRATOR_RESULT_CONTRACT
+    )
+
+
+def build_tranche_integrator_proposal(
+    row: "TrancheRow", merge_result: "TrancheMergeResult", machine_name: str,
+) -> Proposal:
+    """Build the :class:`Proposal` for one tranche integrator leg (#4201).
+
+    `target_branch` pins the worker to `coord.merge_queue.
+    tranche_integration_branch_name` — `merge_tranche_children` has already
+    pushed whatever progress it made there (see that function's docstring)
+    before this is ever called, so checking it out resumes from exactly
+    where the mechanical attempt stopped rather than starting over at
+    `row.base_sha`. `type="work"` reuses the same worktree/routing plumbing
+    every other work leg already has, same as
+    :func:`build_tranche_child_proposal`.
+    """
+    from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
+
+    return Proposal(
+        id=row.id or 0,
+        machine_name=machine_name,
+        repo_name=row.repo_name,
+        issue_number=row.issue_number,
+        issue_title=row.issue_title,
+        rationale=f"tranche row {row.id} integrator",
+        briefing=build_tranche_integrator_briefing(row, merge_result),
+        type="work",
+        target_branch=tranche_integration_branch_name(row),
+    )
+
+
+def dispatch_tranche_integrator(
+    row: "TrancheRow",
+    merge_result: "TrancheMergeResult",
+    config: Config,
+    machine_name: str,
+    *,
+    dispatcher: Callable[..., dict] = dispatch,
+    status_fetcher=None,
+    credential_fetcher=None,
+    board: "Board | None" = None,
+) -> dict:
+    """Dispatch ONE LLM integrator leg for *row* (#4129/#4201) — only ever
+    called when *merge_result.needs_integrator* is ``True``
+    (`coord.merge_queue.merge_tranche_children` is the one place that
+    decides that; this function trusts the caller already checked it rather
+    than re-deriving the same verdict a second way, #2096).
+
+    *status_fetcher*/*credential_fetcher*/*board* are forwarded verbatim to
+    *dispatcher* — the same liveness/credential/Test-host-reservation gates
+    `dispatch_tranche_row_children` wires for the child fan-out, so this
+    single leg is not the one dispatch site in the whole tranche flow that
+    skips them.
+
+    Returns ``{"ok": True, "assignment_id": ..., "machine_name": ...}`` on a
+    confirmed dispatch (an `id` present, and the agent's own ``status`` not
+    `coord.agent.FAILED` — a 2xx `/assign` response alone proves nothing,
+    same fail-closed read `dispatch_tranche_row_children` already applies).
+    Returns ``{"ok": False, "error": ...}`` on any dispatch failure — never
+    raises, so a caller can fold this straight into `row.state` without its
+    own try/except.
+    """
+    from coord.agent import FAILED as AGENT_ASSIGNMENT_FAILED  # noqa: PLC0415
+
+    try:
+        proposal = build_tranche_integrator_proposal(row, merge_result, machine_name)
+        response = dispatcher(
+            proposal, config,
+            status_fetcher=status_fetcher,
+            credential_fetcher=credential_fetcher,
+            board=board,
+        )
+        if not isinstance(response, dict) or not response.get("id"):
+            raise RuntimeError(
+                f"dispatch response carried no assignment id: {response!r}"
+            )
+        if response.get("status") == AGENT_ASSIGNMENT_FAILED:
+            raise RuntimeError(
+                "agent reported dispatch failure: "
+                f"{response.get('error') or 'unknown error'}"
+            )
+    except Exception as exc:  # noqa: BLE001 — fail closed, caller never left guessing
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "assignment_id": response["id"],
+        "machine_name": proposal.machine_name,
+    }

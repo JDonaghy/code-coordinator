@@ -5042,6 +5042,109 @@ def tranche_row_all_children_terminal(row: TrancheRow) -> bool:
     )
 
 
+# ── native tranche rows: coord-side merge + LLM integrator fallback
+# (#4129/#4201) ─────────────────────────────────────────────────────────────
+#
+# Once `tranche_row_all_children_terminal(row)` is `True`, this is the
+# orchestration glue: run `coord.merge_queue.merge_tranche_children`'s
+# mechanical merge + declared `integration_surfaces` regen, and dispatch
+# `coord.dispatch.dispatch_tranche_integrator`'s single LLM fallback leg
+# only when that mechanical attempt reports `needs_integrator=True`.
+# Deciding WHETHER a conflict needs an integrator lives in
+# `coord.merge_queue.merge_tranche_children` alone (#2096: one question, one
+# answer) — this function only acts on that verdict.
+
+
+def integrate_tranche_row(
+    row: TrancheRow,
+    config: Any,
+    machine_names: Sequence[str] = (),
+    *,
+    merger: "Callable[..., Any] | None" = None,
+    integrator_dispatcher: "Callable[..., dict] | None" = None,
+    status_fetcher: "Callable[..., Any] | None" = None,
+    credential_fetcher: "Callable[..., Any] | None" = None,
+    board: "Any | None" = None,
+) -> "tuple[TrancheRow, Any, dict | None]":
+    """Advance *row* from `"dispatched"` to `"integrating"` and attempt the
+    coord-side merge, dispatching one LLM integrator leg when (and only
+    when) the mechanical merge can't finish on its own (#4129/#4201).
+
+    Mutates *row* in place and returns ``(row, merge_result,
+    integrator_dispatch)`` — the :class:`coord.merge_queue.
+    TrancheMergeResult` and (when an integrator leg was actually dispatched)
+    `coord.dispatch.dispatch_tranche_integrator`'s own return dict (carrying
+    `assignment_id`/`machine_name` — the handle a later collection slice
+    needs) are returned alongside *row* rather than folded into a field,
+    because `TrancheRow` has no slot for either (#4199 froze that shape).
+    `integrator_dispatch` is `None` whenever no integrator leg was
+    dispatched at all — never silently discarded the way the #4200 review
+    flagged a bare dispatch response being thrown away elsewhere; the
+    caller has the full handle to persist however the next slice needs it.
+
+    - `result.ok` → `row.state = "done"`. Nothing more to do; the Test/
+      review/PR slice (#4202) picks up from here.
+    - `not result.ok and result.needs_integrator` → dispatches ONE
+      integrator leg via *integrator_dispatcher* (`coord.dispatch.
+      dispatch_tranche_integrator` by default). A confirmed dispatch leaves
+      `row.state = "integrating"` (a later slice collects that leg's
+      completion, mirroring how #4200 defined child dispatch before #4200's
+      OWN collection half landed in this same module); a failed dispatch
+      itself becomes `row.state = "failed"`.
+    - `not result.ok and not result.needs_integrator` → `row.state =
+      "failed"` outright (e.g. a child never reached `"done"`, or a local-
+      checkout/infra problem) — nothing to hand an integrator.
+
+    Raises ValueError if `tranche_row_all_children_terminal(row)` is
+    `False` (the caller's own job to check first — see that function), if
+    `row.state` is not `"dispatched"` (refuses to re-run an integration
+    already in flight or already resolved), or if an integrator dispatch is
+    needed but *machine_names* is empty.
+    """
+    if merger is None:
+        from coord.merge_queue import merge_tranche_children as merger  # noqa: PLC0415
+    if integrator_dispatcher is None:
+        from coord.dispatch import dispatch_tranche_integrator as integrator_dispatcher  # noqa: PLC0415
+
+    if not tranche_row_all_children_terminal(row):
+        raise ValueError(
+            "integrate_tranche_row: not every child of row "
+            f"{row.id} has reached a terminal state yet"
+        )
+    if row.state != "dispatched":
+        raise ValueError(
+            f"integrate_tranche_row: row {row.id} is {row.state!r}, not "
+            "'dispatched' — refusing to re-run an integration already in "
+            "flight or already resolved"
+        )
+
+    row.state = "integrating"
+    result = merger(row, config)
+
+    if result.ok:
+        row.state = "done"
+        return row, result, None
+
+    if not result.needs_integrator:
+        row.state = "failed"
+        return row, result, None
+
+    if not machine_names:
+        raise ValueError(
+            "integrate_tranche_row: row needs an LLM integrator leg but "
+            "machine_names is empty"
+        )
+    dispatched = integrator_dispatcher(
+        row, result, config, machine_names[0],
+        status_fetcher=status_fetcher,
+        credential_fetcher=credential_fetcher,
+        board=board,
+    )
+    if not isinstance(dispatched, dict) or not dispatched.get("ok"):
+        row.state = "failed"
+    return row, result, dispatched
+
+
 # ── #1526: driver/gate divergence ───────────────────────────────────────────
 #
 # `coord drive` decides `test=`/`review=` are satisfied from

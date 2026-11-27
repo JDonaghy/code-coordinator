@@ -13,12 +13,18 @@ import inspect
 import json
 import logging
 import re
+import shutil
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, NamedTuple, Protocol
+
+if TYPE_CHECKING:
+    from coord.config import Config
+    from coord.models import IntegrationSurface, TrancheRow
 
 from coord import sql
 from coord.audit import record_audit
@@ -11989,3 +11995,460 @@ def pending_summary(items: list[QueuedMerge]) -> dict[str, list[QueuedMerge]]:
             continue
         out.setdefault(entry.repo_name, []).append(entry)
     return out
+
+
+# ── Native tranche rows: coord-side merge + integration-surface regen ──────
+# (#4129 Phase 1, this slice #4201)
+#
+# `coord.dispatch.dispatch_tranche_row_children` (#4200) fans a `TrancheRow`'s
+# children out in parallel, each on its own branch off the row's shared
+# `base_sha`; `coord.drive.apply_tranche_child_result` folds each one's
+# graded completion back into the row. Once every child is terminal
+# (`coord.drive.tranche_row_all_children_terminal`), this section does the
+# coord-side half #4129 names: merge every `"done"` child's branch onto
+# `base_sha` itself (no PR, no per-child review — there is nothing for `gh`
+# to merge), run the repo's declared `integration_surfaces` regen ONCE
+# across the merged tree, and report whether a genuine conflict (or a
+# regen/check that itself fails) remains outside those surfaces — the
+# signal `coord.dispatch.dispatch_tranche_integrator` uses to decide whether
+# a single LLM integrator leg is needed at all. This module does the git
+# work locally (the same local-checkout posture `coord.revalidate.
+# local_repo_dir` already uses for `coord test`), not via `gh` — unlike a
+# merge-queue `QueuedMerge` entry, a tranche child branch never has a PR to
+# ask `gh` to merge.
+
+
+def tranche_integration_branch_name(row: "TrancheRow") -> str:
+    """The deterministic branch `merge_tranche_children` pushes the merged
+    tree to, and that `coord.dispatch.dispatch_tranche_integrator` points a
+    fallback LLM integrator leg's ``target_branch`` at (#4201).
+
+    Derived from `row.id` alone — never stored on `TrancheRow` itself, for
+    the same "recomputable, not a second place to drift" reason
+    `coord.dispatch.tranche_child_branch_name` isn't stored on
+    `TrancheChild` either (#2096).
+
+    Raises ValueError if `row.id` is None.
+    """
+    if row.id is None:
+        raise ValueError(
+            "tranche_integration_branch_name: row.id is None — save the row "
+            "(coord.state.save_tranche_row) before integrating its children"
+        )
+    return f"tranche-{row.id}-integrated"
+
+
+@dataclass(frozen=True)
+class TrancheMergeResult:
+    """Outcome of :func:`merge_tranche_children` (#4201).
+
+    ``ok`` is ``True`` only when every `"done"` child merged cleanly (or any
+    conflict was confined to a declared `integration_surfaces` path and
+    resolved by that surface's own `regen`/`check`), AND the resulting tree
+    was pushed to :func:`tranche_integration_branch_name` and re-confirmed
+    there afterward (#2096: derived from a post-push observation, never
+    from the push subprocess's exit code alone).
+
+    ``needs_integrator`` is ``True`` when a human/LLM-resolvable problem
+    remains — a merge conflict touching at least one path NOT covered by a
+    declared surface, or a surface's own `regen`/`check` command failing
+    after a structurally clean merge — and partial progress (everything
+    that *did* merge cleanly) has already been pushed to
+    :func:`tranche_integration_branch_name` for
+    :func:`coord.dispatch.dispatch_tranche_integrator` to continue from.
+    ``False`` with ``ok=False`` means there is nothing sensible to hand an
+    integrator at all (e.g. a child never reached `"done"`) — see
+    ``detail``.
+
+    ``unresolved_conflicts`` are the conflicted paths NOT covered by a
+    declared surface that triggered the decline — empty when the failure
+    was a regen/check command failing instead, or when nothing was
+    attempted (`ok=False, needs_integrator=False`).
+
+    ``integrated_sha`` is the pushed commit on success, else ``None``.
+    ``detail`` is a human-readable reason (decline) or summary (success).
+    """
+
+    ok: bool
+    needs_integrator: bool
+    integrated_sha: str | None
+    unresolved_conflicts: tuple[str, ...]
+    detail: str
+
+
+def _tranche_merge_tail(text: str, limit: int = 4000) -> str:
+    """Trim *text* to its last *limit* characters — mirrors
+    `coord.conflict_fix._surface_tail`'s bound on raw command output landing
+    in a `TrancheMergeResult.detail`."""
+    text = text.strip()
+    return text[-limit:] if len(text) > limit else text
+
+
+def _tranche_merge_run(
+    args: "list[str] | str",
+    *,
+    cwd: Path,
+    timeout: float,
+    shell: bool = False,
+) -> subprocess.CompletedProcess:
+    """`subprocess.run` wrapper for every step of :func:`merge_tranche_children`
+    — a `subprocess.TimeoutExpired`/`OSError` (routine for a `regen`/`check`
+    command that can legitimately take a while) becomes a synthetic
+    non-zero :class:`subprocess.CompletedProcess` instead of propagating,
+    the same posture `coord.conflict_fix._surface_run` uses for its own
+    mechanical surface resolution."""
+    try:
+        return subprocess.run(
+            args, shell=shell, cwd=str(cwd),  # noqa: S602
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            args, 124, stdout="", stderr=f"timed out after {timeout}s: {e}",
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr=str(e))
+
+
+def _tranche_rev_parse(cwd: Path, ref: str) -> str | None:
+    """Resolve *ref* to a full SHA in *cwd*, or ``None`` on any failure."""
+    res = _tranche_merge_run(["git", "rev-parse", ref], cwd=cwd, timeout=60)
+    if res.returncode != 0:
+        return None
+    sha = res.stdout.strip()
+    return sha or None
+
+
+def _tranche_conflicted_paths(worktree: Path) -> list[str] | None:
+    """List files *worktree* currently reports as unmerged, or ``None`` on a
+    subprocess failure (never on "no conflicts" — that is ``[]``)."""
+    res = _tranche_merge_run(
+        ["git", "diff", "--name-only", "--diff-filter=U"], cwd=worktree, timeout=60,
+    )
+    if res.returncode != 0:
+        return None
+    return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+
+def _tranche_worktree_path(row: "TrancheRow") -> Path:
+    """Throwaway worktree for one :func:`merge_tranche_children` attempt.
+
+    Under ``~/.coord/`` — its own directory, separate from
+    `coord.conflict_fix`'s `conflict-fix-surface-worktrees` and
+    `coord.revalidate`'s revalidation worktrees, namespaced by repo/row so
+    two rows (or a retried attempt on the same row) never collide.
+    """
+    name = f"{row.repo_name}-{row.id}".replace("/", "-")
+    return COORD_DIR / "tranche-integration-worktrees" / name
+
+
+def _remove_tranche_worktree(repo_dir: Path, wt_path: Path) -> None:
+    """Best-effort cleanup of *wt_path* — mirrors
+    `coord.conflict_fix._remove_surface_worktree`'s belt-and-suspenders
+    shape. Never raises; called from a ``finally`` block."""
+    for args in (
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        ["git", "worktree", "prune"],
+    ):
+        _tranche_merge_run(args, cwd=repo_dir, timeout=60)
+    shutil.rmtree(wt_path, ignore_errors=True)
+
+
+def _push_tranche_integration_branch(
+    wt_path: Path, branch: str, sha: str,
+) -> tuple[bool, str]:
+    """Push *sha* to :func:`tranche_integration_branch_name`'s *branch*, and
+    re-confirm it landed via a fresh ``git ls-remote`` (#2096: never trust
+    the push subprocess's exit code alone). Pushes the literal *sha* —
+    not ``HEAD`` — so a caller can push a known-clean prior commit even when
+    the worktree's current ``HEAD``/working tree is dirty from an in-progress
+    regen attempt that failed partway.
+
+    Returns ``(True, detail)`` once *branch* is CONFIRMED at *sha* on the
+    remote, else ``(False, reason)``.
+    """
+    pushed = _tranche_merge_run(
+        ["git", "push", "--force", "origin", f"{sha}:refs/heads/{branch}"],
+        cwd=wt_path, timeout=180,
+    )
+    if pushed.returncode != 0:
+        return False, f"push failed: {_tranche_merge_tail(pushed.stderr)}"
+    confirm = _tranche_merge_run(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+        cwd=wt_path, timeout=60,
+    )
+    remote_sha = confirm.stdout.split()[0] if confirm.stdout.strip() else None
+    if confirm.returncode != 0 or not remote_sha:
+        return False, "push reported success but the remote ref could not be re-confirmed afterward"
+    if remote_sha != sha:
+        return False, f"push reported success but {branch} now reads {remote_sha}, not the pushed {sha}"
+    return True, f"pushed {sha} to {branch}"
+
+
+def merge_tranche_children(
+    row: "TrancheRow",
+    config: "Config | None",
+    *,
+    local_repo_dir=None,
+) -> TrancheMergeResult:
+    """Merge every `"done"` child of *row* onto `row.base_sha`, run the
+    repo's declared `integration_surfaces` regen ONCE across the result, and
+    report whether a genuine conflict (or a failing regen/check) remains
+    (#4129/#4201).
+
+    Declines immediately (``ok=False, needs_integrator=False``) when: *row*
+    has no children, any child is not yet terminal
+    (`coord.drive.tranche_row_all_children_terminal` is the caller's own
+    pre-check — this function trusts it was already run), any child is
+    `"failed"` (nothing sensible to integrate — a tranche's children can
+    consume each other's new APIs, so a partial merge of only the survivors
+    is not attempted), *config* is ``None``, or no local checkout for the
+    repo is configured on this machine. None of these push anything —
+    there is no partial progress worth handing an integrator.
+
+    Otherwise, merges each `"done"` child's branch
+    (`coord.dispatch.tranche_child_branch_name`) onto `base_sha`, in
+    `issue_number` order, inside a throwaway worktree:
+
+    - a clean merge commits automatically and the loop continues;
+    - a conflict where every conflicted path is a declared
+      `integration_surfaces` path takes the current (`--ours`) side as a
+      placeholder, stages it, and commits — the declared surface is
+      regenerated afterward, once, not per-child;
+    - a conflict touching ANY path NOT covered by a declared surface aborts
+      just that child's merge (prior children's commits stand) and stops the
+      loop — whatever merged cleanly so far is pushed to
+      :func:`tranche_integration_branch_name` so
+      `coord.dispatch.dispatch_tranche_integrator` has real progress to
+      continue from, and the result reports `needs_integrator=True` with the
+      uncovered paths.
+
+    If every child merged (directly or via a surface-covered placeholder),
+    every declared `integration_surfaces` regen/check runs ONCE across the
+    whole tree — not just the surfaces a conflict touched, since two
+    children can each cleanly add to a generated artifact's SOURCE with no
+    textual conflict yet still leave it stale. A `regen`/`check` failure at
+    this point discards whatever that attempt left in the working tree and
+    pushes the pre-regen (but fully child-merged) commit instead, also
+    reporting `needs_integrator=True` with no uncovered conflict paths — the
+    merge itself was clean, this is a build-time problem only a human/LLM
+    leg can reasonably diagnose.
+
+    Only once every step above succeeds does this push the final result to
+    :func:`tranche_integration_branch_name` (confirmed, #2096) and report
+    ``ok=True``.
+
+    *local_repo_dir* defaults to :func:`coord.revalidate.local_repo_dir`
+    (lazily imported to avoid a module-load cycle); injectable for tests.
+    """
+    if local_repo_dir is None:
+        from coord.revalidate import local_repo_dir as _default_local_repo_dir  # noqa: PLC0415
+
+        local_repo_dir = _default_local_repo_dir
+
+    if not row.children:
+        return TrancheMergeResult(False, False, None, (), "row has no children")
+    if any(c.state not in ("done", "failed") for c in row.children):
+        return TrancheMergeResult(
+            False, False, None, (),
+            "not every child has reached a terminal state yet",
+        )
+    failed = sorted(c.issue_number for c in row.children if c.state == "failed")
+    if failed:
+        return TrancheMergeResult(
+            False, False, None, (),
+            f"child issue(s) {failed} failed — nothing sensible to merge",
+        )
+    done_children = sorted(
+        (c for c in row.children if c.state == "done"), key=lambda c: c.issue_number,
+    )
+    if not done_children:
+        return TrancheMergeResult(False, False, None, (), "row has no done children")
+
+    if config is None:
+        return TrancheMergeResult(False, False, None, (), "no config available")
+    repo_fn = getattr(config, "repo", None)
+    repo_cfg = repo_fn(row.repo_name) if repo_fn is not None else None
+    surfaces: list["IntegrationSurface"] = list(
+        getattr(repo_cfg, "integration_surfaces", None) or []
+    )
+    declared_paths: set[str] = set()
+    for surface in surfaces:
+        declared_paths.update(surface.paths)
+
+    integration_branch = tranche_integration_branch_name(row)
+
+    repo_dir = local_repo_dir(config, row.repo_name)
+    if repo_dir is None or not repo_dir.exists():
+        return TrancheMergeResult(
+            False, False, None, (), "no local repo checkout available on this machine",
+        )
+
+    fetched = _tranche_merge_run(
+        ["git", "fetch", "origin", "--prune"], cwd=repo_dir, timeout=120,
+    )
+    if fetched.returncode != 0:
+        return TrancheMergeResult(
+            False, False, None, (),
+            f"git fetch failed: {_tranche_merge_tail(fetched.stderr)}",
+        )
+
+    wt_path = _tranche_worktree_path(row)
+    _remove_tranche_worktree(repo_dir, wt_path)
+    try:
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return TrancheMergeResult(
+            False, False, None, (), f"could not create worktree parent directory: {e}",
+        )
+
+    added = _tranche_merge_run(
+        ["git", "worktree", "add", "--force", "--detach", str(wt_path), row.base_sha],
+        cwd=repo_dir, timeout=120,
+    )
+    if added.returncode != 0:
+        return TrancheMergeResult(
+            False, False, None, (),
+            f"could not create worktree at {row.base_sha!r}: "
+            f"{_tranche_merge_tail(added.stderr)}",
+        )
+
+    def _abort() -> None:
+        _tranche_merge_run(["git", "merge", "--abort"], cwd=wt_path, timeout=60)
+
+    try:
+        from coord.dispatch import tranche_child_branch_name  # noqa: PLC0415
+
+        for child in done_children:
+            child_branch = tranche_child_branch_name(row, child)
+            merged = _tranche_merge_run(
+                ["git", "merge", "--no-ff", f"origin/{child_branch}"],
+                cwd=wt_path, timeout=120,
+            )
+            if merged.returncode == 0:
+                continue
+
+            conflicted = _tranche_conflicted_paths(wt_path)
+            if not conflicted:
+                _abort()
+                return TrancheMergeResult(
+                    False, False, None, (),
+                    f"merging child #{child.issue_number} failed but reported "
+                    "no conflicted paths",
+                )
+            uncovered = tuple(sorted(p for p in conflicted if p not in declared_paths))
+            if uncovered:
+                _abort()
+                partial_sha = _tranche_rev_parse(wt_path, "HEAD")
+                detail = (
+                    f"merging child #{child.issue_number} conflicts outside "
+                    f"declared integration_surfaces: {', '.join(uncovered)}"
+                )
+                if partial_sha:
+                    ok, push_detail = _push_tranche_integration_branch(
+                        wt_path, integration_branch, partial_sha,
+                    )
+                    detail += f"; {push_detail}" if ok else f"; partial progress not pushed: {push_detail}"
+                return TrancheMergeResult(False, True, None, uncovered, detail)
+
+            for path in conflicted:
+                took = _tranche_merge_run(
+                    ["git", "checkout", "--ours", "--", path], cwd=wt_path, timeout=60,
+                )
+                if took.returncode != 0:
+                    _abort()
+                    return TrancheMergeResult(
+                        False, True, None, (),
+                        f"could not take the base side of {path}: "
+                        f"{_tranche_merge_tail(took.stderr)}",
+                    )
+                staged = _tranche_merge_run(
+                    ["git", "add", "--", path], cwd=wt_path, timeout=60,
+                )
+                if staged.returncode != 0:
+                    _abort()
+                    return TrancheMergeResult(
+                        False, True, None, (),
+                        f"could not stage {path}: {_tranche_merge_tail(staged.stderr)}",
+                    )
+
+            commit = _tranche_merge_run(
+                [
+                    "git", "commit", "-m",
+                    f"Merge child #{child.issue_number} (surface placeholder, "
+                    "regen pending)",
+                ],
+                cwd=wt_path, timeout=120,
+            )
+            if commit.returncode != 0:
+                _abort()
+                return TrancheMergeResult(
+                    False, True, None, (),
+                    f"commit failed for child #{child.issue_number}: "
+                    f"{_tranche_merge_tail(commit.stderr)}",
+                )
+
+        # Every child merged (cleanly, or via a surface-covered placeholder).
+        # Capture this pre-regen sha so a regen/check failure below can fall
+        # back to pushing exactly this known-clean state.
+        merged_sha = _tranche_rev_parse(wt_path, "HEAD")
+        if not merged_sha:
+            return TrancheMergeResult(
+                False, True, None, (),
+                "every child merged, but could not read the resulting HEAD sha",
+            )
+
+        for surface in surfaces:
+            regen = _tranche_merge_run(surface.regen, shell=True, cwd=wt_path, timeout=1800)
+            if regen.returncode != 0:
+                ok, push_detail = _push_tranche_integration_branch(
+                    wt_path, integration_branch, merged_sha,
+                )
+                detail = f"regen command failed for {surface.paths}: {_tranche_merge_tail(regen.stdout + regen.stderr)}"
+                detail += f"; {push_detail}" if ok else f"; partial progress not pushed: {push_detail}"
+                return TrancheMergeResult(False, True, None, (), detail)
+            for path in surface.paths:
+                _tranche_merge_run(["git", "add", "--", path], cwd=wt_path, timeout=60)
+            check = _tranche_merge_run(surface.check, shell=True, cwd=wt_path, timeout=1800)
+            if check.returncode != 0:
+                ok, push_detail = _push_tranche_integration_branch(
+                    wt_path, integration_branch, merged_sha,
+                )
+                detail = f"check command failed for {surface.paths}: {_tranche_merge_tail(check.stdout + check.stderr)}"
+                detail += f"; {push_detail}" if ok else f"; partial progress not pushed: {push_detail}"
+                return TrancheMergeResult(False, True, None, (), detail)
+
+        dirty = _tranche_merge_run(
+            ["git", "status", "--porcelain"], cwd=wt_path, timeout=60,
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            committed = _tranche_merge_run(
+                ["git", "commit", "-am", "Regenerate declared integration_surfaces"],
+                cwd=wt_path, timeout=120,
+            )
+            if committed.returncode != 0:
+                ok, push_detail = _push_tranche_integration_branch(
+                    wt_path, integration_branch, merged_sha,
+                )
+                detail = f"could not commit regenerated surfaces: {_tranche_merge_tail(committed.stderr)}"
+                detail += f"; {push_detail}" if ok else f"; partial progress not pushed: {push_detail}"
+                return TrancheMergeResult(False, True, None, (), detail)
+
+        new_sha = _tranche_rev_parse(wt_path, "HEAD")
+        if not new_sha:
+            return TrancheMergeResult(
+                False, True, None, (),
+                "merged and regenerated, but could not read the new HEAD sha",
+            )
+
+        ok, push_detail = _push_tranche_integration_branch(wt_path, integration_branch, new_sha)
+        if not ok:
+            return TrancheMergeResult(False, True, None, (), push_detail)
+
+        return TrancheMergeResult(
+            True, False, new_sha, (),
+            f"merged {len(done_children)} child(ren) onto {row.base_sha}, "
+            f"ran {len(surfaces)} integration surface(s), {push_detail}",
+        )
+    finally:
+        _remove_tranche_worktree(repo_dir, wt_path)
