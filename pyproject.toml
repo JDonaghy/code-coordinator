@@ -281,6 +281,12 @@ coord = [
     # checkout happens to be parked on. Kept byte-identical to the top-level
     # `deploy/` by tests/test_packaged_deploy_units.py.
     "deploy/*",
+    # #4128: the canned tranche-workflow template, embedded verbatim into a
+    # tranche leg's system prompt (`coord.agent._tranche_leg_system_prompt_
+    # suffix`) by reading it relative to this installed module's own file —
+    # same "no source checkout on a worker machine" reasoning as `templates/*`
+    # above.
+    "tranche_template.js",
 ]
 
 [tool.pytest.ini_options]

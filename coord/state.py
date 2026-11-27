@@ -1091,13 +1091,16 @@ def _record_dispatched_local(
         f"issue-{proposal.issue_number}-{_slugify(proposal.issue_title)}"
     )
 
-    # #3681/#3722: "workflow" only for a `type="work"` dispatch whose issue
-    # carries the opt-in `coord:workflow` label, or `ultracode` (which
-    # implies it) — `is_workflow_leg` is the single source of truth for this
-    # question, also called by `coord.dispatch`'s wire-payload `workflow`
-    # flag, so the two surfaces cannot drift apart. Every other proposal
-    # type (test, review, fix, ...) and every unlabeled work issue records
-    # "single". See `coord.agent.AssignmentSpec.workflow`.
+    # #3681/#3722/#4128: "workflow" only for a `type="work"` dispatch whose
+    # issue carries the opt-in `coord:workflow` label, `ultracode`, or
+    # `coord:tranche` (both of which imply it) — `is_workflow_leg` is the
+    # single source of truth for this question, also called by
+    # `coord.dispatch`'s wire-payload `workflow` flag, so the two surfaces
+    # cannot drift apart. Every other proposal type (test, review, fix,
+    # ...) and every unlabeled work issue records "single". A tranche leg
+    # still records "workflow" here — not a third value — since this
+    # column answers "single vs multi-agent", not "which template"; see
+    # `coord.agent.AssignmentSpec.tranche` for that separate question.
     mode = "workflow" if is_workflow_leg(proposal.type, proposal.issue_labels) else "single"
 
     conn = get_connection()

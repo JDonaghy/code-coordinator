@@ -1918,10 +1918,20 @@ def dispatch(
     # (non-workflow) Work leg. `is_workflow_leg` is the single source of
     # truth for this question — `coord.state`'s recorded `mode` column
     # calls the same function.
-    from coord.agent import is_workflow_leg  # noqa: PLC0415
+    from coord.agent import is_tranche_leg, is_workflow_leg  # noqa: PLC0415
 
     if is_workflow_leg(proposal.type, proposal.issue_labels):
         payload["workflow"] = True
+    # #4128: the canned tranche-template opt-in, independent of (but only
+    # ever True alongside) `workflow` above — `is_tranche_leg` only matches
+    # the explicit `coord:tranche` label, never `ultracode`, so an
+    # `ultracode`-only work leg stays a generic #3681 workflow leg without
+    # also pulling in the pilot-batch-specific recipe. Same "omit, never
+    # send False" discipline as every optional field in this block — an
+    # agent predating `AssignmentSpec.tranche` simply runs the leg as an
+    # ordinary workflow leg (or single leg) instead.
+    if is_tranche_leg(proposal.type, proposal.issue_labels):
+        payload["tranche"] = True
     # #2131: per-leg spend ceiling, resolved here (CLI/daemon lane) and
     # carried on the wire so a config-free agent is covered too. Sent ONLY
     # when the operator has actually configured one — with no `budget:` block

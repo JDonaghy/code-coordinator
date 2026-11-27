@@ -506,6 +506,64 @@ class TestDispatch:
         assert "workflow" not in payload
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_tranche_true_for_opted_in_work_proposal(
+        self, mock_post: MagicMock, config: Config,
+    ) -> None:
+        """#4128: the `coord:tranche` opt-in label on a `type="work"`
+        proposal must flow onto the wire as both `payload["tranche"] =
+        True` and `payload["workflow"] = True` — a tranche leg is also a
+        workflow leg, just one running the canned template."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=4128, issue_title="pilot the tranche template",
+            rationale="batch leg", type="work",
+            issue_labels=["coord:tranche"],
+        )
+        dispatch(p, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["tranche"] is True
+        assert payload["workflow"] is True
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_omits_tranche_when_label_absent(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Older agents (pre-#4128) reject unknown kwargs in
+        AssignmentSpec(**body), so `tranche` must be omitted — never sent
+        as `False` — when the proposal has no opt-in label."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "tranche" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_omits_tranche_for_ultracode_only_work_proposal(
+        self, mock_post: MagicMock, config: Config,
+    ) -> None:
+        """`ultracode` opts into `workflow` but not the pilot tranche
+        template — only the explicit `coord:tranche` label does."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=3722, issue_title="run as a workflow via ultracode",
+            rationale="multi-agent leg", type="work",
+            issue_labels=["ultracode"],
+        )
+        dispatch(p, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["workflow"] is True
+        assert "tranche" not in payload
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_carries_coordinator_only_files(
         self, mock_post: MagicMock, proposal: Proposal,
     ) -> None:

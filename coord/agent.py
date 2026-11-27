@@ -1114,14 +1114,24 @@ WORKFLOW_LEG_LABEL = "coord:workflow"
 # `WORKFLOW_LEG_LABEL` — rather than silently staying a single opus leg.
 ULTRACODE_LABEL = "ultracode"
 
+# #4128: the opt-in label for the canned *tranche* workflow template — a
+# `coord:workflow` leg whose Workflow-tool script is the fixed
+# implement -> integrate -> review -> fix recipe in `tranche_template.js`
+# (parameterized with this issue's children/base SHA/prep pack) rather than
+# a structure the worker invents from scratch each time. Implies
+# `WORKFLOW_LEG_LABEL` the same way `ULTRACODE_LABEL` does — a tranche leg
+# IS a workflow leg, just one with a prescribed shape.
+TRANCHE_LEG_LABEL = "coord:tranche"
+
 
 def is_workflow_leg(proposal_type: str, issue_labels: list[str] | None) -> bool:
     """Whether a ``type="work"`` dispatch should run as a multi-agent workflow.
 
-    True when the issue carries ``WORKFLOW_LEG_LABEL`` or ``ULTRACODE_LABEL``
+    True when the issue carries ``WORKFLOW_LEG_LABEL``, ``ULTRACODE_LABEL``
     (#3722: ``ultracode`` implies the workflow opt-in, not just the opus
-    model). Every non-``"work"`` proposal type (test, review, fix, ...) is
-    never a workflow leg, regardless of labels.
+    model), or ``TRANCHE_LEG_LABEL`` (#4128: a tranche leg is a workflow leg
+    with a canned template). Every non-``"work"`` proposal type (test,
+    review, fix, ...) is never a workflow leg, regardless of labels.
 
     Single source of truth for this question: ``coord/dispatch.py`` (the
     wire ``AssignmentSpec.workflow`` payload) and ``coord/state.py`` (the
@@ -1130,8 +1140,29 @@ def is_workflow_leg(proposal_type: str, issue_labels: list[str] | None) -> bool:
     """
     labels = issue_labels or []
     return proposal_type == "work" and (
-        WORKFLOW_LEG_LABEL in labels or ULTRACODE_LABEL in labels
+        WORKFLOW_LEG_LABEL in labels
+        or ULTRACODE_LABEL in labels
+        or TRANCHE_LEG_LABEL in labels
     )
+
+
+def is_tranche_leg(proposal_type: str, issue_labels: list[str] | None) -> bool:
+    """Whether a ``type="work"`` dispatch should use the canned #4128
+    tranche workflow template, rather than a generic #3681 workflow leg
+    left to invent its own multi-agent structure.
+
+    True only when the issue explicitly carries ``TRANCHE_LEG_LABEL`` —
+    unlike ``is_workflow_leg``, ``ULTRACODE_LABEL`` does NOT imply this:
+    "do the most thorough thing" is not the same ask as "use the specific
+    pilot batch recipe". Gated to ``type == "work"`` like
+    ``is_workflow_leg``, so the same label on a review/test/fix leg for the
+    same issue never opts in.
+
+    Single source of truth for this question — ``coord/dispatch.py`` (the
+    wire ``AssignmentSpec.tranche`` payload) is the only other caller.
+    """
+    labels = issue_labels or []
+    return proposal_type == "work" and TRANCHE_LEG_LABEL in labels
 
 
 @dataclass
@@ -1327,6 +1358,18 @@ class AssignmentSpec:
     # Review for workflow legs — a decision this field intentionally does
     # NOT make on its own.
     workflow: bool = False
+    # #4128: opts an already-``workflow=True`` leg into the canned
+    # *tranche* template (`tranche_template.js`) instead of leaving the
+    # worker to design the implement/integrate/review/fix structure itself.
+    # When True, the system prompt gets an extra section embedding that
+    # template's literal text (`_tranche_leg_system_prompt_suffix`), on top
+    # of (not instead of) the generic `workflow` suffix above — the
+    # isolation/fail-fast/size guardrails from #3730 still apply in full.
+    # Defaults to ``False`` with the same "never 400 an older agent on an
+    # unrecognized kwarg" discipline as every other optional field here, so
+    # only a dispatch whose issue explicitly carries `TRANCHE_LEG_LABEL`
+    # (see `coord/dispatch.py`) ever sets this.
+    tranche: bool = False
 
 
 class _GitError(RuntimeError):
@@ -6363,6 +6406,52 @@ def _workflow_leg_system_prompt_suffix() -> str:
     )
 
 
+def _tranche_template_text() -> str:
+    """Return the literal contents of ``tranche_template.js``.
+
+    Read relative to this module's own file, not the current working
+    directory — `coord` reaches a worker machine as a PyPI install with no
+    source checkout to read from (the same reasoning `pyproject.toml`'s
+    `templates/*` package-data entry documents), so this must resolve
+    against the installed package, not a repo-relative path.
+    """
+    return (Path(__file__).parent / "tranche_template.js").read_text()
+
+
+def _tranche_leg_system_prompt_suffix() -> str:
+    """Return the system-prompt suffix for an opted-in tranche leg (#4128).
+
+    Only appended when ``spec.tranche`` is True, and only ever ON TOP OF
+    :func:`_workflow_leg_system_prompt_suffix` (every tranche leg is also a
+    workflow leg — see ``is_workflow_leg``) — this adds the canned recipe,
+    the generic function still supplies the isolation/fail-fast/size
+    guardrails that apply to any Workflow-tool invocation regardless of
+    which script runs.
+
+    Embeds `tranche_template.js` as literal text, the same "single source
+    of truth embedded verbatim, not re-described" pattern
+    `_workflow_leg_system_prompt_suffix` already uses for
+    `REVIEWER_SYSTEM_PROMPT` (#2096: a worker re-describing the recipe from
+    memory is exactly the kind of second, drifting implementation that
+    pattern exists to avoid).
+    """
+    return (
+        "\n\n## Using the canned tranche template (#4128)\n\n"
+        "This leg has additionally been opted in to the pilot tranche "
+        "template: a fixed implement -> integrate -> review -> fix recipe "
+        "for a batch of sibling children sharing one base SHA, instead of "
+        "a workflow structure you design yourself. Use the following as "
+        "the starting point for your Workflow-tool script, adapting it "
+        "with THIS issue's specific children, pinned base SHA, and prep "
+        "pack (recipe/precedent commits/known base failures) in place of "
+        "its placeholders — do not invent a different phase structure:\n\n"
+        "-----\n" + _tranche_template_text() + "\n-----\n\n"
+        "An implementer result that cannot be parsed against the template's "
+        "structured-result contract must be treated as failed (fail "
+        "closed), never silently skipped or treated as success.\n"
+    )
+
+
 # #3420: every `claude -p` leg loads the full JSON schema for all built-in
 # tools regardless of `--allowedTools`, which is a *permission* filter, not a
 # tool-surface one — a leg with `Read,Bash` in `--allowedTools` still pays
@@ -6709,6 +6798,10 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # this text).
         if spec.workflow:
             system_prompt += _workflow_leg_system_prompt_suffix()
+        # #4128: the canned tranche template, ON TOP OF the generic workflow
+        # suffix above — see _tranche_leg_system_prompt_suffix.
+        if spec.tranche:
+            system_prompt += _tranche_leg_system_prompt_suffix()
         # #4166: the repo's declared fast compliance set, when configured —
         # tell the worker to run it (and fix anything it reports) before
         # its final push, instead of only ever finding out at the Test
