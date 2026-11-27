@@ -1204,7 +1204,10 @@ def retry_on_locked(
 # comment below for the incident this closes.
 # #4147: bumped 30 -> 31 for the new `assignments.unsatisfied_capabilities`
 # column (see the CREATE TABLE comment above).
-_DB_SCHEMA_VERSION = 31
+# #4199: bumped 31 -> 32 for the new `tranche_rows`/`tranche_children`
+# TABLES below (not a column -- same table-only shape as #3113/#3333/
+# #2468/#3889/#3992/#4077 above).
+_DB_SCHEMA_VERSION = 32
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1455,6 +1458,37 @@ _SCHEMA_SQL = """
             title TEXT NOT NULL,
             scope TEXT NOT NULL,
             files_likely TEXT DEFAULT '[]'
+        );
+
+        -- #4129/#4199: `tranche_rows` -- the native tranche row kind, Phase
+        -- 1 of #4129. One row per parent tranche issue that decomposed into
+        -- parallel children sharing a single `base_sha` (see
+        -- `coord.models.TrancheRow`'s docstring for the full shape and
+        -- lifecycle). This slice only persists the row; nothing yet reads
+        -- it to dispatch/merge/test/review -- that's the sibling slices
+        -- #4129 names (#4200/#4201/#4202).
+        CREATE TABLE IF NOT EXISTS tranche_rows (
+            id __AUTOPK_DDL__,
+            repo_name TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            issue_title TEXT NOT NULL DEFAULT '',
+            base_sha TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'pending',
+            created_at REAL
+        );
+
+        -- `tranche_children`: one row per child of a `tranche_rows` row.
+        -- `result` is a placeholder JSON blob for the structured per-child
+        -- result contract the #4200 sibling slice still has to define --
+        -- NULL until that slice writes it.
+        CREATE TABLE IF NOT EXISTS tranche_children (
+            id __AUTOPK_DDL__,
+            tranche_row_id INTEGER NOT NULL REFERENCES tranche_rows(id),
+            issue_number INTEGER NOT NULL,
+            repo_name TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'pending',
+            result TEXT
         );
 
         CREATE TABLE IF NOT EXISTS merge_queue (
@@ -2298,6 +2332,12 @@ _SCHEMA_SQL = """
             ON portal_ledger(submission_id, seq);
         CREATE INDEX IF NOT EXISTS idx_portal_decisions_submission
             ON portal_decisions(submission_id, seq);
+        -- #4199: `coord.state.load_tranche_rows_for_issue`'s hot read is
+        -- "every tranche row for one parent issue".
+        CREATE INDEX IF NOT EXISTS idx_tranche_rows_issue
+            ON tranche_rows(repo_name, issue_number);
+        CREATE INDEX IF NOT EXISTS idx_tranche_children_row
+            ON tranche_children(tranche_row_id);
 """
 
 

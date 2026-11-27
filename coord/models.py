@@ -233,6 +233,35 @@ class BoardDoctorRepoConfig:
 
 
 @dataclass
+class TrancheRepoConfig:
+    """Per-repo opt-in to the native tranche row kind (#4129 Phase 1,
+    this slice #4199): N children dispatched in parallel off one shared
+    ``base_sha``, with one coord-side merge/integration, one Test, one
+    bound review set and one closing PR — instead of today's only
+    decomposition outcome, a serial chain of child issues.
+
+    ``enabled`` is ``False`` by default: an un-opted-in repo's
+    decomposition stays exactly as it is today — nothing in
+    `coord.drive_queue`/`coord.dispatch`/`coord.merge_queue`/
+    `coord.review` reads a `TrancheRow` for a repo that hasn't set this,
+    since none of those call sites exist yet. This slice ONLY parses the
+    flag and gives a `TrancheRow` somewhere to persist
+    (`coord.state.save_tranche_row`/`load_tranche_row`); the sibling
+    slices named in #4129 (parallel child dispatch, coord-side merge, the
+    capability-routed Test/review/PR) are what will actually read it.
+
+    Not to be confused with the PRE-EXISTING, unrelated `coord:tranche`
+    issue LABEL (#4128) — that one opts a single leg into a canned
+    decomposition-workflow template
+    (`coord.agent.AssignmentSpec.tranche`) and has nothing to do with
+    this repo-level config block or the `TrancheRow` it gates. The two
+    reuse the same word ("a bounded batch of work") independently.
+    """
+
+    enabled: bool = False
+
+
+@dataclass
 class Repo:
     name: str
     github: str
@@ -432,6 +461,9 @@ class Repo:
     # #3771: this repo's opt-in to the board-doctor investigate tier. See
     # `BoardDoctorRepoConfig.investigate` for the full rationale.
     board_doctor: BoardDoctorRepoConfig = field(default_factory=BoardDoctorRepoConfig)
+    # #4129/#4199: this repo's opt-in to the native tranche row kind. See
+    # `TrancheRepoConfig.enabled` for the full rationale.
+    tranche: TrancheRepoConfig = field(default_factory=TrancheRepoConfig)
 
     def unresolved_uat_preview_placeholder(
         self,
@@ -2092,6 +2124,92 @@ class SplitProposal:
     issue_title: str
     rationale: str
     chunks: list[SplitChunk] = field(default_factory=list)
+
+
+#: Lifecycle states for `TrancheRow.state` (#4129 Phase 1, this slice
+#: #4199). ``"pending"`` -> ``"dispatched"`` -> ``"integrating"`` ->
+#: ``"done"``/``"failed"``, in that order — see `TrancheRow`'s docstring
+#: for what each means. Nothing in this slice transitions a row through
+#: these; the sibling slices that dispatch/merge/review do. Exposed as a
+#: tuple (not an enum) so a reader can validate against it the same way
+#: `coord.config`'s other string-literal lifecycle fields do.
+TRANCHE_ROW_STATES: tuple[str, ...] = (
+    "pending",
+    "dispatched",
+    "integrating",
+    "done",
+    "failed",
+)
+
+
+@dataclass
+class TrancheChild:
+    """One child of a native `TrancheRow` (#4129 Phase 1, this slice
+    #4199) — a single unit of work dispatched in parallel against the
+    row's shared ``base_sha``, with no per-child PR or review of its own
+    (#4129: "Children run in parallel off one `base_sha`, with no
+    per-child PR or review").
+
+    ``result`` reserves the slot for the structured per-child result
+    contract #4129's sibling slice (#4200, parallel child dispatch) still
+    has to define ("Each child returns a structured result. An
+    unparseable result fails closed.") — this slice only carries it
+    through `coord.state.save_tranche_row`/`load_tranche_row` so the row
+    shape doesn't change out from under that sibling. ``None`` until a
+    later slice writes it; this slice never does.
+    """
+
+    issue_number: int
+    repo_name: str
+    title: str = ""
+    state: str = "pending"
+    result: dict | None = None
+
+
+@dataclass
+class TrancheRow:
+    """A native tranche (#4129 Phase 1, this slice #4199): N children
+    sharing one ``base_sha``, with one coord-side merge/integration, one
+    Test, one bound review set and one closing PR — the alternative to
+    today's only decomposition outcome, a serial chain of child issues.
+
+    This dataclass only describes the row's SHAPE; nothing in this slice
+    dispatches, merges, tests or reviews anything. It exists so the
+    sibling slices #4129 names (#4200 parallel child dispatch and its
+    result contract, #4201 coord-side merge/integration-surface regen/LLM
+    integrator fallback, #4202 capability-routed Test + three-way bound
+    review + the single closing PR) have one row shape to build against,
+    instead of each inventing its own.
+
+    Not to be confused with the PRE-EXISTING, unrelated `coord:tranche`
+    issue LABEL (#4128) — see `TrancheRepoConfig`'s docstring for that
+    distinction.
+
+    ``id`` is this row's own persistence identity: ``None`` until the
+    first `coord.state.save_tranche_row` call assigns one. ``repo_name``/
+    ``issue_number``/``issue_title`` identify the PARENT tranche issue
+    that decomposed into ``children`` — mirroring `SplitProposal`'s own
+    identifying fields. ``base_sha`` is the single commit every child
+    branches from, set once at creation and never rewritten (a rebase
+    onto a new base is a new row, not a mutation of this one).
+
+    ``state`` is this row's own lifecycle — one of `TRANCHE_ROW_STATES`.
+    Each child's own ``state`` (`TrancheChild.state`) is independent of
+    this row's ``state``: deciding "do all children agree, is the row
+    ready to advance" is explicitly a sibling slice's job, not this
+    dataclass's. `coord.state.save_tranche_row`/`load_tranche_row`
+    round-trip every field here; nothing in this slice transitions
+    ``state`` on its own.
+    """
+
+    id: int | None = None
+    repo_name: str = ""
+    issue_number: int = 0
+    issue_title: str = ""
+    base_sha: str = ""
+    children: list[TrancheChild] = field(default_factory=list)
+    state: str = "pending"
+    created_at: float | None = None
 
 
 @dataclass(frozen=True)
