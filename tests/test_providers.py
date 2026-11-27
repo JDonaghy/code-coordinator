@@ -199,6 +199,23 @@ def test_parity_custom_system_prompt() -> None:
     _parity(spec)
 
 
+def test_parity_workflow_leg() -> None:
+    """#3681: a `coord:workflow` leg (spec.workflow=True) gets the same
+    generic workflow suffix and Workflow,Task allowedTools grant on both
+    the legacy and provider paths."""
+    spec = _make_spec(type="work", workflow=True)
+    _parity(spec)
+
+
+def test_parity_tranche_leg() -> None:
+    """#4128: a `coord:tranche` leg (spec.workflow=True, spec.tranche=True)
+    gets the canned tranche template appended ON TOP OF the generic
+    workflow suffix identically on both the legacy and provider paths —
+    the provider seam used to silently drop the tranche template."""
+    spec = _make_spec(type="work", workflow=True, tranche=True)
+    _parity(spec)
+
+
 # ── #2462: CLAUDE.md embed parity ─────────────────────────────────────────────
 #
 # The parity helper above uses repo_path="/some/path", which does not exist —

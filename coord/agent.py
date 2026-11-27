@@ -6805,8 +6805,13 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         if spec.workflow:
             system_prompt += _workflow_leg_system_prompt_suffix()
         # #4128: the canned tranche template, ON TOP OF the generic workflow
-        # suffix above — see _tranche_leg_system_prompt_suffix.
-        if spec.tranche:
+        # suffix above — see _tranche_leg_system_prompt_suffix. Gated on
+        # both flags, not `spec.tranche` alone: `tranche` is only coherent
+        # as an add-on to `workflow` (the #3730 isolation/fail-fast/size
+        # guardrails and the Workflow/Task allowedTools grant below both
+        # come from `spec.workflow`), and today's dispatch never sets
+        # `tranche=True` with `workflow=False` — see `is_tranche_leg`.
+        if spec.workflow and spec.tranche:
             system_prompt += _tranche_leg_system_prompt_suffix()
         # #4166: the repo's declared fast compliance set, when configured —
         # tell the worker to run it (and fix anything it reports) before

@@ -63,10 +63,14 @@
 const implementPhase = {
   name: "implement",
   isolation: "none", // #3730: never "worktree"/"remote" — see the three
-                      // guardrails in _workflow_leg_system_prompt_suffix.
+                     // guardrails in _workflow_leg_system_prompt_suffix.
   baseSha: "<<BASE_SHA>>",
   prepPack: "<<PREP_PACK>>",
-  agents: "<<CHILDREN>>".map((child) => ({
+  // <<CHILDREN>> is filled in with a real JSON array literal (e.g.
+  // ["widget-a", "widget-b"]) before this file is handed to the Workflow
+  // tool, so it is written unquoted here — a quoted "<<CHILDREN>>" would
+  // substitute to a *string*, which has no .map() method.
+  agents: <<CHILDREN>>.map((child) => ({
     role: `implementer:${child}`,
     instructions:
       "Implement exactly this child against the shared prep pack and " +
@@ -79,10 +83,12 @@ const implementPhase = {
 // Phase 2 — integrate (single agent, runs once)
 // ---------------------------------------------------------------------------
 //
-// One agent merges every "done" implementer's diff onto one integration
-// branch, re-derives any generated/integration surface ONCE (not once per
-// child), and resolves cross-child conflicts. A child reported "broken" or
-// whose result failed to parse is excluded from the merge, not force-fit.
+// One agent merges every "done" or "deviated" implementer's diff onto one
+// integration branch, re-derives any generated/integration surface ONCE
+// (not once per child), and resolves cross-child conflicts. "deviated" is
+// information (see `deviations`), not a failure, so it still merges — only
+// a child reported "broken" or whose result failed to parse is excluded
+// from the merge, not force-fit.
 const integratePhase = {
   name: "integrate",
   isolation: "none",
@@ -90,11 +96,12 @@ const integratePhase = {
     {
       role: "integrator",
       instructions:
-        "Merge every implementer result whose status is \"done\" onto one " +
-        "branch off the same base SHA. Exclude \"broken\"/\"deviated\"/" +
-        "unparseable children and say which were excluded and why. " +
-        "Re-derive generated/integration surfaces exactly once for the " +
-        "whole tranche.",
+        "Merge every implementer result whose status is \"done\" or " +
+        "\"deviated\" onto one branch off the same base SHA, surfacing " +
+        "each \"deviated\" child's reported deviations in the merge " +
+        "notes. Exclude \"broken\" and unparseable children and say " +
+        "which were excluded and why. Re-derive generated/integration " +
+        "surfaces exactly once for the whole tranche.",
     },
   ],
 };
@@ -165,7 +172,7 @@ const fixPhase = {
 // and fewer review/rebase cycles per merged child than the serial baseline.
 const trancheWorkflow = {
   baseSha: "<<BASE_SHA>>",
-  children: "<<CHILDREN>>",
+  children: <<CHILDREN>>,
   costCeilingUsd: "<<COST_CEILING_USD>>",
   phases: [implementPhase, integratePhase, reviewPhase, fixPhase],
   onComplete: "open exactly one PR for the whole tranche",
