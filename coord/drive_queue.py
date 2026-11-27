@@ -125,6 +125,7 @@ from coord.models import (
     DEFAULT_ISSUE_RESOLUTION,
     SEALED_PATH_AUTHOR_TYPES,
     WORK_LIKE_TYPES,
+    TrancheRow,
     is_merge_landed_reason,
     is_needs_decomposition_reason,
     is_policy_refusal_reason,
@@ -8932,6 +8933,30 @@ def _hold_alert(hold: Hold) -> QueueAlert:
         details=tuple(details),
         command="coord drive-queue resume",
     )
+
+
+# ── native tranche rows: which ones a tick should dispatch (#4129/#4200) ────
+#
+# `TrancheRow` (#4199) isn't a `QueueEntry` — a tranche row fans out to N
+# children instead of driving one issue, so it doesn't go through
+# `plan_tick`'s one-launch-per-tick walk above. This is the equivalent
+# PURE decision for a tranche row: which of a tick's known rows are ready
+# for `coord.dispatch.dispatch_tranche_row_children` to fan out. The I/O
+# (loading rows, calling the dispatcher, persisting the result) stays with
+# the shell, same separation `plan_tick` itself keeps.
+
+
+def tranche_rows_ready_to_dispatch(rows: Sequence[TrancheRow]) -> list[TrancheRow]:
+    """Filter *rows* down to the ones a tick should dispatch now (#4200).
+
+    Ready means `state == "pending"` AND at least one child: a freshly
+    decomposed row with no children yet has nothing to fan out, and
+    `coord.dispatch.dispatch_tranche_row_children` already refuses
+    (`ValueError`) rather than silently no-op on that case — this filter
+    keeps the shell from ever reaching that refusal for a row that was
+    simply never finished being built, instead of treating it as ready.
+    """
+    return [row for row in rows if row.state == "pending" and row.children]
 
 
 # ── the tick ─────────────────────────────────────────────────────────────────

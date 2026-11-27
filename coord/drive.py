@@ -153,6 +153,8 @@ from coord.models import (
     NEEDS_DECOMPOSITION_MARKER,
     POLICY_REFUSAL_MARKER,
     PREMISE_REFUSAL_MARKER,
+    TrancheChild,
+    TrancheRow,
 )
 from coord.self_health import self_freshness
 from coord.usage_limits import (
@@ -4976,6 +4978,68 @@ def _extract_pr_number(pr_url: str) -> int | None:
         return None
     m = _PR_NUMBER_RE.search(pr_url)
     return int(m.group(1)) if m else None
+
+
+# ── native tranche rows: collecting each child's result (#4129/#4200) ──────
+#
+# `coord.dispatch.dispatch_tranche_row_children` fans a `TrancheRow`'s
+# children out in parallel; this is the other half — once a dispatched
+# child's worker finishes (however the caller obtained its raw completion
+# text — a sibling slice's polling, not this one's concern), grade that
+# text against the wire contract `coord.dispatch.parse_tranche_child_
+# result` defines and fold the verdict back into the row. Deciding what
+# the ROW does once every child lands (merge, integrate, re-dispatch a
+# failed one) is #4201/#4202's job — this only answers "is this one child
+# done, and is the whole row past the point of waiting".
+
+
+def apply_tranche_child_result(
+    row: TrancheRow, issue_number: int, raw_text: str | None,
+) -> TrancheChild:
+    """Classify one dispatched tranche child's completion text and update
+    its state in *row* in place (#4200).
+
+    Routes through `coord.dispatch.parse_tranche_child_result` — the
+    single place that owns the structured-result contract (#2096: one
+    question, one answer) — so a worker's self-report is graded by the
+    exact same rule here as wherever #4201's own integration step replays
+    the stored `result` later. `child.state` becomes `"done"` only when
+    the parsed `outcome` is `"done"`; anything else (including every
+    fail-closed unparseable case) becomes `"failed"`.
+
+    Persisting the mutated row is the caller's job
+    (`coord.state.save_tranche_row`) — this does no I/O itself.
+
+    Raises ValueError if *row* has no child with this `issue_number` —
+    never silently no-ops on a child that isn't actually part of the row.
+    """
+    from coord.dispatch import parse_tranche_child_result  # noqa: PLC0415
+
+    child = next((c for c in row.children if c.issue_number == issue_number), None)
+    if child is None:
+        raise ValueError(
+            f"apply_tranche_child_result: tranche row {row.id} has no "
+            f"child issue #{issue_number}"
+        )
+    result = parse_tranche_child_result(raw_text)
+    child.result = result
+    child.state = "done" if result["outcome"] == "done" else "failed"
+    return child
+
+
+def tranche_row_all_children_terminal(row: TrancheRow) -> bool:
+    """True once every child of *row* has reached a terminal state
+    (#4200) — `"done"` or `"failed"`, never `"pending"`/`"dispatched"`.
+
+    `False` for a row with no children at all — there is nothing to be
+    "done" waiting on, so this deliberately does not read as vacuously
+    true the way `all([])` would (a #2096 "a gate must be able to fail"
+    concern: a row that never got any children built must never look
+    indistinguishable from one whose children all finished).
+    """
+    return bool(row.children) and all(
+        c.state in ("done", "failed") for c in row.children
+    )
 
 
 # ── #1526: driver/gate divergence ───────────────────────────────────────────
