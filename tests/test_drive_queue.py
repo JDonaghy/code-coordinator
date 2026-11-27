@@ -3170,10 +3170,14 @@ def test_merged_partial_is_a_terminal_queue_state():
     assert STATE_MERGED_PARTIAL in TERMINAL_QUEUE_STATES
 
 
-def test_merged_partial_satisfies_a_dependents_after_clause():
-    # #3502: the CODE landed — a dependent chained `--after` this entry
-    # must still be released. Only the issue's OWN resolution is distinct,
-    # not whether downstream work can proceed.
+def test_merged_partial_still_open_defers_a_dependents_after_clause():
+    # #4177: the CODE landed, but a dependent chained `--after` this entry
+    # needs whatever the `ISSUE_RESOLUTION: partial` merge skipped — #3945's
+    # follow-through is what eventually files the remainder issue and
+    # closes this one. Until that happens, `facts.landed` alone must NOT
+    # release the edge: the dependent defers instead, the live-tick half of
+    # the hold `coord.board_doctor.sweep_merged_partial_dependent_holds`
+    # repairs/releases on an hourly cadence.
     entries = [
         entry(1864, position=0, after=()),
         entry(1865, position=1, after=(entry_key(REPO, 1864),)),
@@ -3181,8 +3185,54 @@ def test_merged_partial_satisfies_a_dependents_after_clause():
     plan = plan_tick(
         entries, board(merged=(1864,), open_=(1864,), partial=(1864,)), capacity=1,
     )
+    assert plan.launch is None
+    [deferral] = plan.deferrals
+    assert deferral.key == entry_key(REPO, 1865)
+    assert "ISSUE_RESOLUTION: partial" in deferral.reason
+
+
+def test_merged_partial_once_closed_satisfies_a_dependents_after_clause():
+    # Once the remainder is filed (or the issue is otherwise closed), the
+    # edge releases — only the still-open window withholds dispatch.
+    entries = [
+        entry(1864, position=0, after=()),
+        entry(1865, position=1, after=(entry_key(REPO, 1864),)),
+    ]
+    plan = plan_tick(
+        entries, board(merged=(1864,), closed=(1864,), partial=(1864,)), capacity=1,
+    )
     assert plan.launch is not None
     assert plan.launch.issue == 1865
+
+
+def test_a_merged_partial_queue_row_still_defers_when_the_cache_has_not_caught_up():
+    # #4177: the queue's OWN row already reconciled *dep* to
+    # `merged-partial` this tick, but the cached board facts for it have
+    # not refreshed to show `merged` yet (`facts.landed` false — the same
+    # race #2715 documents for plain `done`). The row is at least as
+    # trustworthy as `facts.landed`, so this must defer on the SAME
+    # `facts.open` signal rather than falling through to the pre-#4177
+    # "queue row says merged-partial, treat it as satisfied" behavior.
+    dep_key = entry_key(REPO, 1960)
+    entries = [
+        entry(1960, position=0, state=STATE_MERGED_PARTIAL),
+        entry(1965, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(open_=(1960,)), capacity=2)
+    assert plan.launch is None
+    [deferral] = plan.deferrals
+    assert deferral.key == entry_key(REPO, 1965)
+    assert "merged-partial" in deferral.reason
+
+
+def test_a_merged_partial_queue_row_launches_once_facts_show_the_issue_closed():
+    dep_key = entry_key(REPO, 1960)
+    entries = [
+        entry(1960, position=0, state=STATE_MERGED_PARTIAL),
+        entry(1965, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(closed=(1960,)), capacity=2)
+    assert plan.launch is not None and plan.launch.issue == 1965
 
 
 # ── plan_tick: self-healing a `done` row written before the board caught
