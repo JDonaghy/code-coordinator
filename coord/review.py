@@ -3136,7 +3136,7 @@ def build_review_briefing(
         )
         lines.append("")
         lines.append(
-            f"This issue's milestone's tracking (epic) issue declares a "
+            "This issue's milestone's tracking (epic) issue declares a "
             "tranche convention — scope the epic itself already deferred "
             "to another issue, and NOT something this PR silently dropped. "
             "Do not `request-changes` for anything this convention already "
@@ -3786,7 +3786,7 @@ def _resolve_pr_base_branch(
     repo,
     *,
     milestone_fetcher=None,
-) -> str:
+) -> tuple[str, int | None]:
     """Resolve the PR base branch for `completed` (#1077's develop_branch /
     milestone routing).
 
@@ -3794,15 +3794,24 @@ def _resolve_pr_base_branch(
     (#2844) so an early PR-open and the later review dispatch always agree
     on the base — opening against the wrong base would surface as a PR that
     `find_pr_for_branch` still finds, but whose diff nobody intended.
+
+    Returns ``(base_branch, milestone_number)``. The milestone number is
+    ``None`` both when the repo never opted into ``develop_branch`` (no
+    fetch is attempted here at all) and when the fetch ran and found none —
+    a caller that needs to tell those two apart checks
+    ``getattr(repo, "develop_branch", None)`` itself, same as this function
+    does (:func:`dispatch_review` does, to decide whether this fetch already
+    covers its own milestone lookup or a separate one is needed, #4189).
     """
     base_branch = repo.default_branch
+    milestone_number = None
     if getattr(repo, "develop_branch", None):
         from coord.branch_model import resolve_base_branch  # noqa: PLC0415
 
         fetch_milestone = milestone_fetcher or _fetch_issue_milestone_number
         milestone_number = fetch_milestone(repo.github, completed.issue_number)
         base_branch = resolve_base_branch(repo, milestone_number)
-    return base_branch
+    return base_branch, milestone_number
 
 
 def _fetch_gate_a_exempt_warning(
@@ -3897,10 +3906,13 @@ def _fetch_tranche_convention_note(
     can stub the two fetchers directly without reaching into
     :mod:`coord.github_ops`. Takes *milestone_number* already resolved
     rather than an *issue_number* it would re-resolve: its one caller
-    (:func:`dispatch_review`) reuses ``_gate_a_milestone_number`` — the
-    SAME fetch the Gate-A advisories immediately above already pay for,
-    gated by ``config.acceptance.has_driver`` so a repo with no acceptance
-    driver configured never pays an extra `gh` round-trip for this.
+    (:func:`dispatch_review`) resolves that number independently of
+    ``config.acceptance.has_driver`` — "has an acceptance driver" is not a
+    proxy for "the epic declared a tranche convention", so this is resolved
+    for every repo. It reuses whichever milestone fetch already ran
+    earlier in that dispatch (the ``develop_branch`` fetch, or the Gate-A
+    advisories' fetch) when one is in hand, and pays exactly one fresh `gh`
+    round-trip otherwise.
 
     Resolves the tracking issue the SAME way :func:`coord.plans.
     find_tracking_issue` already does everywhere else this fleet needs that
@@ -3923,7 +3935,6 @@ def _fetch_tranche_convention_note(
     if milestone_number is None:
         return None
 
-    from coord import github_ops  # noqa: PLC0415
     from coord.plans import find_tracking_issue  # noqa: PLC0415
 
     list_open = open_issue_lister or github_ops.get_open_issues
@@ -3974,7 +3985,7 @@ def open_pr_for_completed_work(
     if repo is None or not completed.branch:
         return None
 
-    base_branch = _resolve_pr_base_branch(
+    base_branch, _ = _resolve_pr_base_branch(
         completed, repo, milestone_fetcher=milestone_fetcher
     )
 
@@ -5053,7 +5064,7 @@ def dispatch_review(
         # `branch` payload field below, so they never disagree. The milestone
         # lookup itself is skipped entirely (no `gh` call) when the repo hasn't
         # opted in — a non-opted-in repo pays zero extra cost.
-        base_branch = _resolve_pr_base_branch(
+        base_branch, _develop_branch_milestone_number = _resolve_pr_base_branch(
             completed, repo, milestone_fetcher=milestone_fetcher
         )
 
@@ -5550,15 +5561,31 @@ def dispatch_review(
             oracle_contract_note_text = None
 
         # #4189: does this issue's milestone's tracking (epic) issue declare
-        # a tranche convention? Reuses `_gate_a_milestone_number` (already
-        # fetched above, gated the same way) rather than a second
-        # unconditional fetch — cost discipline: a repo with no acceptance
-        # driver configured must pay zero extra `gh` calls for this, exactly
-        # like `gate_a_exempt_warning_text`/`exempt_dependency_warnings_text`
-        # /`oracle_contract_note_text` immediately above.
+        # a tranche convention? Resolved independently of
+        # `config.acceptance.has_driver` — that predicate means "does this
+        # repo run the oracle loop", unrelated to whether the epic declared
+        # deferred scope, so every repo (including the ones with no
+        # acceptance driver configured) gets this lookup. Reuses whichever
+        # milestone fetch already ran earlier on THIS dispatch instead of
+        # paying twice: `_resolve_pr_base_branch`'s `develop_branch` fetch
+        # above when the repo opted into that git model, or
+        # `_gate_a_milestone_number`'s fetch when the repo has an
+        # acceptance driver. Only a repo with NEITHER pays a fresh `gh`
+        # call here.
+        if getattr(repo, "develop_branch", None):
+            _tranche_milestone_number = _develop_branch_milestone_number
+        elif config.acceptance.has_driver(repo.name):
+            _tranche_milestone_number = _gate_a_milestone_number
+        else:
+            try:
+                _tranche_milestone_number = _fetch_ms(
+                    repo.github, completed.issue_number
+                )
+            except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
+                _tranche_milestone_number = None
         try:
             tranche_convention_note_text = _fetch_tranche_convention_note(
-                repo, _gate_a_milestone_number,
+                repo, _tranche_milestone_number,
                 open_issue_lister=tranche_open_issue_lister,
                 closed_epic_lister=tranche_closed_epic_lister,
             )
