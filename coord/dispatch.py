@@ -1296,6 +1296,8 @@ def dispatch(
             repo_name=proposal.repo_name,
             machines=config.machines,
             board=board,
+            files_likely=proposal.files_likely,
+            capability_rules=config.smoke_tests.capability_rules,
         )
         if reservation_routing is not None:
             if reservation_routing.machine_name is None:
@@ -2594,6 +2596,8 @@ def route_work_by_test_reservation(
     repo_name: str,
     machines: list[Machine],
     board: "Board | None",
+    files_likely: "list[str] | None" = None,
+    capability_rules: "list[SmokeRule] | None" = None,
     now: "datetime | None" = None,
 ) -> TestReservationRouting | None:
     """Reroute a `type="work"` dispatch away from a sole-capability Test
@@ -2614,6 +2618,19 @@ def route_work_by_test_reservation(
     reservation check — a fallback that is ITSELF reserved protects
     nothing.
 
+    *files_likely* / *capability_rules* apply the SAME coverage floor
+    `route_work_by_liveness`/`route_work_by_credential` apply (review round
+    1): this gate runs AFTER `route_work_by_capability` has already picked
+    `proposed_machine_name` for the capabilities the diff actually needs —
+    on a fleet where macmini is the sole `macos` holder, a capability-blind
+    fallback search here would reroute a `macos`-requiring Work diff onto
+    a `linux`-only box the moment macmini is reserved for its own Test leg,
+    reopening the UNCONFIRMED-verdict hole (#2217/#2464) the two sibling
+    gates' own floors exist to prevent. A fallback is eligible only if it
+    covers at least as many of the matched capabilities as the proposed
+    machine does; passing neither argument (the default) keeps the floor
+    off for callers with no diff to match.
+
     *now* is forwarded to `paused_set` untouched, same contract as every
     other routing function in this module.
     """
@@ -2629,16 +2646,46 @@ def route_work_by_test_reservation(
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
     tried: list[tuple[str, str]] = [(proposed_machine_name, _TEST_RESERVATION_REASON)]
+
+    required: tuple[str, ...] = ()
+    if capability_rules:
+        from coord.smoke import match_rules  # noqa: PLC0415
+
+        required = tuple(match_rules(list(files_likely or []), capability_rules))
+
+    def _coverage(m: Machine) -> int:
+        return sum(1 for cap in required if cap in m.capabilities)
+
     paused = paused_set(machines, now=now)
     fallbacks = repo_capable_unpaused_candidates(
         repo_name, machines, paused, exclude=proposed_machine_name,
     )
-    for m in fallbacks:
+
+    if required:
+        floor = _coverage(proposed)
+        eligible = [m for m in fallbacks if _coverage(m) >= floor]
+        # Stable sort: better coverage first, `machines` declaration order
+        # preserved within a tier — same determinism rule as
+        # `route_work_by_capability`'s tie-break, never dict/set order.
+        eligible.sort(key=_coverage, reverse=True)
+    else:
+        eligible = fallbacks
+
+    skipped: list[tuple[str, str]] = []
+    for m in eligible:
         if machine_reserved_for_test(m, machines, board):
             tried.append((m.name, _TEST_RESERVATION_REASON))
             continue
         return TestReservationRouting(machine_name=m.name, rerouted=True, tried=tuple(tried))
 
+    if required:
+        for m in fallbacks:
+            if _coverage(m) < floor:
+                missing = ", ".join(c for c in required if c not in m.capabilities)
+                skipped.append(
+                    (m.name, f"capability shortfall (does not cover: {missing})")
+                )
+    tried.extend(skipped)
     return TestReservationRouting(machine_name=None, rerouted=False, tried=tuple(tried))
 
 

@@ -5540,6 +5540,70 @@ class TestRouteWorkByTestReservation:
         assert result.machine_name is None
         assert result.rerouted is False
 
+    # ── #4130 review (blocking): capability-aware fallbacks ─────────────
+    #
+    # This gate runs AFTER `route_work_by_capability`, so the machine it is
+    # handed is already the capability-CHOSEN one whenever a rule matched.
+    # A capability-blind fallback search here silently undoes that: on the
+    # fleet this issue is named for (macmini the sole `macos` holder,
+    # dell64 `linux`-only), a `macos`-requiring diff capability-routed to
+    # macmini must not reroute to dell64 just because macmini is reserved
+    # for its own Test leg — that is the UNCONFIRMED-verdict hole
+    # (#2217/#2464) reopened by the very gate meant to make dispatch safer.
+
+    def test_refuses_rather_than_dropping_a_required_capability(self) -> None:
+        from coord.dispatch import route_work_by_test_reservation
+
+        machines = _sole_cap_machines()
+        board = Board(active=[_test_leg("macmini")])
+        result = route_work_by_test_reservation(
+            proposed_machine_name="macmini", repo_name="quadraui",
+            machines=machines, board=board,
+            files_likely=["quadraui/src/macos/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        reasons = dict(result.tried)
+        assert "capability shortfall" in reasons["dell64"]
+        assert "macos" in reasons["dell64"]
+
+    def test_capability_covering_fallback_still_reroutes(self) -> None:
+        """A fallback that covers the same required capability is still a
+        valid reroute target — the floor rejects coverage REGRESSIONS, not
+        every reroute. `macmini`/`dell64` each keep their own SOLE
+        capability (`macos`/`linux`) but both declare `gtk`, so a diff
+        requiring only `gtk` meets the same coverage floor on either."""
+        from coord.dispatch import route_work_by_test_reservation
+
+        machines = [
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos", "gtk"],
+            ),
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["linux", "gtk"],
+            ),
+        ]
+        board = Board(active=[_test_leg("macmini")])
+        result = route_work_by_test_reservation(
+            proposed_machine_name="macmini", repo_name="quadraui",
+            machines=machines, board=board,
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.rerouted is True
+
 
 class TestDispatchTestReservationRouting:
     """#4130 end-to-end: `dispatch()` itself reroutes a `type="work"`
@@ -5627,6 +5691,33 @@ class TestDispatchTestReservationRouting:
         dispatch(p, cfg)
         assert p.machine_name == "macmini"
         mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_rather_than_dropping_a_required_capability(self, mock_post) -> None:
+        """#4130 review (blocking), end to end: `route_work_by_capability`
+        already chose `macmini` for this `macos`-requiring diff — the
+        reservation gate must not then silently hand the work to `dell64`
+        (`linux`-only), which can never run this diff's own suite."""
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", depends_on=[])],
+            machines=_sole_cap_machines(),
+            smoke_tests=SmokeTestsConfig(
+                capability_rules=[
+                    SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+                ],
+            ),
+        )
+        board = Board(
+            repos=cfg.repos, machines=cfg.machines, active=[_test_leg("macmini")],
+        )
+        p = Proposal(
+            id=1, machine_name="macmini", repo_name="quadraui", issue_number=42,
+            issue_title="Fix a bug", rationale="", type="work",
+            files_likely=["quadraui/src/macos/window.rs"],
+        )
+        with pytest.raises(ValueError, match="reserved for a sole-capability Test leg"):
+            dispatch(p, cfg, board=board)
+        mock_post.assert_not_called()
 
 
 class TestDispatchLivenessRouting:
