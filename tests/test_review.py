@@ -1553,13 +1553,43 @@ def test_briefing_notes_sealed_amendment_apply_commit_as_expected() -> None:
         sealed_paths=["tests/acceptance/"],
         assignment_type="test-author",
         commit_messages=[
-            f"{SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX}4178\n\nRationale.\n\nRefs #4178",
+            f"{SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX}4178\n\n"
+            "Rationale.\n\nApproved-by: alice\nApproved-at: 2026-11-26T00:00:00+00:00\n\n"
+            "Refs #4178",
         ],
     )
     assert "SCOPE VIOLATION" not in briefing
     assert "TAMPER DETECTED" not in briefing
     assert "Sealed-amendment apply commit" in briefing
     assert "finding on the issue it names" in briefing
+
+
+def test_briefing_omits_sealed_amendment_note_without_approval_trailers() -> None:
+    """#4179 review: the detection requires the subject to START WITH the
+    prefix (never just contain it anywhere in the message) AND both
+    `Approved-by:`/`Approved-at:` trailers in the same message — a commit
+    that merely mentions the prefix text, or carries the right subject but
+    no trailers, must not get the stand-down note."""
+    from coord.commands.acceptance import SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX
+
+    diff = "diff --git a/tests/acceptance/ms37/foo.rs b/tests/acceptance/ms37/foo.rs\n"
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="test-author",
+        commit_messages=[
+            # Subject carries the prefix, but no Approved-by/Approved-at.
+            f"{SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX}4178\n\nRationale.\n\nRefs #4178",
+            # Prefix text appears, but not as the subject (not startswith).
+            f"edit the slice; see docs note: {SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX}4178"
+            "\n\nApproved-by: alice\nApproved-at: 2026-11-26T00:00:00+00:00",
+        ],
+    )
+    assert "Sealed-amendment apply commit" not in briefing
 
 
 def test_briefing_omits_sealed_amendment_note_without_a_matching_commit() -> None:

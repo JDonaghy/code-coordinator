@@ -95,6 +95,7 @@ from coord.models import (
     SealedAmendmentVerdict,
     path_is_sealed_entry,
 )
+from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
 
 # #4179: the ONE spelling of a sealed-amendment-apply commit's subject line —
 # `acceptance_apply_amendment` below is the only writer, `coord.review`'s
@@ -609,13 +610,13 @@ def _amendment_scratch_path(repo_name: str, issue_number: int) -> Path:
     return COORD_DIR / "acceptance-amendment-worktrees" / f"{repo_name}-{issue_number}"
 
 
-def _load_sealed_amendment_artifact(path: Path) -> SealedAmendmentArtifact:
-    """Parse *path* (JSON, as written by ``coord acceptance
-    propose-amendment``) into a :class:`SealedAmendmentArtifact`, or raise a
-    ``click.ClickException`` naming exactly what's wrong — a worker/planner-
-    emitted file is untrusted input, so a missing/mistyped/empty field is a
-    clear error, never a silent default that papers over a malformed
-    artifact."""
+def _read_json_artifact_file(path: Path) -> dict:
+    """Read and parse *path* as a JSON object, or raise a
+    ``click.ClickException`` naming exactly what's wrong. The single read
+    both :func:`_load_sealed_amendment_artifact` and
+    :func:`_load_approved_sealed_amendment` build on — one ``json.loads``
+    call, never two independent reads of the same file that could
+    observe different bytes."""
     try:
         raw = json.loads(path.read_text())
     except OSError as e:
@@ -624,6 +625,16 @@ def _load_sealed_amendment_artifact(path: Path) -> SealedAmendmentArtifact:
         raise click.ClickException(f"artifact {path} is not valid JSON: {e}") from e
     if not isinstance(raw, dict):
         raise click.ClickException(f"artifact {path} must be a JSON object")
+    return raw
+
+
+def _sealed_amendment_artifact_from_raw(raw: dict, path: Path) -> SealedAmendmentArtifact:
+    """Parse already-loaded *raw* JSON (see :func:`_read_json_artifact_file`)
+    into a :class:`SealedAmendmentArtifact`, or raise a
+    ``click.ClickException`` naming exactly what's wrong — a worker/planner-
+    emitted file is untrusted input, so a missing/mistyped/empty field is a
+    clear error, never a silent default that papers over a malformed
+    artifact."""
     try:
         touched_paths_raw = raw["touched_paths"]
         if not isinstance(touched_paths_raw, list) or not touched_paths_raw:
@@ -641,6 +652,13 @@ def _load_sealed_amendment_artifact(path: Path) -> SealedAmendmentArtifact:
         )
     except (KeyError, TypeError, ValueError) as e:
         raise click.ClickException(f"artifact {path} is malformed: {e}") from e
+
+
+def _load_sealed_amendment_artifact(path: Path) -> SealedAmendmentArtifact:
+    """Parse *path* (JSON, as written by ``coord acceptance
+    propose-amendment``) into a :class:`SealedAmendmentArtifact`. See
+    :func:`_sealed_amendment_artifact_from_raw`."""
+    return _sealed_amendment_artifact_from_raw(_read_json_artifact_file(path), path)
 
 
 def _out_of_scope_paths(diff_paths: list[str], sealed_paths: list[str]) -> list[str]:
@@ -955,17 +973,11 @@ def _sealed_amendment_fingerprint(artifact: SealedAmendmentArtifact) -> str:
     audit-only metadata (see :class:`SealedAmendmentArtifact`'s docstring)
     and was never part of what verify-amendment checked.
     """
-    payload = json.dumps(
-        {
-            "repo_name": artifact.repo_name,
-            "issue_number": artifact.issue_number,
-            "diff": artifact.diff,
-            "touched_paths": list(artifact.touched_paths),
-            "rationale": artifact.rationale,
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
+    payload = {}
+    for field in _AMENDMENT_FINGERPRINT_FIELDS:
+        value = getattr(artifact, field)
+        payload[field] = list(value) if isinstance(value, tuple) else value
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _load_approved_sealed_amendment(path: Path) -> tuple[SealedAmendmentArtifact, str, str]:
@@ -973,23 +985,24 @@ def _load_approved_sealed_amendment(path: Path) -> tuple[SealedAmendmentArtifact
     approve-amendment``) into ``(artifact, approved_by, approved_at)`` —
     or raise a ``click.ClickException`` naming exactly what's wrong.
 
-    Reuses :func:`_load_sealed_amendment_artifact` for the base shape
-    (repo_name/issue_number/diff/touched_paths/rationale), then requires
-    the approval stamp (``approved_by``, ``approved_at``, ``fingerprint``)
-    on top of it — a proposed-but-never-approved artifact, or one whose
-    stamp is simply absent, is rejected the same clear way a malformed one
-    is, never silently treated as approved. The fingerprint is then
-    recomputed from the artifact fields actually read off disk and
-    compared to the stamped value: this is the ONE check standing between
-    ``apply-amendment`` and applying a diff a human never actually looked
-    at (file edited after approval, or a stamped field disagrees with the
-    diff that ships alongside it).
+    Reuses :func:`_sealed_amendment_artifact_from_raw` for the base shape
+    (repo_name/issue_number/diff/touched_paths/rationale) over the SAME
+    parsed JSON used below for the approval stamp — one read, so the
+    fingerprint and the stamp it's compared against can never observe
+    different bytes — then requires the approval stamp (``approved_by``,
+    ``approved_at``, ``fingerprint``) on top of it — a proposed-but-never-
+    approved artifact, or one whose stamp is simply absent, is rejected the
+    same clear way a malformed one is, never silently treated as approved.
+    The fingerprint is then recomputed from the artifact fields actually
+    read off disk and compared to the stamped value, catching a file
+    edited (or corrupted) after approval, or a stamped field that disagrees
+    with the diff shipping alongside it — a speed bump, not a trust
+    boundary: anyone with a shell can write their own ``approved_by``/
+    ``approved_at``/``fingerprint`` onto an unapproved artifact the same
+    way ``approve-amendment`` does.
     """
-    artifact = _load_sealed_amendment_artifact(path)
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        raise click.ClickException(f"could not re-read artifact {path}: {e}") from e
+    raw = _read_json_artifact_file(path)
+    artifact = _sealed_amendment_artifact_from_raw(raw, path)
     approved_by = raw.get("approved_by")
     approved_at = raw.get("approved_at")
     fingerprint = raw.get("fingerprint")
@@ -1164,14 +1177,36 @@ def acceptance_apply_amendment(
         click.echo(f"error: {mismatch}", err=True)
         sys.exit(1)
 
+    # Refuse up front if any of the diff's own files already have
+    # uncommitted changes (staged or not) in this checkout — otherwise
+    # that pre-existing content, including a freehand edit to the same
+    # sealed file, would ride along into the commit below regardless of
+    # how tightly that commit is scoped.
+    dirty_check = subprocess.run(
+        ["git", "status", "--porcelain", "--", *diff_paths], cwd=str(cwd), capture_output=True, text=True,
+    )
+    if dirty_check.returncode != 0:
+        click.echo(f"error: could not check working tree state: {dirty_check.stderr.strip()}", err=True)
+        sys.exit(1)
+    if dirty_check.stdout.strip():
+        click.echo(
+            "error: refusing to apply — these amendment paths already have "
+            "uncommitted changes in this checkout (commit, stash, or "
+            f"discard them first):\n{dirty_check.stdout.strip()}",
+            err=True,
+        )
+        sys.exit(1)
+
     apply_error = _apply_sealed_amendment_diff(cwd, artifact.diff)
     if apply_error is not None:
         click.echo(f"error: {apply_error}", err=True)
         sys.exit(1)
 
-    # Scope the commit to exactly the diff's own files — never `git add -A`
-    # — so any unrelated change already sitting uncommitted in this
-    # checkout is left alone rather than swept into "the approved bytes".
+    # Scope staging AND the commit itself to exactly the diff's own files
+    # — never `git add -A`, and the commit below also takes the same
+    # pathspec (equivalent to `--only`) rather than trusting the index —
+    # so any unrelated change already sitting staged in this checkout is
+    # left alone rather than swept into "the approved bytes".
     add_res = subprocess.run(
         ["git", "add", "--", *diff_paths], cwd=str(cwd), capture_output=True, text=True,
     )
@@ -1179,15 +1214,23 @@ def acceptance_apply_amendment(
         click.echo(f"error: could not stage amendment: {add_res.stderr.strip()}", err=True)
         sys.exit(1)
 
+    # `rationale` is written by the proposing session, not this command —
+    # untrusted input by this module's own standard. A closing keyword in
+    # it (e.g. "Closes #123") would auto-close that issue on merge, which
+    # is exactly what the `Refs #N` below (never `Fixes #N`) is trying to
+    # avoid; downgrade any closing keyword found in it the same way
+    # `coord.merge_queue` already downgrades one found in a PR body.
+    rationale_closes = find_closing_references(artifact.rationale)
+    safe_rationale, _ = downgrade_closing_keywords(artifact.rationale, set(rationale_closes))
     commit_message = (
         f"{SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX}{artifact.issue_number}\n\n"
-        f"{artifact.rationale}\n\n"
+        f"{safe_rationale}\n\n"
         f"Approved-by: {approved_by}\n"
         f"Approved-at: {approved_at}\n\n"
         f"Refs #{artifact.issue_number}"
     )
     commit_res = subprocess.run(
-        ["git", "commit", "-m", commit_message], cwd=str(cwd), capture_output=True, text=True,
+        ["git", "commit", "-m", commit_message, "--", *diff_paths], cwd=str(cwd), capture_output=True, text=True,
     )
     if commit_res.returncode != 0:
         click.echo(f"error: could not commit amendment: {commit_res.stderr.strip() or commit_res.stdout.strip()}", err=True)
@@ -1195,6 +1238,23 @@ def acceptance_apply_amendment(
     commit_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True, check=True,
     ).stdout.strip()
+
+    # Confirm, from an observation taken AFTER the commit, that exactly
+    # the diff's own files landed in it — never infer "exactly the
+    # approved bytes" from the pathspec above alone, or from the mere
+    # absence of a non-zero exit code.
+    committed_res = subprocess.run(
+        ["git", "show", "--name-only", "--format=", commit_sha], cwd=str(cwd), capture_output=True, text=True,
+    )
+    committed_paths = {p for p in committed_res.stdout.splitlines() if p.strip()}
+    if committed_res.returncode != 0 or committed_paths != set(diff_paths):
+        click.echo(
+            f"error: commit {commit_sha} does not contain exactly the "
+            f"amendment's own files (committed {sorted(committed_paths)}, "
+            f"expected {sorted(diff_paths)}) — refusing to report success",
+            err=True,
+        )
+        sys.exit(1)
 
     # Full-suite scope (`ms=None`), mirroring `acceptance_run`'s own
     # `--all` branch — an amendment can touch call sites shared across

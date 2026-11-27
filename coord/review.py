@@ -3042,8 +3042,10 @@ def build_review_briefing(
                     "diff touches the sealed acceptance tree — only flag it if the "
                     "diff also touches anything outside that tree."
                 )
-            if any(
-                SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX in msg
+            if not _mandatory_sealed_paths and any(
+                msg.startswith(SEALED_AMENDMENT_APPLY_COMMIT_SUBJECT_PREFIX)
+                and "Approved-by:" in msg
+                and "Approved-at:" in msg
                 for msg in (commit_messages or [])
             ):
                 # #4179, docs/ORACLE_LOOP.md "Sealed amendment as data" step
