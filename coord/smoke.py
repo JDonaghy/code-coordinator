@@ -3343,9 +3343,11 @@ class SmokeAttempt:
     machine_name: str
     reason: str
     #: True when the reason is expected to clear without operator action (a
-    #: connectivity blip). False for durable faults — an explicit `/health`
-    #: probe contradiction (#1570 D) or a missing `repo_paths` entry — which
-    #: stay broken until somebody fixes the machine or the config.
+    #: connectivity blip, or a load snapshot over the configured
+    #: `max_load_per_core` multiple). False for durable faults — an explicit
+    #: `/health` probe contradiction (#1570 D) or a missing `repo_paths`
+    #: entry — which stay broken until somebody fixes the machine or the
+    #: config.
     transient: bool = False
 
     def describe(self) -> str:
@@ -3827,6 +3829,7 @@ def _walk_candidates_and_dispatch(
             )
             attempts.append(SmokeAttempt(
                 machine_name=choice.machine.name, reason=overloaded,
+                transient=True,
             ))
             continue
 

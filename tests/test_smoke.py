@@ -7880,3 +7880,47 @@ def test_walk_candidates_and_dispatch_skips_overloaded_machine_then_tries_next(
     assert dispatched[0].machine.name == "desktop-b"
     assert client.posts == ["http://desktop-b.tail:7433/assign"]
     assert any("desktop-a" in a.machine_name and "load" in a.reason for a in attempts)
+    # #4130 review: a load spike is a snapshot that clears on its own, not a
+    # durable fault — the attempt must carry `transient=True` so a dead end
+    # built entirely from load skips (see
+    # test_dispatch_smoke_all_overloaded_candidates_leaves_row_redispatchable
+    # below) is not mistaken for one that needs a manual `--reset`.
+    assert all(a.transient for a in attempts)
+
+
+def test_dispatch_smoke_all_overloaded_candidates_leaves_row_redispatchable(
+    three_gtk_config: Config, caplog,
+) -> None:
+    """#4130 review: every capability-matched candidate is merely over its
+    load ceiling — the macmini-is-the-only-`macos`-host shape, where the
+    sole candidate list is entirely load-skipped. That must stay re-
+    dispatchable, exactly like a connectivity blip or a cordon, not wedge
+    the row into `TEST_STATE_BLOCKED` demanding a manual `coord diagnose
+    ... --stage test --reset` for something the next tick clears for free.
+    """
+    three_gtk_config.smoke_tests.max_load_per_core = 1.0
+
+    def _overloaded_gtk_health() -> dict:
+        probe = _gtk_probe(found=True)
+        probe["load"] = {"load1": 50.0, "cpu_count": 4}
+        return probe
+
+    completed = _completed(machine="server")
+    client = _MultiHostClient(
+        health={f"desktop-{s}.tail": _overloaded_gtk_health() for s in "abc"},
+    )
+    with caplog.at_level("WARNING", logger="coord.smoke"):
+        result = dispatch_smoke(
+            completed, Board(), three_gtk_config,
+            http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+        )
+    assert result is None
+    # Still eligible next tick — never poisoned into a durable block.
+    assert completed.test_state is None
+    # Never actually dispatched into any of the overloaded candidates.
+    assert client.calls == []
+    summaries = [
+        r for r in caplog.records if "cannot be routed" in r.getMessage()
+    ]
+    assert summaries, "expected the unroutable dead end to be logged once"
+    assert "re-dispatchable" in summaries[0].getMessage()
