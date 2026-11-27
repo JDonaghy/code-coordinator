@@ -1202,7 +1202,9 @@ def retry_on_locked(
 # claim skips filing a second split entirely instead of also spending a
 # duplicate tracker + child-issue set on GitHub. See that table's own
 # comment below for the incident this closes.
-_DB_SCHEMA_VERSION = 30
+# #4147: bumped 30 -> 31 for the new `assignments.unsatisfied_capabilities`
+# column (see the CREATE TABLE comment above).
+_DB_SCHEMA_VERSION = 31
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1406,7 +1408,16 @@ _SCHEMA_SQL = """
             -- #3681: "single" or "workflow", set once at dispatch time from
             -- whether the issue carried `coord.agent.WORKFLOW_LEG_LABEL`.
             -- NULL for every row predating this column.
-            mode TEXT
+            mode TEXT,
+            -- #4147: capabilities `route_work_by_capability` could not
+            -- satisfy on ANY configured machine for this `type="work"`
+            -- dispatch -- the leg still dispatched to the best-covering
+            -- machine, this just names what it can't verify, so the
+            -- dashboard/stats readers see the gap instead of only a
+            -- dispatch-time log line. JSON list, '[]' for every row
+            -- predating this column and for the common case (every
+            -- machine, or the chosen one, already covers the diff).
+            unsatisfied_capabilities TEXT DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -2873,6 +2884,9 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # docstring. 0 for every row predating this migration, which reads
     # identically to "no auto-heal rerun spent yet" for a fresh entry.
     "ALTER TABLE merge_queue ADD COLUMN ci_stuck_reruns INTEGER NOT NULL DEFAULT 0",
+    # #4147: see the CREATE TABLE comment above. '[]' for every row
+    # predating this migration.
+    "ALTER TABLE assignments ADD COLUMN unsatisfied_capabilities TEXT DEFAULT '[]'",
 ]
 
 

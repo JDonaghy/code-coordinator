@@ -1002,6 +1002,7 @@ def record_dispatched(
     repo_github: str,
     provider_name: str | None = None,
     model_reason: str | None = None,
+    unsatisfied_capabilities: list[str] | None = None,
 ) -> None:
     """Record a newly dispatched assignment — routes to the daemon when set."""
     # #2417: stamp the calling worker's own assignment id (if any) BEFORE
@@ -1023,6 +1024,7 @@ def record_dispatched(
             "repo_github": repo_github,
             "provider_name": provider_name,
             "model_reason": model_reason,
+            "unsatisfied_capabilities": list(unsatisfied_capabilities or []),
         },
     )
     if resp is not None:
@@ -1033,6 +1035,7 @@ def record_dispatched(
         repo_github=repo_github,
         provider_name=provider_name,
         model_reason=model_reason,
+        unsatisfied_capabilities=unsatisfied_capabilities,
     )
 
 
@@ -1043,6 +1046,7 @@ def _record_dispatched_local(
     repo_github: str,
     provider_name: str | None = None,
     model_reason: str | None = None,
+    unsatisfied_capabilities: list[str] | None = None,
     config=None,
 ) -> None:
     """Record a newly dispatched assignment in the assignments table.
@@ -1059,6 +1063,11 @@ def _record_dispatched_local(
             have chosen (today only `coord approve`'s usage-gate reroute
             sets this). ``None`` for every other dispatch — see
             :attr:`coord.models.Assignment.model_reason`.
+        unsatisfied_capabilities: #4147 — capabilities `coord.dispatch.
+            route_work_by_capability` could not satisfy on any configured
+            machine for this dispatch. ``None``/empty for every caller that
+            isn't `type="work"` routed through that gate — see
+            :attr:`coord.models.Assignment.unsatisfied_capabilities`.
         config: optional already-loaded :class:`~coord.config.Config` to
             validate against — see :func:`_validate_dispatch_target`'s
             docstring. The daemon's ``/dispatched-work`` handler passes its
@@ -1098,8 +1107,8 @@ def _record_dispatched_local(
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, required_gates,
             provider_name, branch, driven_by, dispatched_by_assignment_id,
-            model_reason, mode
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            model_reason, mode, unsatisfied_capabilities
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -1120,6 +1129,7 @@ def _record_dispatched_local(
             proposal.dispatched_by_assignment_id,
             model_reason,
             mode,
+            json.dumps(list(unsatisfied_capabilities or [])),
         ),
     )
     conn.commit()

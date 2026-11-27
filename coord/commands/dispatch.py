@@ -925,6 +925,10 @@ def approve(
                 # `Assignment.model_reason`'s docstring for why this needs
                 # to survive past the live `coord approve` terminal output.
                 model_reason=model_reason,
+                # #4147: capabilities `route_work_by_capability` could not
+                # satisfy on any configured machine — see
+                # `coord.dispatch.dispatch`'s matching comment.
+                unsatisfied_capabilities=response.get("_unsatisfied_capabilities"),
             )
 
         try:
