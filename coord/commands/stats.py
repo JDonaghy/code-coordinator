@@ -18,6 +18,12 @@ default), and :func:`coord.usage.fanout_fold_latencies` (how long #3182's
 fan-out fold took to catch up once every leg reported in, #4143) — so a later
 efficiency change against any of those four shapes has a real before/after
 number instead of an anecdote.
+
+#4126 feeds the SAME two reads into a fifth aggregator,
+:func:`coord.board_doctor_policy.score_model_investigator_decisions` — how
+many fix-it legs the model-chosen investigator decision (opt-in,
+``COORD_BOARD_DOCTOR_MODEL_INVESTIGATOR``) replaced, at what confidence,
+and whether each acted-on row actually unstuck.
 """
 
 from __future__ import annotations
@@ -160,6 +166,42 @@ def format_heal_stall_signals(
     return "\n".join(lines)
 
 
+def format_model_investigator_decisions(outcomes) -> str:
+    """Human-readable rendering of the #4126 model-investigator decision
+    section — see :func:`coord.board_doctor_policy.
+    score_model_investigator_decisions`."""
+    if not outcomes:
+        return "\nModel investigator decisions (#4126): none in window"
+
+    acted = [o for o in outcomes if o.outcome != "declined" and o.acted]
+    declined = sum(1 for o in outcomes if o.outcome == "declined")
+    too_recent = sum(1 for o in outcomes if o.outcome == "too_recent")
+    unstuck = sum(1 for o in outcomes if o.outcome == "unstuck")
+    still_stuck = sum(1 for o in outcomes if o.outcome == "still_stuck")
+    escalated = sum(1 for o in outcomes if o.escalated)
+    avg_confidence = (
+        sum(o.confidence for o in outcomes) / len(outcomes) if outcomes else 0.0
+    )
+
+    lines = [
+        "",
+        "Model investigator decisions (#4126):",
+        f"  total={len(outcomes)} acted={len(acted)} declined={declined} "
+        f"escalated_to_sonnet={escalated} avg_confidence={avg_confidence:.2f}",
+        f"  outcomes: unstuck={unstuck} still_stuck={still_stuck} too_recent={too_recent}",
+    ]
+    by_action: dict[str, int] = {}
+    for o in acted:
+        key = o.action or "none"
+        by_action[key] = by_action.get(key, 0) + 1
+    if by_action:
+        lines.append(
+            "  acted by action: "
+            + " ".join(f"{k}={v}" for k, v in sorted(by_action.items()))
+        )
+    return "\n".join(lines)
+
+
 @click.group("stats")
 def stats_group() -> None:
     """Triage-first fleet metrics (#4099): is the pipeline actually getting
@@ -188,6 +230,7 @@ def waste(
     output_json: bool,
     config_path: Path,
 ) -> None:
+    from coord.board_doctor_policy import score_model_investigator_decisions  # noqa: PLC0415
     from coord.leg_waste import build_waste_report, waste_report_to_dict  # noqa: PLC0415
     from coord.state import list_audit_log  # noqa: PLC0415
     from coord.usage import (  # noqa: PLC0415
@@ -278,6 +321,11 @@ def waste(
     except Exception as e:  # noqa: BLE001
         click.echo(f"warning: could not compute fan-out fold latencies: {e}", err=True)
         fold_latencies = []
+    try:
+        model_decisions = score_model_investigator_decisions(audit_entries, assignment_rows)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"warning: could not score model investigator decisions: {e}", err=True)
+        model_decisions = []
 
     if output_json:
         body = waste_report_to_dict(report)
@@ -286,8 +334,23 @@ def waste(
             "repo_attention_thresholds": [t.to_dict() for t in repo_thresholds],
             "fanout_fold_latencies": [f.to_dict() for f in fold_latencies],
         }
+        body["model_investigator_decisions"] = [
+            {
+                "repo_name": o.repo_name,
+                "issue_number": o.issue_number,
+                "ts": o.ts,
+                "action": o.action,
+                "confidence": o.confidence,
+                "model_used": o.model_used,
+                "escalated": o.escalated,
+                "acted": o.acted,
+                "outcome": o.outcome,
+            }
+            for o in model_decisions
+        ]
         click.echo(_json.dumps(body, indent=2, default=str))
         return
 
     click.echo(format_waste_report(report, verbose=verbose))
     click.echo(format_heal_stall_signals(heal_counts, repo_thresholds, fold_latencies))
+    click.echo(format_model_investigator_decisions(model_decisions))
