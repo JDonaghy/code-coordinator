@@ -15,6 +15,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+# #1895: the probe env below (`PATH=/usr/bin:/bin`, `LC_ALL=C`, no
+# `SystemRoot`) stands in for an ASCII-locale POSIX host, not Windows'
+# actual cp1252 default — it would fail to even spawn a child process on
+# Windows, which is the platform the UTF-8-read regression protects.
+_needs_posix_locale_probe = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="probe env (PATH=/usr/bin:/bin, LC_ALL=C) is POSIX-only; a "
+    "Windows ASCII-locale probe needs its own env shape (#1895)",
+)
+
 from coord.agent import (
     TRANCHE_LEG_LABEL,
     ULTRACODE_LABEL,
@@ -73,10 +85,17 @@ class TestTrancheTemplateEncoding:
         text = _tranche_template_text()
         assert any(ord(ch) > 127 for ch in text)
 
+    @pytest.mark.posix_only
+    @_needs_posix_locale_probe
     def test_reads_under_a_non_utf8_default_encoding(self) -> None:
         """A C/ASCII locale stands in for Windows' cp1252 default: a bare
         ``read_text()`` raises ``UnicodeDecodeError`` there, an explicit
-        ``encoding="utf-8"`` one does not."""
+        ``encoding="utf-8"`` one does not.
+
+        The probe env (``PATH=/usr/bin:/bin``, no ``SystemRoot``) is
+        POSIX-only; it is not meant to simulate cp1252 on an actual
+        Windows host, only to exercise the ASCII-locale code path this
+        repo's own CI runs on Linux/macOS."""
         expected = len(_tranche_template_text())
         probe = (
             "from coord.agent import _tranche_template_text\n"
@@ -120,8 +139,6 @@ class TestTrancheSystemPromptSuffix:
         suffix = _tranche_leg_system_prompt_suffix()
 
         assert template_text in suffix
-        start = suffix.index(template_text)
-        assert suffix[start : start + len(template_text)] == template_text
 
     def test_tells_worker_to_fail_closed_on_unparseable_result(self) -> None:
         suffix = _tranche_leg_system_prompt_suffix()

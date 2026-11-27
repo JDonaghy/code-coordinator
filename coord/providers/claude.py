@@ -125,6 +125,7 @@ class ClaudeProvider(Provider):
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
             _claude_md_system_prompt_suffix,
+            _tranche_leg_system_prompt_suffix,
             _workflow_leg_system_prompt_suffix,
             build_deny_prompt,
             worker_disallowed_tools,
@@ -258,6 +259,12 @@ class ClaudeProvider(Provider):
                 # matter which builder produced the argv.
                 if spec.workflow:
                     _sp += _workflow_leg_system_prompt_suffix()
+                # #4128: keep in sync with default_worker_command's identical
+                # `if spec.workflow and spec.tranche:` branch — the canned
+                # tranche template, ON TOP OF the generic workflow suffix
+                # above. See _tranche_leg_system_prompt_suffix.
+                if spec.workflow and spec.tranche:
+                    _sp += _tranche_leg_system_prompt_suffix()
                 # #2169: keep in sync with default_worker_command's identical
                 # branch — Monitor is the sanctioned bounded-poll tool for a
                 # backgrounded long-running command. #2301: this grant is for
