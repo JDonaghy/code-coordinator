@@ -2628,18 +2628,26 @@ def test_dispatch_review_uses_feature_branch_for_opted_in_milestone(
     assert payload["branch"] == "feature/ms-42"
 
 
-def test_dispatch_review_milestone_fetcher_not_consulted_when_not_opted_in(
+def test_dispatch_review_milestone_fetcher_not_consulted_for_base_branch_when_not_opted_in(
     two_machine_config: Config,
 ) -> None:
-    """#934: a repo without develop_branch stays on default_branch even if
-    the milestone_fetcher would return one — it must not even be called,
-    since a non-opted-in repo pays zero extra `gh` calls."""
+    """#934: a repo without `develop_branch` stays on `default_branch` for
+    the PR base even if the milestone_fetcher would return one for it — the
+    `develop_branch` fetch itself is still skipped.
+
+    #4189 (fix round): the SAME fetcher IS now called once, for the
+    tranche-convention lookup, which is resolved independently of whether
+    the repo opted into `develop_branch` or has an acceptance driver (see
+    `TestDispatchReviewTrancheConventionWithoutAcceptanceDriver` below) —
+    only the PR-base-branch resolution this test covers stays a no-op."""
     board = Board()
     completed = _completed_assignment(machine="laptop")
     client = _FakeHTTPClient({"id": "review-id-1"})
+    milestone_fetcher_calls = []
 
-    def _boom_fetcher(repo_github, issue_number):
-        raise AssertionError("milestone_fetcher must not be called for a non-opted-in repo")
+    def _fetcher(repo_github, issue_number):
+        milestone_fetcher_calls.append((repo_github, issue_number))
+        return None  # not under any milestone — no tranche lookup to chase
 
     dispatch_review(
         completed, board, two_machine_config,
@@ -2651,11 +2659,13 @@ def test_dispatch_review_milestone_fetcher_not_consulted_when_not_opted_in(
         issue_body_fetcher=lambda repo, num: "",
         now=123.0,
         remote_branch_checker=lambda repo, branch: True,
-        milestone_fetcher=_boom_fetcher,
+        milestone_fetcher=_fetcher,
     )
 
     _, payload = client.calls[0]
     assert payload["branch"] == "main"
+    assert milestone_fetcher_calls == [("acme/api", completed.issue_number)]
+    assert "Epic tranche convention" not in payload["briefing"]
 
 
 def test_dispatch_review_tolerates_repo_stand_in_without_develop_branch(
@@ -9688,6 +9698,147 @@ class TestDispatchReviewTrancheConvention:
 
         _, payload = client.calls[0]
         assert "Epic tranche convention" not in payload["briefing"]
+
+
+class TestDispatchReviewTrancheConventionWithoutAcceptanceDriver:
+    """#4189 fix round: the tranche-convention lookup must not depend on
+    `config.acceptance.has_driver` — that predicate means "does this repo
+    run the oracle loop", unrelated to whether the epic declared deferred
+    scope. A repo with NO acceptance driver configured at all (ten of the
+    live fleet's sixteen repos) must still see the note, and must still pay
+    only ONE milestone-number `gh` call to get it — never a fetch per
+    advisory."""
+
+    def test_note_surfaces_with_no_acceptance_driver_configured(
+        self, two_machine_config: Config,
+    ) -> None:
+        # `two_machine_config`'s "api" repo has neither `develop_branch` nor
+        # an `acceptance.drivers` entry — the exact gap the review found.
+        board = Board()
+        completed = _completed_assignment(machine="laptop")
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        epic = {
+            "number": 100, "milestone": {"number": 42},
+            "labels": [{"name": "epic"}],
+            "body": "## Tranche convention\n\nDeletion half deferred to #4322.\n",
+        }
+        milestone_fetcher_calls = []
+
+        def _fetcher(repo_github, issue_number):
+            milestone_fetcher_calls.append((repo_github, issue_number))
+            return 42
+
+        dispatch_review(
+            completed, board, two_machine_config,
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 42, "url": "https://github.com/acme/api/pull/42",
+                "existed": True,
+            },
+            claude_md_reader=lambda p: None,
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+            milestone_fetcher=_fetcher,
+            tranche_open_issue_lister=lambda repo_github: [epic],
+            tranche_closed_epic_lister=lambda repo_github: [],
+        )
+
+        _, payload = client.calls[0]
+        assert "Deletion half deferred to #4322." in payload["briefing"]
+        assert milestone_fetcher_calls == [("acme/api", completed.issue_number)]
+
+    def test_no_extra_fetch_when_develop_branch_already_resolved_it(
+        self, two_machine_config: Config,
+    ) -> None:
+        """A repo that opted into `develop_branch` already pays the
+        milestone-number fetch for PR-base-branch routing (#934) — the
+        tranche lookup must reuse that result rather than fetching a
+        second time."""
+        from dataclasses import replace as _replace
+
+        cfg = _replace(
+            two_machine_config,
+            repos=[_replace(two_machine_config.repos[0], develop_branch="develop")],
+        )
+        board = Board()
+        completed = _completed_assignment(machine="laptop")
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        epic = {
+            "number": 100, "milestone": {"number": 42},
+            "labels": [{"name": "epic"}],
+            "body": "## Tranche convention\n\nMigration half deferred to #777.\n",
+        }
+        milestone_fetcher_calls = []
+
+        def _fetcher(repo_github, issue_number):
+            milestone_fetcher_calls.append((repo_github, issue_number))
+            return 42
+
+        dispatch_review(
+            completed, board, cfg,
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 42, "url": "https://github.com/acme/api/pull/42",
+                "existed": True,
+            },
+            claude_md_reader=lambda p: None,
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+            milestone_fetcher=_fetcher,
+            tranche_open_issue_lister=lambda repo_github: [epic],
+            tranche_closed_epic_lister=lambda repo_github: [],
+        )
+
+        _, payload = client.calls[0]
+        assert "Migration half deferred to #777." in payload["briefing"]
+        assert milestone_fetcher_calls == [("acme/api", completed.issue_number)]
+
+    def test_no_extra_fetch_when_gate_a_already_resolved_it(
+        self, two_machine_config: Config,
+    ) -> None:
+        """A repo with an acceptance driver already pays the
+        milestone-number fetch for the Gate-A advisories — the tranche
+        lookup must reuse that result rather than fetching a second time."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        cfg = replace(
+            two_machine_config,
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        board = Board()
+        completed = _completed_assignment(machine="laptop")
+        client = _FakeHTTPClient({"id": "review-id-1"})
+        epic = {
+            "number": 100, "milestone": {"number": 42},
+            "labels": [{"name": "epic"}],
+            "body": "## Tranche convention\n\nDeletion half deferred to #4322.\n",
+        }
+        milestone_fetcher_calls = []
+
+        def _fetcher(repo_github, issue_number):
+            milestone_fetcher_calls.append((repo_github, issue_number))
+            return 42
+
+        dispatch_review(
+            completed, board, cfg,
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 42, "url": "https://github.com/acme/api/pull/42",
+                "existed": True,
+            },
+            claude_md_reader=lambda p: None,
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+            milestone_fetcher=_fetcher,
+            tranche_open_issue_lister=lambda repo_github: [epic],
+            tranche_closed_epic_lister=lambda repo_github: [],
+        )
+
+        _, payload = client.calls[0]
+        assert "Deletion half deferred to #4322." in payload["briefing"]
+        assert milestone_fetcher_calls == [("acme/api", completed.issue_number)]
 
 
 # ── Flood guard: dispatch_pending_reviews (incident 2026-06-08) ──────────────
