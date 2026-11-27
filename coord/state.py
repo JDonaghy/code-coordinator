@@ -62,6 +62,8 @@ from coord.models import (
     Proposal,
     SplitChunk,
     SplitProposal,
+    TrancheChild,
+    TrancheRow,
     test_mode_from_labels,
 )
 from coord.platform_paths import default_coord_dir
@@ -667,6 +669,149 @@ def clear_split_proposals() -> None:
     with conn:
         sql.execute(conn, "DELETE FROM split_chunks")
         sql.execute(conn, "DELETE FROM split_proposals")
+
+
+# ── Native tranche rows (#4129/#4199) ─────────────────────────────────────────
+#
+# Persistence only -- nothing here dispatches, merges, tests or reviews
+# anything. See `coord.models.TrancheRow`'s docstring for the row shape the
+# sibling slices (#4200/#4201/#4202) will build against.
+
+
+def save_tranche_row(row: TrancheRow) -> int:
+    """Insert or update a native tranche row and return its id.
+
+    ``row.id is None`` inserts a new row; any other value updates the
+    existing row at that id in place. Either way, ``row.children`` is
+    written wholesale -- existing children for this row are deleted and
+    reinserted, the same delete-all/reinsert posture
+    :func:`save_split_proposals` already uses for ``split_chunks`` -- since
+    there is no stable per-child identity yet for a partial update to key
+    on.
+
+    Wrapped in :func:`coord.db.retry_on_locked` like every other write in
+    this module: a transient SQLite lock from a concurrent writer resolves
+    instead of raising.
+    """
+
+    def _write() -> int:
+        conn = get_connection()
+        with conn:
+            if row.id is None:
+                row_id = int(
+                    sql.insert_returning_id(
+                        conn,
+                        "INSERT INTO tranche_rows "
+                        "(repo_name, issue_number, issue_title, base_sha, state, "
+                        " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            row.repo_name,
+                            row.issue_number,
+                            row.issue_title,
+                            row.base_sha,
+                            row.state,
+                            row.created_at if row.created_at is not None else time.time(),
+                        ),
+                        pk_column="id",
+                    )
+                )
+            else:
+                row_id = int(row.id)
+                sql.execute(conn,
+                    "UPDATE tranche_rows SET repo_name = ?, issue_number = ?, "
+                    "issue_title = ?, base_sha = ?, state = ?, created_at = ? "
+                    "WHERE id = ?",
+                    (
+                        row.repo_name,
+                        row.issue_number,
+                        row.issue_title,
+                        row.base_sha,
+                        row.state,
+                        row.created_at,
+                        row_id,
+                    ),
+                )
+            sql.execute(
+                conn, "DELETE FROM tranche_children WHERE tranche_row_id = ?", (row_id,)
+            )
+            for child in row.children:
+                sql.execute(conn,
+                    "INSERT INTO tranche_children "
+                    "(tranche_row_id, issue_number, repo_name, title, state, result) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        row_id,
+                        child.issue_number,
+                        child.repo_name,
+                        child.title,
+                        child.state,
+                        json.dumps(child.result) if child.result is not None else None,
+                    ),
+                )
+        return row_id
+
+    return retry_on_locked(_write)
+
+
+def _tranche_row_from_sql_row(conn: Any, sql_row: Any) -> TrancheRow:
+    """Build a :class:`TrancheRow` (with its children) from one
+    ``tranche_rows`` row -- shared by every load function below so there is
+    exactly one place that maps the SQL shape onto the dataclass."""
+    child_rows = sql.execute(conn,
+        "SELECT * FROM tranche_children WHERE tranche_row_id = ? ORDER BY id",
+        (sql_row["id"],),
+    ).fetchall()
+    return TrancheRow(
+        id=sql_row["id"],
+        repo_name=sql_row["repo_name"],
+        issue_number=sql_row["issue_number"],
+        issue_title=sql_row["issue_title"] or "",
+        base_sha=sql_row["base_sha"] or "",
+        state=sql_row["state"] or "pending",
+        created_at=sql_row["created_at"],
+        children=[
+            TrancheChild(
+                issue_number=c["issue_number"],
+                repo_name=c["repo_name"],
+                title=c["title"] or "",
+                state=c["state"] or "pending",
+                result=_json_loads(c["result"]),
+            )
+            for c in child_rows
+        ],
+    )
+
+
+def load_tranche_row(row_id: int) -> TrancheRow | None:
+    """Return the tranche row with id *row_id*, or ``None`` if it doesn't
+    exist."""
+    conn = get_connection()
+    sql_row = sql.execute(
+        conn, "SELECT * FROM tranche_rows WHERE id = ?", (row_id,)
+    ).fetchone()
+    if sql_row is None:
+        return None
+    return _tranche_row_from_sql_row(conn, sql_row)
+
+
+def load_tranche_rows_for_issue(repo_name: str, issue_number: int) -> list[TrancheRow]:
+    """Return every tranche row filed for one parent issue, oldest first."""
+    conn = get_connection()
+    rows = sql.execute(conn,
+        "SELECT * FROM tranche_rows WHERE repo_name = ? AND issue_number = ? "
+        "ORDER BY id",
+        (repo_name, issue_number),
+    ).fetchall()
+    return [_tranche_row_from_sql_row(conn, r) for r in rows]
+
+
+def delete_tranche_row(row_id: int) -> None:
+    """Delete a tranche row and its children. A no-op if *row_id* doesn't
+    exist."""
+    conn = get_connection()
+    with conn:
+        sql.execute(conn, "DELETE FROM tranche_children WHERE tranche_row_id = ?", (row_id,))
+        sql.execute(conn, "DELETE FROM tranche_rows WHERE id = ?", (row_id,))
 
 
 # ── Dispatched-assignment ledger ──────────────────────────────────────────────

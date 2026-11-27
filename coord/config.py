@@ -32,6 +32,7 @@ from coord.models import (
     Machine,
     QuietHours,
     Repo,
+    TrancheRepoConfig,
     WorkerPermissionsConfig,
 )
 from coord.platform_paths import default_coord_dir
@@ -4100,6 +4101,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "max_parallel",
         "board_doctor",
         "precheck",
+        "tranche",
     }
 )
 
@@ -4455,6 +4457,12 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
         # (a stuck row always falls through to the alert tier).
         board_doctor_cfg = _parse_board_doctor_repo_config(entry.get("board_doctor"), i)
 
+        # #4129/#4199: tranche.enabled — this repo's opt-in to the native
+        # tranche row kind. Absent/False means today's only decomposition
+        # outcome (a serial chain of child issues) stays unchanged for this
+        # repo — see `TrancheRepoConfig.enabled`'s docstring.
+        tranche_cfg = _parse_tranche_repo_config(entry.get("tranche"), i)
+
         repos.append(
             Repo(
                 name=name,
@@ -4482,6 +4490,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 requires=list(requires),
                 max_parallel=repo_max_parallel,
                 board_doctor=board_doctor_cfg,
+                tranche=tranche_cfg,
             )
         )
     return repos, warnings
@@ -4663,6 +4672,34 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 "a positive integer"
             )
         cfg.mechanic_leg_cap = mechanic_leg_cap
+    return cfg
+
+
+def _parse_tranche_repo_config(raw: Any, repo_index: int) -> TrancheRepoConfig:
+    """Parse the ``tranche`` block for a single repo (#4129/#4199).
+
+    When *raw* is ``None`` (key absent from YAML), ``enabled`` stays at
+    its opt-in-required-default ``False`` — see
+    :class:`TrancheRepoConfig`.
+    """
+    if raw is None:
+        return TrancheRepoConfig()
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"repos[{repo_index}].tranche must be a mapping")
+
+    unknown = sorted(set(raw) - {"enabled"})
+    if unknown:
+        raise ConfigError(
+            f"repos[{repo_index}].tranche has unknown key(s): {', '.join(unknown)}"
+        )
+
+    cfg = TrancheRepoConfig()
+    if "enabled" in raw:
+        enabled = raw["enabled"]
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"repos[{repo_index}].tranche.enabled must be a boolean")
+        cfg.enabled = enabled
     return cfg
 
 
