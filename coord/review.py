@@ -40,6 +40,7 @@ plumbing — keeping them apart avoids twisting both shapes.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 import re
 import time
@@ -960,6 +961,190 @@ def extract_blocking_section(body: str) -> str:
     if all(_is_no_findings_line(line.strip()) for line in joined.splitlines() if line.strip()):
         return ""
     return joined
+
+
+# ── Stable finding ids for a scoped re-review (#4187) ───────────────────────
+# A scoped re-review responding to a fix round used to be handed the whole
+# `## Blocking findings` section as one opaque blob of prose, so the
+# re-reviewer's own response could only say "yes/no, the fix round addressed
+# it" in equally unstructured prose — nothing a later gate could check
+# mechanically. Each individual finding gets a short, CONTENT-DERIVED id
+# (`finding_id`) instead: deterministic from the finding's own text, so the
+# SAME finding gets the SAME id every time it's re-derived (minting it at
+# briefing-build time and again at response-parsing time always agrees)
+# without needing anywhere to persist an id-to-text mapping.
+FINDING_ID_LEN = 6
+
+_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s+")
+
+
+@dataclass(frozen=True)
+class BlockingFinding:
+    """One top-level item from a review's `## Blocking findings` section,
+    with its stable `id` (see `finding_id`). `text` is the item's own text,
+    bullet marker stripped, continuation/sub-bullet lines preserved verbatim
+    with their original indentation.
+    """
+
+    id: str
+    text: str
+
+
+def finding_id(text: str) -> str:
+    """Stable, content-derived id for one blocking-finding's text.
+
+    Deterministic (same text ⇒ same id, always) and short enough to write
+    inline as ``finding#<id>`` in a briefing/response without needing a
+    lookup table anywhere — the id IS the hash, so a caller holding only the
+    text (never an id it minted earlier) can still recognise which finding a
+    re-reviewer is referring to.
+    """
+    normalized = " ".join(text.strip().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:FINDING_ID_LEN]
+
+
+def parse_blocking_findings(body: str) -> list[BlockingFinding]:
+    """Split *body*'s `## Blocking findings` section (`extract_blocking_section`)
+    into individual top-level items, each given a stable `finding_id`.
+
+    A line is a NEW item only when it starts a top-level bullet (`_BULLET_RE`
+    matched with zero leading whitespace) — anything else (a continuation
+    line, a nested sub-bullet) is folded into the item currently being
+    collected. A section with no recognisable bullets at all (free prose, no
+    `- `/`* `/`1. ` markers) is returned as a single item so it still gets an
+    id rather than being silently dropped.
+
+    Returns ``[]`` when `extract_blocking_section` finds nothing (including
+    an explicit "none" section) — mirrors that function's own empty-means-
+    empty contract.
+    """
+    section = extract_blocking_section(body)
+    if not section:
+        return []
+    items: list[list[str]] = []
+    for raw in section.splitlines():
+        if raw.strip() and not raw[:1].isspace() and _BULLET_RE.match(raw):
+            items.append([_BULLET_PREFIX_RE.sub("", raw, count=1).rstrip()])
+        elif items:
+            items[-1].append(raw.rstrip())
+        else:
+            # No top-level bullet seen yet — free prose; start the first
+            # (and, until a real bullet appears, only) item with it.
+            items.append([raw.rstrip()])
+    findings: list[BlockingFinding] = []
+    for lines in items:
+        text = "\n".join(lines).strip("\n").strip()
+        if not text:
+            continue
+        findings.append(BlockingFinding(id=finding_id(text), text=text))
+    return findings
+
+
+def format_findings_with_ids(findings: list[BlockingFinding]) -> str:
+    """Render *findings* (`parse_blocking_findings`) as a bulleted list, each
+    item prefixed with its `finding#<id>` tag — what a scoped re-review
+    briefing shows instead of the opaque prose blob (#4187)."""
+    rendered: list[str] = []
+    for f in findings:
+        lines = f.text.splitlines() or [""]
+        first = f"- `finding#{f.id}`: {lines[0]}"
+        rest = [f"  {line}" for line in lines[1:]]
+        rendered.append("\n".join([first, *rest]))
+    return "\n".join(rendered)
+
+
+@dataclass(frozen=True)
+class ScopedRereviewClassification:
+    """A scoped re-review's structured response to the prior round's
+    id-tagged blocking findings (#4187) — parsed by
+    `parse_scoped_rereview_classification`.
+
+    `resolved_ids`/`unresolved_ids` cover the PRIOR findings only, keyed by
+    `finding_id`. Every prior id not explicitly listed under `resolved:`
+    counts as unresolved (fail-closed — see that function's docstring).
+    `new_blocking_in_delta` and `new_blocking_out_of_delta` are freeform
+    finding texts (no prior id — these are NEW), kept apart because only the
+    latter triggers the out-of-delta full-review gate
+    (`coord.merge_queue.out_of_delta_full_review_pending`).
+    """
+
+    resolved_ids: frozenset[str]
+    unresolved_ids: frozenset[str]
+    new_blocking_in_delta: tuple[str, ...]
+    new_blocking_out_of_delta: tuple[str, ...]
+
+
+_RESOLVED_LINE_RE = re.compile(r"(?im)^[ \t]*resolved:[ \t]*(.*)$")
+_UNRESOLVED_LINE_RE = re.compile(r"(?im)^[ \t]*unresolved:[ \t]*(.*)$")
+
+
+def _split_finding_ids(text: str) -> frozenset[str]:
+    out: set[str] = set()
+    for tok in re.split(r"[,\s]+", text.strip()):
+        cleaned = tok.strip().strip("`").strip()
+        if cleaned.lower().startswith("finding#"):
+            cleaned = cleaned[len("finding#"):]
+        if cleaned:
+            out.add(cleaned)
+    return frozenset(out)
+
+
+def _bullets_under_heading(body: str, heading_substr: str) -> tuple[str, ...]:
+    """Bullet (or plain-text) lines under the first heading in *body* whose
+    lowercased text contains *heading_substr*, up to the next heading of any
+    level. An explicit "none" line (`_is_no_findings_line`) contributes
+    nothing — mirrors `extract_blocking_section`'s own empty convention."""
+    capturing = False
+    collected: list[str] = []
+    for raw in (body or "").splitlines():
+        line = raw.rstrip()
+        if line.lstrip().startswith("#"):
+            if capturing:
+                break
+            capturing = heading_substr in line.lstrip("#").strip().lower()
+            continue
+        if not capturing:
+            continue
+        stripped = line.strip()
+        if not stripped or _is_no_findings_line(stripped):
+            continue
+        collected.append(_BULLET_PREFIX_RE.sub("", line, count=1).strip())
+    return tuple(collected)
+
+
+def parse_scoped_rereview_classification(
+    body: str, prior_ids: Iterable[str] = (),
+) -> ScopedRereviewClassification:
+    """Parse a scoped re-review's structured response to id-tagged prior
+    findings (#4187) — the counterpart `build_scoped_review_briefing`'s
+    fix-round path asks the reviewer to write.
+
+    Fail-closed, matching every other verdict-evidence parser in this module
+    (`classify_blocking_evidence`'s docstring): a prior id the response never
+    mentions under `resolved:` is `unresolved`, never silently dropped —
+    including when the response has no `resolved:`/`unresolved:` lines at
+    all (an un-upgraded or malformed response carries every prior finding
+    forward as still outstanding).
+    """
+    resolved = frozenset()
+    m = _RESOLVED_LINE_RE.search(body or "")
+    if m:
+        resolved = _split_finding_ids(m.group(1))
+    m = _UNRESOLVED_LINE_RE.search(body or "")
+    explicit_unresolved = _split_finding_ids(m.group(1)) if m else frozenset()
+    prior = frozenset(prior_ids)
+    unresolved = explicit_unresolved | (prior - resolved)
+    resolved = resolved - unresolved  # a conflicting id is never "resolved"
+    new_in_delta = _bullets_under_heading(body or "", "new blocking findings (in delta)")
+    new_out_of_delta = _bullets_under_heading(
+        body or "", "new blocking findings (out of delta)",
+    )
+    return ScopedRereviewClassification(
+        resolved_ids=resolved,
+        unresolved_ids=unresolved,
+        new_blocking_in_delta=new_in_delta,
+        new_blocking_out_of_delta=new_out_of_delta,
+    )
 
 
 def extract_nits_section(body: str) -> str:
@@ -6553,6 +6738,14 @@ def build_scoped_review_briefing(
     missing line must never silently read as "resolved".
     """
     is_fix_round = prior_verdict != "approve"
+    # #4187: each prior blocking finding gets a stable, content-derived id
+    # (`finding_id`) so this briefing can say "finding #id: text" instead of
+    # handing the whole section over as one opaque blob, and the
+    # re-reviewer's response (parsed by `parse_scoped_rereview_classification`)
+    # can classify each one by id rather than free prose.
+    prior_findings = (
+        parse_blocking_findings(prior_findings_body) if is_fix_round and prior_findings_body else []
+    )
     lines: list[str] = []
     lines.append(f"# Scoped re-review: {repo_github} PR #{pr_number}")
     lines.append("")
@@ -6582,6 +6775,14 @@ def build_scoped_review_briefing(
             (prior_findings_body or "(prior findings text unavailable)").strip()
         )
         lines.append("")
+        if prior_findings:
+            lines.append(
+                "### Prior blocking findings, with stable ids (classify EVERY "
+                "one of these by id below)"
+            )
+            lines.append("")
+            lines.append(format_findings_with_ids(prior_findings))
+            lines.append("")
     elif is_base_move:
         # #3917/#3935/#3948: the branch itself never moved — only the base
         # it merges against did — so there is no delta *of diffs* to show
@@ -6732,6 +6933,56 @@ def build_scoped_review_briefing(
             "re-raise non-blocking concerns or nits from the prior review as "
             "new blocking findings — they were already non-blocking."
         )
+        if prior_findings:
+            lines.append("")
+            lines.append(
+                "2a. Classify EVERY one of the id-tagged findings above, by "
+                "id, in a new `## Finding resolution` section inside "
+                "`REVIEW_BODY:` (in addition to the three required headings "
+                "below) — two lines, each listing the relevant ids "
+                "comma-separated:"
+            )
+            lines.append("")
+            lines.append("```")
+            lines.append("## Finding resolution")
+            lines.append(
+                "resolved: " + ", ".join(f"finding#{f.id}" for f in prior_findings[:1])
+                + (", ..." if len(prior_findings) > 1 else "")
+            )
+            lines.append("unresolved: (none, or finding#... likewise)")
+            lines.append("```")
+            lines.append("")
+            lines.append(
+                "An id you omit from BOTH lines is read as `unresolved` "
+                "(fail-closed) — never as resolved by default; list every id "
+                "exactly once."
+            )
+            lines.append("")
+            lines.append(
+                "2b. If, while reading the delta, you spot a genuinely NEW "
+                "blocking problem — not one of the ids above — list it under "
+                "one of two headings depending on where it lives, each "
+                "inside `REVIEW_BODY:`:"
+            )
+            lines.append("")
+            lines.append(
+                "- `## New blocking findings (in delta)` — a new bug the "
+                "delta ITSELF introduces. Treat exactly like any other "
+                "blocking finding: `request-changes`."
+            )
+            lines.append(
+                "- `## New blocking findings (out of delta)` — something you "
+                "noticed OUTSIDE the delta you were scoped to review (code "
+                "this round never touched). Do **not** `request-changes` for "
+                "this alone — list it here instead; the coordinator records "
+                "it as non-blocking for THIS round but will require one "
+                "full, non-scoped review of the whole PR before it can "
+                "merge."
+            )
+            lines.append(
+                "Write `None.` under a heading that doesn't apply — same "
+                "convention as the three required headings."
+            )
     elif is_base_move:
         lines.append(
             "2. `approve` unless the diff, read against the new base, now "
@@ -6795,6 +7046,14 @@ def build_scoped_review_briefing(
         "all three: `## Blocking findings`, `## Non-blocking concerns`, "
         "`## Nits`. Write the single line `None.` under a heading with "
         "nothing under it."
+        + (
+            " PLUS, for this fix round, the three additional headings "
+            "from step 2a/2b above: `## Finding resolution`, "
+            "`## New blocking findings (in delta)`, `## New blocking "
+            "findings (out of delta)`."
+            if is_fix_round and prior_findings
+            else ""
+        )
     )
     lines.append(
         "FORMAT CONTRACT — `REVIEW_VERDICT:`, `REVIEW_BODY:`, and "
