@@ -6668,6 +6668,85 @@ def test_merge_gate_reserved_reason_wins_over_a_stale_diagnostic_fallback():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# The out-of-delta merge gate (`coord.merge_queue.
+# is_out_of_delta_full_review_reason`) is the identical self-refreshing
+# shape as the reservation case above: `merge_queue.process()` itself
+# already auto-dispatches the one full review that clears the gate the
+# moment this reason is produced, so nothing about a `coord drive` retry
+# here resolves it faster — only that review landing a verdict does. Without
+# this arm the generic bounded retry below would spend `merge_attempts` on
+# every poll and escalate to a human well before a review round-trip could
+# complete, exactly the #3886 reservation failure mode this mirrors.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_out_of_delta_full_review_retries_for_real_regardless_of_which_status_the_board_shows(
+    status,
+):
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason=(
+                "full-review gate: a scoped re-review flagged a "
+                "blocking finding outside its delta — one full review is "
+                "required before merge"
+            ),
+        )
+    )
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert action.serialize_merge is True
+    assert "out-of-delta gate requires a full review" in action.label
+    assert "not spending an attempt" in action.label
+
+
+def test_out_of_delta_full_review_never_spends_a_merge_attempt():
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason="full-review gate: one full review is required before merge",
+    )
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == RUN
+        assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+        assert counters.merge_attempts == 0
+
+
+def test_out_of_delta_full_review_reason_is_recognised_via_the_shared_predicate():
+    from coord.merge_queue import (
+        OUT_OF_DELTA_FULL_REVIEW_PREFIX,
+        is_out_of_delta_full_review_reason,
+    )
+
+    assert is_out_of_delta_full_review_reason(
+        f"{OUT_OF_DELTA_FULL_REVIEW_PREFIX}one full review is required"
+    )
+    assert not is_out_of_delta_full_review_reason("review required but not approved")
+    assert not is_out_of_delta_full_review_reason("CI running: build")
+    assert not is_out_of_delta_full_review_reason("")
+    assert not is_out_of_delta_full_review_reason(None)
+
+
+def test_out_of_delta_full_review_reason_wins_over_a_stale_diagnostic_fallback():
+    from coord.drive import _effective_merge_gate_reason
+
+    counters = DriveCounters()
+    counters.last_merge_diagnostic = "  gate review: review required but not approved — will block this merge"
+    s = approved_work(
+        merge_status="READY",
+        merge_reason="full-review gate: one full review is required before merge",
+    )
+
+    reason, from_diagnostic = _effective_merge_gate_reason(s, counters)
+    assert reason == s.merge_reason
+    assert from_diagnostic is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #3254: the FIFTH CI-outcome case — #1904's `checks_absent`
 # (`is_ci_absent_reason`): this repo declares CI but reported ZERO checks for
 # the PR. Unlike #1891/#1892/#2252/#2347 above, this is NOT self-refreshing —

@@ -4650,6 +4650,7 @@ def dispatch_review(
     exempt_dependency_issue_is_closed_fetcher=None,
     tranche_open_issue_lister=None,
     tranche_closed_epic_lister=None,
+    require_full_review_for_out_of_delta_gate: bool = False,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -4752,6 +4753,16 @@ def dispatch_review(
     get_closed_epics`; inject stubs in tests so this advisory lookup never
     shells out to a live ``gh``. Entirely fail-open — see that function's
     docstring.
+
+    *require_full_review_for_out_of_delta_gate* lets exactly one caller —
+    the out-of-delta merge gate's own auto-dispatch — through the "one
+    review per leg" guard below for a leg that already carries an approved
+    *scoped* verdict. That gate's whole point is to require a SECOND,
+    full-diff review on top of a scoped approval, so the ordinary single-
+    review invariant does not apply here; every other guard (the active-
+    dispatch dedupe, the atomic claim, the terminal-work/TOS checks) still
+    runs unchanged, so this still dispatches at most once per leg while a
+    review is pending or in flight for it.
     """
     # #1627: every early-exit guard below used to be a bare `return None`,
     # collapsing 11 distinct outcomes into one signal the caller couldn't
@@ -4855,42 +4866,49 @@ def dispatch_review(
     # where *completed*'s own snapshot is stale but the verdict already
     # landed durably — see that function's docstring for why the claim
     # table alone cannot close this gap.
-    if completed.review_verdict is not None:
-        return _deny(
-            f"assignment {completed.assignment_id} already has a recorded "
-            f"review verdict {completed.review_verdict!r} — refusing a "
-            "second review (#3670)"
-        )
-
-    from coord.state import has_recorded_review_verdict  # noqa: PLC0415
-
-    if has_recorded_review_verdict(completed.assignment_id):
-        return _deny(
-            f"assignment {completed.assignment_id} already has a recorded "
-            "review verdict in the database — refusing a second review "
-            "(#3670, stale board snapshot)"
-        )
-
-    # A scoped re-review that covered this leg carries the leg only in
-    # `review_scoped_work_id` until `propagate_review_verdict` re-points it,
-    # so neither check above sees it yet. Its verdict is about to land on
-    # this leg; a second, full review would only repeat it.
-    _scoped_cover = next(
-        (
-            a for a in list(board.active) + list(board.completed)
-            if a.review_scoped_work_id == completed.assignment_id
-            and review_covers(
-                a, completed.assignment_id, include_dead=False, board=board,
+    #
+    # Both this and the scoped-cover check right below are skipped when
+    # *require_full_review_for_out_of_delta_gate* is set — that caller is
+    # dispatching the SECOND, full review the out-of-delta gate requires on
+    # top of an already-recorded scoped approval, so the condition these
+    # checks refuse is exactly the one it means to produce.
+    if not require_full_review_for_out_of_delta_gate:
+        if completed.review_verdict is not None:
+            return _deny(
+                f"assignment {completed.assignment_id} already has a recorded "
+                f"review verdict {completed.review_verdict!r} — refusing a "
+                "second review (#3670)"
             )
-        ),
-        None,
-    )
-    if _scoped_cover is not None:
-        return _deny(
-            f"assignment {completed.assignment_id} is already covered by "
-            f"scoped review {_scoped_cover.assignment_id} "
-            f"({_scoped_cover.status}) — refusing a second review"
+
+        from coord.state import has_recorded_review_verdict  # noqa: PLC0415
+
+        if has_recorded_review_verdict(completed.assignment_id):
+            return _deny(
+                f"assignment {completed.assignment_id} already has a recorded "
+                "review verdict in the database — refusing a second review "
+                "(#3670, stale board snapshot)"
+            )
+
+        # A scoped re-review that covered this leg carries the leg only in
+        # `review_scoped_work_id` until `propagate_review_verdict` re-points
+        # it, so neither check above sees it yet. Its verdict is about to
+        # land on this leg; a second, full review would only repeat it.
+        _scoped_cover = next(
+            (
+                a for a in list(board.active) + list(board.completed)
+                if a.review_scoped_work_id == completed.assignment_id
+                and review_covers(
+                    a, completed.assignment_id, include_dead=False, board=board,
+                )
+            ),
+            None,
         )
+        if _scoped_cover is not None:
+            return _deny(
+                f"assignment {completed.assignment_id} is already covered by "
+                f"scoped review {_scoped_cover.assignment_id} "
+                f"({_scoped_cover.status}) — refusing a second review"
+            )
 
     # Dedupe: don't fire a second review if one's already in flight for this
     # completed work assignment. This in-memory check is a fast path only —
