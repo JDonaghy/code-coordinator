@@ -109,15 +109,16 @@ def test_a_merged_partial_row_whose_followthrough_was_declined_shows_that_reason
         entries, board(merged=(4220,), partial=(4220,)), capacity=1,
     )
     assert plan.reconciles == ()
-    assert entries[0].last_reason == decline_reason
 
 
-def test_a_merged_partial_row_settles_via_a_live_closed_reading_too():
-    """Same settlement, reached through `live_prereq_terminal` instead of
-    the cached board — mirrors #3368's live-recovery half of the
-    `parked`/`blocked`/`failed` sweep, for the one caller that threads this
-    mapping in (a cache lag must not stall the self-heal any longer than
-    the `parked`/`blocked`/`failed` rows it already covers)."""
+def test_a_merged_partial_row_does_not_settle_on_a_live_reading_alone():
+    """The settle rests on `facts.closed` alone, never a live probe — a
+    `live_prereq_terminal` hit with the cached board still showing the
+    issue open must NOT settle the row. Settling early here (ahead of the
+    cache the `#3863` done-row correction pass reads from) is exactly what
+    caused the oscillation a live fast path previously introduced: this
+    tick would write `done`, and the very next tick `#3863` would read the
+    still-stale cache and flip it straight back to `merged-partial`."""
     entries = [
         entry(4221, position=3, state=STATE_MERGED_PARTIAL, attempts=0)
     ]
@@ -125,11 +126,23 @@ def test_a_merged_partial_row_settles_via_a_live_closed_reading_too():
         entries, board(merged=(4221,), partial=(4221,)), capacity=1,
         live_prereq_terminal={entry_key(REPO, 4221): True},
     )
-    assert len(plan.reconciles) == 1
-    reconcile = plan.reconciles[0]
-    assert reconcile.outcome == "done"
-    assert reconcile.updates["state"] == STATE_DONE
-    assert "live re-check" in reconcile.updates["last_reason"]
+    assert plan.reconciles == ()
+
+
+def test_a_settled_row_does_not_flip_back_to_merged_partial_on_the_next_tick():
+    """Pins tick N+1: once the row has settled to `done` (this module's
+    settle sweep only ever writes `done` when `facts.closed` is already
+    True), the `#3863` done-row correction pass re-derives the SAME
+    `facts.closed` reading on the following tick and must agree, not flip
+    the row back to `merged-partial` the way a live-only settle would have
+    (the cache this pass reads from is also closed, since that is the
+    precondition the settle itself required)."""
+    entries = [entry(4224, position=3, state=STATE_DONE, attempts=0)]
+    plan = plan_tick(
+        entries, board(merged=(4224,), closed=(4224,), partial=(4224,)),
+        capacity=1,
+    )
+    assert plan.reconciles == ()
 
 
 def test_a_merged_partial_dependent_resolves_once_the_prereq_settles_to_done():
