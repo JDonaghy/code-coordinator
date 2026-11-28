@@ -7682,5 +7682,125 @@ def run_sweep(
     return report
 
 
+#: :func:`sweep`'s *counter_namespace* for :func:`run_test_failure_edge_sweep`
+#: — keeps the failure-edge pass's convergence counter separate from both the
+#: plain hourly call's and :data:`MECHANICAL_SWEEP_COUNTER_NAMESPACE`'s, for
+#: the same reason that one is separate: the edge pass fires on a drive-queue
+#: tick's cadence (minutes), so sharing a counter with the hourly sweep would
+#: burn :data:`CONVERGENCE_LIMIT` for these causes far faster than the hourly
+#: call expects.
+TEST_FAILURE_EDGE_COUNTER_NAMESPACE = "test-failure-edge"
+
+#: The only causes :func:`run_test_failure_edge_sweep` ever acts on — exactly
+#: what :func:`_reclassify_test_failed` mints from a failing Test leg's own
+#: evidence. A row the failure-edge walk classifies as anything else is
+#: dropped: this pass exists to answer the Test-failure/ceiling edge, and
+#: every other cause remains the hourly sweep's to decide.
+TEST_FAILURE_EDGE_CAUSES = frozenset({CAUSE_TEST_FAILED, CAUSE_TEST_FAILED_AT_CEILING})
+
+
+def run_test_failure_edge_sweep(
+    *,
+    config,
+    keys: Collection[tuple[str, int]],
+    tier_of: Callable[[str], str] = default_tier_of,
+    auto_dispatchers: Mapping[str, Callable[[StuckRow], bool]] | None = None,
+    alert_dispatcher: Callable[[StuckRow], bool | str] | None = None,
+    dry_run: bool = False,
+    convergence_limit: int = CONVERGENCE_LIMIT,
+    capacity_check: Callable[[StuckRow], bool] | _CapacityCheckUnset | None = (
+        _CAPACITY_CHECK_UNSET
+    ),
+) -> SweepReport:
+    """The failure-EDGE entry point: classify and dispatch for the handful of
+    ``(repo, issue)`` pairs *keys* names, right now, on the tick that
+    produced them — not on the hourly :func:`run_sweep` timer.
+
+    *keys* is the whole scope of this call. A drive-queue tick passes the
+    rows it ITSELF just blocked on the #2972 fix-round ceiling
+    (:func:`coord.drive_queue.test_failure_edge_candidates`), so a row's
+    branch-specific Test failure reaches the investigate tier minutes after
+    the block instead of up to an hour later. An empty *keys* returns an
+    empty report without reading the board at all, so a tick that blocked
+    nothing pays nothing.
+
+    The walk itself is :func:`_collect_rows_with_board` with
+    ``resolve_test_failure_evidence=True`` — the same resolution
+    :func:`run_sweep`'s plain call uses, so the edge pass and the hourly
+    pass classify a given row identically. Its result is then narrowed
+    twice before :func:`sweep` sees it: to *keys*, and to
+    :data:`TEST_FAILURE_EDGE_CAUSES`. Both narrowings matter — a row this
+    tick did not block is not this call's business, and a row whose cause
+    is anything but the two the failing Test leg's own evidence mints is
+    the hourly sweep's to decide.
+
+    ``clear_absent_rows=False`` and :data:`
+    TEST_FAILURE_EDGE_COUNTER_NAMESPACE` are forced for the same reasons
+    :func:`run_sweep`'s *mechanical_causes* call forces its own: this row
+    set is a deliberate subset, so a row outside it must never be read as
+    "resolved" and have its counter wiped, and this pass's far tighter
+    cadence must not burn the convergence budget the hourly call relies on.
+    That is also why there is no *escalation_resolver* parameter here, the
+    one keyword :func:`run_sweep` takes that this function does not:
+    :func:`sweep` only ever consults it from inside the absent-row cleanup
+    ``clear_absent_rows=False`` switches off, so accepting one would
+    promise a dismissal this call can never make.
+
+    Dispatch policy is entirely *tier_of*/*auto_dispatchers*/
+    *alert_dispatcher*'s — in production `coord.board_doctor_policy`'s, the
+    same callbacks the hourly sweep passes. :data:`CAUSE_TEST_FAILED` and
+    :data:`CAUSE_TEST_FAILED_AT_CEILING` are both registered on the
+    investigate tier there, so an eligible row gets ONE fix-it leg
+    (`_investigate`'s own in-flight check, ceiling check and per-repo
+    opt-in all still apply, unchanged), and a row that is not eligible —
+    a ``substantive`` triage verdict at the ceiling, say — falls through to
+    that function's single alert instead. This function adds no policy of
+    its own.
+    """
+    scope = {tuple(key) for key in keys}
+    if not scope:
+        return SweepReport(
+            sweep_id=f"test-failure-edge-{_utcnow().strftime('%Y%m%dT%H%M%SZ')}",
+            dry_run=dry_run,
+        )
+
+    from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
+
+    rows, _board = _collect_rows_with_board(
+        config=config,
+        trigger="board-doctor-test-failure-edge",
+        resolve_test_failure_evidence=True,
+    )
+    edge_rows = [
+        row
+        for row in rows
+        if row.queue == "drive-queue"
+        and row.cause in TEST_FAILURE_EDGE_CAUSES
+        and _parse_row_key(row.key) in scope
+    ]
+    board_doctor_cfg = getattr(config, "board_doctor", None)
+    report = sweep(
+        edge_rows,
+        tier_of=tier_of,
+        auto_dispatchers=auto_dispatchers,
+        alert_dispatcher=alert_dispatcher,
+        dry_run=dry_run,
+        convergence_limit=convergence_limit,
+        capacity_check=(
+            default_investigate_capacity(config)
+            if capacity_check is _CAPACITY_CHECK_UNSET
+            else capacity_check
+        ),
+        clear_absent_rows=False,
+        log_retention_days=getattr(board_doctor_cfg, "log_retention_days", None),
+        backoff_initial_hours=getattr(board_doctor_cfg, "backoff_initial_hours", None),
+        backoff_cap_hours=getattr(board_doctor_cfg, "backoff_cap_hours", None),
+        outcome_grace_hours=getattr(board_doctor_cfg, "outcome_grace_hours", None),
+        counter_namespace=TEST_FAILURE_EDGE_COUNTER_NAMESPACE,
+    )
+    report.rows_observed = len(edge_rows)
+    return report
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)

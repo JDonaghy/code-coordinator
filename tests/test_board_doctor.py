@@ -35,12 +35,14 @@ from coord.board_doctor import (
     CAUSE_STRANDED_PREREQ,
     CAUSE_STRANDED_PREREQ_BLOCKED,
     CAUSE_TEST_FAILED,
+    CAUSE_TEST_FAILED_AT_CEILING,
     IDLE_FLEET_ROOT_QUEUE,
     MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS,
     MECHANICAL_SWEEP_COUNTER_NAMESPACE,
     MERGE_PENDING_STALE_AFTER_SECONDS,
     NEXT_ACTION_UNPERFORMED_STALE_AFTER_SECONDS,
     STRANDED_PREREQ_OPT_OUT_LABEL,
+    TEST_FAILURE_EDGE_COUNTER_NAMESPACE,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
@@ -12128,3 +12130,154 @@ class TestRunSweepBaseSyncFixCeiling:
 
         assert called == []
         assert integration_red_row in captured_other_rows
+
+
+class TestRunTestFailureEdgeSweep:
+    """#4210's same-tick entry point: a drive-queue tick hands the rows it
+    JUST blocked on the #2972 fix-round ceiling straight to the board
+    doctor, so a branch-specific Test failure reaches the investigate tier
+    minutes after the block rather than on the next hourly timer.
+
+    Scope is the whole contract here — the pass must look at the keys it
+    was given and nothing else, and at the two causes a failing Test leg's
+    own evidence mints and nothing else, because every other row is still
+    the hourly sweep's to decide.
+    """
+
+    def _rows(self) -> list[StuckRow]:
+        return [
+            # In scope: the #4202 shape.
+            StuckRow(
+                queue="drive-queue", key="acme/widgets#40", state="blocked",
+                cause=CAUSE_TEST_FAILED_AT_CEILING, confidence="high",
+                evidence=("failing_test=tests/test_thin_client_board_audit.py::test_x",),
+                fresh=True,
+            ),
+            # Right cause, wrong key — a row this tick did not block.
+            StuckRow(
+                queue="drive-queue", key="acme/widgets#41", state="blocked",
+                cause=CAUSE_TEST_FAILED, confidence="high", fresh=True,
+            ),
+            # Right key, wrong cause — still the hourly sweep's to decide.
+            _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED, fresh=True),
+            # Right key and cause, but the MERGE queue's row for it.
+            StuckRow(
+                queue="merge-queue", key="acme/widgets#40", state="pending",
+                cause=CAUSE_TEST_FAILED_AT_CEILING, confidence="high", fresh=True,
+            ),
+        ]
+
+    def test_dispatches_only_for_the_row_this_tick_blocked(self, monkeypatch) -> None:
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda **_: (self._rows(), Board()),
+        )
+        investigate = _Recorder()
+
+        report = board_doctor_mod.run_test_failure_edge_sweep(
+            config=Config(repos=[], machines=[]),
+            keys=[("acme/widgets", 40)],
+            auto_dispatchers={
+                CAUSE_TEST_FAILED: investigate,
+                CAUSE_TEST_FAILED_AT_CEILING: investigate,
+            },
+            alert_dispatcher=_Recorder(),
+            capacity_check=None,
+        )
+
+        assert [(d.queue, d.key, d.cause) for d in report.decisions] == [
+            ("drive-queue", "acme/widgets#40", CAUSE_TEST_FAILED_AT_CEILING),
+        ]
+        assert report.rows_observed == 1
+        assert investigate.count == 1
+        assert [r.key for r in investigate.calls] == ["acme/widgets#40"]
+
+    def test_empty_keys_never_reads_the_board(self, monkeypatch) -> None:
+        """A tick that blocked nothing on the ceiling — the overwhelming
+        majority — must not pay for a board walk just because this pass
+        exists.
+        """
+        import coord.board_doctor as board_doctor_mod
+
+        def _explode(**_):
+            raise AssertionError("the board must not be read for an empty scope")
+
+        monkeypatch.setattr(board_doctor_mod, "_collect_rows_with_board", _explode)
+        investigate = _Recorder()
+
+        report = board_doctor_mod.run_test_failure_edge_sweep(
+            config=Config(repos=[], machines=[]),
+            keys=[],
+            auto_dispatchers={CAUSE_TEST_FAILED_AT_CEILING: investigate},
+        )
+
+        assert report.decisions == []
+        assert report.rows_observed == 0
+        assert investigate.count == 0
+
+    def test_uses_its_own_counter_namespace_and_clears_no_absent_rows(
+        self, monkeypatch,
+    ) -> None:
+        """The pass fires on a tick's cadence, so sharing the hourly
+        sweep's convergence counter would burn `CONVERGENCE_LIMIT` for
+        these causes far faster than the hourly call expects; and its row
+        set is a deliberate subset, so a row outside it must never read as
+        "resolved".
+        """
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda **_: (self._rows(), Board()),
+        )
+        captured: dict = {}
+
+        def _fake_sweep(rows, **kwargs):
+            captured["rows"] = list(rows)
+            captured.update(kwargs)
+            return board_doctor_mod.SweepReport(sweep_id="s1")
+
+        monkeypatch.setattr(board_doctor_mod, "sweep", _fake_sweep)
+
+        board_doctor_mod.run_test_failure_edge_sweep(
+            config=Config(repos=[], machines=[]),
+            keys=[("acme/widgets", 40)],
+        )
+
+        assert captured["counter_namespace"] == TEST_FAILURE_EDGE_COUNTER_NAMESPACE
+        assert captured["counter_namespace"] != MECHANICAL_SWEEP_COUNTER_NAMESPACE
+        assert captured["clear_absent_rows"] is False
+        assert [r.key for r in captured["rows"]] == ["acme/widgets#40"]
+
+    def test_a_substantive_ceiling_row_escalates_once_and_gets_no_leg(
+        self, monkeypatch,
+    ) -> None:
+        """Acceptance case 3 at the harness level: dispatch policy is
+        entirely the caller's callbacks', so a dispatcher that declines
+        (what `board_doctor_policy._investigate` does for a ceiling row
+        whose triage verdict is not ``mechanical``) leaves exactly one
+        alert-free ``auto-dispatch-noop`` decision and no second attempt.
+        """
+        import coord.board_doctor as board_doctor_mod
+
+        monkeypatch.setattr(
+            board_doctor_mod, "_collect_rows_with_board",
+            lambda **_: (self._rows(), Board()),
+        )
+        declines: list[StuckRow] = []
+
+        report = board_doctor_mod.run_test_failure_edge_sweep(
+            config=Config(repos=[], machines=[]),
+            keys=[("acme/widgets", 40)],
+            auto_dispatchers={
+                CAUSE_TEST_FAILED_AT_CEILING: (
+                    lambda row: declines.append(row) or False
+                ),
+            },
+            capacity_check=None,
+        )
+
+        assert len(declines) == 1
+        assert [d.action for d in report.decisions] == ["auto-dispatch-noop"]
