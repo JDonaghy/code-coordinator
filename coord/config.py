@@ -1561,6 +1561,82 @@ class UsageGateConfig:
     reroute_fallback: str = "warn"  # "warn" | "block"
 
 
+#: ``pacing.reset_weekday`` accepts one of these names (case-insensitive),
+#: stored internally as its index — the same ``Mon=0..Sun=6`` convention
+#: ``datetime.weekday()`` already uses, so ``coord.usage_limits`` never has
+#: to re-derive the mapping.
+WEEKDAY_NAMES: tuple[str, ...] = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+@dataclass
+class PacingConfig:
+    """``pacing:`` block (#4228) — budget-paced mode selection against the
+    #1466 usage gate's own probe (``coord.usage_limits``).
+
+    The operator's fixed weekly subscription budget pulls two goals against
+    each other: efficiency (no tokens wasted on trivial single-issue
+    re-review/CI churn) and wall-clock throughput (workflow/tranche legs
+    finish a coherent batch far faster, but too many of them early in the
+    week exhaust the window, and then nothing runs for days until it
+    resets). The ideal is running out of budget shortly before the reset,
+    having done as much as possible — so ``coord`` should pick *how* to run
+    eligible work (single leg, ``coord:workflow`` leg, or a native tranche
+    row — #4226/#4227) by spend pace, not by issue shape alone.
+
+    ``enabled`` is ``False`` by default: an absent block means every
+    dispatch keeps picking its mode exactly as it does today (issue shape
+    alone), with no pacing signal consulted anywhere — see
+    :func:`coord.usage_limits.evaluate_pace`.
+
+    ``reset_weekday``/``reset_time``/``tz`` name the weekly reset instant
+    the plan's own usage window resets against. This is stated directly by
+    the operator rather than parsed out of ``PlanLimits.week_resets_at`` —
+    that field is free-text prose from ``claude -p "/usage"``, not a stable
+    contract to recover a recurring schedule from (see
+    ``coord.usage_limits``'s module docstring). ``tz`` is REQUIRED when
+    ``enabled`` is true, validated against the IANA database, and never
+    defaults to the daemon's own UTC clock — the same posture
+    ``quiet_hours``/:class:`QuietHours` already takes for the identical
+    reason: a naive wall-clock time compared against a UTC daemon clock
+    would silently misjudge the curve by the operator's own UTC offset.
+
+    ``behind_gap_pct``/``ahead_gap_pct`` are the dead-band width (in
+    percentage points) around the target curve before
+    :func:`coord.usage_limits.evaluate_pace` calls the account "behind" or
+    "ahead" of pace rather than "on pace" — without a dead band, noise
+    right at the line would flip the mode decision every tick.
+
+    ``behind_concurrency_multiplier``/``ahead_concurrency_multiplier`` scale
+    the already-resolved concurrency ceiling (see
+    ``coord.drive_queue.pace_adjusted_max_parallel``): behind pace raises
+    it to buy wall-clock time; ahead of pace lowers it.
+
+    ``session_near_limit_pct`` reuses the probe's own ``session_pct``
+    (independent of the weekly curve) — at/above this threshold, a long
+    workflow/tranche leg risks running into the 5h session wall mid-run, so
+    :func:`coord.usage_limits.evaluate_pace` forces single-leg mode
+    regardless of how far behind the weekly curve the account is.
+    """
+
+    enabled: bool = False
+    reset_weekday: int = 5  # Saturday (Mon=0 .. Sun=6) — the operator's own reset day
+    reset_time: time = field(default_factory=lambda: time(9, 0))
+    tz: str = ""
+    behind_gap_pct: float = 10.0
+    ahead_gap_pct: float = 10.0
+    session_near_limit_pct: float = 70.0
+    behind_concurrency_multiplier: float = 1.5
+    ahead_concurrency_multiplier: float = 0.5
+
+
 @dataclass
 class BudgetConfig:
     """``budget:`` block (#2131) — the per-leg spend ceiling.
@@ -3560,6 +3636,10 @@ class Config:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     usage_gate: UsageGateConfig = field(default_factory=UsageGateConfig)
+    # #4228 — absent block == disabled == every dispatch picks its mode
+    # (single/workflow/tranche) and concurrency exactly as it does today,
+    # with no pacing signal consulted anywhere.
+    pacing: PacingConfig = field(default_factory=PacingConfig)
     # #2131 — absent block == no ceiling == today's behaviour.
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
@@ -3892,6 +3972,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
     usage_gate = _parse_usage_gate(raw.get("usage_gate"))
+    pacing = _parse_pacing(raw.get("pacing"))
     budget = _parse_budget(raw.get("budget"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
     store = _parse_store(raw.get("store"))
@@ -3923,6 +4004,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         pipeline=pipeline,
         dispatch=dispatch,
         usage_gate=usage_gate,
+        pacing=pacing,
         budget=budget,
         ci_store=ci_store,
         store=store,
@@ -6192,6 +6274,91 @@ def _parse_usage_gate(raw: Any) -> UsageGateConfig:
         if value not in ("warn", "block"):
             raise ConfigError("usage_gate.reroute_fallback must be one of: warn, block")
         cfg.reroute_fallback = value
+
+    return cfg
+
+
+def _parse_pacing(raw: Any) -> PacingConfig:
+    """Parse the top-level ``pacing:`` block (#4228).
+
+    Absent block (``None``) yields ``PacingConfig(enabled=False)`` —
+    exactly today's behaviour: no pacing signal, every dispatch picks its
+    mode by issue shape alone, same as before this block existed.
+    """
+    if raw is None:
+        return PacingConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'pacing' must be a mapping")
+
+    cfg = PacingConfig()
+
+    known = {
+        "enabled",
+        "reset_weekday",
+        "reset_time",
+        "tz",
+        "behind_gap_pct",
+        "ahead_gap_pct",
+        "session_near_limit_pct",
+        "behind_concurrency_multiplier",
+        "ahead_concurrency_multiplier",
+    }
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(f"pacing has unknown key(s): {', '.join(unknown)}")
+
+    if "enabled" in raw:
+        value = raw["enabled"]
+        if not isinstance(value, bool):
+            raise ConfigError("pacing.enabled must be a boolean")
+        cfg.enabled = value
+
+    if "reset_weekday" in raw:
+        value = raw["reset_weekday"]
+        if not isinstance(value, str) or value.lower() not in WEEKDAY_NAMES:
+            raise ConfigError(
+                "pacing.reset_weekday must be one of: " + ", ".join(WEEKDAY_NAMES)
+            )
+        cfg.reset_weekday = WEEKDAY_NAMES.index(value.lower())
+
+    if "reset_time" in raw:
+        cfg.reset_time = _parse_hhmm(raw["reset_time"], field_path="pacing.reset_time")
+
+    if "tz" in raw:
+        tz = raw["tz"]
+        if not isinstance(tz, str) or not tz:
+            raise ConfigError("pacing.tz must be a non-empty IANA zone name string")
+        try:
+            ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError, OSError) as e:
+            raise ConfigError(f"pacing.tz {tz!r} is not a known IANA zone name: {e}") from e
+        cfg.tz = tz
+
+    for key in ("behind_gap_pct", "ahead_gap_pct", "session_near_limit_pct"):
+        if key in raw:
+            value = raw[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not (0 <= value <= 100)
+            ):
+                raise ConfigError(f"pacing.{key} must be a number between 0 and 100")
+            setattr(cfg, key, float(value))
+
+    for key in ("behind_concurrency_multiplier", "ahead_concurrency_multiplier"):
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ConfigError(f"pacing.{key} must be a positive number")
+            setattr(cfg, key, float(value))
+
+    if cfg.enabled and not cfg.tz:
+        raise ConfigError(
+            "pacing.tz is required when pacing.enabled is true (IANA zone name, "
+            "e.g. 'America/Chicago') — pacing never defaults to the daemon's own "
+            "UTC clock, since that would silently misjudge the weekly curve by "
+            "the operator's own UTC offset"
+        )
 
     return cfg
 

@@ -58,7 +58,10 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from datetime import time as _time_of_day
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 # Reuse the #859 absolute-path resolution (systemd --user strips PATH) rather
 # than re-deriving it — see coord.test_orchestrator.resolve_claude_bin's
@@ -66,7 +69,7 @@ from typing import TYPE_CHECKING
 from coord.test_orchestrator import resolve_claude_bin
 
 if TYPE_CHECKING:
-    from coord.config import ModelsConfig, UsageGateConfig
+    from coord.config import ModelsConfig, PacingConfig, UsageGateConfig
 
 # How long a cached probe stays valid. The `/usage` endpoint is itself
 # rate-limited and Claude Code serves bars up to 60 minutes stale anyway, so
@@ -511,3 +514,265 @@ def format_plan_limits(limits: PlanLimits) -> str:
         reset = f" (resets {m.resets_at})" if m.resets_at else ""
         lines.append(f"  week ({m.label}): {m.used_pct:.0f}% used{reset}")
     return "\n".join(lines)
+
+
+# ── budget-paced mode selection (#4228) ─────────────────────────────────────
+#
+# The #1466 gate above answers "is a dispatch about to run into the wall
+# RIGHT NOW". This section answers a different question: given the SHAPE of
+# the weekly window so far, is the account running ahead of or behind the
+# pace that would exhaust it right before next reset — and if so, should
+# `coord` prefer a cheap single leg, or a `coord:workflow` leg / native
+# tranche row (#4226/#4227) that trades efficiency for wall-clock time?
+#
+# The target curve is deliberately LINEAR: 0% at the reset instant, 100%
+# exactly one week later. A fancier curve (front- or back-loaded) is a
+# tuning exercise for later — the linear case is already enough to tell
+# "behind"/"ahead"/"on pace" apart, and is trivial to reason about and test.
+#
+# `PlanLimits.week_resets_at` (the probe's own prose) is NEVER read here —
+# it is free-text from `claude -p "/usage"`, not a stable contract to derive
+# a recurring schedule from (module docstring above). The operator states
+# the schedule directly via `PacingConfig.reset_weekday`/`.reset_time`/`.tz`
+# instead, and this section's own clock math is checked against THAT,
+# independent of whatever `/usage` happens to say about reset time.
+
+WEEK_SECONDS = 7.0 * 24.0 * 3600.0
+
+#: :func:`evaluate_pace`'s three "which mode should new work prefer" labels.
+#: ``"tranche_or_workflow"`` — behind pace, buy wall-clock time by batching;
+#: ``"single"`` — ahead of pace, or too close to the session wall to risk a
+#: long leg; ``"unconstrained"`` — on pace (or no pacing signal at all):
+#: today's issue-shape-only heuristic decides, unchanged.
+PACE_MODE_TRANCHE_OR_WORKFLOW = "tranche_or_workflow"
+PACE_MODE_SINGLE = "single"
+PACE_MODE_UNCONSTRAINED = "unconstrained"
+
+
+def seconds_since_weekly_reset(
+    now_ts: float, *, reset_weekday: int, reset_time: _time_of_day, tz: str
+) -> float:
+    """How far *now_ts* (unix seconds) sits past the most recent weekly
+    reset instant named by *reset_weekday* (``datetime.weekday()``
+    convention, ``Mon=0..Sun=6``), *reset_time*, and *tz* (a validated IANA
+    zone name — see :func:`coord.config._parse_pacing`).
+
+    Always in ``[0, WEEK_SECONDS)`` — walks back from *now_ts*, converted to
+    *tz*, to the most recent matching weekday/time, stepping back a further
+    7 days if that candidate is still in the future (the weekday matched
+    today, but the time-of-day hasn't happened yet this week).
+    """
+    now_local = datetime.fromtimestamp(now_ts, tz=ZoneInfo(tz))
+    days_since = (now_local.weekday() - reset_weekday) % 7
+    candidate = (now_local - timedelta(days=days_since)).replace(
+        hour=reset_time.hour,
+        minute=reset_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    if candidate > now_local:
+        candidate -= timedelta(days=7)
+    return (now_local - candidate).total_seconds()
+
+
+def target_week_spend_pct(now_ts: float, pacing_cfg: "PacingConfig") -> float:
+    """The target-spend-curve's own position at *now_ts* — 0% right at the
+    reset instant, linearly reaching 100% exactly one week later (see this
+    section's module comment for why linear). Clamped to ``[0, 100]`` so a
+    clock skew or a misconfigured schedule can never read as "over 100%
+    behind schedule" or negative.
+    """
+    elapsed = seconds_since_weekly_reset(
+        now_ts,
+        reset_weekday=pacing_cfg.reset_weekday,
+        reset_time=pacing_cfg.reset_time,
+        tz=pacing_cfg.tz,
+    )
+    fraction = max(0.0, min(1.0, elapsed / WEEK_SECONDS))
+    return fraction * 100.0
+
+
+@dataclass(frozen=True)
+class PaceDecision:
+    """:func:`evaluate_pace`'s full verdict: where the account sits against
+    its own target spend curve, and what that implies for THIS tick's mode
+    and concurrency choices.
+
+    ``status`` is the load-bearing field, same discipline as
+    :attr:`PlanLimits.status`: ``"disabled"`` (``pacing.enabled`` is
+    ``False``) and ``"unknown"`` (the probe has no usable ``week_pct``) both
+    mean "no pacing signal" and MUST be treated identically to "on pace" by
+    any caller — never as license to assume either "behind" or "ahead".
+    ``"behind"``/``"ahead"``/``"on_pace"`` are the three real readings.
+
+    ``near_session_limit`` is independent of ``status`` — the weekly curve
+    can be ``"behind"`` while the account is simultaneously about to hit the
+    5h session wall, in which case :attr:`preferred_mode` and
+    :attr:`allow_tranche_or_workflow` reflect the session limit (never start
+    a long leg that might hit the wall mid-run), not the weekly reading.
+    """
+
+    status: str  # "disabled" | "unknown" | "behind" | "ahead" | "on_pace"
+    target_pct: float | None
+    actual_pct: float | None
+    gap_pct: float | None  # actual - target; negative => behind, positive => ahead
+    near_session_limit: bool
+    preferred_mode: str  # PACE_MODE_*
+    concurrency_multiplier: float
+    allow_tranche_or_workflow: bool
+    message: str
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "target_pct": self.target_pct,
+            "actual_pct": self.actual_pct,
+            "gap_pct": self.gap_pct,
+            "near_session_limit": self.near_session_limit,
+            "preferred_mode": self.preferred_mode,
+            "concurrency_multiplier": self.concurrency_multiplier,
+            "allow_tranche_or_workflow": self.allow_tranche_or_workflow,
+            "message": self.message,
+        }
+
+
+def _no_signal_decision(status: str, message: str) -> PaceDecision:
+    """``"disabled"``/``"unknown"`` both resolve to "behave exactly as
+    today" — unconstrained mode, no concurrency change, tranche/workflow
+    starts allowed (today's issue-shape-only heuristic still governs them).
+    """
+    return PaceDecision(
+        status=status,
+        target_pct=None,
+        actual_pct=None,
+        gap_pct=None,
+        near_session_limit=False,
+        preferred_mode=PACE_MODE_UNCONSTRAINED,
+        concurrency_multiplier=1.0,
+        allow_tranche_or_workflow=True,
+        message=message,
+    )
+
+
+def evaluate_pace(
+    limits: PlanLimits,
+    pacing_cfg: "PacingConfig",
+    *,
+    now: float | None = None,
+) -> PaceDecision:
+    """Pure decision: given a probed :class:`PlanLimits` and a
+    ``coord.config.PacingConfig``, how far is the account from its own
+    target spend curve, and what should THIS tick prefer for mode and
+    concurrency (#4228)?
+
+    - ``pacing_cfg.enabled`` is ``False`` (the on/off switch, same
+      vocabulary as ``usage_gate.mode == "disabled"``) → ``status=
+      "disabled"``, no pacing signal, everything today's heuristics would
+      do anyway.
+    - ``limits`` not ``ok``, or ``week_pct`` missing (non-OAuth auth, a
+      garbled probe) → ``status="unknown"``, same "no signal" treatment —
+      a probe we can't trust must never be read as "ahead" or "behind".
+    - Otherwise, compares ``limits.week_pct`` against
+      :func:`target_week_spend_pct` at *now* (defaults to
+      ``time.time()``):
+      - ``gap_pct <= -pacing_cfg.behind_gap_pct`` → ``"behind"``: prefer
+        :data:`PACE_MODE_TRANCHE_OR_WORKFLOW` and raise concurrency by
+        ``behind_concurrency_multiplier``.
+      - ``gap_pct >= pacing_cfg.ahead_gap_pct`` → ``"ahead"``: prefer
+        :data:`PACE_MODE_SINGLE`, hold back new tranche/workflow starts,
+        and lower concurrency by ``ahead_concurrency_multiplier``.
+      - Otherwise → ``"on_pace"``: :data:`PACE_MODE_UNCONSTRAINED`, no
+        concurrency change — today's issue-shape heuristic decides.
+    - Independently of the weekly reading: ``limits.session_pct >=
+      pacing_cfg.session_near_limit_pct`` forces
+      ``near_session_limit=True``, which overrides :attr:`PaceDecision.
+      preferred_mode` to :data:`PACE_MODE_SINGLE` and
+      :attr:`~PaceDecision.allow_tranche_or_workflow` to ``False`` — a long
+      workflow/tranche leg must never be preferred (or allowed to
+      auto-form, #4226) while close enough to the 5h wall that it could hit
+      it mid-run, no matter how far behind the weekly curve the account is.
+    """
+    if not pacing_cfg.enabled:
+        return _no_signal_decision("disabled", "pacing is disabled (pacing.enabled: false)")
+    if not limits.ok or limits.week_pct is None:
+        return _no_signal_decision(
+            "unknown",
+            "usage probe unavailable or has no week_pct — no pacing signal, "
+            "defaulting to today's behaviour",
+        )
+
+    now_ts = now if now is not None else time.time()
+    target = target_week_spend_pct(now_ts, pacing_cfg)
+    actual = limits.week_pct
+    gap = actual - target
+
+    near_session_limit = (
+        limits.session_pct is not None
+        and limits.session_pct >= pacing_cfg.session_near_limit_pct
+    )
+
+    if gap <= -pacing_cfg.behind_gap_pct:
+        status = "behind"
+        weekly_mode = PACE_MODE_TRANCHE_OR_WORKFLOW
+        multiplier = pacing_cfg.behind_concurrency_multiplier
+        allow_weekly = True
+        weekly_note = (
+            f"behind weekly pace (target {target:.0f}%, actual {actual:.0f}%) — "
+            "preferring tranche/workflow legs and raising concurrency"
+        )
+    elif gap >= pacing_cfg.ahead_gap_pct:
+        status = "ahead"
+        weekly_mode = PACE_MODE_SINGLE
+        multiplier = pacing_cfg.ahead_concurrency_multiplier
+        allow_weekly = False
+        weekly_note = (
+            f"ahead of weekly pace (target {target:.0f}%, actual {actual:.0f}%) — "
+            "preferring single legs, holding back new tranche/workflow starts, "
+            "and lowering concurrency"
+        )
+    else:
+        status = "on_pace"
+        weekly_mode = PACE_MODE_UNCONSTRAINED
+        multiplier = 1.0
+        allow_weekly = True
+        weekly_note = f"on weekly pace (target {target:.0f}%, actual {actual:.0f}%)"
+
+    if near_session_limit:
+        preferred_mode = PACE_MODE_SINGLE
+        allow = False
+        message = (
+            f"{weekly_note}; session usage {limits.session_pct:.0f}% is at/above "
+            f"the near-limit threshold ({pacing_cfg.session_near_limit_pct:.0f}%) — "
+            "holding back long workflow/tranche starts regardless of weekly pace"
+        )
+    else:
+        preferred_mode = weekly_mode
+        allow = allow_weekly
+        message = weekly_note
+
+    return PaceDecision(
+        status=status,
+        target_pct=target,
+        actual_pct=actual,
+        gap_pct=gap,
+        near_session_limit=near_session_limit,
+        preferred_mode=preferred_mode,
+        concurrency_multiplier=multiplier,
+        allow_tranche_or_workflow=allow,
+        message=message,
+    )
+
+
+def format_pace_decision(decision: PaceDecision) -> str:
+    """Render *decision* for ``coord drive-queue status`` and ``coord
+    usage --limits`` — the human-readable counterpart to
+    :func:`format_plan_limits`, one line summarising the pace, the mode
+    preference, and why.
+    """
+    if decision.status in ("disabled", "unknown"):
+        return f"Budget pace: {decision.message}"
+    return (
+        f"Budget pace: {decision.status} — {decision.message} "
+        f"(mode preference: {decision.preferred_mode}, "
+        f"concurrency x{decision.concurrency_multiplier:.2f})"
+    )
