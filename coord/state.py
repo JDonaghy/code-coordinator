@@ -11419,7 +11419,8 @@ _DRIVE_QUEUE_COLUMNS = (
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
     "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at, "
     "max_fix_rounds, no_acceptance, plan_destructive, apply_verdict, "
-    "apply_verdict_reason, apply_verdict_at, legs_at_enqueue"
+    "apply_verdict_reason, apply_verdict_at, legs_at_enqueue, "
+    "intervention_json"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -11467,18 +11468,31 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
         # `legs_at_enqueue`). `position`/`machine` stay enqueue/move-only;
         # only the edge list itself is updatable here.
         "after_json",
+        # #4216: operator/agent-declared — written by `coord drive-queue
+        # note`/`coord.state.set_drive_queue_intervention`/
+        # `clear_drive_queue_intervention`, never by a tick. Updatable
+        # (rather than enqueue/move-only like `after_json` just above)
+        # because it must be settable mid-queue-life, against a row the
+        # operator never re-`add`s.
+        "intervention_json",
     }
 )
 
 
 def _decode_drive_queue_row(row) -> dict:
-    """One ``drive_queue`` row as a dict with ``after_json`` decoded to a list.
+    """One ``drive_queue`` row as a dict with ``after_json``/``intervention_
+    json`` decoded to their wire types.
 
     Mirrors ``coord.board_schema.BoardDriveQueueEntry``'s ``after_json:
     list[str]`` field so the ``/drive-queue`` and ``/board`` payloads agree:
     ``after_json`` is a real JSON array on the wire,
     never a string. A row written by hand with unparseable JSON degrades to
     ``[]`` rather than blowing up the whole list read.
+
+    #4216: ``intervention_json`` decodes the same way, to a ``dict`` (or
+    ``None`` for the common "nothing recorded" case — the empty-string
+    column default) rather than ``[]``, matching
+    ``BoardDriveQueueEntry.intervention_json``'s ``dict | None`` annotation.
     """
     entry = dict(row)
     raw = entry.get("after_json")
@@ -11490,6 +11504,19 @@ def _decode_drive_queue_row(row) -> dict:
         entry["after_json"] = decoded if isinstance(decoded, list) else []
     elif raw is None:
         entry["after_json"] = []
+    raw_intervention = entry.get("intervention_json")
+    if isinstance(raw_intervention, str):
+        decoded_intervention = None
+        if raw_intervention:
+            try:
+                decoded_intervention = json.loads(raw_intervention)
+            except (TypeError, ValueError):
+                decoded_intervention = None
+        entry["intervention_json"] = (
+            decoded_intervention if isinstance(decoded_intervention, dict) else None
+        )
+    elif not isinstance(raw_intervention, dict):
+        entry["intervention_json"] = None
     return entry
 
 
@@ -12057,6 +12084,18 @@ def _update_drive_queue_entry_local(
         # daemon's `/drive-queue` update handler call this same function),
         # so no caller can set one without the other.
         fields = {**fields, "reason_at": time.time()}
+    if fields.get("state") == "done" and "intervention_json" not in fields:
+        # #4216: a row reaching `done` ("done" literal mirrors
+        # `coord.drive_queue.STATE_DONE` — this module cannot import that
+        # name without a circular import, see `coord.drive_queue`'s own
+        # module docstring) clears any intervention record automatically —
+        # the rescue it described, if any, is moot once the row is finished,
+        # and leaving it would show a stale "held: ..." reason on a row that
+        # is actually done. Skipped when the SAME call already supplies its
+        # own `intervention_json` (none does today), so a future caller
+        # that wants to set `state="done"` and a fresh record in one write
+        # is never silently overridden.
+        fields = {**fields, "intervention_json": ""}
 
     # #2846: wrapped in retry_on_locked like every other write in this
     # module (UPDATE-by-natural-key is idempotent, so extending the retry
@@ -12074,6 +12113,68 @@ def _update_drive_queue_entry_local(
         return cur.rowcount > 0
 
     return retry_on_locked(_write)
+
+
+def set_drive_queue_intervention(
+    repo_name: str,
+    issue_number: int,
+    *,
+    by: str,
+    did: str,
+    next_step: str,
+    sha: str | None = None,
+    stale_after_seconds: float | None = None,
+    now: float | None = None,
+) -> bool:
+    """Record a #4216 out-of-band-rescue note on REPO#ISSUE's drive-queue row.
+
+    Written by ``coord drive-queue note`` whenever an operator or agent
+    rescues a row outside the queue's own commands (a hand push, a fix to a
+    red base, a CI rerun) — something the tick itself has no way to observe.
+    The record is a plain JSON object (``by``/``did``/``next``/``sha``/
+    ``at``/``stale_after``); :func:`coord.drive_queue.
+    format_intervention_reason` is what turns it into the row's displayed
+    reason (``coord drive-queue list``, the board API, the dashboard) —
+    this function only stores it.
+
+    *stale_after_seconds* is ``None`` unless the caller overrides it — a
+    `None` reads as "use :data:`coord.drive_queue.
+    INTERVENTION_DEFAULT_STALE_SECONDS`" at DISPLAY time (never baked in
+    here), so a later change to that default also applies to every
+    already-recorded row, not just new ones. *now* mirrors every other
+    ``now=`` parameter in this tree (DQ-2's "no ambient state" rule) —
+    ``None`` reads the wall clock.
+
+    Routes to the daemon the same way :func:`update_drive_queue_entry`
+    already does (this is a thin wrapper around it); returns whether a row
+    was actually updated.
+    """
+    record: dict[str, Any] = {
+        "by": by,
+        "did": did,
+        "next": next_step,
+        "sha": sha,
+        "at": time.time() if now is None else now,
+        "stale_after": (
+            stale_after_seconds if stale_after_seconds and stale_after_seconds > 0
+            else None
+        ),
+    }
+    return update_drive_queue_entry(
+        repo_name, issue_number, intervention_json=json.dumps(record)
+    )
+
+
+def clear_drive_queue_intervention(repo_name: str, issue_number: int) -> bool:
+    """Remove REPO#ISSUE's #4216 intervention record, if any.
+
+    Also happens automatically the moment a row reconciles to `done` (see
+    ``_update_drive_queue_entry_local``'s own state="done" clear) — this is
+    the explicit ``coord drive-queue note --clear`` path for every other
+    case: the rescue turned out to be unnecessary, or was recorded against
+    the wrong row.
+    """
+    return update_drive_queue_entry(repo_name, issue_number, intervention_json="")
 
 
 def move_drive_queue_entry(

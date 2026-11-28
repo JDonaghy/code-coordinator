@@ -2468,6 +2468,15 @@ class QueueEntry:
     # predating this column, which reproduces the pre-#3463
     # `work_leg_count - 1` formula exactly for that row.
     legs_at_enqueue: int = 0
+    # #4216: an operator/agent's own record of an out-of-band rescue (a hand
+    # push, a fix to a red base, a CI rerun) — `None` when nothing is
+    # recorded, otherwise ``{"by", "did", "next", "sha", "at",
+    # "stale_after"}`` (see `coord/db.py`'s CREATE TABLE comment for the
+    # exact shape). Written only by `coord drive-queue note`
+    # (`coord.state.set_drive_queue_intervention`); never by a tick — see
+    # `format_intervention_reason` for how it overrides this row's
+    # displayed reason while active.
+    intervention: dict | None = None
 
     @property
     def key(self) -> str:
@@ -2569,7 +2578,28 @@ class QueueEntry:
                 else float(row.get("apply_verdict_at"))
             ),
             legs_at_enqueue=int(row.get("legs_at_enqueue") or 0),
+            intervention=cls._parse_intervention(row.get("intervention_json")),
         )
+
+    @staticmethod
+    def _parse_intervention(raw: Any) -> dict | None:
+        """``row["intervention_json"]`` -> a `dict`, or `None`.
+
+        Accepts a real `dict` (the `/board`/`/drive-queue` wire shape,
+        already JSON-decoded) or a JSON string (reading the table
+        directly) — same dual acceptance `from_row`'s `after_json` handling
+        gives above. An empty string, `None`, or unparseable/non-object
+        JSON all degrade to `None` ("nothing recorded") rather than raising.
+        """
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw:
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+            return decoded if isinstance(decoded, dict) else None
+        return None
 
 
 def entries_from_rows(rows: Iterable[Mapping[str, Any]]) -> list[QueueEntry]:
@@ -4538,6 +4568,7 @@ def _resolve_prereqs(
     live_prereq_terminal: Mapping[str, bool] | None = None,
     dep_reasons: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+    dep_interventions: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> _Verdict:
     """Decide whether *entry* may launch now.
 
@@ -4621,6 +4652,20 @@ def _resolve_prereqs(
     unchanged pre-#3934 reasoning — the production default today, since
     nothing yet wires a live `reconcile_entry` call into the shell that
     builds this mapping.
+
+    *dep_interventions* (#4216) maps a dep key to its own active `coord
+    drive-queue note` record, when one exists — the same "prefer this
+    tick's fresh write" map `plan_tick` builds alongside `dep_reasons`.
+    Consulted in the SAME `dep_state in (STATE_BLOCKED, STATE_FAILED)`
+    branch *dep_reasons* is: a dep a human/agent has already recorded a
+    rescue against is, by that record's own claim, being worked outside the
+    queue — rendering the dependent's verdict as "it will never satisfy"
+    would contradict the operator's own note. This instead returns an
+    ordinary deferral naming who holds it, so the dependent keeps its
+    position and re-derives a fresh verdict next tick, same as the
+    *dep_reasons* #3368 case. A key ABSENT here (no active record, or one
+    that was never recorded) keeps the pre-#4216 "it will never satisfy"
+    verdict unchanged.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -4761,6 +4806,19 @@ def _resolve_prereqs(
                         "confirmed-still-shut gate — retrying, not blocked "
                         "permanently, #3368)",
                     )
+                dep_intervention = (dep_interventions or {}).get(dep)
+                if dep_intervention:
+                    # #4216: an operator/agent has already recorded a
+                    # rescue against *dep* — see this function's own
+                    # docstring. Naming who holds it (never the raw record)
+                    # keeps this a single sentence, consistent with every
+                    # other deferral reason this branch returns.
+                    held_by = str(dep_intervention.get("by") or "operator")
+                    return _Verdict(
+                        False,
+                        False,
+                        f"waiting on {dep} (held by {held_by} — #4216)",
+                    )
                 return _Verdict(
                     False,
                     True,
@@ -4829,6 +4887,7 @@ def diagnose_blocked_after(
     live_prereq_terminal: Mapping[str, bool] | None = None,
     dep_reasons: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+    dep_interventions: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> BlockedAfterDiagnosis:
     """Re-check a `blocked`/`failed` row's `after=` graph against the CURRENT
     board, fresh on every render (#2183).
@@ -4892,6 +4951,13 @@ def diagnose_blocked_after(
     show a dep as still-pending once a live truth says otherwise, the exact
     #2096 "one question, one answer" this issue exists to enforce against
     the dep's own possibly-stale queue-row ``state``.
+
+    *dep_interventions* (#4216) is passed straight through to
+    :func:`_resolve_prereqs` — see its own docstring. Threading it through
+    here is what lets `coord drive-queue list`/`status` show a dependent as
+    "waiting on ... (held by ...)" instead of "it will never satisfy" the
+    moment an operator/agent records a rescue against the named pre-req,
+    without waiting on a real tick to re-derive the same verdict.
     """
     live_terminal = live_prereq_terminal or {}
     truth_map = prereq_truth or {}
@@ -4911,6 +4977,7 @@ def diagnose_blocked_after(
         live_prereq_terminal=live_prereq_terminal,
         dep_reasons=dep_reasons,
         prereq_truth=prereq_truth,
+        dep_interventions=dep_interventions,
     )
     return BlockedAfterDiagnosis(
         unsatisfied,
@@ -5290,6 +5357,71 @@ def format_coarse_duration(delta_seconds: float) -> str:
     return f"{int(delta_seconds // 86400)}d"
 
 
+# #4216: the default window after which a `coord drive-queue note` record
+# reads as stale (:func:`intervention_is_stale`) — six hours, this issue's
+# own acceptance bar. A record overrides it per-call via `--stale-after`
+# (`coord.state.set_drive_queue_intervention`'s `stale_after_seconds`),
+# stored on the record itself rather than in `coordinator.yml`: this is a
+# per-rescue judgment call ("how long should THIS fix be trusted without a
+# follow-up"), not fleet topology.
+INTERVENTION_DEFAULT_STALE_SECONDS = 6 * 3600
+
+
+def intervention_is_stale(intervention: Mapping[str, Any] | None, now: float) -> bool:
+    """True once *intervention*'s own ``at`` timestamp is older than its
+    ``stale_after`` window (:data:`INTERVENTION_DEFAULT_STALE_SECONDS` when
+    the record didn't override it).
+
+    ``False`` for ``None`` (no record at all) or a record whose ``at`` is
+    missing/unparseable — nothing to measure staleness against, so this
+    reads as fresh rather than guessing stale.
+    """
+    if not intervention:
+        return False
+    at = intervention.get("at")
+    if not isinstance(at, (int, float)):
+        return False
+    stale_after = intervention.get("stale_after")
+    if not isinstance(stale_after, (int, float)) or stale_after <= 0:
+        stale_after = INTERVENTION_DEFAULT_STALE_SECONDS
+    return (now - at) > stale_after
+
+
+def format_intervention_reason(
+    intervention: Mapping[str, Any] | None, now: float,
+) -> str | None:
+    """The row's displayed reason while a `coord drive-queue note` record is
+    active, or ``None`` when there is none to show (#4216).
+
+    `coord drive-queue list`'s CLI rendering and `coord/serve_app.py`'s
+    `/board`/`/drive-queue` projections (which is how coord-tui and the
+    dashboard see it) both call this SAME function rather than each
+    composing their own sentence from the raw record — #2096/#2085's "one
+    question, one answer": the question here is "what should this held row
+    say right now".
+
+    ``held: <by> — <did>; next: <next>``, plus the SHA when one was given,
+    ordinarily. Once the record is older than its own staleness window
+    (:func:`intervention_is_stale`) the sentence is prefixed ``STALE`` and
+    says how long ago it was recorded — the same #2133 rationale
+    (`reason_at`) applied to a tick's own `last_reason`: a stale
+    observation must say so rather than silently keep reading as current.
+    """
+    if not intervention:
+        return None
+    by = str(intervention.get("by") or "operator")
+    did = str(intervention.get("did") or "")
+    next_step = str(intervention.get("next") or "")
+    sha = intervention.get("sha")
+    text = f"held: {by} — {did}; next: {next_step}"
+    if sha:
+        text = f"{text} (sha {sha})"
+    if intervention_is_stale(intervention, now):
+        age = format_coarse_duration(max(0.0, now - float(intervention["at"])))
+        text = f"STALE {text} (recorded {age} ago — may no longer hold)"
+    return text
+
+
 def is_unreachable_wait(
     entry: QueueEntry,
     *,
@@ -5473,6 +5605,7 @@ def _reconcile_blocked_after(
     live_prereq_terminal: Mapping[str, bool] | None = None,
     dep_reasons: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+    dep_interventions: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Reconcile | None:
     """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
     `after=` pre-req, once every named pre-req has since landed. #2756:
@@ -5560,7 +5693,7 @@ def _reconcile_blocked_after(
         return None
     diagnosis = diagnose_blocked_after(
         entry, board, states, cycle_keys, live_prereq_terminal, dep_reasons,
-        prereq_truth,
+        prereq_truth, dep_interventions,
     )
     if diagnosis.unsatisfiable:
         return None
@@ -9475,6 +9608,15 @@ def plan_tick(
     # recorded — instead of the `own_reason`-based text `reconcile.reason`
     # carries fresh, right below.
     effective_last_reason: dict[str, str] = {e.key: e.last_reason for e in ordered}
+    # #4216: a dep key's own active `coord drive-queue note` record, when
+    # one exists — threaded to `_resolve_prereqs`/`diagnose_blocked_after`/
+    # `_reconcile_blocked_after` the same way `effective_last_reason` above
+    # is, so the launch walk's "it will never satisfy" verdict for a
+    # dependent can read "held by ..." instead the SAME tick a rescue is
+    # recorded, without waiting on a stale snapshot.
+    effective_interventions: dict[str, Mapping[str, Any]] = {
+        e.key: e.intervention for e in ordered if e.intervention
+    }
 
     def _refresh_only(reason: str, current: str) -> dict[str, Any]:
         """``{}`` unless *reason* is non-empty and differs from *current*.
@@ -9743,6 +9885,7 @@ def plan_tick(
                 live_prereq_terminal,
                 effective_last_reason,
                 prereq_truth,
+                effective_interventions,
             )
             if blocked_reconcile is None:
                 # #3695: re-check a Test-stage routing dead end (no
@@ -10455,6 +10598,7 @@ def plan_tick(
                 live_prereq_terminal,
                 effective_last_reason,
                 prereq_truth,
+                effective_interventions,
             )
             updates = _refresh_only(verdict.reason, entry.last_reason)
             if not updates:
@@ -10678,6 +10822,7 @@ def plan_tick(
                 live_prereq_terminal,
                 effective_last_reason,
                 prereq_truth,
+                effective_interventions,
             )
             if not verdict.satisfied:
                 deferrals.append(
@@ -10798,6 +10943,7 @@ def plan_tick(
             live_prereq_terminal,
             effective_last_reason,
             prereq_truth,
+            effective_interventions,
         )
         if verdict.unsatisfiable:
             blocked.append(

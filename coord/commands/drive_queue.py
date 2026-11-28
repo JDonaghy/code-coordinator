@@ -95,6 +95,8 @@ from coord.drive_queue import (
     fired_holds,
     flag_shadows_config_warning,
     format_coarse_duration,
+    format_intervention_reason,
+    INTERVENTION_DEFAULT_STALE_SECONDS,
     is_benign_queue_alert_command,
     is_dispatch_failure_reason,
     is_fix_round_ceiling_blocked,
@@ -1969,6 +1971,11 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     # probe failure" text must read the same way here as it does in
     # `coord.drive_queue._resolve_prereqs`.
     dep_reasons = {e.key: e.last_reason for e in all_entries}
+    # #4216: same "thread it through so a render never disagrees with a
+    # live tick" rule as `dep_reasons` just above, for a dep's own active
+    # `coord drive-queue note` record — see `_resolve_prereqs`'s
+    # `dep_interventions` docstring.
+    dep_interventions = {e.key: e.intervention for e in all_entries if e.intervention}
     cycle_keys: dict[str, str] = {}
     cycle = find_cycle({e.key: list(e.after) for e in all_entries})
     if cycle is not None:
@@ -2005,7 +2012,8 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             if not is_unsatisfiable_prereq_reason(candidate.last_reason):
                 continue
             pre_diag = diagnose_blocked_after(
-                candidate, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons
+                candidate, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons,
+                dep_interventions=dep_interventions,
             )
             if not pre_diag.unsatisfiable:
                 cascaded_states[candidate.key] = STATE_WAITING
@@ -2018,7 +2026,8 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         dependency_reason = ""
         if diagnosed:
             diagnosis = diagnose_blocked_after(
-                entry, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons
+                entry, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons,
+                dep_interventions=dep_interventions,
             )
             unsatisfied = diagnosis.unsatisfied
             dependency_reason = diagnosis.dependency_reason
@@ -2148,11 +2157,23 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         # caused (no `after=`, or its real cause is unrelated to it) keeps
         # showing its own frozen `last_reason` exactly as before.
         using_fresh_reason = diagnosed and bool(dependency_reason)
-        display_reason = dependency_reason if using_fresh_reason else entry.last_reason
+        # #4216: an active `coord drive-queue note` record on THIS row wins
+        # over both — the operator's own account of what is actually
+        # happening outranks any `after=` re-diagnosis or frozen
+        # `last_reason`, the same override `coord/serve_app.py`'s
+        # board/drive-queue projections apply for coord-tui/the dashboard
+        # (one function, one answer: #2096).
+        intervention_reason = format_intervention_reason(entry.intervention, now)
+        if intervention_reason is not None:
+            display_reason = intervention_reason
+            using_fresh_reason = True
+        else:
+            display_reason = dependency_reason if using_fresh_reason else entry.last_reason
         # The age suffix (#2133) times how long `entry.last_reason` has sat
         # unrevalidated — meaningless (and actively misleading, implying the
         # fresh sentence is itself stale) once that text has been swapped
-        # for a diagnosis computed THIS call.
+        # for a diagnosis computed THIS call (or an active intervention
+        # record, which carries its own staleness marker instead).
         age_suffix = "" if using_fresh_reason else _reason_age_suffix(entry, now)
         if display_reason:
             click.echo(f"      last{age_suffix}: {display_reason}")
@@ -2482,6 +2503,140 @@ def drive_queue_log_intervention(
         )
         return
     click.echo(f"logged a {category!r} intervention against {key}")
+
+
+# ── note (#4216) ─────────────────────────────────────────────────────────────
+
+
+@drive_queue_group.command("note")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--by", default="",
+    help="Who performed the rescue — a person or agent identifier.",
+)
+@click.option(
+    "--did", default="",
+    help='What you actually did, in your own words (e.g. "force-pushed a '
+    'rebase onto green main").',
+)
+@click.option(
+    "--next", "next_step", default="",
+    help='What should happen next (e.g. "CI rerun in flight, re-check in '
+    '20m").',
+)
+@click.option(
+    "--sha", default=None,
+    help="The commit SHA the rescue landed, if any — shown alongside the note.",
+)
+@click.option(
+    "--stale-after", "stale_after_seconds", type=float, default=None,
+    help="Seconds after which this record reads as stale (default "
+    f"{INTERVENTION_DEFAULT_STALE_SECONDS}s = 6h).",
+)
+@click.option(
+    "--clear", "clear_flag", is_flag=True, default=False,
+    help="Remove the current intervention record instead of writing one.",
+)
+@_CONFIG_OPTION
+def drive_queue_note(
+    repo: str,
+    issue: int,
+    by: str,
+    did: str,
+    next_step: str,
+    sha: str | None,
+    stale_after_seconds: float | None,
+    clear_flag: bool,
+    config_path: Path,
+) -> None:
+    """Record (or `--clear`) a note that a human/agent rescued REPO ISSUE
+    outside the drive queue's own commands (#4216).
+
+    The drive queue has no way to see a hand push, a fix to a red base, or a
+    CI rerun done directly against GitHub — a blocked/parked row keeps
+    showing its OLD gate reading (e.g. "blocked: fix-round ceiling") and its
+    dependents keep showing "it will never satisfy", while the real state
+    has already moved on. This command records your own account of what
+    happened; it does not re-derive or verify anything live itself.
+
+    Once recorded, the row's displayed reason in `coord drive-queue list`,
+    the board API (coord-tui), and the dashboard all become `held: <--by>
+    — <--did>; next: <--next>` instead of the stale reading underneath —
+    and any dependent waiting on REPO ISSUE shows "waiting on ... (held by
+    <--by>)" instead of "it will never satisfy", within one tick. The
+    record goes stale after `--stale-after` seconds (default 6h) and then
+    displays as stale rather than silently keeping on display. `--clear`
+    removes it outright and restores the underlying reading; a row that
+    reaches `done` on its own clears it automatically.
+    """
+    from coord.state import (  # noqa: PLC0415
+        clear_drive_queue_intervention,
+        get_drive_queue_entry,
+        set_drive_queue_intervention,
+    )
+
+    key = entry_key(repo, issue)
+    existing = get_drive_queue_entry(repo, issue)
+    if existing is None:
+        raise click.ClickException(f"{key} is not in the drive queue — nothing to note")
+
+    if clear_flag:
+        if by or did or next_step or sha or stale_after_seconds is not None:
+            raise click.ClickException(
+                "--clear cannot be combined with --by/--did/--next/--sha/--stale-after"
+            )
+        cleared = clear_drive_queue_intervention(repo, issue)
+        if not cleared:
+            raise click.ClickException(f"failed to clear the intervention record on {key}")
+        # #2096: "did not raise" is not "cleared" — read the row back and
+        # confirm before telling the operator it's gone, the same posture
+        # `drive_queue_log_intervention` already applies to its own write.
+        after = get_drive_queue_entry(repo, issue)
+        if after is None or after.get("intervention_json"):
+            raise click.ClickException(
+                f"clear reported success but {key}'s record did not actually "
+                "clear on read-back — try again"
+            )
+        click.echo(f"cleared the intervention record on {key}")
+        return
+
+    by = by.strip()
+    did = did.strip()
+    next_step = next_step.strip()
+    missing = [
+        flag for flag, value in (("--by", by), ("--did", did), ("--next", next_step))
+        if not value
+    ]
+    if missing:
+        raise click.ClickException(
+            f"{', '.join(missing)} must not be empty (pass --clear instead "
+            "to remove the current record)"
+        )
+
+    written = set_drive_queue_intervention(
+        repo, issue, by=by, did=did, next_step=next_step, sha=sha,
+        stale_after_seconds=stale_after_seconds,
+    )
+    if not written:
+        raise click.ClickException(f"failed to record the intervention on {key}")
+    # #2096: read the row back and confirm the record we just wrote is
+    # actually what is stored before telling the operator it's recorded —
+    # the same posture `drive_queue_log_intervention` already applies.
+    after = get_drive_queue_entry(repo, issue)
+    recorded = after.get("intervention_json") if after is not None else None
+    if not isinstance(recorded, dict) or recorded.get("by") != by or recorded.get("did") != did:
+        raise click.ClickException(
+            f"note reported success but {key}'s record did not match on "
+            "read-back — try again"
+        )
+    click.echo(f"recorded on {key}: {format_intervention_reason(recorded, time.time())}")
+    click.echo(
+        "this overrides the row's displayed reason in `coord drive-queue "
+        "list`, the board API, and its dependents, until it goes stale, you "
+        f"`coord drive-queue note {repo} {issue} --clear` it, or the row "
+        "reaches `done`."
+    )
 
 
 # ── remove / move ────────────────────────────────────────────────────────────
