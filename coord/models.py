@@ -256,9 +256,21 @@ class TrancheRepoConfig:
     (`coord.agent.AssignmentSpec.tranche`) and has nothing to do with
     this repo-level config block or the `TrancheRow` it gates. The two
     reuse the same word ("a bounded batch of work") independently.
+
+    ``auto`` (#4226) is a SEPARATE opt-in, one rung further: with
+    ``enabled`` alone, a `TrancheRow` can exist for this repo but nothing
+    forms one on its own — a human (or a future caller) still has to
+    build and save it. ``auto`` lets the pre-start size-triage pass
+    (`coord.preflight_size.propose_tranche`) go the rest of the way and
+    actually form the row for a proposal it finds, instead of only
+    posting an advisory for an operator to act on. ``False`` by default,
+    same as ``enabled`` — and meaningless on its own: a caller must check
+    ``enabled`` too, since `auto=True, enabled=False` has nothing to turn
+    the proposal into.
     """
 
     enabled: bool = False
+    auto: bool = False
 
 
 @dataclass

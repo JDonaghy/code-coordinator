@@ -4685,10 +4685,11 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
 
 
 def _parse_tranche_repo_config(raw: Any, repo_index: int) -> TrancheRepoConfig:
-    """Parse the ``tranche`` block for a single repo (#4129/#4199).
+    """Parse the ``tranche`` block for a single repo (#4129/#4199, ``auto``
+    added by #4226).
 
-    When *raw* is ``None`` (key absent from YAML), ``enabled`` stays at
-    its opt-in-required-default ``False`` — see
+    When *raw* is ``None`` (key absent from YAML), both ``enabled`` and
+    ``auto`` stay at their opt-in-required-default ``False`` — see
     :class:`TrancheRepoConfig`.
     """
     if raw is None:
@@ -4697,7 +4698,7 @@ def _parse_tranche_repo_config(raw: Any, repo_index: int) -> TrancheRepoConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"repos[{repo_index}].tranche must be a mapping")
 
-    unknown = sorted(set(raw) - {"enabled"})
+    unknown = sorted(set(raw) - {"enabled", "auto"})
     if unknown:
         raise ConfigError(
             f"repos[{repo_index}].tranche has unknown key(s): {', '.join(unknown)}"
@@ -4709,6 +4710,11 @@ def _parse_tranche_repo_config(raw: Any, repo_index: int) -> TrancheRepoConfig:
         if not isinstance(enabled, bool):
             raise ConfigError(f"repos[{repo_index}].tranche.enabled must be a boolean")
         cfg.enabled = enabled
+    if "auto" in raw:
+        auto = raw["auto"]
+        if not isinstance(auto, bool):
+            raise ConfigError(f"repos[{repo_index}].tranche.auto must be a boolean")
+        cfg.auto = auto
     return cfg
 
 

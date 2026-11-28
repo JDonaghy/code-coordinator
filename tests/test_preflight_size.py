@@ -24,12 +24,18 @@ from coord.models import SplitChunk, SplitProposal
 from coord.overlap_predict import parse_declared_files
 from coord.preflight_size import (
     DEFAULT_THRESHOLDS,
+    MAX_TRANCHE_MEMBERS,
+    MIN_TRANCHE_MEMBERS,
     NO_BACKEND_SPLIT_MARKER,
     SealedAmendment,
+    SiblingIssue,
     SizeThresholds,
+    TrancheCandidate,
     build_cross_backend_split_proposal,
     build_slice_child_body,
     detect_cross_backend_scope,
+    propose_tranche,
+    render_tranche_advisory,
     score_issue_size,
     sealed_amendment_numbers,
     substitute_slice_tokens,
@@ -2096,3 +2102,372 @@ class TestBuildSliceChildBodyDoesNotDuplicateAParentFilesBlock:
         assert "src/gtk/list_view.rs" in body
         assert "src/macos/list_view.rs" in body
         assert "every backend renders identically" in body
+
+
+# ── propose_tranche / render_tranche_advisory (#4226) ───────────────────────
+
+
+def _files_body(*files: str) -> str:
+    lines = ["Some prose.", "", "## Files", ""]
+    lines.extend(f"- {f}" for f in files)
+    return "\n".join(lines)
+
+
+class TestProposeTrancheHappyPath:
+    def _epic_body(self) -> str:
+        return (
+            "## Work order\n"
+            "- #901  {group: migration}\n"
+            "- #902  {group: migration}\n"
+            "- #903  {group: migration}\n"
+            "- #904\n"
+        )
+
+    def test_forms_a_proposal_from_coupled_group_siblings(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py", "coord/bar.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=self._epic_body(),
+            siblings={
+                902: SiblingIssue(
+                    902, title="Migration part 2", body=_files_body("coord/foo.py")
+                ),
+                903: SiblingIssue(
+                    903, title="Migration part 3", body=_files_body("coord/bar.py")
+                ),
+            },
+            auto=True,
+        )
+        assert proposal is not None
+        assert proposal.member_issue_numbers == (901, 902, 903)
+        assert proposal.serial_recommended is False
+        assert proposal.serial_reason is None
+        assert proposal.formed is True
+        assert [c.coupled_files for c in proposal.candidates] == [
+            ("coord/foo.py",),
+            ("coord/bar.py",),
+        ]
+
+    def test_auto_off_never_forms_even_with_a_valid_proposal(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py", "coord/bar.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=self._epic_body(),
+            siblings={
+                902: SiblingIssue(
+                    902, title="Migration part 2", body=_files_body("coord/foo.py")
+                ),
+                903: SiblingIssue(
+                    903, title="Migration part 3", body=_files_body("coord/bar.py")
+                ),
+            },
+            auto=False,
+        )
+        assert proposal is not None
+        assert proposal.formed is False
+
+
+class TestProposeTrancheAnchorNotInEpic:
+    def test_returns_none_when_anchor_is_not_a_work_order_node(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=999,
+            anchor_issue_title="Unrelated issue",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=(
+                "## Work order\n- #901  {group: migration}\n- #902  {group: migration}\n"
+            ),
+            siblings={},
+            auto=True,
+        )
+        assert proposal is None
+
+    def test_returns_none_for_an_unparseable_work_order(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            # #901 declares after:#999, but #999 is never itself declared
+            # in the block -- WorkOrderError.
+            tracking_issue_body="## Work order\n- #901  {after: #999}\n",
+            siblings={},
+            auto=True,
+        )
+        assert proposal is None
+
+    def test_returns_none_with_no_work_order_at_all(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body="just prose, no work order heading at all",
+            siblings={},
+            auto=True,
+        )
+        assert proposal is None
+
+
+class TestProposeTrancheFallbackRules:
+    def _epic_body(self, *, serial_edge: bool = False) -> str:
+        after = "  {group: migration, after: #902}" if serial_edge else "  {group: migration}"
+        return (
+            "## Work order\n"
+            "- #901  {group: migration}\n"
+            "- #902  {group: migration}\n"
+            f"- #903{after}\n"
+        )
+
+    def test_too_few_coupled_siblings_returns_none(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=self._epic_body(),
+            siblings={
+                # Coupled, but claimed elsewhere -- unavailable.
+                902: SiblingIssue(
+                    902,
+                    title="Migration part 2",
+                    body=_files_body("coord/foo.py"),
+                    claimed=True,
+                ),
+                # Coupled and available, but that's only 2 total members.
+                903: SiblingIssue(
+                    903, title="Migration part 3", body=_files_body("coord/foo.py")
+                ),
+            },
+            auto=True,
+        )
+        assert proposal is None
+
+    def test_uncoupled_adjacent_sibling_is_dropped_not_counted(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=self._epic_body(),
+            siblings={
+                902: SiblingIssue(
+                    902, title="Migration part 2", body=_files_body("coord/foo.py")
+                ),
+                # Adjacent (same group) but declares a disjoint file --
+                # no coupling evidence at all.
+                903: SiblingIssue(
+                    903, title="Migration part 3", body=_files_body("unrelated/x.py")
+                ),
+            },
+            auto=True,
+        )
+        # Only #902 is coupled -- 2 total members, below the min -- so no
+        # proposal at all, and #903 must never silently pad the count.
+        assert proposal is None
+
+    def test_direct_dependency_between_kept_members_forces_serial(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=self._epic_body(serial_edge=True),
+            siblings={
+                902: SiblingIssue(
+                    902, title="Migration part 2", body=_files_body("coord/foo.py")
+                ),
+                903: SiblingIssue(
+                    903, title="Migration part 3", body=_files_body("coord/foo.py")
+                ),
+            },
+            auto=True,
+        )
+        assert proposal is not None
+        assert proposal.serial_recommended is True
+        assert "#903" in proposal.serial_reason
+        # Serial overrides auto -- a parallel row must never form here.
+        assert proposal.formed is False
+
+    def test_shared_integration_surface_is_coupling_evidence_on_its_own(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("migrations/schema/v1.sql"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=self._epic_body(),
+            siblings={
+                902: SiblingIssue(
+                    902,
+                    title="Migration part 2",
+                    body=_files_body("migrations/schema/v2.sql"),
+                ),
+                903: SiblingIssue(
+                    903,
+                    title="Migration part 3",
+                    body=_files_body("migrations/schema/v3.sql"),
+                ),
+            },
+            surface_paths=["migrations/schema/"],
+            auto=True,
+        )
+        assert proposal is not None
+        assert all(c.coupled_files == () for c in proposal.candidates)
+        assert all(
+            c.shared_surface_path == "migrations/schema/" for c in proposal.candidates
+        )
+
+    def test_overflow_truncates_to_the_strongest_coupled_candidates(self) -> None:
+        epic_body = (
+            "## Work order\n"
+            "- #901  {group: cap}\n"
+            "- #902  {group: cap}\n"
+            "- #903  {group: cap}\n"
+            "- #904  {group: cap}\n"
+            "- #905  {group: cap}\n"
+            "- #906  {group: cap}\n"
+        )
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Anchor",
+            anchor_body=_files_body("a.py", "b.py", "c.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Cap epic",
+            tracking_issue_body=epic_body,
+            siblings={
+                902: SiblingIssue(902, title="S2", body=_files_body("a.py", "b.py", "c.py")),
+                903: SiblingIssue(903, title="S3", body=_files_body("a.py", "b.py")),
+                904: SiblingIssue(904, title="S4", body=_files_body("a.py")),
+                905: SiblingIssue(905, title="S5", body=_files_body("a.py")),
+                906: SiblingIssue(906, title="S6", body=_files_body("b.py")),
+            },
+            auto=True,
+            min_members=2,
+            max_members=3,
+        )
+        assert proposal is not None
+        assert [c.issue_number for c in proposal.candidates] == [902, 903]
+        assert "capped at 3" in proposal.rationale
+
+
+class TestTrancheProposalToTrancheRow:
+    def test_builds_an_unsaved_row_with_the_anchor_first(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=(
+                "## Work order\n- #901  {group: g}\n- #902  {group: g}\n"
+                "- #903  {group: g}\n"
+            ),
+            siblings={
+                902: SiblingIssue(902, title="S2", body=_files_body("coord/foo.py")),
+                903: SiblingIssue(903, title="S3", body=_files_body("coord/foo.py")),
+            },
+            auto=True,
+        )
+        assert proposal is not None
+        row = proposal.to_tranche_row(base_sha="deadbeef")
+        assert row.id is None
+        assert row.repo_name == "api"
+        assert row.issue_number == 900
+        assert row.issue_title == "Migration epic"
+        assert row.base_sha == "deadbeef"
+        assert row.state == "pending"
+        assert [c.issue_number for c in row.children] == [901, 902, 903]
+        assert row.children[0].title == "Migration part 1"
+
+
+class TestRenderTrancheAdvisory:
+    def _formed_proposal(self):
+        return propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=(
+                "## Work order\n- #901  {group: g}\n- #902  {group: g}\n"
+                "- #903  {group: g}\n"
+            ),
+            siblings={
+                902: SiblingIssue(902, title="S2", body=_files_body("coord/foo.py")),
+                903: SiblingIssue(903, title="S3", body=_files_body("coord/foo.py")),
+            },
+            auto=True,
+        )
+
+    def test_formed_proposal_says_so(self) -> None:
+        proposal = self._formed_proposal()
+        assert proposal is not None and proposal.formed
+        text = render_tranche_advisory(proposal)
+        assert "formed automatically" in text
+        assert "#901" in text and "#902" in text and "#903" in text
+
+    def test_unformed_proposal_names_the_manual_options(self) -> None:
+        proposal = self._formed_proposal()
+        assert proposal is not None
+        unformed = TrancheCandidate(  # sanity: dataclass is importable/usable directly
+            issue_number=902, title="S2", coupled_files=("coord/foo.py",)
+        )
+        assert unformed.reason == "coupled files: `coord/foo.py`"
+        import dataclasses
+
+        not_formed = dataclasses.replace(proposal, formed=False)
+        text = render_tranche_advisory(not_formed)
+        assert "no row was formed" in text
+
+    def test_serial_recommended_proposal_names_the_reason(self) -> None:
+        proposal = propose_tranche(
+            repo_name="api",
+            anchor_issue_number=901,
+            anchor_issue_title="Migration part 1",
+            anchor_body=_files_body("coord/foo.py"),
+            tracking_issue_number=900,
+            tracking_issue_title="Migration epic",
+            tracking_issue_body=(
+                "## Work order\n- #901  {group: g}\n- #902  {group: g}\n"
+                "- #903  {group: g, after: #902}\n"
+            ),
+            siblings={
+                902: SiblingIssue(902, title="S2", body=_files_body("coord/foo.py")),
+                903: SiblingIssue(903, title="S3", body=_files_body("coord/foo.py")),
+            },
+            auto=True,
+        )
+        assert proposal is not None and proposal.serial_recommended
+        text = render_tranche_advisory(proposal)
+        assert "run serially" in text
+
+
+class TestTrancheMemberCapConstants:
+    def test_defaults_match_the_4129_fallback_rules(self) -> None:
+        assert MIN_TRANCHE_MEMBERS == 3
+        assert MAX_TRANCHE_MEMBERS == 9
