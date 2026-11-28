@@ -6378,7 +6378,9 @@ class TestIssueCostCatalogue:
 #   * myrepo#8 — still open, titled "remainder of #7": never completed, but
 #     its first-ever audit event lands inside the window, so it is a
 #     genuine in-window follow-up.
-#   * myrepo#10 — a drive that gave up on the #2972 fix-round ceiling.
+#   * myrepo#10 — a drive that stopped on its own per-drive
+#     `--max-fix-rounds` budget (not the cross-relaunch #2972 lifetime
+#     ceiling, which has no audit-trail footprint to fold over here).
 #   * other#13 — closed, merged at 500, one `work` leg, cost_total = 5.0,
 #     resolved (no `ISSUE_RESOLUTION:` marker at all).
 #   * other#14 — a drive that exited loudly for an UNRELATED reason (not the
@@ -6635,7 +6637,8 @@ class TestScorecardFold:
 
 class TestScorecardWorkRounds:
     """#3953's own wording: work rounds are `work` + fix-round legs ONLY —
-    a `review`/`smoke` leg on the same issue must never inflate the count."""
+    a `review`/`smoke` leg on the same issue must never inflate the count,
+    and neither must an oracle-loop `test-author` acceptance-slice leg."""
 
     def test_review_and_smoke_legs_are_excluded(self) -> None:
         result = fold_scorecard(
@@ -6657,6 +6660,77 @@ class TestScorecardWorkRounds:
         # 2 work-like legs (both `work`), NOT 4 — review/smoke excluded.
         assert row["work_rounds_mean"] == pytest.approx(2.0)
         assert row["cost_mean"] == pytest.approx(4.0)  # all 4 legs still cost
+
+    def test_oracle_loop_test_author_leg_is_excluded(self) -> None:
+        """A `test-author` leg attributed here by `for_issue_number`
+        (its own `issue_number` is the milestone's tracking issue, #1553)
+        must not count as a work round on the child issue it authored
+        acceptance tests for."""
+        result = fold_scorecard(
+            [
+                {"repo_name": "r", "number": 1, "title": "t", "body": "", "state": "closed"},
+                {"repo_name": "r", "number": 99, "title": "tracking", "body": "", "state": "open"},
+            ],
+            [
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "merged",
+                 "dispatched_at": 10.0, "finished_at": 20.0, "cost_usd": 1.0},
+                {"repo_name": "r", "issue_number": 99, "for_issue_number": 1,
+                 "type": "test-author", "status": "done",
+                 "dispatched_at": 5.0, "finished_at": 8.0, "cost_usd": 1.0},
+            ],
+            [{"repo_name": "r", "issue_number": 1, "state": "merged", "last_attempt": 100.0}],
+            [], [], (SC_START, SC_END), generated_at=SC_END,
+        )
+        row = result.rows[0]
+        # 1 work-like leg, NOT 2 — the test-author leg is excluded even
+        # though it is booked to issue #1's lifetime cost.
+        assert row["work_rounds_mean"] == pytest.approx(1.0)
+        assert row["cost_mean"] == pytest.approx(2.0)  # both legs still cost
+
+
+class TestScorecardPartialResolution:
+    """#3953: the `merged` row's `ISSUE_RESOLUTION:` reading wins
+    outright over a `done` row for the same key — mirrors
+    `coord.drive_queue`'s `BoardView` reduction, never a looser `any()`."""
+
+    def test_merged_row_wins_over_a_stale_done_partial_row(self) -> None:
+        """First attempt ends `done` with a partial self-report; the fix
+        leg lands `merged` fully resolved. The issue reads resolved, not
+        partial — an `any()` over both rows would get this backwards."""
+        result = fold_scorecard(
+            [{"repo_name": "r", "number": 1, "title": "t", "body": "", "state": "closed"}],
+            [
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "done",
+                 "dispatched_at": 10.0, "finished_at": 20.0, "cost_usd": 1.0,
+                 "completion_summary": "ISSUE_RESOLUTION: partial — only half landed"},
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "merged",
+                 "dispatched_at": 30.0, "finished_at": 40.0, "cost_usd": 1.0,
+                 "completion_summary": "all good"},
+            ],
+            [{"repo_name": "r", "issue_number": 1, "state": "merged", "last_attempt": 100.0}],
+            [], [], (SC_START, SC_END), generated_at=SC_END,
+        )
+        row = result.rows[0]
+        assert row["partial_rate_pct"] == pytest.approx(0.0)
+
+    def test_merged_row_wins_over_a_stale_done_resolved_row(self) -> None:
+        """The opposite direction: a `done` row with no marker at all must
+        not hide a `merged` row's own `partial` self-report."""
+        result = fold_scorecard(
+            [{"repo_name": "r", "number": 1, "title": "t", "body": "", "state": "closed"}],
+            [
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "done",
+                 "dispatched_at": 10.0, "finished_at": 20.0, "cost_usd": 1.0,
+                 "completion_summary": "all good"},
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "merged",
+                 "dispatched_at": 30.0, "finished_at": 40.0, "cost_usd": 1.0,
+                 "completion_summary": "ISSUE_RESOLUTION: partial — only half landed"},
+            ],
+            [{"repo_name": "r", "issue_number": 1, "state": "merged", "last_attempt": 100.0}],
+            [], [], (SC_START, SC_END), generated_at=SC_END,
+        )
+        row = result.rows[0]
+        assert row["partial_rate_pct"] == pytest.approx(100.0)
 
 
 class TestScorecardRunner:
@@ -6834,6 +6908,14 @@ class TestCostBasisColumnMeta:
         for other_col in ("repo", "issue", "title", "status", "coverage_pct"):
             assert by_id[other_col].basis == "", other_col
 
+    def test_scorecard_stamps_basis_on_the_two_cost_columns_only(self) -> None:
+        result = _fold_scorecard()
+        by_id = {m.id: m for m in result.column_meta}
+        for cost_col in ("cost_mean", "cost_median"):
+            assert by_id[cost_col].basis == "api_equivalent", cost_col
+        for other_col in ("repo", "issues_completed", "work_rounds_mean"):
+            assert by_id[other_col].basis == "", other_col
+
     def test_billed_basis_propagates_from_the_cost_basis_param(self) -> None:
         """A report doesn't hardcode `api_equivalent` — it stamps whatever
         `cost_basis` it's handed, which `run_*` resolves off
@@ -6975,6 +7057,16 @@ class TestCaptureCoverageNote:
         # 7 total legs across the fixture's issues (5 on myrepo#7, 1 on
         # myrepo#20, 1 on other#13) feed the coverage tally.
         assert "7 leg(s) total" in coverage[0]
+
+    def test_scorecard_reports_the_standard_coverage_note(self) -> None:
+        """#3953: a cost-bearing report with no coverage note makes
+        `assert_public_export_allowed` raise unconditionally for it."""
+        from coord.reports import assert_public_export_allowed
+
+        result = _fold_scorecard()
+        coverage = [n for n in result.notes if n.startswith("Cost basis:")]
+        assert len(coverage) == 1, result.notes
+        assert_public_export_allowed(result.to_dict(), "scorecard")  # must not raise
 
     def test_no_legs_at_all_produces_no_coverage_note(self) -> None:
         """Nothing to report coverage over — a redundant line saying so
