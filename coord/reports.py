@@ -50,7 +50,21 @@ Three layers, deliberately separated so the interesting one is testable:
    coverage so a partial number is never shown as a whole one. Shares
    ``completed``'s exact "merged" definition (:func:`_merged_at_by_issue`)
    and its :func:`~coord.usage_rollup.rollup` per-issue aggregator, rather
-   than a third reimplementation of either.
+   than a third reimplementation of either; and ``scorecard`` (#3953), one
+   row per repo plus a fleet ``totals`` row, grading the fleet against its
+   own goal — issues mostly finishing without intervention, in under 3 work
+   rounds, for under ~$20 each — over issues **completed** in the window.
+   Folds :func:`fold_completed` (the completed-issue set and its lifetime
+   `cost_total`) and :func:`fold_issue_activity` (fix-round-ceiling hits,
+   blocked/parked driver exits, and new-in-window follow-up issues) rather
+   than re-deriving either; work-rounds-per-issue and the partial-merge rate
+   read the SAME per-issue leg rows :func:`_completed_spend` already
+   produces for ``completed``'s own `cost_total`. The two numbers neither
+   existing fold carries — operator interventions — come from
+   :mod:`coord.block_log`'s ``log-intervention`` records plus the audit
+   trail's own `drive_queue_removed(operator=True)` rows. A metric whose
+   source genuinely cannot be read (no block log on this host) reads
+   ``"no_data"``, never a fabricated `0`.
 
 The :class:`ReportResult` field names are the **wire contract** the coord-tui
 Reports panel (#1741) renders against, and the CLI's ``--json`` and the
@@ -68,6 +82,7 @@ import csv
 import io
 import json
 import re
+import statistics
 import time
 import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -75,7 +90,12 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from coord.models import WORK_LIKE_TYPES
+from coord.models import (
+    CLOSES_ISSUE_TYPES,
+    DEFAULT_ISSUE_RESOLUTION,
+    WORK_LIKE_TYPES,
+    parse_issue_resolution,
+)
 from coord.release_gate import LaneResult as ReleaseGateLaneResult
 
 __all__ = [
@@ -129,6 +149,11 @@ __all__ = [
     "ISSUE_COST_STATUS_CHOICES",
     "fold_issue_cost",
     "run_issue_cost",
+    "SCORECARD_COLUMNS",
+    "SCORECARD_COLUMN_META",
+    "SCORECARD_NO_DATA",
+    "fold_scorecard",
+    "run_scorecard",
     "Tier1FeatureSupport",
     "fold_release_parity_matrix",
     "run_release_parity_matrix",
@@ -4390,6 +4415,566 @@ def _validate_issue_cost_status(value: str) -> None:
         )
 
 
+# ── scorecard: is the fleet meeting its own goal? (#3953) ──────────────────
+#
+# Milestone 83's overseer epic, step 1: the fleet's stated goal is that an
+# issue mostly finishes without intervention, in fewer than 3 work rounds,
+# for under ~$20. Nothing added that up — this report is pure arithmetic over
+# three already-folded sources, never a fourth independent reading of any of
+# them (#2096):
+#
+#   * :func:`fold_completed` — the completed-issue set for the window, and
+#     each issue's lifetime `cost_total`. `issues_completed`/`cost_mean`/
+#     `cost_median` are read straight off its rows.
+#   * :func:`_completed_spend` — the SAME per-issue leg rows `fold_completed`
+#     already asked `usage_rollup.rollup` for. `work_rounds_*` counts every
+#     leg whose `type` is work-like (:data:`coord.models.WORK_LIKE_TYPES` —
+#     the same vocabulary `issue-activity`'s `fix_iterations` uses, so "a
+#     work round" means the same thing in both reports); `partial_rate_pct`
+#     reads the worker's own `ISSUE_RESOLUTION:` self-report
+#     (:func:`coord.models.parse_issue_resolution`) off the merged/done
+#     `work` leg's `completion_summary` — the exact column
+#     `coord.drive_queue`'s own `merged_partial`/`STATE_MERGED_PARTIAL`
+#     reasoning is keyed on, so this rate and that live state can never
+#     silently disagree about which issues counted.
+#   * :func:`fold_issue_activity` — the SAME audit-trail fold, over the SAME
+#     window, that report already performs; never a second, independent
+#     audit query. `fix_round_ceiling_hits` reads a row's `drive_exit.reason`
+#     through :func:`coord.drive_queue.is_review_fix_budget_stop_reason` —
+#     the same marker-based predicate `_reconcile_running` itself consults
+#     to recognise "this ONE drive session exhausted its own
+#     `--max-fix-rounds` budget and stopped" (#2096: not a second, looser
+#     regex here). This is deliberately NOT the cross-relaunch, permanent
+#     `(#2972)` lifetime ceiling (`is_fix_round_ceiling_reason`) — that one
+#     lives only on a LIVE `drive_queue` row's `last_reason`, which a
+#     completed issue's row has usually already been removed by the time
+#     this report runs, so there is no audit-trail footprint to fold over.
+#     `blocked_parked_exits` is every OTHER `outcome == "failed"` row (a
+#     driver that exited loudly, but not via the per-session budget
+#     give-up already counted above) — a proxy, not a live
+#     `STATE_BLOCKED`/`STATE_PARKED` read, named as such in this report's
+#     own description. `followups_spawned` matches a completed issue's own
+#     title/body against "remainder of #N" / "split from #N" (the phrasing
+#     `coord.board_doctor_followthrough` itself files those issues with)
+#     among rows the SAME fold already marks `started_before_window=False`
+#     — i.e. genuinely new to the audit trail in this window, the best
+#     signal available since the local `issues` table carries no GitHub
+#     `created_at` to check directly.
+#
+# `operator_interventions` is the one metric neither fold above carries, so
+# it names its OWN two sources explicitly (and only these two — see this
+# report's own description, which lists them for a reader who distrusts the
+# number): `coord drive-queue log-intervention`'s own per-host block-log
+# record (:mod:`coord.block_log`), and the audit trail's own
+# `drive_queue_removed` row stamped `operator=True`
+# (`coord.state._dequeue_drive_queue_local`). The block log is per-host,
+# like `queue-outcomes`'s own source — on a host with no log file at all,
+# this metric reads `SCORECARD_NO_DATA`, never a confident `0` assembled
+# from the audit-trail half alone.
+
+SCORECARD_COLUMNS = [
+    "repo",
+    "issues_completed",
+    "work_rounds_mean",
+    "work_rounds_median",
+    "work_rounds_p90",
+    "work_rounds_le3_pct",
+    "cost_mean",
+    "cost_median",
+    "partial_rate_pct",
+    "followups_spawned",
+    "fix_round_ceiling_hits",
+    "blocked_parked_exits",
+    "operator_interventions",
+]
+
+# One entry per SCORECARD_COLUMNS entry, same order (#1760).
+SCORECARD_COLUMN_META = [
+    ColumnMeta(id="repo", label="Repo", kind="text"),
+    ColumnMeta(id="issues_completed", label="Completed", kind="int", align="right"),
+    ColumnMeta(
+        id="work_rounds_mean", label="Rounds (mean)", kind="float", align="right"
+    ),
+    ColumnMeta(
+        id="work_rounds_median", label="Rounds (median)", kind="float", align="right"
+    ),
+    ColumnMeta(
+        id="work_rounds_p90", label="Rounds (p90)", kind="float", align="right"
+    ),
+    ColumnMeta(
+        id="work_rounds_le3_pct", label="Rounds ≤ 3 %", kind="float", align="right"
+    ),
+    ColumnMeta(id="cost_mean", label="$/Issue (mean)", kind="money", align="right"),
+    ColumnMeta(id="cost_median", label="$/Issue (median)", kind="money", align="right"),
+    ColumnMeta(id="partial_rate_pct", label="Partial %", kind="float", align="right"),
+    ColumnMeta(id="followups_spawned", label="Follow-ups", kind="int", align="right"),
+    ColumnMeta(
+        id="fix_round_ceiling_hits", label="Ceiling Hits", kind="int", align="right"
+    ),
+    ColumnMeta(
+        id="blocked_parked_exits", label="Blocked/Parked", kind="int", align="right"
+    ),
+    ColumnMeta(
+        id="operator_interventions", label="Interventions", kind="int", align="right"
+    ),
+]
+
+#: The sentinel every scorecard metric reads when ITS OWN source could not
+#: supply a number — distinct from a real `0`, which means the source WAS
+#: read and genuinely found nothing (#3953's own acceptance bullet). Reuses
+#: the exact string :data:`DEPRECATED_ROUTE_NO_DATA` already established as
+#: this codebase's "absence is not evidence of zero" spelling, kept as its
+#: own named constant here rather than importing that one — the two values
+#: are the same text by deliberate convention, not because one report's
+#: vocabulary is the other's.
+SCORECARD_NO_DATA = "no_data"
+
+#: "remainder of #N" / "split from #N" — the exact phrasing
+#: `coord.board_doctor_followthrough` already files a merged-partial
+#: remainder issue with (see its `title = f"{candidate.title} (split from
+#: #{candidate.issue_number})"`), matched case-insensitively against a
+#: candidate issue's own title + body.
+_FOLLOWUP_RE = re.compile(r"(?:remainder of|split from)\s+#\d+", re.IGNORECASE)
+
+
+def _scorecard_percentile(values: Sequence[float], pct: float) -> float:
+    """Nearest-rank percentile over *values* (assumed non-empty).
+
+    Deliberately not :func:`statistics.quantiles` — that raises on a
+    single-element input, which this report hits constantly (a repo with
+    exactly one completed issue in the window is the common case, not an
+    edge case worth a crash).
+    """
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    idx = max(0, min(len(ordered) - 1, round(pct / 100.0 * (len(ordered) - 1))))
+    return ordered[idx]
+
+
+def _scorecard_issue_stats(
+    rows_for_repo: Sequence[Mapping[str, Any]],
+    rounds_by_key: Mapping[tuple[str, int], int],
+    partial_by_key: Mapping[tuple[str, int], bool],
+) -> dict[str, Any]:
+    """The 7 per-issue-averaged metrics for one repo's (or the fleet's)
+    slice of :func:`fold_completed`'s rows.
+
+    ``SCORECARD_NO_DATA`` when *rows_for_repo* is empty — zero completed
+    issues leaves nothing to average, which is a fact about the data, not a
+    real `0.0` mean/median/rate (#3953's own "no_data distinct from zero"
+    acceptance bullet).
+    """
+    n = len(rows_for_repo)
+    if n == 0:
+        return {
+            "issues_completed": 0,
+            "work_rounds_mean": SCORECARD_NO_DATA,
+            "work_rounds_median": SCORECARD_NO_DATA,
+            "work_rounds_p90": SCORECARD_NO_DATA,
+            "work_rounds_le3_pct": SCORECARD_NO_DATA,
+            "cost_mean": SCORECARD_NO_DATA,
+            "cost_median": SCORECARD_NO_DATA,
+            "partial_rate_pct": SCORECARD_NO_DATA,
+        }
+    rounds = [rounds_by_key.get((r["repo"], r["issue"]), 0) for r in rows_for_repo]
+    costs = [float(r.get("cost_total") or 0.0) for r in rows_for_repo]
+    partial_count = sum(
+        1 for r in rows_for_repo if partial_by_key.get((r["repo"], r["issue"]), False)
+    )
+    le3 = sum(1 for v in rounds if v <= 3)
+    return {
+        "issues_completed": n,
+        "work_rounds_mean": round(sum(rounds) / n, 2),
+        "work_rounds_median": round(float(statistics.median(rounds)), 2),
+        "work_rounds_p90": round(_scorecard_percentile(rounds, 90), 2),
+        "work_rounds_le3_pct": round(le3 / n * 100.0, 1),
+        "cost_mean": round(sum(costs) / n, _USAGE_COST_PLACES),
+        "cost_median": round(float(statistics.median(costs)), _USAGE_COST_PLACES),
+        "partial_rate_pct": round(partial_count / n * 100.0, 1),
+    }
+
+
+def fold_scorecard(
+    issues: Iterable[Mapping[str, Any]],
+    assignments: Iterable[Mapping[str, Any]],
+    merge_queue: Iterable[Mapping[str, Any]],
+    activity_entries: Iterable[Mapping[str, Any]],
+    intervention_events: Sequence[Mapping[str, Any]] | None,
+    window: tuple[float, float],
+    *,
+    repo: str = "",
+    generated_at: float | None = None,
+    pricing: Any = None,
+    cost_basis: str = DEFAULT_COST_BASIS,
+    truncated: bool = False,
+    prior_activity: frozenset[tuple[str, int]] = frozenset(),
+    extra_notes: Sequence[str] = (),
+) -> ReportResult:
+    """Fold the fleet's own history into one scorecard row per repo (#3953).
+
+    Pure, like every other fold in this module: every input is an
+    already-fetched sequence (board tables, an audit-trail window, a
+    per-host block-log read), so the whole rule set is testable without a
+    DB, a daemon, or a clock. See the module-level comment just above this
+    section for exactly which existing fold backs each column, and why.
+
+    ``intervention_events`` is ``None`` when the block log genuinely does
+    not exist on this host — distinct from ``()``, which means the log
+    exists and has zero `log-intervention` records in it. Only the first
+    reads `operator_interventions` as :data:`SCORECARD_NO_DATA`.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        is_review_fix_budget_stop_reason,
+        parse_key,
+    )
+
+    start, end = window
+    generated_at = time.time() if generated_at is None else float(generated_at)
+    repo_filter = (repo or "").strip()
+
+    issue_rows = list(issues)
+    assignment_rows = list(assignments)
+    merge_rows = list(merge_queue)
+    activity_rows = list(activity_entries)
+
+    # #2472's own fold, reused verbatim for "what counts as completed" and
+    # each issue's lifetime cost — never a second definition of either.
+    completed = fold_completed(
+        issue_rows,
+        assignment_rows,
+        merge_rows,
+        window,
+        generated_at=generated_at,
+        pricing=pricing,
+        cost_basis=cost_basis,
+    )
+    _, leg_rows_by_key = _completed_spend(assignment_rows, pricing)
+
+    body_by_key: dict[tuple[str, int], str] = {}
+    for iss in issue_rows:
+        name = str(iss.get("repo_name") or "")
+        number = iss.get("number")
+        if not name or number is None:
+            continue
+        try:
+            key = (name, int(number))
+        except (TypeError, ValueError):
+            continue
+        body_by_key[key] = f"{iss.get('title') or ''}\n{iss.get('body') or ''}"
+
+    rounds_by_key: dict[tuple[str, int], int] = {}
+    partial_by_key: dict[tuple[str, int], bool] = {}
+    for row in completed.rows:
+        key = (row["repo"], row["issue"])
+        legs = leg_rows_by_key.get(key, ())
+        rounds_by_key[key] = sum(
+            1 for leg in legs if (leg.get("type") or "work") in _WORK_LIKE_TYPES
+        )
+        partial_by_key[key] = any(
+            parse_issue_resolution(leg.get("completion_summary")).value
+            != DEFAULT_ISSUE_RESOLUTION
+            for leg in legs
+            if (leg.get("type") or "work") in CLOSES_ISSUE_TYPES
+            and (leg.get("status") or "") in ("merged", "done")
+        )
+
+    # The SAME #1742 audit-trail fold `issue-activity` performs over this
+    # exact window — never a second, independent query of the trail.
+    activity = fold_issue_activity(
+        activity_rows,
+        window,
+        generated_at=generated_at,
+        prior_activity=prior_activity,
+    )
+    # The universe of repos to show a row for: every repo this board tracks
+    # an issue of at all, so a repo with zero completed issues and zero
+    # in-window activity still gets a real (zero/no_data) row rather than
+    # silently vanishing from the scorecard.
+    all_repos: set[str] = {key[0] for key in body_by_key}
+    ceiling_hits: dict[str, int] = {}
+    blocked_parked: dict[str, int] = {}
+    followups: dict[str, int] = {}
+    for arow in activity.rows:
+        a_repo = str(arow["repo"])
+        all_repos.add(a_repo)
+        drive_exit = arow.get("drive_exit")
+        reason = drive_exit.get("reason") if drive_exit else None
+        is_ceiling = bool(drive_exit) and is_review_fix_budget_stop_reason(reason)
+        if is_ceiling:
+            ceiling_hits[a_repo] = ceiling_hits.get(a_repo, 0) + 1
+        elif arow.get("outcome") == "failed":
+            blocked_parked[a_repo] = blocked_parked.get(a_repo, 0) + 1
+        if not arow.get("started_before_window"):
+            text = body_by_key.get((a_repo, arow["issue"])) or (arow.get("title") or "")
+            if _FOLLOWUP_RE.search(text):
+                followups[a_repo] = followups.get(a_repo, 0) + 1
+
+    # The audit trail's own half of `operator_interventions` — an
+    # operator's `drive-queue remove`, stamped `operator=True` by
+    # `coord.state._dequeue_drive_queue_local`. Read off the SAME entries
+    # `activity` just folded, never a second audit query.
+    operator_removed: dict[str, int] = {}
+    for entry in activity_rows:
+        if entry.get("category") != "drive_queue":
+            continue
+        if entry.get("event_type") != "drive_queue_removed":
+            continue
+        details = entry.get("details") or {}
+        if not isinstance(details, Mapping) or not details.get("operator"):
+            continue
+        r_repo = entry.get("repo")
+        if not r_repo:
+            continue
+        r_repo = str(r_repo)
+        all_repos.add(r_repo)
+        operator_removed[r_repo] = operator_removed.get(r_repo, 0) + 1
+
+    # The block log's own half — #2540's `log-intervention` records.
+    # `None` means the log does not exist on this host at all; `()` means
+    # it exists and has nothing in this window (a real, trustworthy zero).
+    intervention_counts: dict[str, int] | None = None
+    if intervention_events is not None:
+        intervention_counts = {}
+        for event in intervention_events:
+            ts = float(event.get("ts") or 0.0)
+            if ts < start or ts > end:
+                continue
+            parsed = parse_key(str(event.get("key") or ""))
+            if parsed is None:
+                continue
+            i_repo = parsed[0]
+            all_repos.add(i_repo)
+            intervention_counts[i_repo] = intervention_counts.get(i_repo, 0) + 1
+
+    for row in completed.rows:
+        all_repos.add(row["repo"])
+
+    notes: list[str] = list(extra_notes)
+    if repo_filter:
+        if repo_filter not in all_repos and not any(
+            str(i.get("repo_name") or "") == repo_filter for i in issue_rows
+        ):
+            notes.append(
+                f"No issue in this board belongs to repo {repo_filter!r} — "
+                "check the coord-local repo name (the one in "
+                "coordinator.yml), not the GitHub slug."
+            )
+        all_repos &= {repo_filter}
+
+    completed_by_repo: dict[str, list[dict]] = {}
+    for row in completed.rows:
+        if repo_filter and row["repo"] != repo_filter:
+            continue
+        completed_by_repo.setdefault(row["repo"], []).append(row)
+
+    rows: list[dict[str, Any]] = []
+    for r_name in sorted(all_repos):
+        stats = _scorecard_issue_stats(
+            completed_by_repo.get(r_name, []), rounds_by_key, partial_by_key
+        )
+        rows.append(
+            {
+                "repo": r_name,
+                **stats,
+                "followups_spawned": followups.get(r_name, 0),
+                "fix_round_ceiling_hits": ceiling_hits.get(r_name, 0),
+                "blocked_parked_exits": blocked_parked.get(r_name, 0),
+                "operator_interventions": (
+                    SCORECARD_NO_DATA
+                    if intervention_counts is None
+                    else intervention_counts.get(r_name, 0)
+                    + operator_removed.get(r_name, 0)
+                ),
+            }
+        )
+
+    # Fleet totals: counts ADD UP across the rows above; the averaged
+    # metrics are recomputed over the POOLED issue set, never an average of
+    # per-repo averages — the latter is a second, silently-diverging
+    # arithmetic rule for the same question (#2096).
+    all_completed_rows = [r for rs in completed_by_repo.values() for r in rs]
+    totals = {
+        **_scorecard_issue_stats(all_completed_rows, rounds_by_key, partial_by_key),
+        "followups_spawned": sum(followups.get(r, 0) for r in all_repos),
+        "fix_round_ceiling_hits": sum(ceiling_hits.get(r, 0) for r in all_repos),
+        "blocked_parked_exits": sum(blocked_parked.get(r, 0) for r in all_repos),
+        "operator_interventions": (
+            SCORECARD_NO_DATA
+            if intervention_counts is None
+            else sum(intervention_counts.get(r, 0) for r in all_repos)
+            + sum(operator_removed.get(r, 0) for r in all_repos)
+        ),
+    }
+
+    if truncated:
+        notes.append(
+            f"TRUNCATED: the audit trail window {_iso(start)} → {_iso(end)} "
+            "could not be fully fetched (page cap hit) — "
+            "`fix_round_ceiling_hits`/`blocked_parked_exits`/"
+            "`followups_spawned` are lower bounds, not the full count. "
+            "Narrow `since` for a complete answer."
+        )
+    if intervention_events is None:
+        notes.append(
+            "`operator_interventions` reads `no_data`: this host has no "
+            "block log at all (coord drive-queue log-intervention's own "
+            "record store, see coord/block_log.py) — run this report on a "
+            "host that has run `coord drive-queue tick`/`log-intervention` "
+            "for a real count."
+        )
+
+    return ReportResult(
+        report_id="scorecard",
+        generated_at=generated_at,
+        window=(start, end),
+        columns=list(SCORECARD_COLUMNS),
+        column_meta=_stamp_cost_basis(
+            SCORECARD_COLUMN_META, cost_basis, frozenset({"cost_mean", "cost_median"})
+        ),
+        rows=rows,
+        notes=notes,
+        totals=totals,
+    )
+
+
+def _default_scorecard_board_source() -> tuple[list[dict], list[dict], list[dict]]:
+    """``(issues, assignments, merge_queue)`` for :func:`fold_scorecard`.
+
+    The SAME full-history, archive-aware read :func:`_default_issue_cost_
+    source` already performs (every assignment row, including `type` and
+    `completion_summary` — needed to classify a leg as work/fix/test/review
+    and to read a worker's `ISSUE_RESOLUTION:` self-report), with `body`
+    added to the `issues` SELECT for this report's own follow-up-issue
+    detection.
+    """
+    try:
+        from coord import sql  # noqa: PLC0415
+        from coord.board_schema import decode_row  # noqa: PLC0415
+        from coord.db import get_connection, rollback_after_driver_error  # noqa: PLC0415
+
+        conn = get_connection()
+        issues = [
+            dict(r)
+            for r in sql.execute(
+                conn, "SELECT repo_name, number, title, body, state FROM issues"
+            ).fetchall()
+        ]
+        assignments: list[dict] = []
+        for table in ("assignments", "assignments_archive"):
+            try:
+                result = sql.execute(
+                    conn, f"SELECT * FROM {table}"  # noqa: S608 — literal table name
+                ).fetchall()
+            except sql.driver_errors() as exc:
+                rollback_after_driver_error(conn, exc)
+                continue  # assignments_archive may not exist yet
+            assignments.extend(decode_row("assignments", r) for r in result)
+        merge_queue = [
+            dict(r)
+            for r in sql.execute(
+                conn,
+                "SELECT repo_name, issue_number, state, last_attempt FROM merge_queue",
+            ).fetchall()
+        ]
+    except Exception:  # noqa: BLE001 — an unreadable board is an empty report
+        return [], [], []
+    return issues, assignments, merge_queue
+
+
+def _default_scorecard_intervention_events() -> list[dict] | None:
+    """Every #2540 ``log-intervention`` record on this host's block log, or
+    ``None`` when the log file does not exist here at all.
+
+    Same "refuse to invent a confident zero" posture :func:`run_queue_
+    outcomes` already applies to its own block-log read, extended to
+    `operator_interventions`: a host that has never run `coord drive-queue
+    tick` has nothing to say about interventions, and must say so rather
+    than report a reassuring `0`.
+    """
+    from coord.block_log import EVENT_INTERVENTION, log_location, read_events  # noqa: PLC0415
+
+    where = log_location()
+    if not where.get("exists"):
+        return None
+    try:
+        events = read_events()
+    except Exception:  # noqa: BLE001 — unreadable log reads the same as absent
+        return None
+    return [e for e in events if e.get("event") == EVENT_INTERVENTION]
+
+
+def run_scorecard(
+    *,
+    since: str = "7d",
+    until: str = "",
+    repo: str = "",
+    now: float | None = None,
+    source: Callable[[], tuple[
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+    ]] | None = None,
+    fetch: Callable[..., Mapping[str, Any]] | None = None,
+    intervention_source: Callable[[], list[dict] | None] | None = None,
+    pricing: Any = None,
+    cost_basis: str | None = None,
+) -> ReportResult:
+    """Read the board, the audit trail, and this host's block log, and fold
+    them.  ``now``/``source``/``fetch``/``intervention_source``/``pricing``/
+    ``cost_basis`` are test seams; the report's own parameters are
+    ``since``/``until``/``repo`` — the same three, same vocabulary, same
+    validators every other windowed report here uses."""
+    generated_at = time.time() if now is None else float(now)
+    end = parse_timestamp(until) if until else generated_at
+    start = end - parse_duration(since)
+
+    source_fn = _default_scorecard_board_source if source is None else source
+    issues, assignments, merge_queue = source_fn()
+
+    extra_notes: list[str] = []
+    if pricing is None or cost_basis is None:
+        loaded_pricing, loaded_basis, extra_notes = _load_pricing()
+        if pricing is None:
+            pricing = loaded_pricing
+        if cost_basis is None:
+            cost_basis = loaded_basis
+
+    fetch_fn = _default_fetch if fetch is None else fetch
+    activity_entries, truncated = fetch_audit_window(
+        since=start, until=end, repo=repo or None, fetch=fetch_fn
+    )
+    keys = {
+        (str(e["repo"]), int(e["issue"]))
+        for e in activity_entries
+        if e.get("repo") and e.get("issue") is not None
+    }
+    prior_activity = detect_prior_activity(keys, until=start, fetch=fetch_fn)
+
+    intervention_fn = (
+        _default_scorecard_intervention_events
+        if intervention_source is None
+        else intervention_source
+    )
+    intervention_events = intervention_fn()
+
+    return fold_scorecard(
+        issues,
+        assignments,
+        merge_queue,
+        activity_entries,
+        intervention_events,
+        (start, end),
+        repo=repo,
+        generated_at=generated_at,
+        pricing=pricing,
+        cost_basis=cost_basis,
+        truncated=truncated,
+        prior_activity=prior_activity,
+        extra_notes=extra_notes,
+    )
+
+
 # ── deprecated-routes: evidence for RPC retirement (#1945) ────────────────
 #
 # A live snapshot, same posture as `drive-queue-status`: no window, no
@@ -5043,6 +5628,67 @@ ISSUE_COST = ReportDef(
     ),
     run=run_issue_cost,
     row_identity=RowIdentity(repo_column="repo", issue_column="issue"),
+)
+
+
+SCORECARD = ReportDef(
+    id="scorecard",
+    title="Scorecard",
+    description=(
+        "Is the fleet meeting its own goal — issues mostly finishing without "
+        "intervention, in under 3 work rounds, for under ~$20 each? One row "
+        "per repo plus a fleet `totals` row, over issues COMPLETED in the "
+        "window (`completed`'s own definition, reused). WORK ROUNDS counts "
+        "work + fix-round legs only (never test/review legs) — mean, "
+        "median, p90, and the % at <=3. $/ISSUE is lifetime spend (mean, "
+        "median), the same number `completed`/`usage` show. PARTIAL % is "
+        "the share of completed issues whose merged work leg self-reported "
+        "ISSUE_RESOLUTION: partial or investigation (coord.drive_queue's "
+        "own merged-partial reasoning, read off the same column). "
+        "FOLLOW-UPS is issues new to this window whose title/body says "
+        "'remainder of #N' or 'split from #N'. CEILING HITS is drive "
+        "sessions that exhausted their OWN --max-fix-rounds budget and "
+        "stopped (not the separate, cross-relaunch #2972 lifetime ceiling, "
+        "which leaves no audit-trail record once a row is gone); "
+        "BLOCKED/PARKED is every other loud (non-zero) driver exit — both "
+        "are fleet-wide, not scoped to the completed set above, since a "
+        "row that hit either did not complete. INTERVENTIONS sums "
+        "`coord drive-queue log-intervention` records (per-host block log) "
+        "plus the audit "
+        "trail's own operator `drive-queue remove` rows; reads `no_data` "
+        "(never a bare 0) on a host with no block log at all."
+    ),
+    params=(
+        ReportParam(
+            id="since",
+            label="Time range",
+            kind="choice",
+            choices=SINCE_PRESETS,
+            default="7d",
+            help="How far back the window reaches from `until`. Presets, or any duration (e.g. 13h).",
+            free_form=True,
+            validate=_validate_since,
+        ),
+        ReportParam(
+            id="until",
+            label="Window end",
+            kind="text",
+            default="",
+            help="Epoch seconds or ISO-8601. Empty means now.",
+            validate=_validate_until,
+        ),
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_scorecard,
+    # Rows are per-repo (plus a fleet total), never about one `(repo, issue)`
+    # — same reasoning `usage`'s grouped rows and `trend`'s buckets declare
+    # no row_identity.
 )
 
 
@@ -6392,6 +7038,7 @@ REPORTS: dict[str, ReportDef] = {
     QUEUE_OUTCOMES.id: QUEUE_OUTCOMES,
     TREND.id: TREND,
     ISSUE_COST.id: ISSUE_COST,
+    SCORECARD.id: SCORECARD,
     DEPRECATED_ROUTES.id: DEPRECATED_ROUTES,
     RELEASE_PARITY_MATRIX.id: RELEASE_PARITY_MATRIX,
 }

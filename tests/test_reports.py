@@ -47,6 +47,9 @@ from coord.reports import (
     ISSUE_COST_SINCE_CHOICES,
     ISSUE_COST_STATUS_CHOICES,
     REPORTS,
+    SCORECARD_COLUMN_META,
+    SCORECARD_COLUMNS,
+    SCORECARD_NO_DATA,
     TREND_COLUMN_META,
     TREND_COLUMNS,
     TREND_RANGE_CHOICES,
@@ -68,6 +71,7 @@ from coord.reports import (
     fold_issue_activity,
     fold_issue_cost,
     fold_queue_outcomes,
+    fold_scorecard,
     fold_trend,
     md_filename,
     ndjson_filename,
@@ -86,6 +90,7 @@ from coord.reports import (
     run_issue_cost,
     run_queue_outcomes,
     run_report,
+    run_scorecard,
     run_trend,
     xlsx_filename,
 )
@@ -1842,7 +1847,7 @@ class TestCatalogue:
         assert set(REPORTS) == {
             "issue-activity", "completed", "drive-queue-status", "decisions",
             "usage", "queue-outcomes", "trend", "deprecated-routes", "issue-cost",
-            "release-parity-matrix",
+            "release-parity-matrix", "scorecard",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
@@ -1850,7 +1855,7 @@ class TestCatalogue:
         assert [r["id"] for r in cat["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
             "issue-activity", "issue-cost", "queue-outcomes", "release-parity-matrix",
-            "trend", "usage",
+            "scorecard", "trend", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -2022,7 +2027,7 @@ class TestCli:
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
             "issue-activity", "issue-cost", "queue-outcomes", "release-parity-matrix",
-            "trend", "usage",
+            "scorecard", "trend", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -2482,7 +2487,7 @@ class TestDaemonEndpoints:
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
             "issue-activity", "issue-cost", "queue-outcomes", "release-parity-matrix",
-            "trend", "usage",
+            "scorecard", "trend", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
@@ -6359,6 +6364,428 @@ class TestIssueCostCatalogue:
     def test_row_identity_names_repo_and_issue(self) -> None:
         rep = next(r for r in catalogue()["reports"] if r["id"] == "issue-cost")
         assert rep["row_identity"] == {"repo_column": "repo", "issue_column": "issue"}
+
+
+# ── #3953: the `scorecard` report ───────────────────────────────────────────
+#
+# One fixture window exercising every column:
+#
+#   * myrepo#7 — closed, merged at 300. Three `work`-like legs (1 work + 2
+#     fix-rounds), the LAST one self-reporting `ISSUE_RESOLUTION: partial`.
+#     cost_total = 3.0 (1.0 per leg).
+#   * myrepo#9 — closed, merged at 400, ZERO legs (a hand-closed issue with
+#     no assignment ever dispatched) — a real `0`, not a hole.
+#   * myrepo#8 — still open, titled "remainder of #7": never completed, but
+#     its first-ever audit event lands inside the window, so it is a
+#     genuine in-window follow-up.
+#   * myrepo#10 — a drive that gave up on the #2972 fix-round ceiling.
+#   * other#13 — closed, merged at 500, one `work` leg, cost_total = 5.0,
+#     resolved (no `ISSUE_RESOLUTION:` marker at all).
+#   * other#14 — a drive that exited loudly for an UNRELATED reason (not the
+#     ceiling) — `blocked_parked_exits`, not `fix_round_ceiling_hits`.
+#   * other#15 — an operator's `drive-queue remove`, audit-trail-recorded.
+#
+# Totals: 3 completed issues (myrepo#7, myrepo#9, other#13), rounds
+# [3, 0, 1], costs [3.0, 0.0, 5.0], 1 of 3 partial, 1 follow-up, 1 ceiling
+# hit, 1 blocked/parked exit, 2 operator interventions (1 block-log, 1
+# audit-trail).
+SC_START = 0.0
+SC_END = 10_000.0
+
+
+def _scorecard_issues() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "number": 7, "title": "Fix the thing", "body": "", "state": "closed"},
+        {"repo_name": "myrepo", "number": 9, "title": "No legs at all", "body": "", "state": "closed"},
+        {"repo_name": "myrepo", "number": 8, "title": "remainder of #7", "body": "", "state": "open"},
+        {"repo_name": "other", "number": 13, "title": "A different repo", "body": "", "state": "closed"},
+    ]
+
+
+def _scorecard_assignments() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "issue_number": 7, "type": "work", "status": "merged",
+         "dispatched_at": 100.0, "finished_at": 110.0, "model": "sonnet", "cost_usd": 1.0},
+        {"repo_name": "myrepo", "issue_number": 7, "type": "work", "status": "merged",
+         "dispatched_at": 120.0, "finished_at": 130.0, "model": "sonnet", "cost_usd": 1.0},
+        {"repo_name": "myrepo", "issue_number": 7, "type": "work", "status": "merged",
+         "dispatched_at": 140.0, "finished_at": 150.0, "model": "sonnet", "cost_usd": 1.0,
+         "completion_summary": "ISSUE_RESOLUTION: partial — only half the fix landed here"},
+        {"repo_name": "other", "issue_number": 13, "type": "work", "status": "merged",
+         "dispatched_at": 200.0, "finished_at": 210.0, "model": "sonnet", "cost_usd": 5.0,
+         "completion_summary": "all good"},
+    ]
+
+
+def _scorecard_merge_queue() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "issue_number": 7, "state": "merged", "last_attempt": 300.0},
+        {"repo_name": "myrepo", "issue_number": 9, "state": "merged", "last_attempt": 400.0},
+        {"repo_name": "other", "issue_number": 13, "state": "merged", "last_attempt": 500.0},
+    ]
+
+
+def _scorecard_activity() -> list[dict]:
+    return [
+        # myrepo#8: the only audit event for this key in the fixture, so
+        # `fold_issue_activity` reports `started_before_window=False` — a
+        # genuine first-ever appearance, not merely "the look-back wasn't
+        # asked about it" (`prior_activity` stays empty in these tests).
+        _ev(10, "dispatch", "dispatched", repo="myrepo", issue=8, details={"type": "work"}),
+        # myrepo#10: gave up on the #2972 fix-round ceiling.
+        _ev(
+            20, "drive", "drive_exited", repo="myrepo", issue=10,
+            details={
+                "exit_code": 1,
+                "reason": "review requested changes after 3 fix round(s) "
+                "this drive — stopping.",
+            },
+        ),
+        # other#14: a loud exit for an unrelated reason.
+        _ev(
+            30, "drive", "drive_exited", repo="other", issue=14,
+            details={"exit_code": 1, "reason": "agent unreachable"},
+        ),
+        # other#15: an operator's `drive-queue remove`, audit-trail-recorded.
+        _ev(
+            40, "drive_queue", "drive_queue_removed", repo="other", issue=15,
+            details={"operator": True},
+        ),
+        # A NON-operator removal (the sweep's own cleanup) must not count.
+        _ev(
+            50, "drive_queue", "drive_queue_removed", repo="other", issue=16,
+            details={"operator": False},
+        ),
+    ]
+
+
+def _scorecard_interventions() -> list[dict]:
+    return [
+        {"event": "intervention", "ts": 50.0, "key": "myrepo#7", "category": "git-recovery"},
+        # Outside the window — must not be counted.
+        {"event": "intervention", "ts": SC_END + 500.0, "key": "myrepo#7", "category": "other"},
+    ]
+
+
+def _fold_scorecard(window=(SC_START, SC_END), **kw) -> ReportResult:
+    kw.setdefault("intervention_events", _scorecard_interventions())
+    intervention_events = kw.pop("intervention_events")
+    return fold_scorecard(
+        _scorecard_issues(),
+        _scorecard_assignments(),
+        _scorecard_merge_queue(),
+        _scorecard_activity(),
+        intervention_events,
+        window,
+        generated_at=SC_END,
+        **kw,
+    )
+
+
+class TestScorecardFold:
+    def test_columns_are_the_wire_contract(self) -> None:
+        result = _fold_scorecard()
+        assert result.report_id == "scorecard"
+        assert result.columns == SCORECARD_COLUMNS
+        assert [m.id for m in result.column_meta] == result.columns
+        assert [m.id for m in SCORECARD_COLUMN_META] == SCORECARD_COLUMNS
+
+    def test_one_row_per_repo(self) -> None:
+        result = _fold_scorecard()
+        assert {r["repo"] for r in result.rows} == {"myrepo", "other"}
+
+    def test_work_rounds_counts_work_and_fix_legs_only(self) -> None:
+        """myrepo#7's 3 `work`-like legs (1 work + 2 fix-rounds) all count;
+        a `review`/`smoke` leg never would (none in this fixture, but the
+        rule is exercised again directly in TestScorecardWorkRounds)."""
+        row = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        # myrepo#7: 3 rounds. myrepo#9: 0 rounds (no legs at all).
+        assert row["work_rounds_mean"] == pytest.approx(1.5)
+        assert row["work_rounds_median"] == pytest.approx(1.5)
+        assert row["work_rounds_le3_pct"] == pytest.approx(100.0)
+
+    def test_cost_mean_and_median_are_lifetime_spend(self) -> None:
+        row = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        # myrepo#7 = 3.0, myrepo#9 = 0.0.
+        assert row["cost_mean"] == pytest.approx(1.5)
+        assert row["cost_median"] == pytest.approx(1.5)
+
+    def test_partial_rate_reads_the_merged_legs_own_resolution_marker(self) -> None:
+        myrepo = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        other = next(r for r in _fold_scorecard().rows if r["repo"] == "other")
+        # myrepo: #7 partial, #9 has no legs at all (resolved by default).
+        assert myrepo["partial_rate_pct"] == pytest.approx(50.0)
+        # other#13: no ISSUE_RESOLUTION marker at all -> resolved.
+        assert other["partial_rate_pct"] == pytest.approx(0.0)
+
+    def test_followups_spawned_matches_title_or_body_pattern(self) -> None:
+        myrepo = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        other = next(r for r in _fold_scorecard().rows if r["repo"] == "other")
+        assert myrepo["followups_spawned"] == 1
+        assert other["followups_spawned"] == 0
+
+    def test_a_followup_already_active_before_the_window_does_not_count(self) -> None:
+        """`started_before_window=True` (the look-back found prior activity)
+        means this is a re-dispatch, not a genuinely new follow-up."""
+        result = fold_scorecard(
+            _scorecard_issues(), _scorecard_assignments(), _scorecard_merge_queue(),
+            _scorecard_activity(), _scorecard_interventions(), (SC_START, SC_END),
+            generated_at=SC_END, prior_activity=frozenset({("myrepo", 8)}),
+        )
+        row = next(r for r in result.rows if r["repo"] == "myrepo")
+        assert row["followups_spawned"] == 0
+
+    def test_fix_round_ceiling_hits_reads_the_shared_classifier(self) -> None:
+        myrepo = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        other = next(r for r in _fold_scorecard().rows if r["repo"] == "other")
+        assert myrepo["fix_round_ceiling_hits"] == 1
+        assert other["fix_round_ceiling_hits"] == 0
+
+    def test_blocked_parked_exits_excludes_ceiling_hits(self) -> None:
+        myrepo = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        other = next(r for r in _fold_scorecard().rows if r["repo"] == "other")
+        # myrepo#10's loud exit is already counted as a ceiling hit above.
+        assert myrepo["blocked_parked_exits"] == 0
+        # other#14's loud exit is unrelated to the ceiling.
+        assert other["blocked_parked_exits"] == 1
+
+    def test_operator_interventions_sums_block_log_and_audit_trail(self) -> None:
+        myrepo = next(r for r in _fold_scorecard().rows if r["repo"] == "myrepo")
+        other = next(r for r in _fold_scorecard().rows if r["repo"] == "other")
+        # myrepo: 1 block-log intervention (the one out-of-window record
+        # excluded), 0 audit-trail operator removals.
+        assert myrepo["operator_interventions"] == 1
+        # other: 0 block-log, 1 audit-trail operator removal (#15); #16's
+        # non-operator removal must not count.
+        assert other["operator_interventions"] == 1
+
+    def test_no_data_distinct_from_a_real_zero(self) -> None:
+        """A host with no block log at all reads `no_data` for
+        `operator_interventions` — never a confident `0` that looks
+        identical to "this host checked and found none"."""
+        with_log = _fold_scorecard().rows
+        without_log = fold_scorecard(
+            _scorecard_issues(), _scorecard_assignments(), _scorecard_merge_queue(),
+            _scorecard_activity(), None, (SC_START, SC_END), generated_at=SC_END,
+        ).rows
+        assert all(r["operator_interventions"] != SCORECARD_NO_DATA for r in with_log)
+        assert all(r["operator_interventions"] == SCORECARD_NO_DATA for r in without_log)
+
+    def test_zero_completed_issues_reads_no_data_not_zero(self) -> None:
+        """A repo with no issues completed in the window has nothing to
+        average — `no_data`, not a misleading `0.0`."""
+        result = fold_scorecard(
+            [{"repo_name": "untouched", "number": 1, "title": "t", "body": "", "state": "open"}],
+            [], [], [], [], (SC_START, SC_END), generated_at=SC_END,
+        )
+        row = result.rows[0]
+        assert row["issues_completed"] == 0
+        for metric in (
+            "work_rounds_mean", "work_rounds_median", "work_rounds_p90",
+            "work_rounds_le3_pct", "cost_mean", "cost_median", "partial_rate_pct",
+        ):
+            assert row[metric] == SCORECARD_NO_DATA
+
+    def test_per_repo_rows_add_up_to_the_fleet_total(self) -> None:
+        result = _fold_scorecard()
+        assert result.totals is not None
+        for metric in (
+            "issues_completed", "followups_spawned", "fix_round_ceiling_hits",
+            "blocked_parked_exits", "operator_interventions",
+        ):
+            assert result.totals[metric] == sum(r[metric] for r in result.rows)
+        # 3 completed issues fleet-wide: rounds [3, 0, 1], costs [3.0, 0.0, 5.0].
+        assert result.totals["issues_completed"] == 3
+        assert result.totals["work_rounds_mean"] == pytest.approx(4.0 / 3.0, abs=0.01)
+        assert result.totals["work_rounds_median"] == pytest.approx(1.0)
+        assert result.totals["cost_mean"] == pytest.approx(8.0 / 3.0, abs=0.01)
+        assert result.totals["cost_median"] == pytest.approx(3.0)
+        # 1 of the 3 completed issues is partial.
+        assert result.totals["partial_rate_pct"] == pytest.approx(100.0 / 3.0, abs=0.1)
+
+    def test_totals_never_carry_a_repo_identity_column(self) -> None:
+        """Mirrors `issue-cost`'s own convention: identity columns are
+        absent from `totals`, not filled with a placeholder."""
+        result = _fold_scorecard()
+        assert "repo" not in result.totals
+
+    def test_repo_filter_restricts_to_one_repo(self) -> None:
+        result = _fold_scorecard(repo="other")
+        assert [r["repo"] for r in result.rows] == ["other"]
+        assert result.totals["issues_completed"] == 1
+
+    def test_an_unknown_repo_filter_is_noted(self) -> None:
+        result = _fold_scorecard(repo="does-not-exist")
+        assert result.rows == []
+        assert any("does-not-exist" in n for n in result.notes)
+
+    def test_truncation_is_noted(self) -> None:
+        result = _fold_scorecard(truncated=True)
+        assert any("TRUNCATED" in n for n in result.notes)
+
+    def test_the_result_is_json_serialisable(self) -> None:
+        json.dumps(_fold_scorecard().to_dict())
+        json.dumps(
+            fold_scorecard(
+                _scorecard_issues(), _scorecard_assignments(), _scorecard_merge_queue(),
+                _scorecard_activity(), None, (SC_START, SC_END), generated_at=SC_END,
+            ).to_dict()
+        )
+
+
+class TestScorecardWorkRounds:
+    """#3953's own wording: work rounds are `work` + fix-round legs ONLY —
+    a `review`/`smoke` leg on the same issue must never inflate the count."""
+
+    def test_review_and_smoke_legs_are_excluded(self) -> None:
+        result = fold_scorecard(
+            [{"repo_name": "r", "number": 1, "title": "t", "body": "", "state": "closed"}],
+            [
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "merged",
+                 "dispatched_at": 10.0, "finished_at": 20.0, "cost_usd": 1.0},
+                {"repo_name": "r", "issue_number": 1, "type": "review", "status": "done",
+                 "dispatched_at": 30.0, "finished_at": 40.0, "cost_usd": 1.0},
+                {"repo_name": "r", "issue_number": 1, "type": "smoke", "status": "done",
+                 "dispatched_at": 50.0, "finished_at": 60.0, "cost_usd": 1.0},
+                {"repo_name": "r", "issue_number": 1, "type": "work", "status": "merged",
+                 "dispatched_at": 70.0, "finished_at": 80.0, "cost_usd": 1.0},
+            ],
+            [{"repo_name": "r", "issue_number": 1, "state": "merged", "last_attempt": 100.0}],
+            [], [], (SC_START, SC_END), generated_at=SC_END,
+        )
+        row = result.rows[0]
+        # 2 work-like legs (both `work`), NOT 4 — review/smoke excluded.
+        assert row["work_rounds_mean"] == pytest.approx(2.0)
+        assert row["cost_mean"] == pytest.approx(4.0)  # all 4 legs still cost
+
+
+class TestScorecardRunner:
+    def test_since_and_until_bound_the_window(self) -> None:
+        issues = _scorecard_issues()
+        assignments = _scorecard_assignments()
+        merge_queue = _scorecard_merge_queue()
+
+        def source():
+            return issues, assignments, merge_queue
+
+        def fetch(**kw):
+            return {"entries": [], "has_more": False, "next_cursor": None}
+
+        result = run_scorecard(
+            since="1h", now=SC_END, source=source, fetch=fetch,
+            intervention_source=lambda: [],
+        )
+        assert result.window == (SC_END - 3600.0, SC_END)
+
+    def test_intervention_source_none_propagates_to_no_data(self) -> None:
+        def source():
+            return [], [], []
+
+        def fetch(**kw):
+            return {"entries": [], "has_more": False, "next_cursor": None}
+
+        result = run_scorecard(
+            since="1h", now=SC_END, source=source, fetch=fetch,
+            intervention_source=lambda: None,
+        )
+        assert result.totals["operator_interventions"] == SCORECARD_NO_DATA
+        assert any("no block log" in n for n in result.notes)
+
+    def test_default_intervention_source_reads_the_real_block_log(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """`_default_scorecard_intervention_events` reads `None` when this
+        host's block log file does not exist — not an exception, not a
+        confident empty list."""
+        from coord.reports import _default_scorecard_intervention_events
+
+        monkeypatch.setattr(
+            "coord.block_log.log_location",
+            lambda: {"exists": False, "path": str(tmp_path / "missing.jsonl")},
+        )
+        assert _default_scorecard_intervention_events() is None
+
+
+class TestScorecardAgainstTheRealSchema:
+    """The `source` seam above lets every rule be tested without a DB — this
+    exercises the actual default source's SQL against the real schema,
+    the same `assignments` + `assignments_archive` span `issue-cost`'s own
+    real-schema test covers (#3953 reuses that exact read shape, plus
+    `body`)."""
+
+    def test_runs_end_to_end_against_a_seeded_board(self, coord_db) -> None:
+        with coord_db:
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, body, state) "
+                "VALUES ('api', 1629, 'Closed and merged', '', 'closed')"
+            )
+            coord_db.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state, last_attempt) "
+                "VALUES ('a1', 'api', 'acme/api', 'b', 'main', 1629, "
+                "'Closed and merged', 'merged', 2500.0)"
+            )
+            _ic_insert_assignment(
+                coord_db, "assignments", "a1", repo_name="api", issue_number=1629,
+                dispatched_at=1000.0, finished_at=2000.0, cost_usd=1.25,
+            )
+        result = run_scorecard(since="3650d", repo="api", now=3000.0)
+        assert [r["repo"] for r in result.rows] == ["api"]
+        row = result.rows[0]
+        assert row["issues_completed"] == 1
+        assert row["cost_mean"] == pytest.approx(1.25)
+
+    def test_it_runs_through_the_cli(self, coord_db) -> None:
+        with coord_db:
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, body, state) "
+                "VALUES ('api', 1, 't', '', 'closed')"
+            )
+            coord_db.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state, last_attempt) "
+                "VALUES ('a1', 'api', 'acme/api', 'b', 'main', 1, 't', 'merged', 300.0)"
+            )
+            _ic_insert_assignment(
+                coord_db, "assignments", "a1", repo_name="api", issue_number=1,
+                dispatched_at=100.0, finished_at=200.0, cost_usd=1.0,
+            )
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "scorecard", "--param", "since=3650d",
+             "--param", "until=1000", "--param", "repo=api", "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["report_id"] == "scorecard"
+        assert [r["repo"] for r in body["rows"]] == ["api"]
+        assert body["rows"][0]["issues_completed"] == 1
+
+
+class TestScorecardCatalogue:
+    def test_scorecard_is_a_real_catalogue_entry(self) -> None:
+        ids = [r["id"] for r in catalogue()["reports"]]
+        assert "scorecard" in ids
+
+    def test_its_params_are_since_until_and_repo(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "scorecard")
+        assert rep["title"] == "Scorecard"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"since", "until", "repo"}
+        assert params["since"]["kind"] == "choice"
+        assert params["since"]["default"] == "7d"
+        assert params["since"]["free_form"] is True
+
+    def test_row_identity_is_none_rows_are_per_repo_not_per_issue(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "scorecard")
+        assert rep["row_identity"] is None
+
+    def test_coord_report_list_shows_it_with_its_params(self) -> None:
+        result = CliRunner().invoke(main, ["report", "list"])
+        assert result.exit_code == 0, result.output
+        assert "scorecard" in result.output
+        assert "Scorecard" in result.output
 
 
 # ── #3471: cost basis + coverage, across all four cost-bearing reports ─────
