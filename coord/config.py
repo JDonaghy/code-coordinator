@@ -269,6 +269,15 @@ class ReviewsConfig:
     # flag) so the command can never be used to wave through a genuine
     # rewrite. 0 disables the bound (not recommended).
     reaffirm_max_diff_lines: int = 300
+    # #4174: reuse check — ask the reviewer to search the repo for an
+    # existing equivalent of every substantial new function/type/impl block
+    # in a `type="work"` diff before accepting it, instead of only judging
+    # the diff against CLAUDE.md and correctness. Defaults to `True` (unlike
+    # `require_shared_scenario`, which defaults opted-out) because it adds
+    # reviewer instructions, not a mechanical mandatory-request-changes gate
+    # — a repo that wants the old behavior opts out with
+    # `reviews.reuse_check: false`. See `coord.review.reuse_check_focus_lines`.
+    reuse_check: bool = True
 
 
 @dataclass
@@ -4993,7 +5002,10 @@ def _parse_reviews(
             )
         cfg.provider = value
 
-    for bool_field in ("enabled", "auto_dispatch", "require_approval", "allow_review_flood"):
+    for bool_field in (
+        "enabled", "auto_dispatch", "require_approval", "allow_review_flood",
+        "reuse_check",
+    ):
         if bool_field in raw:
             value = raw[bool_field]
             if not isinstance(value, bool):

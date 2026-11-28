@@ -126,6 +126,27 @@ def test_reviews_config_can_be_disabled(tmp_path: Path) -> None:
     assert cfg.reviews.enabled is False
 
 
+def test_reviews_config_reuse_check_defaults_true(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.reuse_check is True
+
+
+def test_reviews_config_reuse_check_can_be_disabled(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  reuse_check: false\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.reuse_check is False
+
+
 def test_reviews_config_parses_all_fields(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(
@@ -1462,6 +1483,103 @@ def test_build_review_briefing_includes_shared_scenario_section() -> None:
     assert "tests/conformance/scenarios" in briefing
     assert "MUST" in briefing
     assert "request-changes" in briefing
+
+
+# ── #4174: reuse check ───────────────────────────────────────────────────────
+
+
+def test_reuse_check_focus_lines_present_by_default() -> None:
+    from coord.review import reuse_check_focus_lines
+
+    lines = reuse_check_focus_lines(ReviewsConfig(), assignment_type="work")
+    text = "\n".join(lines)
+    assert "Reuse check" in text
+    assert "duplicates X at file:line" in text
+
+
+def test_reuse_check_focus_lines_empty_when_opted_out() -> None:
+    from coord.review import reuse_check_focus_lines
+
+    cfg = ReviewsConfig(reuse_check=False)
+    assert reuse_check_focus_lines(cfg, assignment_type="work") == []
+
+
+def test_reuse_check_focus_lines_empty_for_non_work_assignment_type() -> None:
+    from coord.review import reuse_check_focus_lines
+
+    cfg = ReviewsConfig()
+    assert reuse_check_focus_lines(cfg, assignment_type="test-author") == []
+    assert reuse_check_focus_lines(cfg, assignment_type="mock-author") == []
+
+
+def test_build_review_briefing_includes_reuse_check_section_by_default() -> None:
+    """A work-leg briefing includes the reuse-check instructions when the
+    option is enabled (the default) (#4174)."""
+    briefing = build_review_briefing(**_briefing_kwargs())
+    assert "Reuse check" in briefing
+    assert "duplicates X at file:line" in briefing
+
+
+def test_build_review_briefing_omits_reuse_check_section_when_disabled() -> None:
+    """A repo that opts out with `reviews.reuse_check: false` sees no reuse
+    check instructions in its briefing (#4174)."""
+    briefing = build_review_briefing(
+        **_briefing_kwargs(reviews_cfg=ReviewsConfig(reuse_check=False))
+    )
+    assert "Reuse check" not in briefing
+
+
+def test_build_review_briefing_omits_reuse_check_for_mock_author() -> None:
+    """The rule is scoped to `type="work"` (and fix rounds, which are
+    dispatched with the same type) — not test-author/mock-author/
+    epic-decompose diffs (#4174)."""
+    briefing = build_review_briefing(
+        **_briefing_kwargs(assignment_type="mock-author")
+    )
+    assert "Reuse check" not in briefing
+
+
+def test_count_reuse_findings_counts_instructed_phrasing() -> None:
+    from coord.review import count_reuse_findings
+
+    body = textwrap.dedent("""\
+        ## Blocking findings
+        - duplicates `behaviour::nav::NavLoop` at src/behaviour/nav.rs:42; reuse or extend it.
+
+        ## Non-blocking concerns
+        None
+
+        ## Nits
+        - duplicates a leaf helper at src/tree_controller.rs:88; reuse or extend it.
+    """)
+    assert count_reuse_findings(body) == 2
+
+
+def test_count_reuse_findings_zero_when_no_reuse_findings() -> None:
+    from coord.review import count_reuse_findings
+
+    body = textwrap.dedent("""\
+        ## Blocking findings
+        - Off-by-one in the loop bound at src/foo.rs:12.
+
+        ## Non-blocking concerns
+        None
+
+        ## Nits
+        None
+    """)
+    assert count_reuse_findings(body) == 0
+
+
+def test_format_review_header_round_trips_reuse_count() -> None:
+    from coord.review import format_review_header, parse_review_header
+
+    header = format_review_header(
+        verdict="request-changes", blocking=1, nonblocking=0, nits=1, reuse=1,
+    )
+    parsed = parse_review_header(header)
+    assert parsed is not None
+    assert parsed["reuse"] == 1
 
 
 def test_build_review_briefing_omits_shared_scenario_section_when_not_opted_in() -> None:

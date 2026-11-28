@@ -539,11 +539,18 @@ def format_review_header(
     blocking: int | None = None,
     nonblocking: int | None = None,
     nits: int | None = None,
+    reuse: int | None = None,
 ) -> str:
     """Build the HTML-comment header that machines parse.
 
     `verdict` is required; everything else is optional and only emitted
     when provided.  Returns a single line (no trailing newline).
+
+    `reuse` (#4174) is the `count_reuse_findings` count for this review's
+    body — how many of its findings were reuse-check findings, regardless
+    of which section they landed in — so `coord fleet stats` can track the
+    rate over time. Optional and additive: omitting it changes nothing for
+    an existing caller.
     """
     parts = [f"verdict={verdict}"]
     if blocking is not None:
@@ -552,6 +559,8 @@ def format_review_header(
         parts.append(f"nonblocking={nonblocking}")
     if nits is not None:
         parts.append(f"nits={nits}")
+    if reuse is not None:
+        parts.append(f"reuse={reuse}")
     if reviewer_machine:
         parts.append(f"reviewer={reviewer_machine}")
     if assignment_id:
@@ -562,9 +571,9 @@ def format_review_header(
 def parse_review_header(body: str) -> dict[str, str | int] | None:
     """Extract the coord:review header from *body*, or ``None`` when missing.
 
-    Numeric tokens (``blocking``, ``nonblocking``, ``nits``) are returned as
-    ``int``; everything else stays a ``str``.  Tolerates extra whitespace
-    and unknown tokens.
+    Numeric tokens (``blocking``, ``nonblocking``, ``nits``, ``reuse``) are
+    returned as ``int``; everything else stays a ``str``.  Tolerates extra
+    whitespace and unknown tokens.
     """
     m = _REVIEW_HEADER_RE.search(body)
     if not m:
@@ -575,7 +584,7 @@ def parse_review_header(body: str) -> dict[str, str | int] | None:
             continue
         key, value = token.split("=", 1)
         key = key.lower()
-        if key in ("blocking", "nonblocking", "nits"):
+        if key in ("blocking", "nonblocking", "nits", "reuse"):
             try:
                 out[key] = int(value)
             except ValueError:
@@ -2870,6 +2879,96 @@ def shared_scenario_focus_lines(
     return lines
 
 
+# #4174: the "duplicates X at file:line; reuse or extend it" phrasing the
+# reuse-check instructions (`reuse_check_focus_lines`) ask the reviewer to
+# use for every reuse finding, regardless of which section (blocking or
+# nits — severity depends on whether the duplicate is a shared module) it
+# lands in. Deliberately loose: it only anchors on "duplicates" + "at
+# <path>:<line>" so it matches the instructed shape without caring about
+# exact wording around it, since reviewers paraphrase.
+_REUSE_FINDING_RE = re.compile(
+    r"\bduplicates\b.{0,200}?\bat\b\s+\S+:\d+",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def count_reuse_findings(body: str) -> int:
+    """Count reuse-check findings (#4174) in a reviewer's body text.
+
+    Looks for the "duplicates X at file:line" phrasing
+    `reuse_check_focus_lines` instructs the reviewer to use, one line at a
+    time, regardless of which section (`## Blocking findings` or `## Nits`)
+    it appears under — severity is already captured by that section, this
+    just tags how many of a review's findings are reuse findings so
+    `coord fleet stats` can track the rate over time.
+
+    Returns ``0``, never ``None``, for a body with no such findings — unlike
+    `estimate_review_counts`'s "could not determine" heuristic, there is no
+    ambiguous case here: this only matches an explicit, instructed phrase,
+    so its absence is a real zero, not a parse failure.
+    """
+    return sum(1 for line in body.splitlines() if _REUSE_FINDING_RE.search(line))
+
+
+# #4174: reuse-check instructions, appended to the briefing for a `type="work"`
+# review (which also covers a fix round — dispatched with the same
+# `assignment_type="work"`, just a higher `review_iteration`) unless the repo
+# opts out with `reviews.reuse_check: false`. Models are weak at keeping
+# duplication down in a large codebase: a worker solves its issue locally — a
+# new helper, a new navigation loop, a new painter — even when the repo
+# already has a shared one, and the adversarial review never asked whether
+# this code already exists somewhere. Bounded (at most 8 searches, skip
+# diffs under 30 added lines) so this stays a cheap pass over "substantial
+# new code", not a full-diff audit on every review.
+_REUSE_CHECK_LINES: tuple[str, ...] = (
+    "",
+    "## Reuse check (`reviews.reuse_check`, #4174)",
+    "",
+    "Skip this check entirely if the diff adds fewer than 30 lines. "
+    "Otherwise, for every NEW function, type, impl block, or match arm "
+    "larger than ~15 lines in the diff, search the repo for an existing "
+    "equivalent — a graphify query (e.g. \"where is X handled\") and a grep "
+    "for distinctive identifiers from the new code. Cap yourself at 8 "
+    "searches total for this review.",
+    "",
+    "If a search turns up a substantial existing equivalent, raise a "
+    "finding citing BOTH locations in this exact shape: \"duplicates X at "
+    "file:line; reuse or extend it\". Severity: a duplicate of an existing "
+    "SHARED module (e.g. a `behaviour::*`, `row_stack`, or `*_paint` style "
+    "helper meant to be reused across call sites) is a "
+    "`## Blocking findings` entry; a near-duplicate between two leaf "
+    "modules with no shared helper yet is a `## Nits` entry, plus a "
+    "suggestion to extract the shared code.",
+)
+
+
+def reuse_check_focus_lines(
+    reviews_cfg: ReviewsConfig, *, assignment_type: str = "work",
+) -> list[str]:
+    """Return the ``## Reuse check`` briefing section (#4174), or ``[]``.
+
+    Empty when the repo opted out (``reviews.reuse_check: false`` — the
+    field defaults to ``True``, unlike ``require_shared_scenario``'s
+    opt-in-by-default-absent shape, since this only adds reviewer
+    instructions rather than a mechanical mandatory-request-changes gate) or
+    when *assignment_type* isn't ``"work"`` — the only
+    :data:`coord.models.WORK_LIKE_TYPES` member that writes new application
+    code to solve an issue from scratch (a fix round is dispatched with the
+    same ``assignment_type="work"``, just a higher ``review_iteration``, so
+    this covers both without a separate check). ``test-author``/
+    ``mock-author``/``epic-decompose`` diffs aren't the "wrote a new helper
+    the repo already had" shape this rule exists for.
+
+    Mirrors `shared_scenario_focus_lines`'s "inert unless configured" shape
+    (#3112) so a caller can simply ``lines.extend(...)``.
+    """
+    if not reviews_cfg.reuse_check:
+        return []
+    if assignment_type != "work":
+        return []
+    return list(_REUSE_CHECK_LINES)
+
+
 def repo_focus_lines(reviews_cfg: ReviewsConfig, repo_name: str) -> list[str]:
     """Return the ``### Repo-specific focus`` block for *repo_name*, or ``[]``
     if the repo has no ``reviews.repo_overrides`` configured (#3112).
@@ -3223,6 +3322,9 @@ def build_review_briefing(
             diff_text=diff_text,
             completion_summary=completion_summary,
         )
+    )
+    lines.extend(
+        reuse_check_focus_lines(reviews_cfg, assignment_type=assignment_type)
     )
 
     if reviews_cfg.reviewer_prompt.strip():
