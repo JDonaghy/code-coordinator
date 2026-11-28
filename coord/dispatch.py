@@ -4303,7 +4303,7 @@ def tranche_test_machine_name(
         if (
             machine is not None
             and machine.can_work_on(row.repo_name)
-            and all(cap in machine.capabilities for cap in required)
+            and machine.covers_capabilities(required)
         ):
             return name
     return None
@@ -4495,3 +4495,36 @@ def dispatch_tranche_test(
     )
 
     return {"ok": True, "assignment_id": assignment_id, "machine_name": machine_name}
+
+
+def tranche_test_leg_assignment(
+    board: "Board", row: "TrancheRow",
+) -> "Assignment | None":
+    """The most recently dispatched Test leg for *row*'s integrated tree,
+    scanned off *board* (#4202), or `None` when no Test leg has ever been
+    dispatched for this row.
+
+    Keyed on `coord.merge_queue.tranche_integration_branch_name(row)` —
+    derived from `row.id`, so unique per row — rather than a column stored
+    anywhere new, the same re-derive-don't-store shape
+    `coord.review.tranche_review_leg_assignments` uses for the review
+    legs. Scans completed and active together and returns the newest by
+    `dispatched_at`, so a re-dispatch after a mute or failed leg always
+    wins over the stale one it replaced.
+
+    Returns `None` when `row.id` is None (no branch name to key on, so no
+    leg can have been dispatched yet) rather than raising — the caller is
+    asking "has a Test leg run", and an unsaved row's answer is plainly
+    no.
+    """
+    if row.id is None:
+        return None
+    from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
+
+    branch = tranche_integration_branch_name(row)
+    matches = [
+        a for a in list(board.completed) + list(board.active)
+        if a.type == "smoke" and a.repo_name == row.repo_name and a.branch == branch
+    ]
+    matches.sort(key=lambda a: a.dispatched_at or 0.0)
+    return matches[-1] if matches else None

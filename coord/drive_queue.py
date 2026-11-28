@@ -8959,6 +8959,34 @@ def tranche_rows_ready_to_dispatch(rows: Sequence[TrancheRow]) -> list[TrancheRo
     return [row for row in rows if row.state == "pending" and row.children]
 
 
+# The states a row still has somewhere left to go: its children are out,
+# so every remaining step (integrate, Test, review, PR) is
+# `coord.drive.advance_tranche_row`'s to take. `"pending"` is excluded
+# because it belongs to `tranche_rows_ready_to_dispatch` above, and
+# `"failed"` because nothing advances a failed row.
+TRANCHE_ADVANCEABLE_STATES: tuple[str, ...] = ("dispatched", "integrating", "done")
+
+
+def tranche_rows_ready_to_advance(rows: Sequence[TrancheRow]) -> list[TrancheRow]:
+    """Filter *rows* down to the ones a tick should advance now (#4202) —
+    the Test/review/PR sibling of :func:`tranche_rows_ready_to_dispatch`.
+
+    Ready means `state` is one of :data:`TRANCHE_ADVANCEABLE_STATES` AND
+    the row has an id (an unsaved row has no integration branch name or
+    review sentinel to key its legs on, and `coord.drive.
+    advance_tranche_row` already refuses rather than silently no-op on
+    that case — same reason the dispatch filter above screens out a row
+    with no children).
+
+    Order is preserved, so the shell walks rows oldest-id first exactly as
+    `coord.state` handed them over.
+    """
+    return [
+        row for row in rows
+        if row.id is not None and row.state in TRANCHE_ADVANCEABLE_STATES
+    ]
+
+
 # ── the tick ─────────────────────────────────────────────────────────────────
 
 

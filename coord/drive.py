@@ -5145,6 +5145,381 @@ def integrate_tranche_row(
     return row, result, dispatched
 
 
+# ── native tranche rows: the Test -> review -> PR tail (#4129/#4202) ────────
+#
+# `advance_tranche_row` below is the ONE place the order of the tranche
+# tail is enforced, and it is enforced by code: a Test leg is dispatched
+# only against an integrated tree, the three review legs only once that
+# Test leg recorded `test_state == "passed"`, and the single closing PR
+# only once `coord.review.tranche_review_verdict` reports `approved=True`
+# for all three legs bound to the CURRENT integrated patch-id. Every
+# caller gets one step per call and a named stage back, so the sequencing
+# lives in one function rather than in each caller's own ordering of five
+# primitives (#2096).
+
+# How long a Test-stage verdict has to look like for the tranche's single
+# Test gate to count as satisfied. Deliberately `"passed"` alone, not
+# `coord.merge_queue.has_smoke_verdict`'s wider set: a `"skipped"` verdict
+# (a baseline-red suite) is a legitimate Test-stage outcome but says
+# nothing about the integrated tree, and #4129 buys the tranche shape on
+# the strength of ONE Test run actually exercising it. Anything else —
+# including `None` and the non-verdict `"running"` marker — is "not yet",
+# never a pass.
+TRANCHE_TEST_PASSED_STATE = "passed"
+
+
+def advance_tranche_row(
+    row: TrancheRow,
+    config: Any,
+    machine_names: Sequence[str] = (),
+    board: "Any | None" = None,
+    *,
+    integrated_sha: str | None = None,
+    sha_resolver: "Callable[..., str | None] | None" = None,
+    integrator: "Callable[..., Any] | None" = None,
+    test_dispatcher: "Callable[..., dict] | None" = None,
+    test_state_reader: "Callable[[str], str | None] | None" = None,
+    review_dispatcher: "Callable[..., dict] | None" = None,
+    patch_id_fingerprinter: "Callable[..., str | None] | None" = None,
+    pr_opener: "Callable[..., dict | None] | None" = None,
+) -> dict:
+    """Advance *row* one step along the tranche tail — integrate, Test,
+    review, PR — and report which stage it now sits at (#4129/#4202).
+
+    Re-entrant: call it again on the next tick and it picks up wherever
+    the row got to, reading the board for the legs it already dispatched
+    rather than tracking progress in a field of its own (`TrancheRow`'s
+    shape is frozen, #4199). The stage names it returns are the whole
+    contract:
+
+    - `"awaiting-children"` — some child is still `"pending"`/
+      `"dispatched"`; nothing to integrate yet.
+    - `"integrating"`/`"failed"` — this call delegated to
+      :func:`integrate_tranche_row` (the row was `"dispatched"` with every
+      child terminal). A row that integrated cleanly falls straight
+      through to the Test dispatch in this same call, so reaching
+      `state == "done"` and getting a Test leg are never two separate
+      ticks.
+    - `"awaiting-integrator"` — an LLM integrator leg is in flight.
+    - `"awaiting-integrated-sha"` — the integration branch's head could
+      not be read, so there is no tree to bind a Test leg or a patch-id
+      to. Dispatches nothing: a verdict bound to an unknown sha is bound
+      to nothing.
+    - `"test-dispatched"` / `"test-dispatch-failed"` / `"awaiting-test"` /
+      `"test-failed"` — the single capability-routed Test leg.
+    - `"awaiting-patch-id"` — the integrated diff could not be
+      fingerprinted, so no review approval can be bound to it. Dispatches
+      nothing and opens nothing.
+    - `"review-dispatched"` / `"review-dispatch-failed"` /
+      `"awaiting-review"` / `"review-blocking"` — the three bound review
+      legs. A focus whose leg is still in flight AGAINST THE CURRENT
+      patch-id is awaited; a focus with no leg, or one whose binding went
+      stale because a fix moved the tree, is (re-)dispatched — that is the
+      mandatory scoped re-review. A focus that actually requested changes
+      is `"review-blocking"`: the row needs a fix, and re-asking the same
+      reviewer would not produce one.
+    - `"pr-opened"` / `"pr-failed"` — the single closing PR, opened only
+      once the Test leg passed and all three legs approved the current
+      patch-id.
+
+    The returned dict always carries `"stage"` and `"detail"`, plus the
+    raw handle of whatever this call did (`"test"`, `"review"`, `"pr"`,
+    `"merge_result"`, `"integrator_dispatch"`, `"review_verdict"`) — never
+    discarded, the same posture :func:`integrate_tranche_row` keeps for
+    its own integrator handle.
+
+    *integrated_sha* is not stored on the row, so when it is not given
+    this resolves it — from the merge result's own post-push re-confirmed
+    sha when this very call integrated the row, else from the integration
+    branch's head (`coord.github_ops.get_branch_sha`, overridable via
+    *sha_resolver*).
+
+    Every injectable defaults to the real production primitive
+    (:func:`integrate_tranche_row`, `coord.dispatch.dispatch_tranche_test`,
+    `coord.state.load_assignment_test_state`,
+    `coord.review.dispatch_tranche_review_legs`,
+    `coord.review.tranche_integrated_patch_id`,
+    `coord.merge_queue.open_tranche_closing_pr`); tests inject stubs the
+    same way :func:`integrate_tranche_row` takes its *merger*.
+
+    Raises ValueError if *machine_names* is empty (nowhere to route any
+    leg), if *board* is None (every stage past integration is decided by
+    reading the legs off the board), if `row.id` is None (no branch name
+    or review sentinel can be derived), or if `row.state` is `"pending"`
+    (the children were never dispatched — `coord.dispatch.
+    dispatch_tranche_row_children`'s job, not this one's).
+    """
+    from coord.dispatch import (  # noqa: PLC0415
+        dispatch_tranche_test,
+        tranche_test_leg_assignment,
+    )
+    from coord.merge_queue import (  # noqa: PLC0415
+        open_tranche_closing_pr,
+        tranche_integration_branch_name,
+    )
+    from coord.review import (  # noqa: PLC0415
+        TRANCHE_REVIEW_FOCUSES,
+        dispatch_tranche_review_legs,
+        tranche_integrated_patch_id,
+        tranche_review_leg_assignments,
+        tranche_review_verdict,
+    )
+
+    if not machine_names:
+        raise ValueError("advance_tranche_row: machine_names is empty")
+    if board is None:
+        raise ValueError(
+            "advance_tranche_row: board is None — the Test and review "
+            "stages are decided by reading this row's own legs off the board"
+        )
+    if row.id is None:
+        raise ValueError(
+            "advance_tranche_row: row.id is None — save the row "
+            "(coord.state.save_tranche_row) before advancing it"
+        )
+    if row.state == "pending":
+        raise ValueError(
+            f"advance_tranche_row: row {row.id} is still 'pending' — "
+            "dispatch its children (coord.dispatch."
+            "dispatch_tranche_row_children) before advancing it"
+        )
+
+    if row.state == "failed":
+        return {
+            "stage": "failed",
+            "detail": f"tranche row {row.id} has failed; nothing to advance",
+        }
+
+    if row.state == "dispatched":
+        if not tranche_row_all_children_terminal(row):
+            waiting = sorted(
+                c.issue_number for c in row.children
+                if c.state not in ("done", "failed")
+            )
+            return {
+                "stage": "awaiting-children",
+                "detail": (
+                    f"{len(waiting)} child(ren) not terminal yet: "
+                    + ", ".join(f"#{n}" for n in waiting)
+                ),
+            }
+        _integrator = integrator or integrate_tranche_row
+        row, merge_result, integrator_dispatch = _integrator(
+            row, config, machine_names, board=board,
+        )
+        step = {
+            "merge_result": merge_result,
+            "integrator_dispatch": integrator_dispatch,
+        }
+        if row.state == "failed":
+            return {
+                "stage": "failed",
+                "detail": f"integration failed: {getattr(merge_result, 'detail', '')}",
+                **step,
+            }
+        if row.state != "done":
+            return {
+                "stage": "integrating",
+                "detail": (
+                    "an LLM integrator leg is resolving the remaining "
+                    f"conflicts: {getattr(merge_result, 'detail', '')}"
+                ),
+                **step,
+            }
+        # Clean mechanical merge: fall through and dispatch the Test leg in
+        # THIS call, so a row never sits integrated-but-untested for a tick.
+        # The merge result's own `integrated_sha` is the post-push
+        # re-confirmed commit, so prefer it over re-reading the branch head
+        # (#2096: one question, one answer).
+        if integrated_sha is None:
+            integrated_sha = getattr(merge_result, "integrated_sha", None)
+        integrated_step = step
+    elif row.state == "integrating":
+        return {
+            "stage": "awaiting-integrator",
+            "detail": f"tranche row {row.id} has an integrator leg in flight",
+        }
+    elif row.state == "done":
+        integrated_step = {}
+    else:
+        # Fail closed on a state outside the vocabulary #4199 froze, rather
+        # than treating an unrecognised one as "integrated and ready to
+        # test" — that would bind a Test verdict to a tree this function
+        # knows nothing about.
+        raise ValueError(
+            f"advance_tranche_row: row {row.id} has unknown state "
+            f"{row.state!r}"
+        )
+
+    if integrated_sha is None:
+        _sha_resolver = sha_resolver
+        if _sha_resolver is None:
+            from coord.github_ops import get_branch_sha as _sha_resolver  # noqa: PLC0415
+        repo_cfg = config.repo(row.repo_name)
+        if repo_cfg is None:
+            return {
+                "stage": "awaiting-integrated-sha",
+                "detail": f"repo {row.repo_name!r} is not configured",
+                **integrated_step,
+            }
+        integrated_sha = _sha_resolver(
+            repo_cfg.github, tranche_integration_branch_name(row),
+        )
+    if not integrated_sha:
+        return {
+            "stage": "awaiting-integrated-sha",
+            "detail": (
+                "could not read the head of "
+                f"{tranche_integration_branch_name(row)} — refusing to bind "
+                "a Test or review verdict to an unknown tree"
+            ),
+            **integrated_step,
+        }
+
+    test_leg = tranche_test_leg_assignment(board, row)
+    if test_leg is None:
+        _test_dispatcher = test_dispatcher or dispatch_tranche_test
+        dispatched = _test_dispatcher(
+            row, integrated_sha, config, machine_names, board,
+        )
+        ok = isinstance(dispatched, dict) and dispatched.get("ok")
+        return {
+            "stage": "test-dispatched" if ok else "test-dispatch-failed",
+            "detail": (
+                f"dispatched the Test leg to "
+                f"{(dispatched or {}).get('machine_name')!r}"
+                if ok
+                else f"Test leg not dispatched: {(dispatched or {}).get('error')}"
+            ),
+            "test": dispatched,
+            **integrated_step,
+        }
+
+    _test_state_reader = test_state_reader
+    if _test_state_reader is None:
+        from coord.state import load_assignment_test_state as _test_state_reader  # noqa: PLC0415
+    test_state = _test_state_reader(test_leg.assignment_id) or test_leg.test_state
+    if test_state == "failed":
+        return {
+            "stage": "test-failed",
+            "detail": (
+                f"the Test leg on the integrated tree failed: "
+                f"{test_leg.test_reason or 'no reason recorded'}"
+            ),
+            **integrated_step,
+        }
+    if test_state != TRANCHE_TEST_PASSED_STATE:
+        return {
+            "stage": "awaiting-test",
+            "detail": (
+                f"Test leg {test_leg.assignment_id} has not passed yet "
+                f"(test_state={test_state!r})"
+            ),
+            **integrated_step,
+        }
+
+    _fingerprinter = patch_id_fingerprinter or tranche_integrated_patch_id
+    integrated_patch_id = _fingerprinter(row, integrated_sha, config)
+    if not integrated_patch_id:
+        # `tranche_integrated_patch_id` is fail-SAFE (a diff it cannot
+        # fetch or fingerprint comes back `None`), and `tranche_review_
+        # verdict` reads a `None` binding as "skip the check". Passing that
+        # through here would let three approvals of an older tree open the
+        # closing PR — the exact staleness the binding exists to catch — so
+        # this stage stops instead, visibly, every tick.
+        return {
+            "stage": "awaiting-patch-id",
+            "detail": (
+                f"could not fingerprint the diff {row.base_sha}.."
+                f"{integrated_sha} — refusing to judge review approvals "
+                "against an unbound tree"
+            ),
+            **integrated_step,
+        }
+    legs = tranche_review_leg_assignments(board, row)
+    verdict = tranche_review_verdict(legs, integrated_patch_id=integrated_patch_id)
+
+    if verdict["approved"]:
+        _pr_opener = pr_opener or open_tranche_closing_pr
+        pr = _pr_opener(
+            row, config, test_passed=True, review_verdict=verdict,
+        )
+        return {
+            "stage": "pr-opened" if pr else "pr-failed",
+            "detail": (
+                f"opened the closing PR: {(pr or {}).get('url')}"
+                if pr else "the closing PR could not be opened"
+            ),
+            "pr": pr,
+            "review_verdict": verdict,
+            **integrated_step,
+        }
+
+    if verdict["blocking"]:
+        return {
+            "stage": "review-blocking",
+            "detail": (
+                "review leg(s) requested changes: "
+                + ", ".join(verdict["blocking"])
+                + " — the integrated tree needs a fix before the closing "
+                "PR can open"
+            ),
+            "review_verdict": verdict,
+            **integrated_step,
+        }
+
+    from coord.dao import TERMINAL_STATUSES  # noqa: PLC0415
+
+    awaiting: list[str] = []
+    to_dispatch: list[str] = []
+    for focus in verdict["pending"]:
+        leg = legs.get(focus)
+        in_flight = leg is not None and leg.status not in TERMINAL_STATUSES
+        bound = leg is not None and leg.review_patch_id == integrated_patch_id
+        (awaiting if in_flight and bound else to_dispatch).append(focus)
+
+    if not to_dispatch:
+        return {
+            "stage": "awaiting-review",
+            "detail": (
+                "review leg(s) still in flight against the current "
+                "patch-id: " + ", ".join(awaiting)
+            ),
+            "review_verdict": verdict,
+            **integrated_step,
+        }
+
+    _review_dispatcher = review_dispatcher or dispatch_tranche_review_legs
+    prior_verdicts = {
+        focus: legs[focus].review_verdict
+        for focus in to_dispatch
+        if legs.get(focus) is not None and legs[focus].review_verdict is not None
+    }
+    dispatched = _review_dispatcher(
+        row, integrated_sha, config, machine_names, board,
+        integrated_patch_id=integrated_patch_id,
+        focuses=[f for f in TRANCHE_REVIEW_FOCUSES if f in to_dispatch],
+        prior_verdicts=prior_verdicts or None,
+    )
+    ok = isinstance(dispatched, dict) and dispatched.get("ok")
+    return {
+        "stage": "review-dispatched" if ok else "review-dispatch-failed",
+        "detail": (
+            "dispatched review leg(s): " + ", ".join(to_dispatch)
+            if ok
+            else "one or more review legs failed to dispatch: "
+            + ", ".join(
+                f"{focus}: {leg.get('error')}"
+                for focus, leg in ((dispatched or {}).get("legs") or {}).items()
+                if not leg.get("ok")
+            )
+        ),
+        "review": dispatched,
+        "review_verdict": verdict,
+        **integrated_step,
+    }
+
+
 # ── #1526: driver/gate divergence ───────────────────────────────────────────
 #
 # `coord drive` decides `test=`/`review=` are satisfied from

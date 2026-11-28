@@ -9500,14 +9500,28 @@ def dispatch_tranche_review_legs(
     now: float | None = None,
     prior_verdicts: "Mapping[str, str] | None" = None,
     integrated_patch_id: str | None = None,
+    focuses: "Sequence[str] | None" = None,
     diff_fetcher=None,
     patch_id_computer=None,
 ) -> dict:
-    """Dispatch the three bound review legs for *row*'s integrated tree
+    """Dispatch the bound review legs for *row*'s integrated tree
     (#4129/#4202) — only ever called once `row.state == "done"`.
 
-    One leg per `TRANCHE_REVIEW_FOCUSES` entry, round-robined across
-    *machine_names* in that order. Each is a standalone raw `/assign` POST
+    One leg per requested focus, round-robined across *machine_names* by
+    each focus's own index in `TRANCHE_REVIEW_FOCUSES` — so a focus always
+    lands on the same machine whether it is dispatched with its siblings
+    or on its own.
+
+    *focuses* narrows the dispatch to a subset of
+    `TRANCHE_REVIEW_FOCUSES`; `None` (the default) dispatches all three.
+    The scoped re-review of a fix delta needs this: once a fix moves the
+    integrated patch-id, `tranche_review_verdict` reports the focuses
+    whose binding went stale, and only those get re-dispatched — a focus
+    whose own leg is still in flight against the CURRENT patch-id must
+    not be dispatched a second time. `ok` then reports only the requested
+    focuses, so an unrequested one never reads as a failure.
+
+    Each leg is a standalone raw `/assign` POST
     (mirrors `coord.gate_b.dispatch_gate_b_review`'s posture — see this
     section's own module comment for why `dispatch_review`'s PR-centric
     machinery doesn't apply here), appending a `type="review"` `Assignment`
@@ -9538,13 +9552,17 @@ def dispatch_tranche_review_legs(
     independently, mirroring `dispatch_tranche_row_children`'s per-child
     posture, so one agent rejecting a POST doesn't strand the other two
     legs undispatched. Returns ``{"ok": bool, "legs": {focus: {...}}}``:
-    ``ok`` is `True` only when EVERY focus's own leg dispatched
+    ``ok`` is `True` only when EVERY REQUESTED focus's own leg dispatched
     successfully; each `legs[focus]` is ``{"ok": True, "assignment_id":
     ..., "machine_name": ...}`` or ``{"ok": False, "error": ...}``.
 
-    Raises ValueError if *machine_names* is empty or *row.id* is None —
-    there is nowhere to route the legs to, or no stable sentinel
-    (`tranche_review_target_for`) to dispatch them under.
+    Raises ValueError if *machine_names* is empty, if *row.id* is None, or
+    if *focuses* names anything outside `TRANCHE_REVIEW_FOCUSES` or is
+    given as an empty sequence — there is nowhere to route the legs to, no
+    stable sentinel (`tranche_review_target_for`) to dispatch them under,
+    or no focus to review. An empty *focuses* must never read as "all
+    three dispatched fine": `ok` over an empty `legs` map would be
+    vacuously `True`.
     """
     if not machine_names:
         raise ValueError("dispatch_tranche_review_legs: machine_names is empty")
@@ -9553,6 +9571,21 @@ def dispatch_tranche_review_legs(
             "dispatch_tranche_review_legs: row.id is None — save the row "
             "(coord.state.save_tranche_row) before dispatching its review legs"
         )
+    if focuses is None:
+        requested = list(TRANCHE_REVIEW_FOCUSES)
+    else:
+        requested = list(focuses)
+        if not requested:
+            raise ValueError(
+                "dispatch_tranche_review_legs: focuses is empty — pass None "
+                "for all of TRANCHE_REVIEW_FOCUSES, never an empty sequence"
+            )
+        unknown = [f for f in requested if f not in TRANCHE_REVIEW_FOCUSES]
+        if unknown:
+            raise ValueError(
+                f"dispatch_tranche_review_legs: unknown focus(es) {unknown!r} "
+                f"— must be among {list(TRANCHE_REVIEW_FOCUSES)!r}"
+            )
     if integrated_patch_id is None:
         integrated_patch_id = tranche_integrated_patch_id(
             row, integrated_sha, config,
@@ -9571,8 +9604,10 @@ def dispatch_tranche_review_legs(
     client = http_client or httpx
     legs: dict[str, dict] = {}
 
-    for i, focus in enumerate(TRANCHE_REVIEW_FOCUSES):
-        machine_name = machine_names[i % len(machine_names)]
+    for focus in requested:
+        machine_name = machine_names[
+            TRANCHE_REVIEW_FOCUSES.index(focus) % len(machine_names)
+        ]
         machine = next((m for m in config.machines if m.name == machine_name), None)
         if machine is None:
             legs[focus] = {"ok": False, "error": f"unknown machine {machine_name!r}"}
