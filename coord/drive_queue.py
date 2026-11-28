@@ -5422,6 +5422,37 @@ def format_intervention_reason(
     return text
 
 
+def fresh_interventions(
+    interventions: Mapping[str, Mapping[str, Any]], now: float | None,
+) -> Mapping[str, Mapping[str, Any]]:
+    """*interventions* with every entry :func:`intervention_is_stale` of
+    *now* dropped.
+
+    Both callers that build a dep-keyed intervention map for
+    `_resolve_prereqs`/`diagnose_blocked_after` — `plan_tick`'s
+    `effective_interventions` and `coord.commands.drive_queue`'s
+    `dep_interventions` — run this before handing the map through, so a
+    dependent's "held by ..." verdict (and the `unsatisfiable=False` it
+    drives in `diagnose_blocked_after`/`_reconcile_blocked_after`) can never
+    outlive the SAME record `format_intervention_reason` already renders
+    ``STALE`` on the held row itself. Without this a month-old record kept
+    both deferring the dependent forever and disagreeing with the row it
+    names, the opposite of what the staleness window exists to do.
+
+    ``now is None`` (a pure-logic caller with no clock) returns
+    *interventions* unfiltered — nothing to measure staleness against, same
+    posture :func:`intervention_is_stale` itself takes for an unparseable
+    record.
+    """
+    if now is None:
+        return interventions
+    return {
+        key: rec
+        for key, rec in interventions.items()
+        if not intervention_is_stale(rec, now)
+    }
+
+
 def is_unreachable_wait(
     entry: QueueEntry,
     *,
@@ -9613,10 +9644,13 @@ def plan_tick(
     # `_reconcile_blocked_after` the same way `effective_last_reason` above
     # is, so the launch walk's "it will never satisfy" verdict for a
     # dependent can read "held by ..." instead the SAME tick a rescue is
-    # recorded, without waiting on a stale snapshot.
-    effective_interventions: dict[str, Mapping[str, Any]] = {
-        e.key: e.intervention for e in ordered if e.intervention
-    }
+    # recorded, without waiting on a stale snapshot. Run through
+    # `fresh_interventions` so a record old enough to render `STALE` on its
+    # own held row drops out here too, instead of deferring the dependent
+    # forever on a claim the row itself no longer stands behind.
+    effective_interventions: Mapping[str, Mapping[str, Any]] = fresh_interventions(
+        {e.key: e.intervention for e in ordered if e.intervention}, now,
+    )
 
     def _refresh_only(reason: str, current: str) -> dict[str, Any]:
         """``{}`` unless *reason* is non-empty and differs from *current*.

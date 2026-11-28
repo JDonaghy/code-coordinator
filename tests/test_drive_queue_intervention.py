@@ -30,6 +30,7 @@ from coord.cli import main
 from coord.drive_queue import (
     INTERVENTION_DEFAULT_STALE_SECONDS,
     format_intervention_reason,
+    fresh_interventions,
     intervention_is_stale,
 )
 from tests import backends
@@ -213,6 +214,49 @@ def test_dependent_shows_held_by_instead_of_will_never_satisfy(cli, seed):
     assert "it will never satisfy" not in after.output
 
 
+def test_dependent_reverts_to_will_never_satisfy_once_the_record_goes_stale(
+    cli, seed, monkeypatch
+):
+    """A dependent's "held by ..." deferral (and the `unsatisfiable=False`
+    verdict behind it) must not outlive the SAME record `drive-queue list`
+    already renders `STALE` on the held row itself — otherwise the
+    dependent would wait forever on a claim the system has already
+    declared expired."""
+    seed(issues={210: "open", 211: "open"})
+    cli("add", REPO, "210")
+    state._update_drive_queue_entry_local(
+        REPO, 210, state="blocked", last_reason="drive session died"
+    )
+    cli("add", REPO, "211", "--after", "210")
+    dep_reason = f"pre-req {REPO}#210 is queued but blocked — it will never satisfy"
+    state._update_drive_queue_entry_local(
+        REPO, 211, state="blocked", last_reason=dep_reason
+    )
+
+    # Backdated directly via `coord.state`, same determinism rationale as
+    # `test_a_record_past_its_own_stale_after_renders_stale` above.
+    state.set_drive_queue_intervention(
+        REPO, 210, by="bob", did="manual conflict resolution",
+        next_step="nothing, should land on its own",
+        stale_after_seconds=10, now=1_000_000.0,
+    )
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue.time.time", lambda: 1_000_000.0 + 5
+    )
+    fresh = cli("list")
+    assert f"waiting on {REPO}#210 (held by bob — #4216)" in fresh.output
+    assert "it will never satisfy" not in fresh.output
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue.time.time", lambda: 1_000_000.0 + 20
+    )
+    stale = cli("list")
+    assert stale.exit_code == 0, stale.output
+    assert f"waiting on {REPO}#210 (held by bob — #4216)" not in stale.output
+    assert "it will never satisfy" in stale.output
+
+
 # ── staleness ─────────────────────────────────────────────────────────────────
 
 
@@ -263,6 +307,24 @@ def test_intervention_is_stale_and_format_intervention_reason_boundaries():
     with_override = {**record, "stale_after": 5}
     assert intervention_is_stale(with_override, 100.0 + 6)
     assert not intervention_is_stale(with_override, 100.0 + 4)
+
+
+def test_fresh_interventions_drops_stale_records_but_not_fresh_ones():
+    """`plan_tick`'s `effective_interventions` and `coord.commands.
+    drive_queue`'s `dep_interventions` both run their map through this
+    before handing it to `_resolve_prereqs`/`diagnose_blocked_after` — a
+    dependent must never be told "held by ..." off a record the row itself
+    would already render `STALE`."""
+    fresh = {"by": "alice", "did": "x", "next": "y", "at": 100.0}
+    stale = {"by": "bob", "did": "x", "next": "y", "at": 100.0, "stale_after": 5}
+    interventions = {"repo#1": fresh, "repo#2": stale}
+
+    result = fresh_interventions(interventions, 100.0 + 10)
+    assert result == {"repo#1": fresh}
+
+    # No clock to judge staleness against: unfiltered, same posture
+    # `intervention_is_stale` itself takes for an unparseable record.
+    assert fresh_interventions(interventions, None) == interventions
 
 
 # ── auto-clear on `done` ──────────────────────────────────────────────────────

@@ -96,6 +96,7 @@ from coord.drive_queue import (
     flag_shadows_config_warning,
     format_coarse_duration,
     format_intervention_reason,
+    fresh_interventions,
     INTERVENTION_DEFAULT_STALE_SECONDS,
     is_benign_queue_alert_command,
     is_dispatch_failure_reason,
@@ -1974,8 +1975,12 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     # #4216: same "thread it through so a render never disagrees with a
     # live tick" rule as `dep_reasons` just above, for a dep's own active
     # `coord drive-queue note` record — see `_resolve_prereqs`'s
-    # `dep_interventions` docstring.
-    dep_interventions = {e.key: e.intervention for e in all_entries if e.intervention}
+    # `dep_interventions` docstring. Run through `fresh_interventions` so a
+    # record old enough to render `STALE` on its own held row (`now` above)
+    # drops out here too, matching `plan_tick`'s `effective_interventions`.
+    dep_interventions = fresh_interventions(
+        {e.key: e.intervention for e in all_entries if e.intervention}, now,
+    )
     cycle_keys: dict[str, str] = {}
     cycle = find_cycle({e.key: list(e.after) for e in all_entries})
     if cycle is not None:
