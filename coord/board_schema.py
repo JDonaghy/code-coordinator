@@ -328,6 +328,16 @@ class BoardDriveQueueEntry:
     # talking to a daemon that predates it — reproduces the pre-#3463
     # `work_leg_count - 1` fix-round formula exactly.
     legs_at_enqueue: int = 0
+    # #4216: a human/agent's own record of an out-of-band rescue, or `None`
+    # when there isn't one — see the `drive_queue.intervention_json` CREATE
+    # TABLE comment in `coord/db.py` for the shape. The structured record
+    # itself, for a client that wants it raw; `coord/serve_app.py` ALSO
+    # overwrites this same row's `last_reason` above with
+    # `coord.drive_queue.format_intervention_reason`'s rendering of it
+    # before shipping the row, so coord-tui and the dashboard — neither of
+    # which re-implements "is this row held" — show the identical sentence
+    # `coord drive-queue list` does without reading this field at all.
+    intervention_json: dict | None = None
 
 
 # ── #3428 (#3408 item 3): concurrency ceilings + provenance + occupancy ──────

@@ -366,6 +366,8 @@ def test_drive_queue_is_registered_with_every_verb():
         "doctor-log",
         # #3881: the daemon-host investigator's one audited action wrapper.
         "doctor-act",
+        # #4216: the per-row out-of-band-rescue note.
+        "note",
     }
 
 

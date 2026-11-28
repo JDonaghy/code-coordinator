@@ -1207,7 +1207,9 @@ def retry_on_locked(
 # #4199: bumped 31 -> 32 for the new `tranche_rows`/`tranche_children`
 # TABLES below (not a column -- same table-only shape as #3113/#3333/
 # #2468/#3889/#3992/#4077 above).
-_DB_SCHEMA_VERSION = 32
+# #4216: bumped 32 -> 33 for the new `drive_queue.intervention_json`
+# column (see the CREATE TABLE comment above).
+_DB_SCHEMA_VERSION = 33
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1875,6 +1877,18 @@ _SCHEMA_SQL = """
             -- exactly, so an existing row's already-computed remaining
             -- budget does not change under this migration.
             legs_at_enqueue INTEGER NOT NULL DEFAULT 0,
+            -- #4216: a human/agent's own record of an out-of-band rescue
+            -- (a hand push, a fix to a red base, a CI rerun) — JSON object
+            -- `{"by", "did", "next", "sha", "at", "stale_after"}`, or ''
+            -- (unset). Written only by `coord drive-queue note`
+            -- (coord.state.set_drive_queue_intervention /
+            -- clear_drive_queue_intervention) and cleared automatically the
+            -- moment this row reconciles to `done` — see
+            -- coord.state._update_drive_queue_entry_local. See
+            -- coord.drive_queue.format_intervention_reason for how this
+            -- overrides the row's displayed reason while active. '' for
+            -- every row predating this column.
+            intervention_json TEXT NOT NULL DEFAULT '',
             UNIQUE(repo_name, issue_number)
         );
 
@@ -2927,6 +2941,9 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # #4147: see the CREATE TABLE comment above. '[]' for every row
     # predating this migration.
     "ALTER TABLE assignments ADD COLUMN unsatisfied_capabilities TEXT DEFAULT '[]'",
+    # #4216: see the CREATE TABLE comment above. '' for every row predating
+    # this migration — reads identically to "no intervention recorded".
+    "ALTER TABLE drive_queue ADD COLUMN intervention_json TEXT NOT NULL DEFAULT ''",
 ]
 
 
