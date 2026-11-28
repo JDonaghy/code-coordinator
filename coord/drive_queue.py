@@ -540,6 +540,34 @@ def fix_round_ceiling_blocked_for_issue(repo_name: str, issue_number: int) -> bo
     return is_fix_round_ceiling_blocked(entry.state, entry.last_reason)
 
 
+def branch_specific_test_failures(
+    own_failing_tests: Sequence[str], base_failing_tests: Sequence[str],
+) -> tuple[str, ...]:
+    """Which of *own_failing_tests* are NOT also failing on the base (#4210).
+
+    A baseline-red streak poisons every row for its repo (`coord.
+    board_doctor._collect_rows_with_board`'s blocked-streaks fold) on the
+    premise that nothing in the queue is individually at fault — the base
+    itself is red. That premise is only true for a failure the branch
+    SHARES with the base; a failure the branch's own diff introduced, on
+    top of an unrelated already-red base, is still this row's own fault
+    and must not be withdrawn from the sweep along with it. This is the
+    one, pure, reusable answer to "which of these are genuinely the
+    branch's own" (#2096) — `coord.board_doctor._reclassify_test_failed`
+    is its only caller today, but any future caller asks the SAME
+    question through this function rather than re-deriving the
+    subtraction independently.
+
+    Order-preserving (the order *own_failing_tests* names them in),
+    de-duplicated; ``()`` when *own_failing_tests* is empty or every one
+    of its entries also appears in *base_failing_tests* — the signal for
+    "fully explained by the base, a baseline-red fold may suppress this
+    row exactly as before."
+    """
+    base = set(base_failing_tests)
+    return tuple(t for t in dict.fromkeys(own_failing_tests) if t not in base)
+
+
 #: #4133: the wall-clock-free ceiling on work legs dispatched since a
 #: drive-queue row's own baseline (:attr:`QueueEntry.legs_at_enqueue`) that
 #: :func:`may_dispatch_rework`'s own latch trips on. Fixed fleet-wide,

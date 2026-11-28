@@ -226,8 +226,10 @@ from coord.board_doctor import (
     CAUSE_NEXT_ACTION_UNPERFORMED,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
+    CAUSE_TEST_FAILED_AT_CEILING,
     TIER_ALERT,
     TIER_AUTO,
+    TRIAGE_BUCKET_EVIDENCE_PREFIX,
     StuckRow,
     after_prereqs_landed_for_entry,
     stranded_prereq_dep,
@@ -3158,7 +3160,9 @@ def _alert_fallback(row: StuckRow) -> bool:
 #: Every other cause, and every confidence `_fixit_rebudget_environmental`
 #: does not explicitly admit, stays governed by the ceiling exactly as
 #: before (#3767: uncertain defaults to NO, the conservative existing
-#: behavior).
+#: behavior) — except `CAUSE_TEST_FAILED_AT_CEILING` (#4210), which that
+#: function admits through a SECOND, independent path keyed on the #4093
+#: triage verdict rather than on membership in this set at all.
 _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES = frozenset(
     {
         CAUSE_CEILING_BLOCKED_MERGEABLE,
@@ -3166,6 +3170,20 @@ _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES = frozenset(
         queue_diagnose.CAUSE_INTEGRATION_RED,
     }
 )
+
+
+def _row_triage_bucket(row: StuckRow) -> str | None:
+    """The #4093 triage-verdict bucket `coord.board_doctor.
+    _reclassify_test_failed` stashed onto *row*'s evidence (the
+    :data:`TRIAGE_BUCKET_EVIDENCE_PREFIX`-prefixed marker), or ``None``
+    when no caller ever supplied one. The ONE reader of that marker
+    (#2096) — :func:`_fixit_rebudget_environmental` calls this rather
+    than re-deriving the prefix strip inline.
+    """
+    for item in row.evidence:
+        if item.startswith(TRIAGE_BUCKET_EVIDENCE_PREFIX):
+            return item[len(TRIAGE_BUCKET_EVIDENCE_PREFIX):]
+    return None
 
 
 def _fixit_rebudget_environmental(row: StuckRow) -> bool:
@@ -3195,10 +3213,27 @@ def _fixit_rebudget_environmental(row: StuckRow) -> bool:
     `CONFIDENCE_HIGH` and so is admitted either way, but the bar stays
     ``!= CONFIDENCE_LOW`` for all three so this function has one rule, not
     a per-cause exception.
+
+    #4210: :data:`CAUSE_TEST_FAILED_AT_CEILING` is admitted through a
+    SECOND, independent path that ignores ``confidence`` entirely — a
+    small, mechanical, branch-specific Test failure is investigable past
+    the ceiling even though nothing about it is "environmental" in the
+    sense above (the failure is real, not a merge-ref/check-state
+    artifact that cleared on its own); what makes it safe to rebudget is
+    the #4093 triage verdict, read back via :func:`_row_triage_bucket`,
+    classifying it ``BUCKET_MECHANICAL`` — never on a wider bucket: a
+    ``BUCKET_SUBSTANTIVE`` (or any other) verdict for this cause still
+    falls through to ``False``, the ordinary ceiling escalation.
     """
-    if not row.fresh or row.cause not in _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES:
+    if not row.fresh:
         return False
-    return row.confidence != queue_diagnose.CONFIDENCE_LOW
+    if row.cause in _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES:
+        return row.confidence != queue_diagnose.CONFIDENCE_LOW
+    if row.cause == CAUSE_TEST_FAILED_AT_CEILING:
+        from coord.failure_triage import BUCKET_MECHANICAL  # noqa: PLC0415
+
+        return _row_triage_bucket(row) == BUCKET_MECHANICAL
+    return False
 
 
 def _fixit_rebudget_eligible(row: StuckRow, repo_name: str, issue_number: int) -> bool:
@@ -3804,6 +3839,16 @@ for _investigate_cause in (
     queue_diagnose.CAUSE_GATE_BLOCKED,
     queue_diagnose.CAUSE_AGENT_UNREACHABLE,
     queue_diagnose.CAUSE_UNKNOWN,
+    # #4210: a row whose failing Test leg's own evidence names a real,
+    # branch-specific failure AND whose drive-queue row has already
+    # exhausted the #2972 fix-round ceiling (`coord.board_doctor.
+    # _reclassify_test_failed`, the only minter of this cause). Reaches
+    # `_investigate`'s ordinary ceiling check like every other
+    # investigate-eligible cause; `_fixit_rebudget_environmental`'s own
+    # #4210 branch is what lets a BUCKET_MECHANICAL verdict bypass it —
+    # a BUCKET_SUBSTANTIVE (or unclassified) verdict still escalates once
+    # to the alert tier instead, same as any other ceiling-blocked cause.
+    CAUSE_TEST_FAILED_AT_CEILING,
 ):
     _register_investigate_action(_investigate_cause)
 del _investigate_cause
