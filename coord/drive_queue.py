@@ -2472,9 +2472,11 @@ class QueueEntry:
     # push, a fix to a red base, a CI rerun) — `None` when nothing is
     # recorded, otherwise ``{"by", "did", "next", "sha", "at",
     # "stale_after"}`` (see `coord/db.py`'s CREATE TABLE comment for the
-    # exact shape). Written only by `coord drive-queue note`
-    # (`coord.state.set_drive_queue_intervention`); never by a tick — see
-    # `format_intervention_reason` for how it overrides this row's
+    # exact shape). Written by `coord drive-queue note`
+    # (`coord.state.set_drive_queue_intervention`) for an operator/agent's
+    # own record, and by `coord.reconcile.reconcile_rescued_blocked_rows`'s
+    # #4217 tick for a record it auto-detects (`RESCUE_INTERVENTION_BY`) —
+    # see `format_intervention_reason` for how it overrides this row's
     # displayed reason while active.
     intervention: dict | None = None
 
@@ -5504,12 +5506,19 @@ def is_rescue_resume_eligible(
     `True` only for `state == STATE_BLOCKED` AND (the #2972 fix-round
     ceiling — :func:`is_fix_round_ceiling_reason` — OR a non-stale #4216
     intervention record — :func:`intervention_is_stale` — whether that
-    record is human-authored or this same sweep's own). Every OTHER
-    `blocked` cause (#1844/#2019/#3522/#4133/#4177, or a plain unconfirmed
-    gate block with neither a ceiling nor a record) is left alone: #2230's
-    own gate-based resume already owns those, and widening this sweep to
-    them would relaunch a row for a reason the ceiling/held shape was never
-    meant to cover.
+    record is human-authored or this same sweep's own). A `blocked` cause
+    with neither a ceiling reason nor ANY intervention record (#1844/#2019/
+    #3522/#4133/#4177, or a plain unconfirmed gate block) is left alone —
+    #2230's own gate-based resume already owns those, and widening this
+    sweep to them would relaunch a row for a reason the ceiling/held shape
+    was never meant to cover. This does NOT, by itself, guarantee one of
+    those other causes stays ineligible forever: `coord.reconcile.
+    reconcile_rescued_blocked_rows`'s own detection writes a fresh #4216
+    record for ANY blocked row whose branch moves (not only a ceiling/held
+    one), and that record alone makes this predicate return `True` on the
+    very next check — i.e. a plain-blocked row (e.g. "no capable machine")
+    whose branch gets pushed to and reads CI-green WILL get auto-resumed
+    too, via the record the detection half of that same sweep just wrote.
     """
     if state != STATE_BLOCKED:
         return False

@@ -1119,7 +1119,7 @@ def _reconcile_one_rescued_row(
         )
         resumed_sha = None
         if entry.intervention is None or entry.intervention.get("sha") != live_sha:
-            state.set_drive_queue_intervention(
+            wrote = state.set_drive_queue_intervention(
                 repo_name,
                 issue_number,
                 by=dq.RESCUE_INTERVENTION_BY,
@@ -1128,10 +1128,27 @@ def _reconcile_one_rescued_row(
                 sha=live_sha,
                 now=now,
             )
-            changed_key = dq.entry_key(repo_name, issue_number)
+            # #2096: a reported outcome must come from an observation taken
+            # after the write, never from the write primitive's own bool —
+            # re-read the row and only count this as "changed" once the
+            # record is confirmed actually sitting there.
             fresh_row = state.get_drive_queue_entry(repo_name, issue_number)
             if fresh_row is not None:
                 entry = dq.QueueEntry.from_row(fresh_row)
+            if (
+                wrote
+                and entry.intervention is not None
+                and entry.intervention.get("sha") == live_sha
+            ):
+                changed_key = dq.entry_key(repo_name, issue_number)
+            else:
+                import logging  # noqa: PLC0415
+
+                logging.warning(
+                    "reconcile_rescued_blocked_rows: %s#%s intervention "
+                    "write for sha %s could not be confirmed on re-read",
+                    repo_name, issue_number, live_sha,
+                )
 
     if not dq.is_rescue_resume_eligible(
         entry.state, entry.last_reason, entry.intervention, now=now
@@ -1146,6 +1163,25 @@ def _reconcile_one_rescued_row(
         # repeat it on the same SHA (that would clobber an in-flight leg's
         # own `running` stamp, or re-fire forever after a genuine red
         # verdict already came back; see this function's docstring).
+        return changed_key
+    if dq.is_fix_round_ceiling_reason(entry.last_reason) and any(
+        a.repo_name == repo_name
+        and a.issue_number == issue_number
+        and a.type == "conflict-fix"
+        and (a.dispatched_at or 0.0) > (completed.finished_at or completed.dispatched_at or 0.0)
+        for a in list(board.active) + list(board.completed)
+    ):
+        # #2085/#4036: a ceiling-blocked row with a `type="conflict-fix"`
+        # leg dispatched AFTER the blocking work leg finished is exactly
+        # the shape `coord.board_doctor.run_conflict_fix_ceiling_pending_
+        # sweep`/`coord.drive_queue.requeue_after_conflict_fix` already
+        # owns — that owner resets the SAME Test/Review stage AND grants a
+        # fresh #2972 fix-round budget via a full remove+re-add, which this
+        # sweep must never race: defer to it rather than resetting the
+        # stage here under a stale budget. This sweep stays the sole owner
+        # of every OTHER ceiling-blocked rescue (a hand push with no
+        # conflict-fix leg involved) and of every `held` row (that owner
+        # never looks at those at all).
         return changed_key
 
     pr = github_ops.find_pr_for_branch(repo_cfg.github, completed.branch)
@@ -1172,8 +1208,60 @@ def _reconcile_one_rescued_row(
     # `coord.drive_queue.plan_tick`'s own unconditional `facts.landed`
     # re-check (#2055/#3368) is what eventually flips it to `done` once the
     # issue actually merges.
-    state.reset_work_test_state(repo_name, issue_number)
-    state.reset_work_review_state(repo_name, issue_number)
+    #
+    # `reset_work_test_state`/`reset_work_review_state` leave `test-author`/
+    # `mock-author` rows untouched unless told exactly which assignment —
+    # pass the one this sweep resolved `completed` to be for those two
+    # types (see each function's own #3305/#1180 docstring).
+    reset_assignment_id = (
+        completed.assignment_id
+        if completed.type in ("test-author", "mock-author")
+        else None
+    )
+    reset_kwargs = (
+        {"assignment_id": reset_assignment_id}
+        if reset_assignment_id is not None
+        else {}
+    )
+    state.reset_work_test_state(repo_name, issue_number, **reset_kwargs)
+    state.reset_work_review_state(repo_name, issue_number, **reset_kwargs)
+
+    # #2096: a reported outcome must come from an observation taken after
+    # the write, never from `reset_work_test_state`/`reset_work_review_
+    # state`'s own row-matched rowcount (which proves only that the WHERE
+    # clause matched something, not that the value actually changed) — the
+    # same confirmation `coord.drive_queue.requeue_after_conflict_fix`
+    # already does for its own GREEN arm. Leave `resumed_sha` unset when the
+    # confirmation fails, so a later tick retries rather than latching a
+    # "resumed" watermark on a reset that never actually landed.
+    fresh_board = state.build_board()
+    still_stale = sorted(
+        a.assignment_id or ""
+        for a in list(fresh_board.active) + list(fresh_board.completed)
+        if a.repo_name == repo_name
+        and a.issue_number == issue_number
+        and a.type in WORK_LIKE_TYPES
+        and (
+            a.type not in ("test-author", "mock-author")
+            or a.assignment_id == completed.assignment_id
+        )
+        and (
+            a.review_state not in (None, "pending")
+            or a.review_verdict is not None
+            or a.test_state is not None
+        )
+    )
+    if still_stale:
+        import logging  # noqa: PLC0415
+
+        logging.warning(
+            "reconcile_rescued_blocked_rows: %s#%s Test/Review reset for "
+            "sha %s could not be confirmed on re-read for %s — leaving "
+            "resumed_sha unset so a later tick retries",
+            repo_name, issue_number, live_sha, ", ".join(still_stale),
+        )
+        return changed_key
+
     state.set_rescue_watch(repo_name, issue_number, baseline=live_sha, resumed_sha=live_sha)
     return dq.entry_key(repo_name, issue_number)
 
@@ -1231,6 +1319,33 @@ def reconcile_rescued_blocked_rows(
     second, duplicate dispatch call here would be exactly the "two
     surfaces answering the same question" split this codebase's own review
     bar rejects.
+
+    #2085/#4036: ``coord.board_doctor.run_conflict_fix_ceiling_pending_
+    sweep`` already owns "a ceiling-blocked row whose branch moved and
+    reads CI-green" for the specific case where a `type="conflict-fix"`
+    leg is what pushed the fix — it resets the SAME Test/Review stage
+    this function does, but ALSO grants a fresh #2972 fix-round budget via
+    a full remove+re-add (``sweep_drive_queue_requeue``), because
+    dispatching that leg is what spent the old one. This sweep's own
+    auto-resume (bullet 2) explicitly defers — a ceiling-blocked row with a
+    conflict-fix leg dispatched after its blocking work leg finished is
+    left untouched here (see :func:`_reconcile_one_rescued_row`'s own
+    guard) — so the two can never answer "reset this row's stage" for the
+    same event: that sweep owns every conflict-fix-leg rescue, this one
+    owns every OTHER ceiling-blocked rescue (a hand push, with no
+    conflict-fix leg involved) plus every `held` row (which that sweep's
+    own candidate list — ceiling-blocked only — never looks at). Unlike
+    that sweep, this one's resume is deliberately budget-preserving: no
+    fresh fix-round grant, because nothing here dispatched a leg that
+    would have spent one.
+
+    A third existing answer to "has the head moved past the recorded
+    verdict", ``coord.smoke._test_verdict_is_stale``, is not reused here
+    because it never fires for a `failed` verdict — the exact shape this
+    sweep exists to unstick (a row ceiling-blocked specifically because
+    its LAST Test/Review run already came back red or was never retried)
+    needs a watermark that notices a push regardless of what the stale
+    verdict says, not an extension of a check that stays silent for it.
 
     Best-effort throughout: any one row's live GitHub read failing, or a
     repo/PR this sweep cannot resolve, skips that row and moves on to the
