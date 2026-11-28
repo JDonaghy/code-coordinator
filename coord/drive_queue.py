@@ -2082,8 +2082,12 @@ def resolve_concurrency_report(
 # `concurrency.max_workers` — an explicit `--max-parallel`/
 # `pipeline.max_parallel` is not, so `behind_concurrency_multiplier` (default
 # 1.5) can still raise the scaled result above the fleet's real worker
-# capacity; *max_workers_cap* below re-clamps it regardless of which branch
-# produced *base_max_parallel*.
+# capacity; *max_workers_cap* below bounds that RAISE regardless of which
+# branch produced *base_max_parallel*. It bounds the raise only: an
+# explicit `--max-parallel N` outranks `concurrency.max_workers` by design
+# (#3388's resolution order — `--max-parallel 7` on a `max_workers: 2`
+# fleet dispatches against 7), and pacing is a modifier on that chain, not
+# a new place to overrule it.
 
 
 def pace_adjusted_max_parallel(
@@ -2108,20 +2112,30 @@ def pace_adjusted_max_parallel(
 
     *max_workers_cap* (``concurrency.max_workers``, the fleet's actual
     worker capacity — same meaning and same "0 or less means no cap known"
-    convention :func:`default_max_parallel` uses) re-clamps the SCALED
-    result. This is the one ceiling in the resolution chain not already
-    bounded by it: :func:`resolve_max_parallel`'s derived-default branch
-    clamps to it before this function ever sees the value, but an explicit
-    ``--max-parallel``/``pipeline.max_parallel`` does not, and
+    convention :func:`default_max_parallel` uses) bounds how far a
+    ``> 1.0`` multiplier may RAISE the ceiling:
+    :func:`resolve_max_parallel`'s derived-default branch is clamped to it
+    before this function ever sees the value, but an explicit
+    ``--max-parallel``/``pipeline.max_parallel`` is not, so
     ``behind_concurrency_multiplier`` could otherwise scale either one
     above what the fleet can actually run.
+
+    It can only ever give back a ceiling BETWEEN the scaled figure and
+    *base_max_parallel* — never less than *base_max_parallel* itself. An
+    explicit ``--max-parallel N`` deliberately outranks
+    ``concurrency.max_workers`` in the resolution order (``--max-parallel
+    7`` on a ``max_workers: 2`` fleet dispatches against 7), and pacing
+    scales that chain's answer rather than becoming a second, lower
+    ceiling of its own: on such a fleet a ``behind`` reading leaves the 7
+    alone instead of silently cutting it to 2, which is what a
+    multiplier-of-1.0 no-op requires too.
     """
     if base_max_parallel <= 0:
         return base_max_parallel
     scaled = round(base_max_parallel * decision.concurrency_multiplier)
     scaled = max(1, scaled)
     if max_workers_cap > 0:
-        scaled = min(scaled, max_workers_cap)
+        scaled = min(scaled, max(max_workers_cap, base_max_parallel))
     return scaled
 
 
