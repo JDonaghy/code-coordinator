@@ -134,6 +134,7 @@ from coord.models import (
     is_upstream_gap_park_reason,
     parse_issue_resolution,
 )
+from coord.usage_limits import PaceDecision
 from coord.worker_events import classify_zero_commit_outcome
 
 # ── dispatch type selection (#3132) ─────────────────────────────────────────
@@ -2060,6 +2061,41 @@ def resolve_concurrency_report(
         occupied=occupied,
         repo_occupied=repo_occupied,
     )
+
+
+# ── budget-paced concurrency (#4228) ─────────────────────────────────────────
+#
+# `coord.usage_limits.evaluate_pace` decides how far the account sits from
+# its own target spend curve and what that implies; this is the one place
+# that reading turns into an actual NUMBER the tick dispatches against —
+# scaling an already-fully-resolved ceiling (every ceiling above:
+# `--max-parallel`/`pipeline.max_parallel`/the derived default, already
+# clamped to `concurrency.max_workers`), never re-deriving concurrency a
+# second way (#2096 "one question, one answer" — the ceiling resolution
+# chain above is untouched; this only scales its OUTPUT).
+
+
+def pace_adjusted_max_parallel(base_max_parallel: int, decision: PaceDecision) -> int:
+    """Scale *base_max_parallel* — an already-resolved concurrency ceiling
+    (:func:`resolve_max_parallel` / :func:`resolve_concurrency_report`'s own
+    output) — by *decision*'s :attr:`~coord.usage_limits.PaceDecision.
+    concurrency_multiplier` (#4228): behind the target spend curve raises
+    it (buy wall-clock time while there's budget to spare); ahead of it
+    lowers it; ``"disabled"``/``"unknown"``/``"on_pace"`` all carry
+    ``concurrency_multiplier == 1.0``, so this is a no-op whenever there is
+    no pacing signal or the account is already on pace.
+
+    ``base_max_parallel <= 0`` (``--max-parallel 0``/``--reconcile-only``,
+    the operator's own explicit "launch nothing" request) passes through
+    UNCHANGED: scaling "launch nothing" by any factor must never turn it
+    into a different number. Otherwise the scaled result is rounded to
+    the nearest int and floored at 1 — pacing changes how FAST the queue
+    drains, never whether it drains at all.
+    """
+    if base_max_parallel <= 0:
+        return base_max_parallel
+    scaled = round(base_max_parallel * decision.concurrency_multiplier)
+    return max(1, scaled)
 
 
 # ── the startup grace window (#1794) ─────────────────────────────────────────

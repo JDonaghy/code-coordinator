@@ -111,6 +111,7 @@ from coord.drive_queue import (
     is_unsatisfiable_prereq_reason,
     merge_gate_remedy_command,
     merge_plan_inspect_command,
+    pace_adjusted_max_parallel,
     parse_after_spec,
     parse_key,
     pending_probe_targets,
@@ -153,6 +154,7 @@ if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.client import DriveQueueRead
     from coord.config import Config
     from coord.merge_queue import QueuedMerge
+    from coord.usage_limits import PaceDecision
 
 log = logging.getLogger(__name__)
 
@@ -2978,6 +2980,53 @@ def _unreachable_wait_alert_dict(rows: list[Mapping[str, Any]]) -> dict | None:
     }
 
 
+def _current_pace_decision(config_path: Path) -> PaceDecision:
+    """`coord drive-queue status`'s and `drive_queue_tick`'s SHARED pace
+    reading (#4228): one `coord.usage_limits.get_plan_limits` probe
+    (already cached — see that function's own docstring) and one
+    `coord.usage_limits.evaluate_pace` call, so the number a tick actually
+    dispatches against (`coord.drive_queue.pace_adjusted_max_parallel`)
+    and the number an operator reads from `status` can never silently
+    disagree (#2096 "one question, one answer").
+
+    Best-effort and SILENT on failure, the same posture
+    `_tranche_status_lines`/`_fetch_tranche_prereq_members` take for a
+    comparable "can this even be read right now" fallback: an
+    unreadable/missing `coordinator.yml` degrades to `PacingConfig()`
+    (`enabled=False`) with no warning printed, never failing `status` (or
+    the whole tick) over it. Unlike `_fetch_cordons`/
+    `_fetch_no_eligible_host` (which DO warn), a missing/invalid
+    ``--config`` here is not exceptional fleet state — `status` has never
+    required a loadable config to run at all, and warning on every call
+    for a `--config` path that simply doesn't resolve to anything would
+    be noise, not signal. Deliberately goes through
+    `coord.commands._common.resolve_and_load_config` rather than
+    `_load_config` — the latter is the CLI's own print-and-exit-2 boot
+    path (right for a command whose ENTIRE job is to load config, wrong
+    here, where a missing/invalid ``--config`` path must not take the
+    whole command down — see that function's own docstring for why
+    `coord.drive.Driver`'s per-poll reload makes the identical choice).
+
+    When pacing is NOT enabled, the `/usage` probe is skipped entirely —
+    `evaluate_pace`'s own disabled branch never inspects its `limits`
+    argument, so there is no reason to pay that round trip on every
+    tick/status call for a fleet that has not opted in (`pacing.enabled`
+    defaults to `False`).
+    """
+    from coord.commands._common import resolve_and_load_config  # noqa: PLC0415
+    from coord.config import PacingConfig  # noqa: PLC0415
+    from coord.usage_limits import PlanLimits, evaluate_pace, get_plan_limits  # noqa: PLC0415
+
+    try:
+        pacing_cfg = resolve_and_load_config(config_path).pacing
+    except Exception:  # noqa: BLE001 — see docstring
+        pacing_cfg = PacingConfig()
+
+    if not pacing_cfg.enabled:
+        return evaluate_pace(PlanLimits(status="unknown"), pacing_cfg)
+    return evaluate_pace(get_plan_limits(), pacing_cfg)
+
+
 def _tranche_status_lines() -> list[str]:
     """`coord drive-queue status`'s tranche block (#4227): every live
     tranche row's master/riding-children view, rendered by
@@ -3024,6 +3073,11 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
     rows = list_drive_queue()
     counts = _counts(rows)
     tranche_lines = _tranche_status_lines()
+    # #4228: the account's own budget pace against its target spend curve
+    # — surfaced here so an operator reading `status` sees not just the
+    # queue's state but WHY a tick is scaling concurrency or preferring a
+    # single leg over a workflow/tranche one.
+    pace_decision = _current_pace_decision(config_path)
     # #2944: a tick-raised alert (a HELD gate, a real BLOCKED-entry remedy)
     # takes priority when one exists — it is fresher and, on a busy queue,
     # `_unreachable_wait_alert_dict` would silently win-and-hide it every
@@ -3111,6 +3165,12 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                     # `QueueEntry`, so it is otherwise entirely absent from
                     # this payload's `counts`/`rows`.
                     "tranche_rows": tranche_lines,
+                    # #4228: the same `PaceDecision` a tick scales its own
+                    # concurrency by (`coord.drive_queue.
+                    # pace_adjusted_max_parallel`) — typed, so a client
+                    # reads the status/target/actual/mode without parsing
+                    # the text line below back out.
+                    "pace": pace_decision.to_dict(),
                 }
             )
         )
@@ -3129,6 +3189,12 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
     # right, not an annotation on something else already printed.
     for line in tranche_lines:
         click.echo(line)
+    # #4228: same placement logic — the account's own spend pace is a
+    # standing fact about this tick's own capacity/mode decisions, not a
+    # footnote on the alert below.
+    from coord.usage_limits import format_pace_decision  # noqa: PLC0415
+
+    click.echo(format_pace_decision(pace_decision))
     # The gate goes ABOVE the alert: "HELD" is the state, the alert is the
     # note about it, and an operator scanning the first line must not have to
     # read three more to learn the queue has stopped.
@@ -9480,6 +9546,26 @@ def drive_queue_tick(
             "--max-parallel must be at least 0 (0 = reconcile-only, launch "
             "nothing this run — see --reconcile-only)"
         )
+
+    # #4228: scale the already-resolved, already-validated ceiling by the
+    # account's own budget pace — behind the weekly target spend curve
+    # raises it (buy wall-clock time while there's budget to spare), ahead
+    # of it lowers it; see `coord.usage_limits.evaluate_pace` and
+    # `coord.drive_queue.pace_adjusted_max_parallel`. Applied AFTER the
+    # `< 0` check above (a bad `--max-parallel` is still caught before any
+    # scaling) and BEFORE `reconcile_only`/`explicit_reconcile_only` are
+    # derived from `max_parallel == 0` below — `pace_adjusted_max_parallel`
+    # never turns a positive ceiling into 0 (floored at 1), so this cannot
+    # change whether THIS tick is reconcile-only, only how many slots a
+    # launching tick actually has. A fleet that has not opted into
+    # `pacing:` (or whose probe has no usable reading) gets
+    # `concurrency_multiplier == 1.0`, i.e. this is a no-op — today's
+    # behaviour exactly. `_current_pace_decision` is the SAME reading
+    # `coord drive-queue status` renders, so the number this tick
+    # dispatches against and the number an operator sees can never
+    # silently disagree (#2096).
+    pace_decision = _current_pace_decision(config_path)
+    max_parallel = pace_adjusted_max_parallel(max_parallel, pace_decision)
 
     # #2110: `--reconcile-only` and `--max-parallel 0` are the same request —
     # one flag is a mnemonic for the other rather than a second code path, so
