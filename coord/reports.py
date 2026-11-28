@@ -4428,15 +4428,27 @@ def _validate_issue_cost_status(value: str) -> None:
 #     `cost_median` are read straight off its rows.
 #   * :func:`_completed_spend` — the SAME per-issue leg rows `fold_completed`
 #     already asked `usage_rollup.rollup` for. `work_rounds_*` counts every
-#     leg whose `type` is work-like (:data:`coord.models.WORK_LIKE_TYPES` —
-#     the same vocabulary `issue-activity`'s `fix_iterations` uses, so "a
-#     work round" means the same thing in both reports); `partial_rate_pct`
-#     reads the worker's own `ISSUE_RESOLUTION:` self-report
-#     (:func:`coord.models.parse_issue_resolution`) off the merged/done
-#     `work` leg's `completion_summary` — the exact column
-#     `coord.drive_queue`'s own `merged_partial`/`STATE_MERGED_PARTIAL`
-#     reasoning is keyed on, so this rate and that live state can never
-#     silently disagree about which issues counted.
+#     leg whose `type` is in :data:`coord.models.CLOSES_ISSUE_TYPES` (today
+#     exactly `{"work"}`, which also covers every fix round — a fix leg's
+#     own type mirrors the work leg it fixes). Deliberately narrower than
+#     `issue-activity`'s own `fix_iterations`, which counts every
+#     `WORK_LIKE_TYPES` dispatch event: a `test-author` leg attributed to
+#     this key by `for_issue_number` (an oracle-loop milestone's one-off
+#     acceptance-authoring leg) is not a work round, so "a work round"
+#     does NOT mean quite the same thing in both reports here.
+#     `partial_rate_pct` reads the worker's own `ISSUE_RESOLUTION:`
+#     self-report (:func:`coord.models.parse_issue_resolution`) off the
+#     `work` leg's `completion_summary`, with the SAME merged-row-wins
+#     precedence `coord.drive_queue`'s `BoardView` reduction applies for
+#     its own `merged_partial`/`STATE_MERGED_PARTIAL` reasoning
+#     (:func:`_scorecard_merge_resolution`) — but NOT identical to it:
+#     `facts.merged_partial` additionally reads `False` for a `closed`
+#     issue regardless of its `merge_resolution` (see that property's own
+#     docstring), while this rate has no such exclusion. The two can
+#     therefore still read differently for a closed-but-partial issue —
+#     intentional, since this report counts the worker's self-report over
+#     every completed issue, not just the ones the live board still
+#     tracks as merged-and-open.
 #   * :func:`fold_issue_activity` — the SAME audit-trail fold, over the SAME
 #     window, that report already performs; never a second, independent
 #     audit query. `fix_round_ceiling_hits` reads a row's `drive_exit.reason`
@@ -4595,6 +4607,40 @@ def _scorecard_issue_stats(
     }
 
 
+def _scorecard_merge_resolution(legs: Iterable[Mapping[str, Any]]) -> bool:
+    """``True`` when one issue's own legs read `merged-partial` (#3953).
+
+    Mirrors ``coord.drive_queue``'s `BoardView` reduction precedence, NOT a
+    second, looser `any()` over every `merged`/`done` leg: a `merged` row's
+    own `completion_summary` wins outright over any `done` row for the same
+    key, since a `done` leg lingers forever for every OTHER leg of an issue
+    that already landed (multiple work legs per issue is normal). Without
+    this precedence, a completed first attempt (`done`, `ISSUE_RESOLUTION:
+    partial`) followed by a landed fix (`merged`, resolved) reads partial
+    here — #2096's "one question, one answer" rule failing against the
+    live board's own `facts.merged_partial` reading of the SAME issue.
+    """
+    resolution_from_merged = False
+    partial = False
+    for leg in legs:
+        if (leg.get("type") or "work") not in CLOSES_ISSUE_TYPES:
+            continue
+        status = leg.get("status") or ""
+        if status == "merged":
+            partial = (
+                parse_issue_resolution(leg.get("completion_summary")).value
+                != DEFAULT_ISSUE_RESOLUTION
+            )
+            resolution_from_merged = True
+        elif status == "done" and not resolution_from_merged:
+            summary = leg.get("completion_summary")
+            if summary:
+                partial = (
+                    parse_issue_resolution(summary).value != DEFAULT_ISSUE_RESOLUTION
+                )
+    return partial
+
+
 def fold_scorecard(
     issues: Iterable[Mapping[str, Any]],
     assignments: Iterable[Mapping[str, Any]],
@@ -4668,16 +4714,18 @@ def fold_scorecard(
     for row in completed.rows:
         key = (row["repo"], row["issue"])
         legs = leg_rows_by_key.get(key, ())
+        # #3953: `CLOSES_ISSUE_TYPES` (today exactly `{"work"}`), NOT
+        # the broader `WORK_LIKE_TYPES` `issue-activity`'s `fix_iterations`
+        # reads dispatch events for — a `test-author` leg attributed to this
+        # key by `for_issue_number` (an oracle-loop milestone's one-off
+        # acceptance-authoring leg, `coord.drive_state`) is not a work round
+        # at all, and must not inflate it. A fix leg's own type mirrors the
+        # work leg it is fixing (`coord.auto_loop._dispatch_fix_for_review`),
+        # so every real work + fix round is still counted.
         rounds_by_key[key] = sum(
-            1 for leg in legs if (leg.get("type") or "work") in _WORK_LIKE_TYPES
+            1 for leg in legs if (leg.get("type") or "work") in CLOSES_ISSUE_TYPES
         )
-        partial_by_key[key] = any(
-            parse_issue_resolution(leg.get("completion_summary")).value
-            != DEFAULT_ISSUE_RESOLUTION
-            for leg in legs
-            if (leg.get("type") or "work") in CLOSES_ISSUE_TYPES
-            and (leg.get("status") or "") in ("merged", "done")
-        )
+        partial_by_key[key] = _scorecard_merge_resolution(legs)
 
     # The SAME #1742 audit-trail fold `issue-activity` performs over this
     # exact window — never a second, independent query of the trail.
@@ -4806,6 +4854,22 @@ def fold_scorecard(
             + sum(operator_removed.get(r, 0) for r in all_repos)
         ),
     }
+
+    # #3471: the standard coverage line every cost-bearing report appends —
+    # `cost_mean`/`cost_median` is stamped with `basis` above, so
+    # `assert_public_export_allowed` requires this note too (#2096: one
+    # shared rule, not a report-by-report opt-in). Over the exact legs
+    # behind the shown rows' `cost_mean`/`cost_median` — every repo this
+    # report actually displays (`all_completed_rows`, already repo-filtered
+    # above), never every leg ever fetched.
+    shown_legs = [
+        leg
+        for r in all_completed_rows
+        for leg in leg_rows_by_key.get((r["repo"], r["issue"]), ())
+    ]
+    coverage_note = _capture_coverage_note(shown_legs, pricing, cost_basis)
+    if coverage_note:
+        notes.append(coverage_note)
 
     if truncated:
         notes.append(
