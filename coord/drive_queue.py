@@ -3285,8 +3285,8 @@ def _merge_landed_state(
     equivalent live-confirmed-merge reading) into a terminal write can't
     drift from each other (#2096: one question, one answer) — two in
     `_reconcile_running`, plus the `_capacity_for` STATE_PARKED/BLOCKED/
-    FAILED sweep, `_cordon_reason`, and the retroactive `done` ->
-    `merged-partial` self-heal pass (#3863), five in total.
+    FAILED/MERGED_PARTIAL sweep, `_cordon_reason`, and the retroactive
+    `done` -> `merged-partial` self-heal pass (#3863), six in total.
 
     *confirmed_merged* (#3863): set by a caller that already has evidence
     of the MERGE itself STRONGER than the cached board — specifically the
@@ -9475,13 +9475,18 @@ def plan_tick(
     to today's behaviour, never to a wrongly-skipped relaunch.
 
     The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, #2055's
-    extension of it, #2230's further extension for `blocked`, and #2362's
-    narrower extension of THAT:
+    extension of it, #2230's further extension for `blocked`, #2362's
+    narrower extension of THAT, and #4218's extension to `merged-partial`:
 
     1. Reconcile every ``running`` entry (:func:`_reconcile_running`).
-    1b. Re-check every ``parked``/``blocked``/``failed`` entry against the
-        CURRENT board: landed ⇒ ``done`` (#1891 for ``parked``, #2055 for
-        ``blocked``/``failed``). Not-yet-landed then also checks the gate,
+    1b. Re-check every ``parked``/``blocked``/``failed``/``merged-partial``
+        entry against the CURRENT board: landed ⇒ ``done`` (#1891 for
+        ``parked``, #2055 for ``blocked``/``failed``). A ``merged-partial``
+        entry is ALWAYS already landed (its own PR merged) so it gets a
+        narrower question instead (#4218): its issue closing specifically
+        ⇒ ``done``; still open ⇒ untouched, same "no write, nothing to
+        report" posture as the others below. Not-yet-landed then also
+        checks the gate,
         for ``parked`` and (#2230) for RE-EVALUABLE ``blocked`` entries
         alike: cleared ⇒ ``waiting`` (falls into step 4 on this SAME tick,
         `blocked`'s `attempts` reset to 0 — see :func:`_reconcile_blocked`);
@@ -9924,7 +9929,77 @@ def plan_tick(
     # question ("has this key's issue actually landed?"), one answer,
     # whether asked on behalf of the row itself or a dependent chained
     # `--after` it.
+    #
+    # #4218 widens this to `merged-partial`: that row's own issue stays OPEN
+    # until board-doctor follow-through (or an operator by hand) files the
+    # remainder and closes it, and nothing before this re-checked that row
+    # once it went `merged-partial` — it sat stale forever, even after its
+    # issue closed. The check CANNOT simply join the `facts.landed`
+    # condition the loop below uses for `parked`/`blocked`/`failed`: a
+    # `merged-partial` row is `facts.landed` ALREADY (its own PR merged —
+    # that is how it got this state in the first place), so that condition
+    # is true on every tick whether or not the issue has since closed, and
+    # writing its generic "done — issue already merged ..." text over a row
+    # that is NOT actually settling to `done` would be exactly the stale,
+    # misleading line this issue exists to stop showing. The question this
+    # branch asks is narrower and different: not "has it landed" (already
+    # true) but "has its issue since CLOSED" — so it checks `facts.closed`/
+    # a live-confirmed close directly, and only ever writes when that is
+    # true. A `merged-partial` row whose issue is still open (an operator
+    # declined the follow-through plan, or it simply has not run yet) is
+    # left untouched here, same as every other branch below leaves a
+    # not-yet-resolved row alone — whatever reason is already on it (the
+    # decline, or the original merge note) keeps showing instead of being
+    # overwritten.
     for entry in ordered:
+        if entry.state == STATE_MERGED_PARTIAL:
+            facts = board.facts(entry.key)
+            live_closed = (live_prereq_terminal or {}).get(entry.key, False)
+            if facts.closed:
+                # `_merge_landed_state` already encodes "closed wins
+                # outright, regardless of `merge_resolution`"
+                # (`IssueFacts.merged_partial`'s own docstring) — the
+                # cached board itself shows this, so asking it is both
+                # correct and the one answer every other call site shares.
+                state, _witness = _merge_landed_state(facts)
+                reason = (
+                    f"done — issue closed while {entry.state} (#4218), "
+                    "settling the remainder as landed"
+                )
+            elif live_closed:
+                # The cached `facts.closed` has not caught up yet, so
+                # `_merge_landed_state(facts)` would still read `facts.
+                # merge_resolution`'s stale "partial" and answer
+                # `STATE_MERGED_PARTIAL` — wrong, the same gap
+                # `_merge_landed_state`'s own docstring already documents
+                # for its `confirmed_merged` caller: a close is `landed`'s
+                # "closed wins outright" case regardless of any stale
+                # resolution marker, so this resolves straight to
+                # `STATE_DONE` without consulting a cache this live
+                # evidence has already outrun.
+                state = STATE_DONE
+                reason = (
+                    "done — a live re-check this tick confirms the issue "
+                    f"is now closed while {entry.state} (#4218), "
+                    "independent of the cached board"
+                )
+            else:
+                continue
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "done",
+                    reason,
+                    occupies=False,
+                    updates={
+                        "state": state,
+                        "last_reason": reason,
+                        "session_name": None,
+                    },
+                )
+            )
+            states[entry.key] = state
+            continue
         if entry.state not in (STATE_PARKED, STATE_BLOCKED, STATE_FAILED):
             continue
         facts = board.facts(entry.key)
