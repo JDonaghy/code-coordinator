@@ -125,6 +125,7 @@ from coord.models import (
     DEFAULT_ISSUE_RESOLUTION,
     SEALED_PATH_AUTHOR_TYPES,
     WORK_LIKE_TYPES,
+    TrancheChild,
     TrancheRow,
     is_merge_landed_reason,
     is_needs_decomposition_reason,
@@ -9223,6 +9224,224 @@ def tranche_rows_ready_to_advance(rows: Sequence[TrancheRow]) -> list[TrancheRow
         row for row in rows
         if row.id is not None and row.state in TRANCHE_ADVANCEABLE_STATES
     ]
+
+
+# ── native tranche rows: pipeline presentation (#4227) ──────────────────────
+#
+# A `TrancheRow` (#4199) is not a `QueueEntry`, so it never appears in
+# `coord drive-queue list`/`status`'s ordinary per-entry walk at all — an
+# operator watching a tranche in flight sees nothing for it, and nothing
+# for the children it claimed either. This section is the pure
+# presentation layer #4227 adds on top of the frozen `TrancheRow`/
+# `TrancheChild` shape (#4199) and the dispatch/merge/review machinery
+# #4200-#4202 already built against it: one MASTER row per tranche,
+# carrying the row's own coarse Work -> Test -> Review -> Merge progress,
+# with every child rendered as "riding" that master instead of a stage
+# row of its own — it never gets one, since `coord.dispatch.
+# dispatch_tranche_row_children` deliberately never records a child's
+# agent assignment on the board (see that function's own module comment),
+# and no `QueueEntry` is ever enqueued for it either (#4226's
+# `propose_tranche` only ever reads a candidate off the epic's `## Work
+# order`, never off the drive queue).
+
+
+def tranche_master_key(row: TrancheRow) -> str:
+    """The `entry_key`-shaped identity of *row*'s own tranche issue —
+    `row.repo_name`#`row.issue_number`, the tracking issue it decomposed
+    (#4199's `issue_number`/`issue_title` pair), not `row.id` (this row's
+    own DB primary key, meaningless to an operator reading the queue).
+    Every rendering in this module keys a tranche row on this, the same
+    `repo#N` shape every ordinary `QueueEntry.key` already uses.
+    """
+    return entry_key(row.repo_name, row.issue_number)
+
+
+def tranche_child_key(child: TrancheChild) -> str:
+    """The `entry_key`-shaped identity of one `TrancheChild` — its own
+    `repo_name`#`issue_number`, independent of whichever row it rides in.
+    """
+    return entry_key(child.repo_name, child.issue_number)
+
+
+def tranche_riding_members(rows: Sequence[TrancheRow]) -> dict[str, str]:
+    """Map every child's own key (:func:`tranche_child_key`) to the master
+    key (:func:`tranche_master_key`) of the tranche row it rides in, across
+    every row in *rows* that still has a closing PR ahead of it.
+
+    The one place "is this issue actually riding inside a tranche right
+    now" is answered (#2096) — any renderer or caller that needs that
+    membership reads it from here rather than re-deriving it from
+    `row.state`/`row.children` a second way.
+
+    A `"failed"` row's children are deliberately EXCLUDED: #4227's own
+    `tranche_requeue_plan` is what gives them a disposition once a row
+    reaches that state (an ordinary queue row, not a rider), so by the
+    time a row is `"failed"` nothing is riding it anymore. Every other
+    state still has an open closing PR ahead of it, so every child is
+    still riding.
+    """
+    riding: dict[str, str] = {}
+    for row in rows:
+        if row.state == "failed":
+            continue
+        master_key = tranche_master_key(row)
+        for child in row.children:
+            riding[tranche_child_key(child)] = master_key
+    return riding
+
+
+# `TrancheRow.state` (#4199) is the only field the frozen row shape carries
+# for its ENTIRE remaining tail once children are dispatched — nothing
+# here distinguishes "the Test leg is running" from "all three review legs
+# already approved the integrated tree", because that distinction lives in
+# assignments `coord.dispatch`/`coord.review` track on the board (type=
+# "smoke"/"review"), never on this dataclass (#4199 froze its shape). This
+# module reports exactly the granularity the row itself can confirm — never
+# a specific Test/Review/Merge reading it has no way to back up (#2096: an
+# unconfirmed stage is not a stage).
+_TRANCHE_ROW_WORK_STATES: frozenset[str] = frozenset(
+    {"pending", "dispatched", "integrating"}
+)
+
+
+def tranche_row_pipeline_label(row: TrancheRow) -> str:
+    """Render *row*'s own coarse position in Work -> Test -> Review ->
+    Merge (#4227), bracketing whichever segment(s) `row.state` can
+    actually confirm it is in:
+
+    - `"pending"`/`"dispatched"`/`"integrating"` — still turning the
+      children's own work into one integrated tree:
+      ``"[Work] -> Test -> Review -> Merge"``.
+    - `"done"` — the mechanical merge succeeded; everything from here is
+      `coord.drive.advance_tranche_row`'s Test/review/PR tail, which this
+      row's own state cannot further distinguish:
+      ``"Work -> [Test -> Review -> Merge]"``.
+    - `"failed"` — ``"[Work: FAILED]"``; there is no tail to show.
+    """
+    if row.state == "failed":
+        return "[Work: FAILED]"
+    if row.state in _TRANCHE_ROW_WORK_STATES:
+        return "[Work] -> Test -> Review -> Merge"
+    return "Work -> [Test -> Review -> Merge]"
+
+
+def render_tranche_row(row: TrancheRow) -> list[str]:
+    """The `coord drive-queue list`/`status` rendering for one tranche row
+    (#4227): one MASTER line carrying :func:`tranche_row_pipeline_label`,
+    followed by one "riding" line per child instead of a stage row each —
+    a child never gets one of its own (see this section's module
+    comment), so this is the only place its progress is visible at all.
+
+    `[]` for a row with no children — nothing to show (mirrors
+    `tranche_rows_ready_to_dispatch`'s own "nothing to fan out" screen).
+    """
+    if not row.children:
+        return []
+    master_key = tranche_master_key(row)
+    label = tranche_row_pipeline_label(row)
+    title_suffix = f"  ({row.issue_title})" if row.issue_title else ""
+    lines = [f"{master_key}  TRANCHE {label}{title_suffix}"]
+    for child in sorted(row.children, key=lambda c: c.issue_number):
+        child_title = f"  ({child.title})" if child.title else ""
+        lines.append(
+            f"  {tranche_child_key(child)}  riding in tranche {master_key}"
+            f"{child_title}"
+        )
+    return lines
+
+
+def render_tranche_rows(rows: Sequence[TrancheRow]) -> list[str]:
+    """:func:`render_tranche_row` across every row in *rows*, in the order
+    given — the whole tranche block `coord drive-queue list`/`status`
+    prints alongside its ordinary per-`QueueEntry` lines (#4227).
+    """
+    lines: list[str] = []
+    for row in rows:
+        lines.extend(render_tranche_row(row))
+    return lines
+
+
+# ── native tranche rows: dropping unfinished children back to the queue
+# (#4227) ─────────────────────────────────────────────────────────────────
+#
+# `coord.merge_queue.merge_tranche_children` declines the WHOLE merge the
+# moment any one child is `"failed"` (that function's own docstring: "a
+# tranche's children can consume each other's new APIs, so a partial merge
+# of only the survivors is not attempted"), and `coord.drive.
+# integrate_tranche_row` then sets `row.state = "failed"` with nothing left
+# to advance (`advance_tranche_row`'s own `state == "failed"` branch: "has
+# failed; nothing to advance"). Nothing upstream of this gives those
+# children anywhere else to go — this is that disposition: every child of
+# a failed row becomes an ordinary queue row again, with the drop-back
+# itself recorded in plain text for whoever reads it.
+
+
+@dataclass(frozen=True)
+class TrancheRequeuePlan:
+    """What a `"failed"` tranche row (#4227) hands back to the ordinary
+    queue, and the human-readable record of what didn't make it into a
+    closing PR.
+
+    `requeue` is EVERY child of the row, not just the failed one(s): per
+    this section's module comment, a `"failed"` row never opened a closing
+    PR for any child, including ones that themselves reported `"done"` —
+    none of them rode a PR to closure, so none of them are riding anything
+    anymore either.
+    """
+
+    row_id: int | None
+    master_key: str
+    requeue: tuple[TrancheChild, ...]
+    remainder_note: str
+
+
+def tranche_rows_ready_to_requeue(rows: Sequence[TrancheRow]) -> list[TrancheRow]:
+    """Filter *rows* down to the ones a tick should hand back to the
+    ordinary queue now (#4227) — the "it didn't make it" sibling of
+    :func:`tranche_rows_ready_to_dispatch`/:func:`tranche_rows_ready_to_advance`.
+
+    Ready means `state == "failed"` AND at least one child — a row that
+    failed with no children ever assigned has nothing to hand back,
+    mirroring the "nothing to act on" screen both sibling filters already
+    apply.
+    """
+    return [row for row in rows if row.state == "failed" and row.children]
+
+
+def tranche_requeue_plan(row: TrancheRow) -> TrancheRequeuePlan:
+    """Decide what *row* hands back to the ordinary queue (#4227).
+
+    Every child in `row.children` is handed back, sorted by issue number —
+    see :class:`TrancheRequeuePlan`'s docstring for why this is never a
+    subset. `remainder_note` is the operator-facing record of the drop-
+    back: which children, off which failed tranche row, naming the master
+    key the operator would otherwise have to cross-reference by hand.
+
+    Raises `ValueError` if `row.state != "failed"` — the caller's job is
+    to select only ready rows first (:func:`tranche_rows_ready_to_requeue`),
+    the same precondition-on-the-caller contract `coord.drive.
+    integrate_tranche_row`/`advance_tranche_row` already use for their own
+    state checks.
+    """
+    if row.state != "failed":
+        raise ValueError(
+            f"tranche_requeue_plan: row {row.id} is {row.state!r}, not "
+            "'failed' — nothing to hand back to the ordinary queue"
+        )
+    master_key = tranche_master_key(row)
+    requeue = tuple(sorted(row.children, key=lambda c: c.issue_number))
+    names = ", ".join(f"#{c.issue_number}" for c in requeue)
+    remainder_note = (
+        f"tranche row {row.id} ({master_key}) failed before its closing "
+        f"PR — {names or '(no children)'} dropped back to the queue as "
+        "ordinary row(s)"
+    )
+    return TrancheRequeuePlan(
+        row_id=row.id,
+        master_key=master_key,
+        requeue=requeue,
+        remainder_note=remainder_note,
+    )
 
 
 # ── the tick ─────────────────────────────────────────────────────────────────
