@@ -68,7 +68,14 @@ from coord.board_doctor_policy import (
     write_drive_escalation,
 )
 from coord.config import Config
-from coord.drive_queue import branch_specific_test_failures, parse_key
+from coord.drive_queue import (
+    Blocked,
+    Reconcile,
+    TickPlan,
+    branch_specific_test_failures,
+    parse_key,
+    test_failure_edge_candidates,
+)
 from coord.models import Assignment, Board, Machine, Repo
 
 _IN_FLIGHT_DETAIL = (
@@ -4809,6 +4816,77 @@ class TestBranchSpecificTestFailures:
         assert branch_specific_test_failures(
             ("t2", "t1", "t2", "t3"), ("t3",),
         ) == ("t2", "t1")
+
+
+class TestTestFailureEdgeCandidates:
+    """#4210's pure read of the FAILURE EDGE: which rows a tick itself
+    just blocked on the #2972 fix-round ceiling, i.e. which rows the
+    same-tick board-doctor pass (`coord.board_doctor.
+    run_test_failure_edge_sweep`) is allowed to look at this tick.
+    """
+
+    def _ceiling(self, key: str) -> Blocked:
+        return Blocked(
+            key=key,
+            reason=(
+                "fix-round ceiling reached across relaunches (#2972): 3 work "
+                "leg(s) already run against this row's own budget of 3"
+            ),
+        )
+
+    def test_picks_only_the_ceiling_blocks(self) -> None:
+        plan = TickPlan(
+            blocked=(
+                self._ceiling("acme/widgets#40"),
+                Blocked(key="acme/widgets#41", reason="dead end (#2019)"),
+                Blocked(
+                    key="acme/widgets#42",
+                    reason="pre-dispatch guard refused (#1844)",
+                ),
+                Blocked(key="acme/widgets#43", reason="attempts 3/3 exhausted"),
+            ),
+        )
+
+        assert test_failure_edge_candidates(plan) == (("acme/widgets", 40),)
+
+    def test_empty_when_this_tick_blocked_nothing(self) -> None:
+        assert test_failure_edge_candidates(TickPlan()) == ()
+
+    def test_a_row_already_blocked_before_this_tick_is_not_a_candidate(self) -> None:
+        """``plan.blocked`` is only what THIS tick moves into ``blocked``.
+        A row carrying the same ceiling reason that is merely still sitting
+        there arrives as a `Reconcile`, never a `Blocked` — so it is not
+        re-offered to the edge pass on every subsequent tick.
+        """
+        plan = TickPlan(
+            reconciles=(
+                Reconcile(
+                    "acme/widgets#40",
+                    "exhausted",
+                    "fix-round ceiling reached across relaunches (#2972): ...",
+                ),
+            ),
+        )
+
+        assert test_failure_edge_candidates(plan) == ()
+
+    def test_order_preserving_and_deduplicated(self) -> None:
+        plan = TickPlan(
+            blocked=(
+                self._ceiling("acme/widgets#41"),
+                self._ceiling("acme/widgets#40"),
+                self._ceiling("acme/widgets#41"),
+            ),
+        )
+
+        assert test_failure_edge_candidates(plan) == (
+            ("acme/widgets", 41), ("acme/widgets", 40),
+        )
+
+    def test_an_unparseable_key_is_skipped(self) -> None:
+        plan = TickPlan(blocked=(self._ceiling("not-a-key"),))
+
+        assert test_failure_edge_candidates(plan) == ()
 
 
 class TestReclassifyTestFailed:

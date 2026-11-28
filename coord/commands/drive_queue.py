@@ -9293,6 +9293,90 @@ def _blocked_escalation_command(
     return _requeue_command(entry, key)
 
 
+def _run_test_failure_edge_sweep(plan, config) -> list[str]:
+    """Run the board doctor's failure-EDGE pass for whatever *plan* just
+    blocked on the #2972 fix-round ceiling, and return the lines to echo.
+
+    This is the same-tick half of the board doctor: `coord.board_doctor.
+    run_test_failure_edge_sweep` classifies those rows from their failing
+    Test leg's own evidence and hands an investigate-eligible one to the
+    same `coord.board_doctor_policy` callbacks the hourly sweep uses, so a
+    branch-specific Test failure at the ceiling reaches the investigate
+    tier minutes after the block rather than on the next hourly timer.
+
+    Nothing here invents policy. Which rows are candidates is
+    :func:`coord.drive_queue.test_failure_edge_candidates`' pure read of
+    ``plan.blocked``; whether any of them earns a leg is the doctor's own
+    tier/convergence/capacity work; the per-repo ``repos[].board_doctor.
+    investigate`` opt-in and the fleet-wide kill switch still gate the
+    dispatch inside ``board_doctor_policy._investigate``.
+
+    THREE WAYS THIS DECLINES, each reported rather than silent:
+
+    * No ceiling block this tick — the common case. Returns ``[]`` without
+      importing the board doctor or reading the board at all, so an
+      ordinary tick pays nothing for this pass existing.
+    * ``coord.board_service.is_remote()`` — the sweep reads the daemon
+      host's queues, board and block log directly, exactly as `coord
+      drive-queue sweep` does, while a tick is explicitly safe to run from
+      any machine that can reach the board daemon. A thin client would
+      sweep an empty queue, so it declines and says so; the daemon host's
+      own tick (and, failing that, the hourly sweep) still covers the row.
+    * An unreadable ``coordinator.yml`` (*config* ``None``) — the tick's
+      own documented fail-open posture for every other config read on this
+      path.
+
+    A sweep that raises is caught and reported as a warning: this runs
+    AFTER the tick's writes are already applied, so an advisory pass
+    failing must never turn an already-successful tick into a CLI failure.
+    """
+    from coord.drive_queue import test_failure_edge_candidates  # noqa: PLC0415
+
+    keys = test_failure_edge_candidates(plan)
+    if not keys:
+        return []
+
+    from coord.board_service import is_remote  # noqa: PLC0415
+
+    pairs = ", ".join(f"{repo}#{issue}" for repo, issue in keys)
+    if is_remote():
+        return [
+            f"note: not running the same-tick Test-failure-edge pass for "
+            f"{pairs} — it reads the daemon host's queues directly and this "
+            f"tick is a thin client; the daemon host's board doctor covers it"
+        ]
+    if config is None:
+        return [
+            f"note: not running the same-tick Test-failure-edge pass for "
+            f"{pairs} — this tick could not read coordinator.yml"
+        ]
+
+    from coord import board_doctor, board_doctor_policy  # noqa: PLC0415
+
+    try:
+        report = board_doctor.run_test_failure_edge_sweep(
+            config=config,
+            keys=keys,
+            tier_of=board_doctor_policy.policy_tier_of,
+            auto_dispatchers=board_doctor_policy.AUTO_DISPATCHERS,
+            alert_dispatcher=board_doctor_policy.escalation_alert_dispatcher,
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory, see docstring
+        return [
+            f"warning: the same-tick Test-failure-edge pass for {pairs} "
+            f"failed ({exc}) — the hourly board-doctor sweep still covers "
+            f"these rows"
+        ]
+
+    lines = [f"test-failure edge ({pairs}): {report.rows_observed} row(s)"]
+    for decision in report.decisions:
+        lines.append(
+            f"  {decision.key}: {decision.cause} -> {decision.tier}/"
+            f"{decision.action}"
+        )
+    return lines
+
+
 @drive_queue_group.command("tick")
 @click.option(
     "--max-parallel",
@@ -10237,6 +10321,19 @@ def drive_queue_tick(
                 ),
                 written=escalated_this_tick,
             )
+
+        # The same-tick board-doctor pass for the rows the loop above just
+        # blocked on the #2972 fix-round ceiling: classify each from its
+        # failing Test leg's own evidence and, when one reads as a real,
+        # branch-specific failure, dispatch the investigate tier's leg now
+        # rather than waiting up to an hour for the scheduled sweep. Run
+        # here, right after the block's own escalation, so the two readings
+        # of the same edge cannot disagree about which rows this tick
+        # blocked. Skipped under `--reconcile-only`, which promises to
+        # start nothing new, and already past the `--dry-run` return above.
+        if not reconcile_only:
+            for line in _run_test_failure_edge_sweep(plan, _config_for_defaults()):
+                click.echo(line)
 
         # #2230: an entry #2230's sweep would have resumed, but has already
         # oscillated blocked/waiting :data:`MAX_BLOCKED_RESUMES` times — the

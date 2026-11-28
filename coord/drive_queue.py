@@ -568,6 +568,39 @@ def branch_specific_test_failures(
     return tuple(t for t in dict.fromkeys(own_failing_tests) if t not in base)
 
 
+def test_failure_edge_candidates(plan: TickPlan) -> tuple[tuple[str, int], ...]:
+    """The ``(repo, issue)`` pairs *plan* blocks on the #2972 fix-round
+    ceiling — the failure EDGE a same-tick board-doctor pass acts on
+    (`coord.board_doctor.run_test_failure_edge_sweep`), rather than waiting
+    up to an hour for the next scheduled sweep to notice the same row.
+
+    Read off :attr:`TickPlan.blocked` alone, which is the set of entries
+    this tick ITSELF moves into ``blocked`` — never the whole queue — so a
+    row that was already blocked on a previous tick is not re-offered here
+    every tick. :func:`is_fix_round_ceiling_reason` is the same marker-based
+    predicate every other ceiling-aware caller uses; a block for any other
+    reason (a #1844 guard refusal, a dead end, an attempts exhaustion) is
+    not a Test-failure edge and is excluded.
+
+    Pure: takes an already-decided :class:`TickPlan` and returns pairs,
+    reading no state and dispatching nothing — deciding whether any of
+    these rows actually warrants a leg is the board doctor's own
+    classification/tier work, not this function's.
+
+    Order-preserving (``plan.blocked``'s own order) and de-duplicated; a
+    key :func:`parse_key` cannot parse is skipped.
+    """
+    candidates: dict[tuple[str, int], None] = {}
+    for item in plan.blocked:
+        if not is_fix_round_ceiling_reason(item.reason):
+            continue
+        parsed = parse_key(item.key)
+        if parsed is None:
+            continue
+        candidates.setdefault(parsed, None)
+    return tuple(candidates)
+
+
 #: #4133: the wall-clock-free ceiling on work legs dispatched since a
 #: drive-queue row's own baseline (:attr:`QueueEntry.legs_at_enqueue`) that
 #: :func:`may_dispatch_rework`'s own latch trips on. Fixed fleet-wide,

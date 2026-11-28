@@ -3930,6 +3930,145 @@ def test_a_review_fix_budget_stop_relaunches_with_a_budget_that_can_dispatch(
     assert argv[argv.index("--max-fix-rounds") + 1] == "2", argv
 
 
+def test_a_fix_round_ceiling_block_investigates_in_the_same_tick(
+    cli, seed, launches, monkeypatch,
+):
+    """#4210 acceptance: the tick that blocks a row on the #2972 fix-round
+    ceiling also runs the board doctor's failure-edge pass for that row, so
+    a branch-specific Test failure reaches the investigate tier in minutes
+    rather than waiting up to an hour for the scheduled sweep.
+
+    The #4202 incident is exactly the gap this closes: the row was blocked
+    at 01:27 and the hourly sweeps at 00:49 and 01:50 both misread it, so
+    nothing acted at the failure edge at all.
+
+    Setup mirrors the #4117 ceiling test above — 3 work legs against
+    `--max-fix-rounds 2`, then a plain drive death that earns no ceiling
+    exemption — so the `(#2972)` block is produced by the REAL tick, not
+    written by hand. Only two things are stubbed, both "the world" rather
+    than logic: the doctor's own `gh`/board classification walk (its own
+    end-to-end coverage lives in tests/test_board_doctor.py), and the
+    registered dispatcher for the cause, so this asserts the row reached
+    the investigate tier without starting a real `claude -p` leg.
+    """
+    from coord import board_doctor, board_doctor_policy
+    from coord.audit import record_audit
+    from coord.drive_queue import entry_key
+    from coord.models import Board
+
+    key = entry_key(REPO, 1650)
+
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--machine", "dellserver",
+               "--max-fix-rounds", "2").exit_code == 0
+    assert cli("tick").exit_code == 0
+    assert queued(1650)["state"] == "running"
+
+    seed(assignments=[
+        {"issue_number": 1650, "type": "work", "status": "done"}
+        for _ in range(3)
+    ])
+
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): test still failing after 2 "
+        "fix round(s) — stopping."
+    )
+    launched_at = queued(1650)["launched_at"]
+    _backdate(1650, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=own_reason, repo=REPO, issue=1650,
+        ts=launched_at + 5,
+    )
+
+    # The doctor's classification of that row, once it looks: a real,
+    # branch-specific Test failure on a row already at the ceiling.
+    failure_row = board_doctor.StuckRow(
+        queue="drive-queue", key=key, state=STATE_BLOCKED,
+        cause=board_doctor.CAUSE_TEST_FAILED_AT_CEILING, confidence="high",
+        evidence=("failing_test=tests/test_thin_client_board_audit.py::test_x",),
+        fresh=True,
+    )
+    monkeypatch.setattr(
+        board_doctor, "_collect_rows_with_board",
+        lambda **_: ([failure_row], Board()),
+    )
+    investigated: list[str] = []
+    monkeypatch.setitem(
+        board_doctor_policy.AUTO_DISPATCHERS,
+        board_doctor.CAUSE_TEST_FAILED_AT_CEILING,
+        lambda row: investigated.append(row.key) or True,
+    )
+
+    ceiling = cli("tick")
+    assert ceiling.exit_code == 0, ceiling.output
+    row = queued(1650)
+    assert row["state"] == STATE_BLOCKED
+    assert "(#2972)" in row["last_reason"]
+    # The block and the investigation happened in the SAME tick.
+    assert investigated == [key], ceiling.output
+    assert "test-failure edge" in ceiling.output
+    # No relaunch: the edge pass dispatches a fix-it leg through the
+    # doctor, never another `coord drive --tmux`.
+    assert len(launches) == 1, launches
+
+
+def test_a_reconcile_only_tick_never_runs_the_test_failure_edge_pass(
+    cli, seed, launches, monkeypatch,
+):
+    """`--reconcile-only` promises to start nothing new, and a fix-it leg
+    is something new — so the same-tick failure-edge pass is skipped there
+    even though the `(#2972)` block itself is still written.
+    """
+    from coord import board_doctor, board_doctor_policy
+    from coord.audit import record_audit
+    from coord.drive_queue import entry_key
+    from coord.models import Board
+
+    key = entry_key(REPO, 1650)
+
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--machine", "dellserver",
+               "--max-fix-rounds", "2").exit_code == 0
+    assert cli("tick").exit_code == 0
+    seed(assignments=[
+        {"issue_number": 1650, "type": "work", "status": "done"}
+        for _ in range(3)
+    ])
+    launched_at = queued(1650)["launched_at"]
+    _backdate(1650, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=(
+            f"drive exited for {key} (exit_code=1): test still failing after "
+            "2 fix round(s) — stopping."
+        ),
+        repo=REPO, issue=1650, ts=launched_at + 5,
+    )
+
+    failure_row = board_doctor.StuckRow(
+        queue="drive-queue", key=key, state=STATE_BLOCKED,
+        cause=board_doctor.CAUSE_TEST_FAILED_AT_CEILING, confidence="high",
+        fresh=True,
+    )
+    monkeypatch.setattr(
+        board_doctor, "_collect_rows_with_board",
+        lambda **_: ([failure_row], Board()),
+    )
+    investigated: list[str] = []
+    monkeypatch.setitem(
+        board_doctor_policy.AUTO_DISPATCHERS,
+        board_doctor.CAUSE_TEST_FAILED_AT_CEILING,
+        lambda row: investigated.append(row.key) or True,
+    )
+
+    result = cli("tick", "--reconcile-only")
+    assert result.exit_code == 0, result.output
+    assert "(#2972)" in queued(1650)["last_reason"]
+    assert investigated == []
+    assert "test-failure edge" not in result.output
+
+
 def test_a_premise_refusal_park_escalates_exactly_once(
     cli, seed, launches, coord_db, monkeypatch,
 ):
