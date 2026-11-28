@@ -627,6 +627,15 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "connection has to be opened with check_same_thread=False, which it "
         "does not do.",
     ),
+    "test_tranche_after_edges_4227.py": Classification(
+        1, (BUCKET_C,),
+        "TestDashboardQueueSummary drives the tranche queue summary through "
+        "the real dashboard app under TestClient, so it needs the same rw_db "
+        "fixture as test_dashboard_api.py above: the handler runs on a "
+        "TestClient worker thread that the autouse coord_db connection is "
+        "thread-bound away from. scratch_database() does not fit, because the "
+        "file connection has to be opened with check_same_thread=False.",
+    ),
     "test_cli_issue_reopen.py": Classification(
         1, (BUCKET_C,),
         "_make_file_db seeds a real board file for the SqliteStore-backed "
