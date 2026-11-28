@@ -568,7 +568,7 @@ def branch_specific_test_failures(
     return tuple(t for t in dict.fromkeys(own_failing_tests) if t not in base)
 
 
-def test_failure_edge_candidates(plan: TickPlan) -> tuple[tuple[str, int], ...]:
+def ceiling_block_failure_edges(plan: TickPlan) -> tuple[tuple[str, int], ...]:
     """The ``(repo, issue)`` pairs *plan* blocks on the #2972 fix-round
     ceiling — the failure EDGE a same-tick board-doctor pass acts on
     (`coord.board_doctor.run_test_failure_edge_sweep`), rather than waiting

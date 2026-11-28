@@ -73,8 +73,8 @@ from coord.drive_queue import (
     Reconcile,
     TickPlan,
     branch_specific_test_failures,
+    ceiling_block_failure_edges,
     parse_key,
-    test_failure_edge_candidates,
 )
 from coord.models import Assignment, Board, Machine, Repo
 
@@ -4818,7 +4818,7 @@ class TestBranchSpecificTestFailures:
         ) == ("t2", "t1")
 
 
-class TestTestFailureEdgeCandidates:
+class TestCeilingBlockFailureEdges:
     """#4210's pure read of the FAILURE EDGE: which rows a tick itself
     just blocked on the #2972 fix-round ceiling, i.e. which rows the
     same-tick board-doctor pass (`coord.board_doctor.
@@ -4847,10 +4847,10 @@ class TestTestFailureEdgeCandidates:
             ),
         )
 
-        assert test_failure_edge_candidates(plan) == (("acme/widgets", 40),)
+        assert ceiling_block_failure_edges(plan) == (("acme/widgets", 40),)
 
     def test_empty_when_this_tick_blocked_nothing(self) -> None:
-        assert test_failure_edge_candidates(TickPlan()) == ()
+        assert ceiling_block_failure_edges(TickPlan()) == ()
 
     def test_a_row_already_blocked_before_this_tick_is_not_a_candidate(self) -> None:
         """``plan.blocked`` is only what THIS tick moves into ``blocked``.
@@ -4868,7 +4868,7 @@ class TestTestFailureEdgeCandidates:
             ),
         )
 
-        assert test_failure_edge_candidates(plan) == ()
+        assert ceiling_block_failure_edges(plan) == ()
 
     def test_order_preserving_and_deduplicated(self) -> None:
         plan = TickPlan(
@@ -4879,14 +4879,14 @@ class TestTestFailureEdgeCandidates:
             ),
         )
 
-        assert test_failure_edge_candidates(plan) == (
+        assert ceiling_block_failure_edges(plan) == (
             ("acme/widgets", 41), ("acme/widgets", 40),
         )
 
     def test_an_unparseable_key_is_skipped(self) -> None:
         plan = TickPlan(blocked=(self._ceiling("not-a-key"),))
 
-        assert test_failure_edge_candidates(plan) == ()
+        assert ceiling_block_failure_edges(plan) == ()
 
 
 class TestReclassifyTestFailed:
