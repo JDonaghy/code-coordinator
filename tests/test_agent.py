@@ -6717,9 +6717,15 @@ class TestStatusPayloadSize:
 
         assert len(listing["completed"]) == N
         assert big_briefing not in payload, "a full briefing leaked into the /status payload"
-        assert len(payload) < 300_000, (
+        # A per-entry budget, not a fixed total: every slimmed entry still
+        # carries the spec's paths (long under a populated $TMPDIR) and one key
+        # per optional status field, so honest growth moves the total. A leaked
+        # briefing adds ~20KB per entry, ten times this budget.
+        per_entry_budget = 2_000
+        assert len(payload) < N * per_entry_budget, (
             f"/status payload too large: {len(payload)} bytes for {N} terminal "
-            "entries — briefing stripping appears to have regressed"
+            f"entries (budget {per_entry_budget} each) — briefing stripping "
+            "appears to have regressed"
         )
         assert elapsed < 1.0, (
             f"list_assignments() + json.dumps() took {elapsed:.2f}s for {N} "
