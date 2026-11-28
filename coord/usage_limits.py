@@ -654,6 +654,27 @@ def _no_signal_decision(status: str, message: str) -> PaceDecision:
     )
 
 
+def pace_decision_for_unreadable_config(error: BaseException | str) -> PaceDecision:
+    """A caller's config load failed (missing file, bad YAML, or a rejected
+    ``pacing:`` block — e.g. ``pacing.enabled: true`` with no ``tz``) before
+    it ever reached :func:`evaluate_pace`.
+
+    Deliberately reports ``status="unknown"`` — the same "no pacing signal"
+    reading as a failed ``/usage`` probe — rather than ``"disabled"``: this
+    config was never actually observed to have ``pacing.enabled: false``,
+    so claiming that status would assert a fact the caller doesn't have
+    (the #2096 "unconfirmed verdict" shape). A config that genuinely sets
+    ``pacing.enabled: false`` (or omits the block) parses fine and reaches
+    :func:`evaluate_pace`'s own ``"disabled"`` branch instead — this helper
+    is reached only when the config could not be read/validated at all.
+    """
+    return _no_signal_decision(
+        "unknown",
+        f"pacing config could not be read ({error}) — no pacing signal, "
+        "defaulting to today's behaviour",
+    )
+
+
 def evaluate_pace(
     limits: PlanLimits,
     pacing_cfg: "PacingConfig",
@@ -764,10 +785,9 @@ def evaluate_pace(
 
 
 def format_pace_decision(decision: PaceDecision) -> str:
-    """Render *decision* for ``coord drive-queue status`` and ``coord
-    usage --limits`` — the human-readable counterpart to
-    :func:`format_plan_limits`, one line summarising the pace, the mode
-    preference, and why.
+    """Render *decision* for ``coord drive-queue status`` — the
+    human-readable counterpart to :func:`format_plan_limits`, one line
+    summarising the pace, the mode preference, and why.
     """
     if decision.status in ("disabled", "unknown"):
         return f"Budget pace: {decision.message}"

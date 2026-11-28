@@ -89,7 +89,7 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence, TypedDict
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence, TypedDict
 
 from coord.decomposition_chat import is_size_triage_pending_reason
 from coord.dispatch_liveness import is_credential_probe_refusal_reason
@@ -134,8 +134,14 @@ from coord.models import (
     is_upstream_gap_park_reason,
     parse_issue_resolution,
 )
-from coord.usage_limits import PaceDecision
 from coord.worker_events import classify_zero_commit_outcome
+
+if TYPE_CHECKING:
+    # Annotation-only (`pace_adjusted_max_parallel`'s `decision` parameter)
+    # — `from __future__ import annotations` makes this safe to defer, and
+    # deferring it keeps `coord.usage_limits` (which pulls in
+    # `coord.test_orchestrator`) out of this hot module's real import graph.
+    from coord.usage_limits import PaceDecision
 
 # ── dispatch type selection (#3132) ─────────────────────────────────────────
 #
@@ -2068,14 +2074,21 @@ def resolve_concurrency_report(
 # `coord.usage_limits.evaluate_pace` decides how far the account sits from
 # its own target spend curve and what that implies; this is the one place
 # that reading turns into an actual NUMBER the tick dispatches against —
-# scaling an already-fully-resolved ceiling (every ceiling above:
-# `--max-parallel`/`pipeline.max_parallel`/the derived default, already
-# clamped to `concurrency.max_workers`), never re-deriving concurrency a
-# second way (#2096 "one question, one answer" — the ceiling resolution
-# chain above is untouched; this only scales its OUTPUT).
+# scaling an already-fully-resolved ceiling (`--max-parallel`/
+# `pipeline.max_parallel`/the derived default), never re-deriving
+# concurrency a second way (#2096 "one question, one answer" — the ceiling
+# resolution chain above is untouched; this only scales its OUTPUT). Only
+# `resolve_max_parallel`'s DERIVED branch is itself already clamped to
+# `concurrency.max_workers` — an explicit `--max-parallel`/
+# `pipeline.max_parallel` is not, so `behind_concurrency_multiplier` (default
+# 1.5) can still raise the scaled result above the fleet's real worker
+# capacity; *max_workers_cap* below re-clamps it regardless of which branch
+# produced *base_max_parallel*.
 
 
-def pace_adjusted_max_parallel(base_max_parallel: int, decision: PaceDecision) -> int:
+def pace_adjusted_max_parallel(
+    base_max_parallel: int, decision: PaceDecision, *, max_workers_cap: int = 0
+) -> int:
     """Scale *base_max_parallel* — an already-resolved concurrency ceiling
     (:func:`resolve_max_parallel` / :func:`resolve_concurrency_report`'s own
     output) — by *decision*'s :attr:`~coord.usage_limits.PaceDecision.
@@ -2088,14 +2101,28 @@ def pace_adjusted_max_parallel(base_max_parallel: int, decision: PaceDecision) -
     ``base_max_parallel <= 0`` (``--max-parallel 0``/``--reconcile-only``,
     the operator's own explicit "launch nothing" request) passes through
     UNCHANGED: scaling "launch nothing" by any factor must never turn it
-    into a different number. Otherwise the scaled result is rounded to
-    the nearest int and floored at 1 — pacing changes how FAST the queue
-    drains, never whether it drains at all.
+    into a different number. Otherwise the scaled result is rounded
+    (Python's banker's rounding — a `0.5x` multiplier can round a `base=3`
+    and a `base=5` to the same `2`) and floored at 1 — pacing changes how
+    FAST the queue drains, never whether it drains at all.
+
+    *max_workers_cap* (``concurrency.max_workers``, the fleet's actual
+    worker capacity — same meaning and same "0 or less means no cap known"
+    convention :func:`default_max_parallel` uses) re-clamps the SCALED
+    result. This is the one ceiling in the resolution chain not already
+    bounded by it: :func:`resolve_max_parallel`'s derived-default branch
+    clamps to it before this function ever sees the value, but an explicit
+    ``--max-parallel``/``pipeline.max_parallel`` does not, and
+    ``behind_concurrency_multiplier`` could otherwise scale either one
+    above what the fleet can actually run.
     """
     if base_max_parallel <= 0:
         return base_max_parallel
     scaled = round(base_max_parallel * decision.concurrency_multiplier)
-    return max(1, scaled)
+    scaled = max(1, scaled)
+    if max_workers_cap > 0:
+        scaled = min(scaled, max_workers_cap)
+    return scaled
 
 
 # ── the startup grace window (#1794) ─────────────────────────────────────────

@@ -2989,23 +2989,38 @@ def _current_pace_decision(config_path: Path) -> PaceDecision:
     and the number an operator reads from `status` can never silently
     disagree (#2096 "one question, one answer").
 
-    Best-effort and SILENT on failure, the same posture
-    `_tranche_status_lines`/`_fetch_tranche_prereq_members` take for a
-    comparable "can this even be read right now" fallback: an
-    unreadable/missing `coordinator.yml` degrades to `PacingConfig()`
-    (`enabled=False`) with no warning printed, never failing `status` (or
-    the whole tick) over it. Unlike `_fetch_cordons`/
-    `_fetch_no_eligible_host` (which DO warn), a missing/invalid
-    ``--config`` here is not exceptional fleet state — `status` has never
-    required a loadable config to run at all, and warning on every call
-    for a `--config` path that simply doesn't resolve to anything would
-    be noise, not signal. Deliberately goes through
-    `coord.commands._common.resolve_and_load_config` rather than
-    `_load_config` — the latter is the CLI's own print-and-exit-2 boot
-    path (right for a command whose ENTIRE job is to load config, wrong
-    here, where a missing/invalid ``--config`` path must not take the
-    whole command down — see that function's own docstring for why
-    `coord.drive.Driver`'s per-poll reload makes the identical choice).
+    Best-effort and never raises, the same posture `_tranche_status_lines`/
+    `_fetch_tranche_prereq_members` take for a comparable "can this even be
+    read right now" fallback — a missing/invalid ``coordinator.yml`` never
+    fails `status` (or the whole tick) over it. But it must never CLAIM
+    `pacing.enabled: false` for a config it never actually read: a
+    `ConfigError` (missing file, bad YAML, or a rejected `pacing:` block —
+    e.g. `pacing.enabled: true` with no `tz`, the exact first-run mistake
+    `coord.config._parse_pacing` exists to catch) reports
+    `status="unknown"` via `coord.usage_limits.
+    pace_decision_for_unreadable_config` instead of silently substituting
+    a fresh, disabled `PacingConfig()` — that substitution used to make
+    this read as `"disabled"`, asserting an observed `pacing.enabled:
+    false` the code never actually saw (#2096 "unconfirmed verdict";
+    see that helper's own docstring for why `"unknown"` and not
+    `"disabled"`). A config that genuinely has no `pacing:` block (or sets
+    `enabled: false`) still parses cleanly and reaches `evaluate_pace`'s
+    own `"disabled"` branch below.
+
+    Unlike `_fetch_cordons`/`_fetch_no_eligible_host` (which DO warn on a
+    config failure), this never echoes a warning either — `status` has
+    never required a loadable config to run at all, and warning on every
+    call for a `--config` path that simply doesn't resolve to anything
+    would be noise, not signal. The DISTINCT `"unknown"` status is what
+    lets a caller that cares (a test, a future stricter surface) tell the
+    two causes apart without this function needing to print anything.
+    Deliberately goes through `coord.commands._common.
+    resolve_and_load_config` rather than `_load_config` — the latter is
+    the CLI's own print-and-exit-2 boot path (right for a command whose
+    ENTIRE job is to load config, wrong here, where a missing/invalid
+    ``--config`` path must not take the whole command down — see that
+    function's own docstring for why `coord.drive.Driver`'s per-poll
+    reload makes the identical choice).
 
     When pacing is NOT enabled, the `/usage` probe is skipped entirely —
     `evaluate_pace`'s own disabled branch never inspects its `limits`
@@ -3014,13 +3029,19 @@ def _current_pace_decision(config_path: Path) -> PaceDecision:
     defaults to `False`).
     """
     from coord.commands._common import resolve_and_load_config  # noqa: PLC0415
-    from coord.config import PacingConfig  # noqa: PLC0415
-    from coord.usage_limits import PlanLimits, evaluate_pace, get_plan_limits  # noqa: PLC0415
+    from coord.usage_limits import (  # noqa: PLC0415
+        PlanLimits,
+        evaluate_pace,
+        get_plan_limits,
+        pace_decision_for_unreadable_config,
+    )
 
     try:
         pacing_cfg = resolve_and_load_config(config_path).pacing
-    except Exception:  # noqa: BLE001 — see docstring
-        pacing_cfg = PacingConfig()
+    except Exception as e:  # noqa: BLE001 — see docstring (ConfigError is the
+        # expected shape here, but a missing/invalid `--config` must not
+        # take `status`/the whole tick down regardless of what it raises)
+        return pace_decision_for_unreadable_config(e)
 
     if not pacing_cfg.enabled:
         return evaluate_pace(PlanLimits(status="unknown"), pacing_cfg)
@@ -9565,7 +9586,11 @@ def drive_queue_tick(
     # dispatches against and the number an operator sees can never
     # silently disagree (#2096).
     pace_decision = _current_pace_decision(config_path)
-    max_parallel = pace_adjusted_max_parallel(max_parallel, pace_decision)
+    max_parallel = pace_adjusted_max_parallel(
+        max_parallel,
+        pace_decision,
+        max_workers_cap=0 if _cfg is None else _cfg.concurrency.max_workers,
+    )
 
     # #2110: `--reconcile-only` and `--max-parallel 0` are the same request —
     # one flag is a mnemonic for the other rather than a second code path, so
