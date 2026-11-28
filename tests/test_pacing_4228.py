@@ -32,6 +32,7 @@ from coord.usage_limits import (
     PlanLimits,
     evaluate_pace,
     format_pace_decision,
+    pace_decision_for_unreadable_config,
     seconds_since_weekly_reset,
     target_week_spend_pct,
 )
@@ -49,6 +50,43 @@ machines:
 
 # Saturday 09:00 UTC reset, same shape the operator described in the issue.
 _SATURDAY_RESET = PacingConfig(enabled=True, reset_weekday=5, reset_time=PacingConfig().reset_time, tz="UTC")
+
+# The same reset, as a `coordinator.yml` `pacing:` block — for the CLI-level
+# (black-box) tests below, where `evaluate_pace` is reached through
+# `coord drive-queue status`/`tick`, not called directly.
+ENABLED_PACING = (
+    BASE
+    + """\
+pacing:
+  enabled: true
+  reset_weekday: saturday
+  reset_time: "09:00"
+  tz: UTC
+concurrency:
+  max_workers: 100
+"""
+)
+
+# `pacing.enabled: true` with no `tz` — the exact first-run mistake
+# `coord.config._parse_pacing` rejects with `ConfigError`. Used to prove
+# `coord drive-queue status`/`tick` report this as "the config could not be
+# read" (`status="unknown"`), never as the OBSERVED `"disabled"` a
+# fail-soft substitution used to assert without ever reading the config.
+INVALID_PACING = (
+    BASE
+    + """\
+pacing:
+  enabled: true
+"""
+)
+
+# One hour after the Saturday 09:00 UTC reset — close to the START of the
+# week, so the target spend curve is near 0%.
+_JUST_AFTER_RESET = datetime(2026, 11, 28, 10, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+
+# One hour before the NEXT Saturday 09:00 UTC reset — close to the END of
+# the week, so the target spend curve is near 100%.
+_JUST_BEFORE_RESET = datetime(2026, 12, 5, 8, 0, tzinfo=ZoneInfo("UTC")).timestamp()
 
 
 def _ts(year, month, day, hour=0, minute=0, tz="UTC") -> float:
@@ -251,6 +289,19 @@ class TestPaceAdjustedMaxParallel:
         decision = evaluate_pace(PlanLimits(status="unknown"), PacingConfig())
         assert pace_adjusted_max_parallel(7, decision) == 7
 
+    def test_max_workers_cap_reclamps_the_scaled_result(self) -> None:
+        # An explicit `--max-parallel`/`pipeline.max_parallel` is never
+        # clamped to `concurrency.max_workers` upstream (only
+        # `resolve_max_parallel`'s derived-default branch is) — so
+        # `behind_concurrency_multiplier` can scale it above the fleet's
+        # real worker capacity unless this function re-clamps it itself.
+        limits = PlanLimits(status="ok", session_pct=10.0, week_pct=5.0)
+        decision = evaluate_pace(limits, _SATURDAY_RESET, now=TestEvaluatePace.NOW)
+        assert pace_adjusted_max_parallel(4, decision, max_workers_cap=5) == 5  # 6, capped
+        # `max_workers_cap<=0` keeps today's "no cap known" convention.
+        assert pace_adjusted_max_parallel(4, decision, max_workers_cap=0) == 6
+        assert pace_adjusted_max_parallel(4, decision, max_workers_cap=-1) == 6
+
 
 # ── coord drive-queue status wiring ─────────────────────────────────────────
 
@@ -290,3 +341,227 @@ class TestDriveQueueStatusSurfacesPace:
         assert result.exit_code == 0, result.output
         payload = _json.loads(result.output)
         assert payload["pace"]["status"] == "disabled"
+
+    def test_invalid_config_reads_as_unknown_not_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `pacing.enabled: true` with no `tz` fails `coord.config.load` —
+        # `status` must report that it never actually read a disabled
+        # config, not assert `"disabled"` for a config it couldn't parse
+        # at all (the #2096 "unconfirmed verdict" shape).
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(INVALID_PACING)
+        # The probe must never be consulted either — the config was
+        # rejected before `evaluate_pace` was ever reached.
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("probe must not run when the config is unreadable")
+            ),
+        )
+        result = CliRunner().invoke(
+            main,
+            ["drive-queue", "status", "--json", "--config", str(config_path)],
+        )
+        assert result.exit_code == 0, result.output
+        payload = _json.loads(result.output)
+        assert payload["pace"]["status"] == "unknown"
+        assert "could not be read" in payload["pace"]["message"]
+
+        # Text output must not claim `pacing.enabled: false` either.
+        text_result = CliRunner().invoke(
+            main, ["drive-queue", "status", "--config", str(config_path)],
+        )
+        assert text_result.exit_code == 0, text_result.output
+        assert "pacing.enabled: false" not in text_result.output
+
+    def test_disabled_pacing_never_consults_the_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(BASE)  # no `pacing:` block -> disabled
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("probe must not run while pacing is disabled")
+            ),
+        )
+        result = CliRunner().invoke(
+            main,
+            ["drive-queue", "status", "--json", "--config", str(config_path)],
+        )
+        assert result.exit_code == 0, result.output
+        assert _json.loads(result.output)["pace"]["status"] == "disabled"
+
+    def test_enabled_behind_pace_renders_through_status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(ENABLED_PACING)
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=5.0, session_pct=10.0),
+        )
+
+        json_result = CliRunner().invoke(
+            main,
+            ["drive-queue", "status", "--json", "--config", str(config_path)],
+        )
+        assert json_result.exit_code == 0, json_result.output
+        pace = _json.loads(json_result.output)["pace"]
+        assert pace["status"] == "behind"
+        assert pace["preferred_mode"] == PACE_MODE_TRANCHE_OR_WORKFLOW
+        assert pace["allow_tranche_or_workflow"] is True
+        assert pace["concurrency_multiplier"] == 1.5
+
+        text_result = CliRunner().invoke(
+            main, ["drive-queue", "status", "--config", str(config_path)],
+        )
+        assert text_result.exit_code == 0, text_result.output
+        assert "Budget pace: behind" in text_result.output
+        assert f"mode preference: {PACE_MODE_TRANCHE_OR_WORKFLOW}" in text_result.output
+        assert "concurrency x1.50" in text_result.output
+
+
+# ── `_current_pace_decision` (status/tick's shared config load) ─────────────
+
+
+class TestCurrentPaceDecision:
+    def test_unreadable_config_decision_is_unknown_not_disabled(self) -> None:
+        decision = pace_decision_for_unreadable_config(
+            ConfigError("pacing.tz is required when pacing.enabled is true")
+        )
+        assert decision.status == "unknown"
+        assert decision.preferred_mode == PACE_MODE_UNCONSTRAINED
+        assert decision.allow_tranche_or_workflow is True
+        assert "could not be read" in decision.message
+        assert "pacing.tz is required" in decision.message
+
+
+# ── `coord drive-queue tick` — the one place pacing changes real behaviour ──
+
+
+class TestDriveQueueTickScalesConcurrency:
+    def test_minus_one_max_parallel_is_rejected_even_when_pacing_is_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The `< 0` validation runs BEFORE pace scaling — a bad
+        # `--max-parallel` is caught regardless of what pacing would do
+        # with it.
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(ENABLED_PACING)
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=5.0, session_pct=10.0),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "drive-queue", "tick", "--dry-run", "--max-parallel", "-1",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--max-parallel must be at least 0" in result.output
+
+    def test_behind_pace_scales_up_the_dry_run_ceiling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(ENABLED_PACING)
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=5.0, session_pct=10.0),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "drive-queue", "tick", "--dry-run", "--max-parallel", "4",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # 4 * 1.5 (behind_concurrency_multiplier) == 6.
+        assert "capacity: 0/6 occupied, 6 free" in result.output
+
+    def test_behind_pace_scaling_is_reclamped_to_max_workers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An explicit `--max-parallel` is not itself clamped to
+        # `concurrency.max_workers` upstream, so without the pace scaler's
+        # own re-clamp this would dispatch against 6, not the fleet's
+        # declared real worker capacity.
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(
+            BASE
+            + """\
+pacing:
+  enabled: true
+  reset_weekday: saturday
+  reset_time: "09:00"
+  tz: UTC
+concurrency:
+  max_workers: 3
+"""
+        )
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=5.0, session_pct=10.0),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "drive-queue", "tick", "--dry-run", "--max-parallel", "4",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # 4 * 1.5 == 6, re-clamped down to concurrency.max_workers (3).
+        assert "capacity: 0/3 occupied, 3 free" in result.output
+
+    def test_ahead_pace_scales_down_but_never_to_reconcile_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(ENABLED_PACING)
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_AFTER_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=50.0, session_pct=10.0),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "drive-queue", "tick", "--dry-run", "--max-parallel", "1",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # `round(1 * 0.5) == 0`, floored to 1 — scaling must never flip a
+        # launching tick into reconcile-only on its own.
+        assert "capacity: 0/1 occupied, 1 free" in result.output
+        assert "--reconcile-only: updating queue state, launching nothing" not in result.output
+
+    def test_explicit_max_parallel_zero_stays_reconcile_only_under_pacing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(ENABLED_PACING)
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=5.0, session_pct=10.0),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "drive-queue", "tick", "--dry-run", "--max-parallel", "0",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "--reconcile-only: updating queue state, launching nothing" in result.output
