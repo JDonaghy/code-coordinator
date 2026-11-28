@@ -7798,7 +7798,6 @@ def run_test_failure_edge_sweep(
         outcome_grace_hours=getattr(board_doctor_cfg, "outcome_grace_hours", None),
         counter_namespace=TEST_FAILURE_EDGE_COUNTER_NAMESPACE,
     )
-    report.rows_observed = len(edge_rows)
     return report
 
 
