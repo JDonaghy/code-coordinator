@@ -30,6 +30,11 @@ Public entry points:
   pushes its branch, rather than waiting for `dispatch_review` to do it once
   the Test/smoke leg finishes — lets the `pull_request` CI run overlap smoke
   and review instead of being serialised after both.
+- `reuse_check_focus_lines(...)`, `count_reuse_findings(...)` — #4174: opt-out
+  per-repo rule (`reviews.reuse_check`, default on) instructing the reviewer
+  to flag new code that duplicates an existing helper/module, and a prose
+  scan that counts how many findings used the instructed "duplicates X at
+  file:line" phrasing, for the `reuse=` count in the review verdict marker.
 
 Why a separate module: the work-dispatch path (`coord/dispatch.py`) is shaped
 around `Proposal` objects from the brain. Reviews are triggered by completion
@@ -731,7 +736,7 @@ def _parse_trusted_self_reported_marker(
             continue
         key, value = token.split("=", 1)
         key = key.lower()
-        if key in ("blocking", "nonblocking", "nits"):
+        if key in ("blocking", "nonblocking", "nits", "reuse"):
             try:
                 header[key] = int(value)
             except ValueError:
@@ -2906,6 +2911,12 @@ def count_reuse_findings(body: str) -> int:
     `estimate_review_counts`'s "could not determine" heuristic, there is no
     ambiguous case here: this only matches an explicit, instructed phrase,
     so its absence is a real zero, not a parse failure.
+
+    This is a rate estimate, not an exact count, on both sides: matching is
+    per-line, so a "duplicates ..." / "at path:line" pair that a reviewer
+    wraps across two lines is missed; and a negative statement such as "no
+    duplicates of this helper exist at path:line" matches too. Good enough
+    for tracking the rate over time, not for auditing a single review.
     """
     return sum(1 for line in body.splitlines() if _REUSE_FINDING_RE.search(line))
 

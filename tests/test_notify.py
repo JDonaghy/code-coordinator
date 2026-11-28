@@ -1298,6 +1298,34 @@ class TestReviewNotify:
             "<!-- coord:review verdict=request-changes blocking=0",
         )
 
+    def test_review_header_carries_reuse_count(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """#4174: a posted review's header carries a `reuse=` count derived
+        from `count_reuse_findings`, so `coord fleet stats` can track the
+        reuse-check finding rate over time — the header isn't just
+        `format_review_header`'s own default of omitting it."""
+        body = (
+            "## Blocking findings\n"
+            "- This duplicates the existing helper at coord/review.py:42; "
+            "reuse or extend it.\n"
+        )
+        _record_review_assignment("rev5", review_target="101")
+        log_path = _make_log_with_review(tmp_path, "request-changes", body)
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev5", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        mock_review.assert_called_once()
+        _, _, _, body_arg = mock_review.call_args.args
+        header_line = body_arg.splitlines()[0]
+        assert "reuse=1" in header_line
+
     def test_review_fallback_when_log_parse_fails(
         self, coord_dir: Path, config: Config, tmp_path: Path
     ) -> None:
