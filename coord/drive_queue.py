@@ -5453,6 +5453,71 @@ def fresh_interventions(
     }
 
 
+# ── #4217 out-of-band rescue detection + auto-resume (board truth 2/3) ──────
+#
+# Builds directly on #4216's `intervention_json` storage/rendering above: a
+# `blocked` row whose branch moves to a commit no coord leg pushed gets the
+# SAME record a human's `coord drive-queue note` would write, just authored
+# by the sweep itself rather than an operator — see `RESCUE_INTERVENTION_BY`/
+# `describe_out_of_band_push` below. A row that is *already* `blocked` on the
+# #2972 fix-round ceiling, or carries a non-stale intervention of either
+# kind, and whose rescued head's PR checks read CI-green, gets its Test/
+# Review verdicts reset instead of needing an operator's `remove && add` —
+# see :func:`is_rescue_resume_eligible` and
+# `coord.reconcile.reconcile_rescued_blocked_rows` (the live-I/O side; this
+# module stays pure).
+
+#: The `by` this sweep stamps on an auto-detected rescue record — distinct
+#: from any human `--by` an operator's own `coord drive-queue note` would
+#: supply, so `coord drive-queue list`'s "held by ..." text stays honest
+#: about who actually recorded it.
+RESCUE_INTERVENTION_BY = "coord (auto-detected)"
+
+#: The `next` text stamped alongside an auto-detected rescue — the sweep's
+#: own plan (wait for CI, then dispatch Test/Review itself), not an
+#: operator's.
+RESCUE_INTERVENTION_NEXT = (
+    "auto-resume once CI is green on the new head — Test, then review; "
+    "no operator action needed unless it reblocks"
+)
+
+
+def describe_out_of_band_push(sha: str) -> str:
+    """The `did` text for an auto-detected rescue at *sha* (#4217).
+
+    One function so `coord.reconcile.reconcile_rescued_blocked_rows`'s
+    detection and any future reader of the record agree on the exact
+    wording — #2096, "one question, one answer".
+    """
+    return f"out-of-band push {sha}"
+
+
+def is_rescue_resume_eligible(
+    state: str | None,
+    last_reason: str | None,
+    intervention: Mapping[str, Any] | None,
+    *,
+    now: float,
+) -> bool:
+    """Is this `blocked` row a candidate for #4217's auto-resume sweep?
+
+    `True` only for `state == STATE_BLOCKED` AND (the #2972 fix-round
+    ceiling — :func:`is_fix_round_ceiling_reason` — OR a non-stale #4216
+    intervention record — :func:`intervention_is_stale` — whether that
+    record is human-authored or this same sweep's own). Every OTHER
+    `blocked` cause (#1844/#2019/#3522/#4133/#4177, or a plain unconfirmed
+    gate block with neither a ceiling nor a record) is left alone: #2230's
+    own gate-based resume already owns those, and widening this sweep to
+    them would relaunch a row for a reason the ceiling/held shape was never
+    meant to cover.
+    """
+    if state != STATE_BLOCKED:
+        return False
+    if is_fix_round_ceiling_reason(last_reason):
+        return True
+    return intervention is not None and not intervention_is_stale(intervention, now)
+
+
 def is_unreachable_wait(
     entry: QueueEntry,
     *,
