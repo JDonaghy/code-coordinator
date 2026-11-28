@@ -665,6 +665,42 @@ def _surface_covers(path: str, surface: str) -> bool:
     return bool(surface.endswith("/") and path.startswith(surface))
 
 
+def shared_surface(
+    left_files: Sequence[str], right_files: Sequence[str], surface_paths: Sequence[str],
+) -> str | None:
+    """The first declared ``integration_surfaces`` path (#4151) that
+    *both* file lists have at least one file under, or ``None`` when none
+    does (#4226).
+
+    The POSITIVE counterpart to :func:`predict_overlap`'s own
+    ``surface_paths=`` handling: there, a match confined to a declared
+    surface is evidence the "collision" is just shared mechanical
+    regen/check noise, so it is DROPPED from the predicted overlap rather
+    than ordering one side after the other. Here, two issues both
+    declaring files under the SAME surface (a schema, a trait
+    implementation list, a ratchet-test fixture) is exactly the opposite
+    signal — real, shared-contract coupling a tranche candidate scan
+    (`coord.preflight_size.propose_tranche`) wants to find, even when the
+    two sides' declared files otherwise have no plain overlap at all.
+    Reuses :func:`_surface_covers` — the one function that already answers
+    "does this surface cover this path" — rather than a second, directed
+    containment check of its own (#2096).
+
+    Checked in *surface_paths*' own order; the first surface satisfied by
+    at least one file on EACH side wins — a caller that cares which file
+    on each side matched can re-derive it from the returned surface via
+    the same :func:`_surface_covers` check.
+    """
+    for surface in surface_paths or ():
+        if not surface:
+            continue
+        if any(_surface_covers(f, surface) for f in left_files or ()) and any(
+            _surface_covers(f, surface) for f in right_files or ()
+        ):
+            return surface
+    return None
+
+
 def _intersect(
     candidate: Sequence[str],
     other: Sequence[str],

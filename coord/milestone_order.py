@@ -171,6 +171,46 @@ class WorkOrder:
     def issue_numbers(self) -> tuple[int, ...]:
         return tuple(n.issue_number for n in self.nodes)
 
+    def adjacent(self, issue_number: int) -> tuple[int, ...]:
+        """#4226: every node directly connected to *issue_number* in this
+        DAG — the mechanical reading of "adjacent in the Work order" a
+        tranche-candidate scan (`coord.preflight_size.propose_tranche`)
+        needs: nothing here is itself a coupling signal (two adjacent
+        nodes can still touch disjoint files), only "worth checking for
+        one".
+
+        Three ways a node counts as adjacent, deduplicated and returned in
+        ascending issue-number order:
+
+        1. *issue_number*'s own declared ``after`` targets (its direct
+           predecessors);
+        2. any node that declares *issue_number* in ITS ``after`` (its
+           direct successors); and
+        3. any other node sharing the same non-empty ``group`` annotation
+           — siblings a human already banded together under one label,
+           even with no edge between them.
+
+        ``()`` when *issue_number* isn't itself a node in this work order
+        (nothing to be adjacent to) — the same fail-open posture
+        :func:`ready_frontier` takes toward a work order it wasn't asked
+        about.
+        """
+        node = self.node(issue_number)
+        if node is None:
+            return ()
+        adjacent: set[int] = set(node.after)
+        adjacent.update(
+            n.issue_number for n in self.nodes if issue_number in n.after
+        )
+        if node.group:
+            adjacent.update(
+                n.issue_number
+                for n in self.nodes
+                if n.group == node.group and n.issue_number != issue_number
+            )
+        adjacent.discard(issue_number)
+        return tuple(sorted(adjacent))
+
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 

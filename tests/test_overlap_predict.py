@@ -35,6 +35,7 @@ from coord.overlap_predict import (
     paths_overlap,
     predict_overlap,
     predictions_from_audit,
+    shared_surface,
     tally,
 )
 
@@ -459,6 +460,52 @@ def test_intersect_every_hit_covered_but_by_different_surfaces():
         ["a/one.json", "b/two.json"],
         surface_paths=["a/one.json", "b/two.json"],
     ) == ()
+
+
+# ── shared_surface (#4226) ───────────────────────────────────────────────────
+
+
+def test_shared_surface_finds_a_path_both_sides_declare():
+    assert (
+        shared_surface(
+            ["coord/schema.py"],
+            ["coord/schema.py", "coord/other.py"],
+            ["coord/schema.py"],
+        )
+        == "coord/schema.py"
+    )
+
+
+def test_shared_surface_honors_directory_declarations():
+    assert (
+        shared_surface(
+            ["scripts/baselines/one.json"],
+            ["scripts/baselines/two.json"],
+            ["scripts/baselines/"],
+        )
+        == "scripts/baselines/"
+    )
+
+
+def test_shared_surface_none_when_only_one_side_matches():
+    assert shared_surface(
+        ["coord/schema.py"], ["coord/unrelated.py"], ["coord/schema.py"],
+    ) is None
+
+
+def test_shared_surface_none_with_no_surface_paths():
+    assert shared_surface(["a/x.py"], ["a/x.py"], []) is None
+
+
+def test_shared_surface_returns_first_satisfied_surface_in_order():
+    assert (
+        shared_surface(
+            ["a/one.json", "b/two.json"],
+            ["a/one.json", "b/two.json"],
+            ["b/two.json", "a/one.json"],
+        )
+        == "b/two.json"
+    )
 
 
 # ── #2603: an edge's PROVENANCE, not just its conclusion ────────────────────

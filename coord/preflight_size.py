@@ -54,10 +54,16 @@ from coord.milestone_order import (
     WorkOrderError,
     WorkOrderNode,
     parse_sub_issues,
+    parse_work_order,
     render_sub_issues,
 )
-from coord.models import SplitChunk, SplitProposal
-from coord.overlap_predict import Footprint, parse_declared_files, predict_overlap
+from coord.models import SplitChunk, SplitProposal, TrancheChild, TrancheRow
+from coord.overlap_predict import (
+    Footprint,
+    parse_declared_files,
+    predict_overlap,
+    shared_surface,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -79,6 +85,13 @@ __all__ = [
     "build_slice_header",
     "build_slice_child_body",
     "substitute_slice_tokens",
+    "SiblingIssue",
+    "TrancheCandidate",
+    "TrancheProposal",
+    "MIN_TRANCHE_MEMBERS",
+    "MAX_TRANCHE_MEMBERS",
+    "propose_tranche",
+    "render_tranche_advisory",
 ]
 
 #: #4175: `coord.audit.record_audit`'s `category=`/`event_type=` for every
@@ -1373,3 +1386,385 @@ def substitute_slice_tokens(body: str, position_to_real: Mapping[int, int]) -> s
         return f"#{real}" if real is not None else match.group(0)
 
     return _SLICE_TOKEN_RE.sub(_replace, body)
+
+
+# ── #4226: tranche auto-detection at pre-start ──────────────────────────────
+#
+# WHAT THIS ADDS. #4206's tranche-vs-single-vs-workflow pacing epic names a
+# pre-start check: when the size-triage/preflight pass (this module) looks at
+# an issue that already belongs to a filed epic, could it run FASTER as part
+# of a native tranche row (#4129/#4199: N children dispatched in parallel off
+# one shared `base_sha`, one coord-side merge/Test/review/PR) instead of as
+# an ordinary serial chain of single issues? This is the CANDIDATE-SELECTION
+# half only — building the `TrancheRow`/`TrancheChild` shape and deciding
+# whether to form it (`repos[].tranche.auto`) or merely advise. Actually
+# dispatching the row's children, merging them, and running its bound
+# Test/review/PR are the sibling slices #4200–#4202 already built against
+# `TrancheRow` as a plain dataclass — this never touches those paths.
+#
+# NO DISPATCH, NO LLM, NO GITHUB WRITES — same posture as the rest of this
+# module. :func:`propose_tranche` is pure: every piece of live state (the
+# epic's own tracking-issue body, each sibling's title/body/open-claimed
+# state) is a plain argument, never fetched here. The caller (a future
+# drive-queue preflight hook, out of scope for this slice — see #4227/#4228)
+# owns resolving `repos[].tranche.enabled`/`.auto` and deciding what to DO
+# with the result: save it via `coord.state.save_tranche_row` when `formed`,
+# or post :func:`render_tranche_advisory` as an issue comment otherwise.
+#
+# ONE QUESTION, ONE ANSWER (#2096). "Which nodes are adjacent to this one in
+# the Work order" is answered by :meth:`~coord.milestone_order.WorkOrder.
+# adjacent` (added alongside this feature, in that module, for exactly this
+# reason — it is a Work-order-DAG question, not a preflight-heuristic one).
+# "Do these two file lists overlap" and "do they share a declared
+# integration surface" are answered by :func:`coord.overlap_predict.
+# predict_overlap` / :func:`coord.overlap_predict.shared_surface`
+# respectively — reused here, never re-derived.
+
+
+@dataclass(frozen=True)
+class SiblingIssue:
+    """One epic sibling's live state, as the caller already holds it from
+    the board/GitHub — :func:`propose_tranche` takes this as plain data
+    rather than querying anything itself, the same "caller already has it"
+    posture :func:`score_issue_size` takes toward prior-leg cost history.
+
+    ``open``/``claimed``/``in_other_tranche`` are the three independent
+    ways a sibling can be unavailable as a NEW tranche candidate —
+    already closed, already claimed/in-flight under an ordinary
+    assignment, or already riding a DIFFERENT tranche row — regardless of
+    whether it would otherwise be adjacent or file-coupled at all. All
+    default to "available" (``open=True``, the other two ``False``) since
+    most callers build these from a live board where a sibling simply
+    absent from any claim/row listing IS available.
+    """
+
+    issue_number: int
+    title: str = ""
+    body: str | None = None
+    open: bool = True
+    claimed: bool = False
+    in_other_tranche: bool = False
+
+    @property
+    def available(self) -> bool:
+        return self.open and not self.claimed and not self.in_other_tranche
+
+
+@dataclass(frozen=True)
+class TrancheCandidate:
+    """One sibling :func:`propose_tranche` picked to ride alongside the
+    anchor issue — carrying WHY, not just WHO, so the advisory/row this
+    proposal becomes never has to re-derive its own rationale.
+
+    ``coupled_files`` is the (possibly empty) set of the sibling's own
+    declared files :func:`~coord.overlap_predict.predict_overlap` matched
+    against the anchor's; ``shared_surface`` is the (possibly ``None``)
+    declared ``integration_surfaces`` path :func:`~coord.overlap_predict.
+    shared_surface` found covering a file on BOTH sides. At least one of
+    the two is always truthy — :func:`propose_tranche` never builds a
+    candidate with neither, since that would be a bare Work-order
+    adjacency with no coupling evidence at all.
+    """
+
+    issue_number: int
+    title: str = ""
+    coupled_files: tuple[str, ...] = field(default_factory=tuple)
+    shared_surface_path: str | None = None
+
+    @property
+    def reason(self) -> str:
+        bits: list[str] = []
+        if self.coupled_files:
+            shown = ", ".join(f"`{f}`" for f in self.coupled_files[:3])
+            if len(self.coupled_files) > 3:
+                shown += f" (+{len(self.coupled_files) - 3} more)"
+            bits.append(f"coupled files: {shown}")
+        if self.shared_surface_path:
+            bits.append(f"shared integration surface: `{self.shared_surface_path}`")
+        return "; ".join(bits)
+
+
+@dataclass(frozen=True)
+class TrancheProposal:
+    """:func:`propose_tranche`'s full verdict: the anchor issue plus every
+    candidate it picked, the #4129 fallback decision, and whether the
+    caller should actually FORM a `TrancheRow` (``formed``) or only post
+    :func:`render_tranche_advisory` as a comment.
+
+    ``formed`` is ``True`` only when the caller passed ``auto=True`` AND
+    ``serial_recommended`` is ``False`` — forming a `TrancheRow` (which
+    dispatches its children in PARALLEL off one shared ``base_sha``,
+    #4129's own contract) would be actively wrong for a set of members
+    the #4129 fallback rules say must land serially instead.
+    """
+
+    repo_name: str
+    tracking_issue_number: int
+    tracking_issue_title: str
+    anchor_issue_number: int
+    anchor_issue_title: str
+    candidates: tuple[TrancheCandidate, ...]
+    serial_recommended: bool
+    serial_reason: str | None
+    formed: bool
+    rationale: str
+
+    @property
+    def member_issue_numbers(self) -> tuple[int, ...]:
+        return (self.anchor_issue_number,) + tuple(
+            c.issue_number for c in self.candidates
+        )
+
+    def to_tranche_row(self, *, base_sha: str = "") -> TrancheRow:
+        """Build the (unsaved — ``id=None``) `TrancheRow` this proposal
+        describes: the epic's own tracking issue identifies the row
+        (``row.issue_number`` — "the decomposition tracking issue this row
+        came from", per `coord.merge_queue.tranche_closing_pr_body`'s own
+        docstring — never something the row's closing PR itself resolves),
+        and every member (the anchor first, then each candidate) becomes
+        one pending `TrancheChild`.
+
+        The caller still has to supply ``base_sha`` — the shared commit
+        every child branches from is a live git fact this pure proposal
+        has no access to — and is the one that actually persists the
+        result via `coord.state.save_tranche_row`, after checking
+        ``formed`` (this method builds the row unconditionally; it is the
+        caller's job to decide whether to call it at all).
+        """
+        children = [
+            TrancheChild(
+                issue_number=self.anchor_issue_number,
+                repo_name=self.repo_name,
+                title=self.anchor_issue_title,
+            )
+        ] + [
+            TrancheChild(
+                issue_number=c.issue_number,
+                repo_name=self.repo_name,
+                title=c.title,
+            )
+            for c in self.candidates
+        ]
+        return TrancheRow(
+            repo_name=self.repo_name,
+            issue_number=self.tracking_issue_number,
+            issue_title=self.tracking_issue_title,
+            base_sha=base_sha,
+            children=children,
+        )
+
+
+#: #4226 (#4129's own fallback rule, restated): fewer members than this and
+#: the coord-side merge/integration overhead of a native tranche row costs
+#: more than just running them one at a time — the serial path already
+#: handles "fewer than 3 small children" fine.
+MIN_TRANCHE_MEMBERS = 3
+
+#: #4226 (#4129: "cap the size at one theme and about 5-9 children; bigger
+#: tranches landed partial in the quadraui W7/W8 runs"). Includes the anchor
+#: issue itself, same as :data:`MIN_TRANCHE_MEMBERS`.
+MAX_TRANCHE_MEMBERS = 9
+
+
+def propose_tranche(
+    *,
+    repo_name: str,
+    anchor_issue_number: int,
+    anchor_issue_title: str,
+    anchor_body: str | None,
+    tracking_issue_number: int,
+    tracking_issue_title: str,
+    tracking_issue_body: str | None,
+    siblings: Mapping[int, SiblingIssue],
+    surface_paths: Sequence[str] = (),
+    auto: bool = False,
+    min_members: int = MIN_TRANCHE_MEMBERS,
+    max_members: int = MAX_TRANCHE_MEMBERS,
+) -> TrancheProposal | None:
+    """Propose a native tranche row for *anchor_issue_number*, or ``None``
+    when there is nothing worth proposing (#4226).
+
+    *tracking_issue_body* is the epic's own body — parsed via
+    :func:`~coord.milestone_order.parse_work_order`, exactly like every
+    other `## Work order` reader in this codebase. Returns ``None`` when
+    the anchor issue isn't itself a node of that work order (it isn't
+    actually a member of this epic, or the epic has no — or an
+    unparseable — `## Work order` block at all): nothing here applies to
+    an issue outside an epic.
+
+    *siblings* is every OTHER node's live state the caller already holds
+    (see :class:`SiblingIssue`) — a sibling absent from this mapping is
+    treated as unavailable, the same fail-closed posture as one present
+    with ``available=False``.
+
+    Candidate selection, in order:
+
+    1. Start from :meth:`~coord.milestone_order.WorkOrder.adjacent` —
+       every node directly connected to the anchor by an ``after`` edge
+       (either direction) or a shared ``group`` annotation.
+    2. Drop any adjacent sibling absent from *siblings*, or present but
+       not :attr:`SiblingIssue.available`.
+    3. Of what's left, keep only a sibling whose OWN declared files
+       (parsed the same way :func:`score_issue_size` reads the anchor's)
+       either overlap the anchor's (:func:`~coord.overlap_predict.
+       predict_overlap`) or share a declared integration surface with it
+       (:func:`~coord.overlap_predict.shared_surface`) — bare Work-order
+       adjacency with neither is not evidence these two are actually
+       coupled enough to ride together.
+    4. Sort the survivors strongest-coupling-first (most coupled files,
+       then a shared surface, then issue number for a stable tie-break) —
+       the order :data:`MAX_TRANCHE_MEMBERS` truncates from when there are
+       more candidates than the cap allows.
+
+    The #4129 fallback rules, applied to the final member set (anchor +
+    kept candidates):
+
+    * **Too few.** Fewer than *min_members* total: returns ``None`` — not
+      enough coupled siblings to justify a tranche at all; the ordinary
+      serial path already handles this fine.
+    * **Too many.** More than *max_members* total: the weakest-coupled
+      candidates are dropped until the cap is met (step 4's sort order).
+    * **Must run serially.** Any ``after`` edge in the work order directly
+      connecting two KEPT members (not just anchor-to-candidate — two
+      candidates can be each other's dependency too) means one consumes
+      the other's new API/output — :attr:`TrancheProposal.
+      serial_recommended` is ``True`` and :attr:`~TrancheProposal.formed`
+      is unconditionally ``False`` (see that field's own docstring),
+      regardless of *auto*.
+
+    *auto* is the caller's already-resolved `repos[].tranche.auto` value
+    (this function never reads config itself) — ``True`` forms the row
+    (``formed=True``) when the fallback rules above don't force serial;
+    ``False`` always leaves ``formed=False`` so the caller only ever
+    posts :func:`render_tranche_advisory`.
+    """
+    try:
+        work_order = parse_work_order(tracking_issue_body or "")
+    except WorkOrderError:
+        return None
+    if work_order.node(anchor_issue_number) is None:
+        return None
+
+    anchor_files = tuple(parse_declared_files(anchor_body))
+    anchor_footprint = Footprint(
+        key=f"#{anchor_issue_number}",
+        issue_number=anchor_issue_number,
+        files=anchor_files,
+    )
+
+    adjacent_numbers = work_order.adjacent(anchor_issue_number)
+
+    candidates: list[TrancheCandidate] = []
+    for number in adjacent_numbers:
+        sibling = siblings.get(number)
+        if sibling is None or not sibling.available:
+            continue
+        sibling_files = tuple(parse_declared_files(sibling.body))
+        prediction = predict_overlap(sibling_files, (anchor_footprint,))
+        coupled_files = prediction.overlaps[0].files if prediction.overlaps else ()
+        surface = shared_surface(anchor_files, sibling_files, surface_paths)
+        if not coupled_files and not surface:
+            continue
+        candidates.append(
+            TrancheCandidate(
+                issue_number=number,
+                title=sibling.title,
+                coupled_files=coupled_files,
+                shared_surface_path=surface,
+            )
+        )
+
+    candidates.sort(
+        key=lambda c: (
+            -(len(c.coupled_files) + (1 if c.shared_surface_path else 0)),
+            c.issue_number,
+        )
+    )
+
+    total_members = 1 + len(candidates)
+    if total_members < min_members:
+        return None
+
+    overflow = total_members > max_members
+    if overflow:
+        candidates = candidates[: max_members - 1]
+
+    member_numbers = {anchor_issue_number, *(c.issue_number for c in candidates)}
+    serial_targets = sorted(
+        {
+            n
+            for n in member_numbers
+            for node in (work_order.node(n),)
+            if node is not None
+            for target in node.after
+            if target in member_numbers
+        }
+    )
+    serial_recommended = bool(serial_targets)
+    serial_reason: str | None = None
+    if serial_recommended:
+        named = ", ".join(f"#{n}" for n in serial_targets)
+        serial_reason = (
+            "the work order declares a direct dependency between proposed "
+            f"members ({named}) — a member consuming another's new API/output "
+            "must land after it, not alongside it in a parallel tranche"
+        )
+
+    rationale = (
+        f"#{anchor_issue_number} is adjacent to {len(adjacent_numbers)} "
+        f"sibling(s) in #{tracking_issue_number}'s work order; "
+        f"{len(candidates)} qualify via coupled files or a shared "
+        "integration surface"
+        + (f" (capped at {max_members} total members)" if overflow else "")
+        + "."
+    )
+
+    return TrancheProposal(
+        repo_name=repo_name,
+        tracking_issue_number=tracking_issue_number,
+        tracking_issue_title=tracking_issue_title,
+        anchor_issue_number=anchor_issue_number,
+        anchor_issue_title=anchor_issue_title,
+        candidates=tuple(candidates),
+        serial_recommended=serial_recommended,
+        serial_reason=serial_reason,
+        formed=auto and not serial_recommended,
+        rationale=rationale,
+    )
+
+
+def render_tranche_advisory(proposal: TrancheProposal) -> str:
+    """Markdown comment body for a :class:`TrancheProposal` the caller is
+    NOT forming into a real `TrancheRow` (:attr:`TrancheProposal.formed`
+    is ``False`` — either `repos[].tranche.auto` is off, or the #4129
+    fallback rules forced ``serial_recommended``) — the "post an operator
+    prompt or advisory" half of #4226's acceptance bar.
+
+    Deliberately prose, not another machine-parsed wire format — unlike
+    this module's `SIZE_TRIAGE_VERDICT:`/`## Child N:` conventions, nothing
+    reads this comment back; it exists purely for a human deciding whether
+    to form the tranche by hand (`coord.state.save_tranche_row`) or flip
+    `repos[].tranche.auto` on for next time.
+    """
+    lines = [
+        f"**Tranche candidate found for #{proposal.anchor_issue_number}** "
+        f"(epic #{proposal.tracking_issue_number} — {proposal.tracking_issue_title})",
+        "",
+        proposal.rationale,
+        "",
+        "Members:",
+        f"- #{proposal.anchor_issue_number} — {proposal.anchor_issue_title} (anchor)",
+    ]
+    for c in proposal.candidates:
+        lines.append(f"- #{c.issue_number} — {c.title}: {c.reason}")
+    lines.append("")
+    if proposal.serial_recommended:
+        lines.append(f"**Recommendation: run serially, not as a tranche.** {proposal.serial_reason}")
+    elif proposal.formed:
+        lines.append("Tranche row formed automatically (`tranche.auto` is on).")
+    else:
+        lines.append(
+            "`tranche.auto` is off for this repo — no row was formed. An "
+            "operator can form one by hand, or enable `tranche.auto`."
+        )
+    return "\n".join(lines)

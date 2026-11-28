@@ -88,6 +88,36 @@ class TestParseWorkOrder:
         wo = parse_work_order("just some prose, no heading here")
         assert wo == WorkOrder(nodes=())
 
+
+# ── WorkOrder.adjacent (#4226) ───────────────────────────────────────────────
+
+
+class TestWorkOrderAdjacent:
+    def test_after_edges_both_directions(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        # #765 declares after: #762, #763 (predecessors) and is itself
+        # named by #766's after (successor).
+        assert wo.adjacent(765) == (762, 763, 766)
+
+    def test_same_group_siblings_with_no_edge(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        # #762/#763 share group A (no after edge between THEM), but both
+        # are also direct predecessors of #765 — so #765 is adjacent too.
+        assert wo.adjacent(762) == (763, 765)
+        assert wo.adjacent(763) == (762, 765)
+
+    def test_isolated_node_has_no_adjacency(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        assert wo.adjacent(767) == ()
+
+    def test_unknown_issue_returns_empty(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        assert wo.adjacent(999) == ()
+
+    def test_never_includes_itself(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        assert 766 not in wo.adjacent(766)
+
     def test_checked_item_is_tracked(self) -> None:
         wo = parse_work_order(
             "## Work order\n- [x] #1\n- [ ] #2 {after: #1}\n"
