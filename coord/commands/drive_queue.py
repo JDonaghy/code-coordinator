@@ -7380,6 +7380,98 @@ def _fetch_live_dispatch_evidence(
     return evidence
 
 
+def _advance_tranche_rows(config_path: Path) -> list[str]:
+    """Advance every native tranche row that still has a step left to take
+    (#4129/#4202) and return one report line per row.
+
+    A `TrancheRow` is not a `QueueEntry` — it fans out to N children off
+    one base sha instead of driving one issue — so it never goes through
+    `plan_tick`'s one-launch-per-tick walk. This is its tick: load the
+    rows, let `coord.drive_queue.tranche_rows_ready_to_advance` decide
+    which ones are candidates, and hand each to `coord.drive.
+    advance_tranche_row`, which owns the whole Test -> review -> PR
+    ordering and takes exactly one step per call. Every decision lives in
+    those two functions; this is only the I/O shell around them.
+
+    Each row's own pool is the machines that can work on its repo and are
+    not currently paused or cordoned (`coord.machine_pause.paused_set`
+    with cordons included — the #3599 reason a drain must not keep
+    receiving dispatches). A row with no eligible machine is reported and
+    skipped: `advance_tranche_row` refuses an empty pool, and a Test
+    verdict from a machine that was never eligible is worse than waiting.
+
+    Best-effort throughout, like every other live re-read this tick runs:
+    an unreadable config/board, or one row raising, costs that row this
+    tick only and never the queue walk.
+
+    Runs only on the daemon host: a thin client returns before the local
+    board read is imported, because the tranche rows, the board and the
+    legs it dispatches all live on the daemon host.
+    """
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return []
+
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.drive import advance_tranche_row  # noqa: PLC0415
+        from coord.drive_queue import (  # noqa: PLC0415
+            TRANCHE_ADVANCEABLE_STATES,
+            tranche_rows_ready_to_advance,
+        )
+        from coord.machine_pause import paused_set  # noqa: PLC0415
+        from coord.models import Board  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            load_board,
+            load_tranche_rows_in_states,
+            save_tranche_row,
+        )
+
+        config = _load_config(config_path)
+        rows = tranche_rows_ready_to_advance(
+            load_tranche_rows_in_states(TRANCHE_ADVANCEABLE_STATES)
+        )
+        if not rows:
+            return []
+        # `load_board` returns None only when no board was ever saved —
+        # genuinely "no legs have ever been dispatched", not "the board
+        # could not be read" (that raises, and is caught below).
+        board = load_board() or Board()
+        paused = paused_set(config.machines, include_cordons=True)
+    except Exception as exc:  # noqa: BLE001 — see docstring: this tick only
+        return [f"(tranche rows not advanced this tick: {exc})"]
+
+    lines: list[str] = []
+    for row in rows:
+        pool = [
+            m.name for m in config.machines
+            if m.can_work_on(row.repo_name) and m.name not in paused
+        ]
+        if not pool:
+            lines.append(
+                f"tranche row {row.id} ({row.repo_name}#{row.issue_number}): "
+                "every machine for this repo is paused or cordoned — waiting"
+            )
+            continue
+        before = row.state
+        try:
+            step = advance_tranche_row(row, config, pool, board)
+        except Exception as exc:  # noqa: BLE001 — one row never breaks the tick
+            lines.append(
+                f"tranche row {row.id} ({row.repo_name}#{row.issue_number}): "
+                f"could not advance: {exc}"
+            )
+            continue
+        if row.state != before:
+            save_tranche_row(row)
+        lines.append(
+            f"tranche row {row.id} ({row.repo_name}#{row.issue_number}): "
+            f"{step['stage']} — {step['detail']}"
+        )
+    return lines
+
+
 def _fetch_merge_only_ready(
     entries: list,
     live_ci_gate: Mapping[str, bool],
@@ -9397,6 +9489,16 @@ def drive_queue_tick(
             return
 
         _apply_writes(plan)
+
+        # Native tranche rows advance on their own track, outside the
+        # capacity walk above: a row's children are one dispatch, not one
+        # launched drive per step, and the Test/review/PR tail launches no
+        # drive at all. Deliberately AFTER the `dry_run` return just above
+        # (it dispatches legs and opens a PR) and skipped under
+        # `--reconcile-only`, which promises to start nothing new.
+        if not reconcile_only:
+            for line in _advance_tranche_rows(config_path):
+                click.echo(line)
 
         # #3413: the writes have LANDED — but ONLY a tick that reached
         # `plan_tick`'s step-4 walk actually re-stamped every queue row's

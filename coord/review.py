@@ -46,11 +46,14 @@ import os
 import re
 import time
 import uuid
-from typing import Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+
+if TYPE_CHECKING:
+    from coord.models import TrancheRow
 
 from coord import github_ops
 from coord.claim import review_covers
@@ -9320,3 +9323,508 @@ def dispatch_headless_fix(
         work, briefing, board, config, next_iteration,
         model=model, http_client=http_client,
     )
+
+
+# ── Native tranche rows: three-way bound review (#4129 Phase 1, this slice
+# #4202) ───────────────────────────────────────────────────────────────────
+#
+# Once `coord.merge_queue.merge_tranche_children` has pushed a clean
+# integrated tree (`row.state == "done"`), #4129 names THREE independent
+# review legs instead of the ordinary single review:
+#
+#   - "recipe"    — did the merge/integration faithfully apply what each
+#                    child actually did (the coordinator's own mechanical
+#                    merge, or the LLM integrator fallback, might have
+#                    silently dropped or mangled a child's change);
+#   - "behaviour" — does the INTEGRATED tree behave correctly end to end —
+#                    the cross-child seams no single child's own
+#                    structured result (#4200) ever saw, since children
+#                    never reviewed each other;
+#   - "gates"     — does the integrated diff still pass this repo's own
+#                    CLAUDE.md/sealed-path/policy rules, the same checks
+#                    an ordinary single review already runs.
+#
+# All three review the SAME diff (`row.base_sha` -> the integrated sha)
+# through the SAME `REVIEWER_SYSTEM_PROMPT`/`REVIEW_VERDICT`/`END_REVIEW`
+# contract every other review leg already uses — grading reuses the
+# existing `Assignment.review_verdict`/`review_patch_id` machinery
+# `coord.notify` already populates for ANY `type="review"` row, nothing
+# new to parse. Dispatched as standalone raw `/assign` POSTs, mirroring
+# `coord.gate_b.dispatch_gate_b_review`'s posture (reusing `type="review"`
+# + `REVIEWER_SYSTEM_PROMPT` verbatim rather than inventing a new
+# assignment type) for the same reason that function states: there is no
+# PR yet for this diff (the PR opens LAST, once review approves — see
+# `coord.merge_queue.open_tranche_closing_pr`), so `dispatch_review`'s own
+# PR-centric machinery doesn't apply.
+#
+# Approval requires EVERY leg to come back `"approve"` AGAINST THE SAME
+# integrated patch-id (`tranche_review_verdict`) — a leg whose own
+# `review_patch_id` doesn't match the row's CURRENT integrated patch-id
+# reads exactly like "never reviewed", never like a stale approval that
+# still counts. That is what makes a scoped re-review of any fix delta
+# MANDATORY: a fix lands, the integrated patch-id moves, and every leg
+# bound to the old one stops counting until it (or a fresh dispatch of
+# it) is re-run against the new one — `dispatch_tranche_review_legs`'s own
+# *prior_verdict* briefing note is how a caller tells a leg's re-dispatch
+# it's scoped to just that delta.
+
+#: The three review legs #4129 requires for a tranche row's integrated
+#: tree — see this section's own module comment for what each checks.
+#: Order is deliberate (recipe before behaviour before gates) and is also
+#: the round-robin order `dispatch_tranche_review_legs` assigns machines
+#: in; it carries no other significance.
+TRANCHE_REVIEW_FOCUSES: tuple[str, ...] = ("recipe", "behaviour", "gates")
+
+_TRANCHE_REVIEW_FOCUS_INSTRUCTIONS: dict[str, str] = {
+    "recipe": (
+        "Does the integrated tree faithfully carry EVERY done child's own "
+        "change through? Diff each child's own branch against the "
+        "integrated tree and confirm nothing was silently dropped, "
+        "reverted, or mangled by the coordinator's mechanical merge (or, "
+        "if one ran, the LLM integrator fallback leg). A child's change "
+        "going missing or being altered in the merge is ALWAYS blocking, "
+        "even if the integrated tree otherwise looks fine."
+    ),
+    "behaviour": (
+        "Does the INTEGRATED tree behave correctly end to end — "
+        "specifically the seams BETWEEN children's changes, which no "
+        "single child's own work ever exercised (children ran in "
+        "parallel off the same base, with no visibility into each "
+        "other). Look for a function one child added that another child "
+        "needed but called differently than defined, a shared file two "
+        "children both touched where the merge's resolution doesn't "
+        "actually work, or a regenerated integration-surface artifact "
+        "that is stale relative to what the children's sources now say."
+    ),
+    "gates": (
+        "Does the integrated diff still pass this repo's own CLAUDE.md "
+        "rules — sealed paths, coordinator-owned docs, and every other "
+        "policy check an ordinary single-PR review already runs. Review "
+        "this exactly as you would any other PR's diff against CLAUDE.md; "
+        "nothing about this being a tranche integration changes what "
+        "counts as a policy violation."
+    ),
+}
+
+
+def tranche_review_target_for(row_id: int, focus: str) -> str:
+    """The `review_target` sentinel one tranche review leg's `Assignment`
+    carries (#4202) — mirrors `coord.gate_b.review_target_for`'s own
+    non-numeric-sentinel shape: there is no PR to post a review to (the PR
+    opens LAST — see `coord.merge_queue.open_tranche_closing_pr`), so
+    `coord.notify`'s existing `int(review_target)` PR-post attempt fails
+    and it falls back to posting a plain issue comment instead, same as
+    Gate B's own reviews.
+
+    Deterministic from `(row_id, focus)` alone, never stored anywhere new
+    — `tranche_review_leg_assignments` below re-derives it to scan the
+    board for the SAME leg, the single-source-of-truth shape every other
+    `tranche_*_name` helper in this feature already uses.
+    """
+    return f"tranche-{row_id}-review-{focus}"
+
+
+def build_tranche_review_briefing(
+    row: "TrancheRow",
+    focus: str,
+    integrated_sha: str,
+    *,
+    prior_verdict: str | None = None,
+) -> str:
+    """Briefing text for ONE of the three bound review legs (#4202).
+
+    Tells the reviewer this is one of three independent legs covering the
+    same integrated tree, names its own narrow focus
+    (`_TRANCHE_REVIEW_FOCUS_INSTRUCTIONS`), and lists every integrated
+    child so the reviewer has the same "what actually merged" context
+    `build_tranche_integrator_briefing` gives its own leg.
+
+    *prior_verdict* (#4202's mandatory scoped re-review) is the PRIOR
+    dispatch's own verdict for this exact focus — when it was
+    `"request-changes"`, the briefing narrows to "did the fix actually
+    resolve this leg's own prior findings" instead of a from-scratch
+    review, same spirit as `coord.review.build_scoped_review_briefing`'s
+    delta framing elsewhere. `None` (the default) is an ordinary
+    from-scratch review — the common case, and every first dispatch.
+    """
+    if focus not in TRANCHE_REVIEW_FOCUSES:
+        raise ValueError(
+            f"build_tranche_review_briefing: focus {focus!r} is not one of "
+            f"{TRANCHE_REVIEW_FOCUSES}"
+        )
+    done_children = sorted(
+        (c for c in row.children if c.state == "done"), key=lambda c: c.issue_number,
+    )
+    children_lines = "\n".join(
+        f"- #{c.issue_number} ({c.title or 'untitled'})" for c in done_children
+    ) or "(none)"
+    rereview_note = ""
+    if prior_verdict == "request-changes":
+        rereview_note = (
+            "\n\nSCOPED RE-REVIEW (#4129/#4202): a PRIOR run of this exact "
+            f"`{focus}` leg requested changes on this same tranche row. A "
+            "fix has since landed on the integrated tree — check ONLY "
+            "whether it actually resolves what you (or the prior session "
+            "covering this leg) flagged before; do not re-litigate "
+            "anything already approved."
+        )
+    return (
+        f"Three-way bound review — `{focus}` leg (#4129/#4202) for tranche "
+        f"row {row.id}, {row.repo_name}#{row.issue_number} "
+        f"({row.issue_title}).\n\n"
+        f"This PR integrates {len(done_children)} child issue(s) onto one "
+        f"tree with no per-child PR or review of their own. This review, "
+        f"together with its two sibling legs (the other two of "
+        f"`recipe`/`behaviour`/`gates`), is the ONLY review this "
+        f"integration gets. Approval requires ALL THREE legs to approve; "
+        f"a `request-changes` from any one blocks the merge.\n\n"
+        f"Children integrated:\n{children_lines}\n\n"
+        f"Base commit: `{row.base_sha}`  \n"
+        f"Integrated tree sha (already checked out): `{integrated_sha}`\n\n"
+        f"Your focus for THIS leg — {focus}:\n"
+        f"{_TRANCHE_REVIEW_FOCUS_INSTRUCTIONS[focus]}"
+        f"{rereview_note}\n\n"
+        f"Diff the base against your checkout (`git diff {row.base_sha}`) "
+        f"to see exactly what this integration changed."
+    )
+
+
+def dispatch_tranche_review_legs(
+    row: "TrancheRow",
+    integrated_sha: str,
+    config: Config,
+    machine_names: Sequence[str],
+    board: Board,
+    *,
+    http_client: httpx.Client | None = None,
+    now: float | None = None,
+    prior_verdicts: "Mapping[str, str] | None" = None,
+    integrated_patch_id: str | None = None,
+    focuses: "Sequence[str] | None" = None,
+    diff_fetcher=None,
+    patch_id_computer=None,
+) -> dict:
+    """Dispatch the bound review legs for *row*'s integrated tree
+    (#4129/#4202) — only ever called once `row.state == "done"`.
+
+    One leg per requested focus, round-robined across *machine_names* by
+    each focus's own index in `TRANCHE_REVIEW_FOCUSES` — so a focus always
+    lands on the same machine whether it is dispatched with its siblings
+    or on its own.
+
+    *focuses* narrows the dispatch to a subset of
+    `TRANCHE_REVIEW_FOCUSES`; `None` (the default) dispatches all three.
+    The scoped re-review of a fix delta needs this: once a fix moves the
+    integrated patch-id, `tranche_review_verdict` reports the focuses
+    whose binding went stale, and only those get re-dispatched — a focus
+    whose own leg is still in flight against the CURRENT patch-id must
+    not be dispatched a second time. `ok` then reports only the requested
+    focuses, so an unrequested one never reads as a failure.
+
+    Each leg is a standalone raw `/assign` POST
+    (mirrors `coord.gate_b.dispatch_gate_b_review`'s posture — see this
+    section's own module comment for why `dispatch_review`'s PR-centric
+    machinery doesn't apply here), appending a `type="review"` `Assignment`
+    to `board.active` and recording it via
+    `coord.state.record_dispatched_assignment` on success.
+
+    *prior_verdicts* (#4202's mandatory scoped re-review) is an optional
+    `{focus: verdict}` map — the caller's own record of each focus's most
+    recent verdict (e.g. from `tranche_review_verdict`'s own `blocking`
+    list) — threaded into `build_tranche_review_briefing`'s *prior_verdict*
+    so a leg being RE-dispatched after a fix gets the scoped framing
+    instead of a from-scratch review. Absent entirely for a row's first
+    dispatch.
+
+    *integrated_patch_id* is what makes the "bound to the integrated
+    patch-id" requirement reachable: every leg's `Assignment` gets
+    `review_head_sha=integrated_sha` and `review_patch_id=
+    integrated_patch_id` stamped on it at dispatch time, so a later
+    `tranche_review_verdict(..., integrated_patch_id=...)` call can
+    actually compare a leg's own patch-id against the row's CURRENT one.
+    When not given explicitly, this computes it itself via
+    `tranche_integrated_patch_id(row, integrated_sha, config,
+    diff_fetcher=diff_fetcher, patch_id_computer=patch_id_computer)` —
+    *diff_fetcher*/*patch_id_computer* are forwarded to that call only,
+    and ignored once *integrated_patch_id* is given directly.
+
+    Never raises on a single leg's dispatch failure — each focus fails
+    independently, mirroring `dispatch_tranche_row_children`'s per-child
+    posture, so one agent rejecting a POST doesn't strand the other two
+    legs undispatched. Returns ``{"ok": bool, "legs": {focus: {...}}}``:
+    ``ok`` is `True` only when EVERY REQUESTED focus's own leg dispatched
+    successfully; each `legs[focus]` is ``{"ok": True, "assignment_id":
+    ..., "machine_name": ...}`` or ``{"ok": False, "error": ...}``.
+
+    Raises ValueError if *machine_names* is empty, if *row.id* is None, or
+    if *focuses* names anything outside `TRANCHE_REVIEW_FOCUSES` or is
+    given as an empty sequence — there is nowhere to route the legs to, no
+    stable sentinel (`tranche_review_target_for`) to dispatch them under,
+    or no focus to review. An empty *focuses* must never read as "all
+    three dispatched fine": `ok` over an empty `legs` map would be
+    vacuously `True`.
+    """
+    if not machine_names:
+        raise ValueError("dispatch_tranche_review_legs: machine_names is empty")
+    if row.id is None:
+        raise ValueError(
+            "dispatch_tranche_review_legs: row.id is None — save the row "
+            "(coord.state.save_tranche_row) before dispatching its review legs"
+        )
+    if focuses is None:
+        requested = list(TRANCHE_REVIEW_FOCUSES)
+    else:
+        requested = list(focuses)
+        if not requested:
+            raise ValueError(
+                "dispatch_tranche_review_legs: focuses is empty — pass None "
+                "for all of TRANCHE_REVIEW_FOCUSES, never an empty sequence"
+            )
+        unknown = [f for f in requested if f not in TRANCHE_REVIEW_FOCUSES]
+        if unknown:
+            raise ValueError(
+                f"dispatch_tranche_review_legs: unknown focus(es) {unknown!r} "
+                f"— must be among {list(TRANCHE_REVIEW_FOCUSES)!r}"
+            )
+    if integrated_patch_id is None:
+        integrated_patch_id = tranche_integrated_patch_id(
+            row, integrated_sha, config,
+            diff_fetcher=diff_fetcher, patch_id_computer=patch_id_computer,
+        )
+    repo_cfg = config.repo(row.repo_name)
+    if repo_cfg is None:
+        raise ValueError(
+            f"dispatch_tranche_review_legs: repo {row.repo_name!r} is not configured"
+        )
+
+    from coord.agent import FAILED as AGENT_ASSIGNMENT_FAILED  # noqa: PLC0415
+    from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
+
+    target_branch = tranche_integration_branch_name(row)
+    client = http_client or httpx
+    legs: dict[str, dict] = {}
+
+    for focus in requested:
+        machine_name = machine_names[
+            TRANCHE_REVIEW_FOCUSES.index(focus) % len(machine_names)
+        ]
+        machine = next((m for m in config.machines if m.name == machine_name), None)
+        if machine is None:
+            legs[focus] = {"ok": False, "error": f"unknown machine {machine_name!r}"}
+            continue
+        repo_path = machine.repo_path(row.repo_name)
+        if repo_path is None:
+            legs[focus] = {
+                "ok": False,
+                "error": (
+                    f"machine {machine_name!r} has no repo_path for "
+                    f"{row.repo_name!r}"
+                ),
+            }
+            continue
+
+        review_target = tranche_review_target_for(row.id, focus)
+        prior_verdict = (prior_verdicts or {}).get(focus)
+        briefing = build_tranche_review_briefing(
+            row, focus, integrated_sha, prior_verdict=prior_verdict,
+        )
+        payload = {
+            "repo_name": row.repo_name,
+            "repo_path": repo_path,
+            "issue_number": row.issue_number,
+            "issue_title": f"[review:{focus}] {row.issue_title}",
+            "briefing": briefing,
+            "files_allowed": [],
+            "files_forbidden": [],
+            "pull_repos": [],
+            "type": "review",
+            "model": config.models.default,
+            "system_prompt": REVIEWER_SYSTEM_PROMPT,
+            "review_target": review_target,
+            "branch": target_branch,
+        }
+        url = f"http://{machine.host}:{AGENT_PORT}/assign"
+        try:
+            resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
+            resp.raise_for_status()
+            agent_response = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            legs[focus] = {
+                "ok": False,
+                "error": f"agent {machine_name!r} rejected dispatch: {exc}",
+            }
+            continue
+
+        if not isinstance(agent_response, dict) or not agent_response.get("id"):
+            legs[focus] = {
+                "ok": False,
+                "error": f"dispatch response carried no assignment id: {agent_response!r}",
+            }
+            continue
+        if agent_response.get("status") == AGENT_ASSIGNMENT_FAILED:
+            legs[focus] = {
+                "ok": False,
+                "error": (
+                    "agent reported dispatch failure: "
+                    f"{agent_response.get('error') or 'unknown error'}"
+                ),
+            }
+            continue
+
+        assignment_id = agent_response["id"]
+        assignment = Assignment(
+            machine_name=machine_name,
+            repo_name=row.repo_name,
+            issue_number=row.issue_number,
+            issue_title=f"[review:{focus}] {row.issue_title}",
+            files_allowed=[],
+            files_forbidden=[],
+            briefing=briefing,
+            assignment_id=assignment_id,
+            status="running",
+            branch=target_branch,
+            dispatched_at=now if now is not None else time.time(),
+            type="review",
+            review_target=review_target,
+            model=config.models.default,
+            review_head_sha=integrated_sha,
+            review_patch_id=integrated_patch_id,
+        )
+        board.active.append(assignment)
+
+        from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+        record_dispatched_assignment(assignment=assignment, repo_github=repo_cfg.github)
+
+        legs[focus] = {
+            "ok": True, "assignment_id": assignment_id, "machine_name": machine_name,
+        }
+
+    return {"ok": all(leg.get("ok") for leg in legs.values()), "legs": legs}
+
+
+def tranche_review_leg_assignments(
+    board: Board, row: "TrancheRow",
+) -> dict[str, Assignment | None]:
+    """The most recently dispatched review `Assignment` for each of
+    `TRANCHE_REVIEW_FOCUSES` on *row*, scanned off *board* (#4202).
+
+    Mirrors `coord.gate_b.latest_gate_b_verdict`'s "scan both completed and
+    active, pick the most recently DISPATCHED one" shape — a re-dispatch
+    after a request-changes reuses the SAME `tranche_review_target_for`
+    sentinel, so the newest one is always the authoritative leg. `None`
+    for a focus never dispatched.
+    """
+    pool = list(board.completed) + list(board.active)
+    result: dict[str, Assignment | None] = {}
+    for focus in TRANCHE_REVIEW_FOCUSES:
+        target = tranche_review_target_for(row.id, focus) if row.id is not None else None
+        matches = [
+            a for a in pool
+            if a.type == "review" and a.repo_name == row.repo_name
+            and target is not None and a.review_target == target
+        ]
+        matches.sort(key=lambda a: a.dispatched_at or 0.0)
+        result[focus] = matches[-1] if matches else None
+    return result
+
+
+def tranche_review_verdict(
+    legs: "Mapping[str, Assignment | None]",
+    *,
+    integrated_patch_id: str | None = None,
+) -> dict:
+    """Aggregate the three bound review legs into ONE tranche-level
+    approval decision (#4129/#4202).
+
+    `approved` is `True` only when EVERY name in `TRANCHE_REVIEW_FOCUSES`
+    has a leg in *legs* with a non-`None` `review_verdict` of `"approve"`
+    — a focus missing entirely, or whose leg hasn't finished yet, reads
+    exactly like one that explicitly requested changes, never as
+    vacuously approved (#2096, "a gate must be able to fail": a tranche
+    row that never got a `"gates"` leg dispatched at all must never look
+    indistinguishable from one all three legs actually approved).
+
+    *integrated_patch_id*, when given, enforces the "bound to the
+    integrated patch-id" requirement directly: a leg whose own
+    `review_patch_id` does not match it — INCLUDING a leg whose
+    `review_patch_id` is `None` (a leg dispatched before a caller started
+    stamping it, or one whose own patch-id computation failed) — is
+    treated as `pending`, needing a fresh (or scoped) dispatch,
+    REGARDLESS of what verdict it already carries. A missing
+    `review_patch_id` is never read as "binding satisfied" — that would
+    make this check unreachable for every leg a real dispatch failed to
+    stamp. This is what makes a scoped re-review of a fix delta mandatory
+    rather than advisory: an `"approve"` against a patch-id the row has
+    since moved past, or against no recorded patch-id at all, simply does
+    not count. `None` (the default) skips this check entirely — the
+    caller's own job when it has no reliable integrated-sha diff to
+    fingerprint yet.
+
+    Returns `{"approved": bool, "pending": (...), "blocking": (...)}` —
+    `pending` names focuses with no (current) verdict yet; `blocking`
+    names focuses whose CURRENT verdict is a `"request-changes"`. Both
+    are empty tuples iff `approved` is `True`.
+    """
+    pending: list[str] = []
+    blocking: list[str] = []
+    for focus in TRANCHE_REVIEW_FOCUSES:
+        leg = legs.get(focus)
+        if leg is None or leg.review_verdict is None:
+            pending.append(focus)
+            continue
+        if integrated_patch_id is not None and leg.review_patch_id != integrated_patch_id:
+            pending.append(focus)
+            continue
+        if leg.review_verdict != "approve":
+            blocking.append(focus)
+    return {
+        "approved": not pending and not blocking,
+        "pending": tuple(pending),
+        "blocking": tuple(blocking),
+    }
+
+
+def tranche_integrated_patch_id(
+    row: "TrancheRow",
+    integrated_sha: str,
+    config: Config,
+    *,
+    diff_fetcher=None,
+    patch_id_computer=None,
+) -> str | None:
+    """Fingerprint the diff `row.base_sha` -> *integrated_sha* (#4202) —
+    the patch-id `tranche_review_verdict`'s *integrated_patch_id* binds
+    every review leg's own approval to.
+
+    Reuses the exact same two primitives `dispatch_review` already uses
+    for its own no-PR-yet branch (#1475/#1484): *diff_fetcher* defaults to
+    `coord.github_ops.get_compare_diff` (a real `gh api .../compare` call;
+    inject a stub in tests), *patch_id_computer* to
+    `coord.github_ops.compute_patch_id` (a pure, no-network `git patch-id
+    --stable`). There is no PR for a tranche integration branch at review
+    time — the PR opens LAST, see `coord.merge_queue.
+    open_tranche_closing_pr` — so this always takes that branch rather
+    than `dispatch_review`'s PR-diff one.
+
+    Returns `None` (fail-safe, never raises) when either the diff fetch or
+    the fingerprint computation fails — `tranche_review_verdict` already
+    treats a `None` *integrated_patch_id* as "skip the binding check
+    entirely", the same fail-open posture `dispatch_review` itself applies
+    to a missing `review_patch_id`.
+    """
+    _diff_fetcher = diff_fetcher or github_ops.get_compare_diff
+    _patch_id_computer = patch_id_computer or github_ops.compute_patch_id
+    repo_cfg = config.repo(row.repo_name)
+    if repo_cfg is None:
+        return None
+    try:
+        diff_text = _diff_fetcher(repo_cfg.github, row.base_sha, integrated_sha)
+    except Exception:  # noqa: BLE001 — fail-safe: missing diff is not blocking
+        return None
+    if not diff_text:
+        return None
+    try:
+        return _patch_id_computer(diff_text)
+    except Exception:  # noqa: BLE001 — fail-safe: missing patch-id is not blocking
+        return None

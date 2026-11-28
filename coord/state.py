@@ -805,6 +805,27 @@ def load_tranche_rows_for_issue(repo_name: str, issue_number: int) -> list[Tranc
     return [_tranche_row_from_sql_row(conn, r) for r in rows]
 
 
+def load_tranche_rows_in_states(states: Sequence[str]) -> list[TrancheRow]:
+    """Return every tranche row whose ``state`` is one of *states*, oldest
+    id first.
+
+    The read a periodic tick needs: "which rows still have a step left to
+    take" (see :func:`coord.drive_queue.tranche_rows_ready_to_advance` for
+    which states those are). Returns ``[]`` for an empty *states* rather
+    than every row -- an empty filter means "nothing selected", never
+    "select all".
+    """
+    if not states:
+        return []
+    conn = get_connection()
+    placeholders = ", ".join("?" for _ in states)
+    rows = sql.execute(conn,
+        f"SELECT * FROM tranche_rows WHERE state IN ({placeholders}) ORDER BY id",
+        tuple(states),
+    ).fetchall()
+    return [_tranche_row_from_sql_row(conn, r) for r in rows]
+
+
 def delete_tranche_row(row_id: int) -> None:
     """Delete a tranche row and its children. A no-op if *row_id* doesn't
     exist."""

@@ -12470,3 +12470,131 @@ def merge_tranche_children(
         )
     finally:
         _remove_tranche_worktree(repo_dir, wt_path)
+
+
+# ── Native tranche rows: the single closing PR (#4129 Phase 1, this slice
+# #4202) ─────────────────────────────────────────────────────────────────
+#
+# The last step of the tranche flow: once `coord.dispatch.
+# dispatch_tranche_test`'s Test leg has passed AND
+# `coord.review.tranche_review_verdict` reports `approved=True` for all
+# three bound review legs, open ONE PR for the integrated tree that
+# closes every child issue it merged — #4129's "one PR closes every
+# child" requirement, as opposed to today's only decomposition outcome (a
+# serial chain, one PR per child). Unlike an ordinary `QueuedMerge` entry,
+# a tranche integration branch never had its own PR before this point —
+# the Test and review legs above all ran against the bare branch, not a
+# PR diff — so this is the FIRST PR this row's branch ever gets.
+
+
+def tranche_closing_pr_body(row: "TrancheRow") -> str:
+    """Body for the single PR that closes every `"done"` child of *row*
+    (#4129/#4202) — one `Closes #N` line per child issue, since GitHub
+    only auto-closes an issue on merge when ITS OWN `Closes #N` keyword is
+    present; a single combined line can't close more than one. Also
+    carries a non-closing `Refs #N` back to the parent tranche issue
+    itself (`row.issue_number`) — the decomposition tracking issue this
+    row came from, not something this diff resolves on its own, so it
+    must never pick up a closing keyword (mirrors
+    `coord.review._find_or_open_pr`'s "work" vs. "mock-author"/`Refs`
+    keyword distinction, for the same reason: only the issues this diff
+    actually implements get `Closes`).
+
+    Every child named here is expected to be `"done"` — the caller's job
+    to guarantee by only calling this once `merge_tranche_children` has
+    already reported `ok=True`, which itself declines outright the
+    moment any child is `"failed"` (see that function's own docstring) —
+    this reads `row.children` as given rather than re-deriving that
+    precondition a second way.
+    """
+    lines = [
+        f"Closes #{c.issue_number}"
+        for c in sorted(row.children, key=lambda c: c.issue_number)
+        if c.state == "done"
+    ]
+    lines.append("")
+    lines.append(f"Refs #{row.issue_number}")
+    lines.append("")
+    lines.append(
+        f"Automated PR opened by the coordinator for tranche row {row.id} "
+        "— the single integration of every child issue above onto "
+        f"`{row.base_sha}`. The capability-routed Test leg and all three "
+        "bound review legs (recipe/behaviour/gates) already ran against "
+        "this exact integrated tree before this PR opened."
+    )
+    return "\n".join(lines)
+
+
+def open_tranche_closing_pr(
+    row: "TrancheRow",
+    config: "Config | None",
+    *,
+    test_passed: bool,
+    review_verdict: "Mapping[str, object] | None",
+    gh_ops: "GhOps | None" = None,
+) -> dict | None:
+    """Open (or find) the single PR for *row*'s integrated tree that
+    closes every `"done"` child issue (#4129/#4202) — the LAST step of
+    the tranche flow.
+
+    *test_passed* and *review_verdict* (the dict `coord.review.
+    tranche_review_verdict` returns) are the gate this function enforces
+    itself: it raises `ValueError` unless *test_passed* is `True` AND
+    *review_verdict* reports `"approved": True`. Nothing upstream of this
+    function refuses on either condition on its own, so this is the one
+    place the whole tranche flow actually checks "has the Test leg
+    passed, and did all three bound review legs approve" before a PR can
+    close every child issue. This is deliberately a raise, not the same
+    `None` a missing-repo-config or `gh` failure below returns: those are
+    environment problems a retry might clear on its own; an unmet gate is
+    a caller bug (the caller must check readiness itself, same as
+    `integrate_tranche_row`'s own precondition raises) and must not look
+    identical to "retry me".
+
+    Targets `tranche_integration_branch_name(row)` against the repo's
+    `default_branch`, mirroring `coord.review._find_or_open_pr`'s
+    find-or-create shape but for the multi-`Closes` body
+    `tranche_closing_pr_body` builds instead — `_find_or_open_pr` itself
+    only ever closes ONE issue, so it doesn't fit a tranche row.
+
+    *gh_ops* defaults to the real `coord.github_ops` module — its
+    `create_pr`/`find_pr_for_branch` free functions structurally satisfy
+    `GhOps`, the same real implementation every other caller in this
+    module defaults to; inject a stub in tests. `create_pr` itself
+    already calls `find_pr_for_branch` internally and returns the
+    existing PR idempotently when one is already open on this branch, so
+    a retried call after a partial prior failure never opens a second PR
+    for the same row.
+
+    Returns `{"number": int, "url": str, "existed": bool}` on success, or
+    `None` when *config* has no entry for `row.repo_name` (nothing to
+    target) or the `create_pr` call itself raises — never propagates a
+    `gh` failure to the caller, matching `_find_or_open_pr`'s own
+    fail-safe contract.
+    """
+    if not test_passed or not isinstance(review_verdict, Mapping) or not review_verdict.get("approved"):
+        raise ValueError(
+            "open_tranche_closing_pr: refusing — test_passed="
+            f"{test_passed!r}, review_verdict={review_verdict!r}; both the "
+            "Test leg must have passed and tranche_review_verdict must "
+            "report approved=True before the closing PR can open"
+        )
+
+    if gh_ops is None:
+        from coord import github_ops as gh_ops  # noqa: PLC0415
+
+    repo_fn = getattr(config, "repo", None)
+    repo_cfg = repo_fn(row.repo_name) if repo_fn is not None else None
+    if repo_cfg is None:
+        return None
+
+    try:
+        return gh_ops.create_pr(
+            repo_cfg.github,
+            base=repo_cfg.default_branch,
+            head=tranche_integration_branch_name(row),
+            title=f"Tranche row {row.id}: {row.issue_title}",
+            body=tranche_closing_pr_body(row),
+        )
+    except Exception:  # noqa: BLE001 — fail-safe: a gh failure must not raise
+        return None
