@@ -93,6 +93,24 @@ def _ts(year, month, day, hour=0, minute=0, tz="UTC") -> float:
     return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(tz)).timestamp()
 
 
+def _enabled_pacing_with_max_workers(max_workers: int) -> str:
+    """`ENABLED_PACING` with a tight `concurrency.max_workers` instead of
+    its deliberately-generous 100 — for the tests that drive the pace
+    scaler's interaction with the fleet's real worker capacity."""
+    return (
+        BASE
+        + f"""\
+pacing:
+  enabled: true
+  reset_weekday: saturday
+  reset_time: "09:00"
+  tz: UTC
+concurrency:
+  max_workers: {max_workers}
+"""
+    )
+
+
 # ── coord.config._parse_pacing / PacingConfig ───────────────────────────────
 
 
@@ -289,18 +307,42 @@ class TestPaceAdjustedMaxParallel:
         decision = evaluate_pace(PlanLimits(status="unknown"), PacingConfig())
         assert pace_adjusted_max_parallel(7, decision) == 7
 
-    def test_max_workers_cap_reclamps_the_scaled_result(self) -> None:
+    def test_max_workers_cap_bounds_the_raise(self) -> None:
         # An explicit `--max-parallel`/`pipeline.max_parallel` is never
         # clamped to `concurrency.max_workers` upstream (only
         # `resolve_max_parallel`'s derived-default branch is) — so
         # `behind_concurrency_multiplier` can scale it above the fleet's
-        # real worker capacity unless this function re-clamps it itself.
+        # real worker capacity unless this function bounds the raise.
         limits = PlanLimits(status="ok", session_pct=10.0, week_pct=5.0)
         decision = evaluate_pace(limits, _SATURDAY_RESET, now=TestEvaluatePace.NOW)
         assert pace_adjusted_max_parallel(4, decision, max_workers_cap=5) == 5  # 6, capped
         # `max_workers_cap<=0` keeps today's "no cap known" convention.
         assert pace_adjusted_max_parallel(4, decision, max_workers_cap=0) == 6
         assert pace_adjusted_max_parallel(4, decision, max_workers_cap=-1) == 6
+
+    def test_max_workers_cap_never_lowers_the_resolved_ceiling(self) -> None:
+        # #3388's resolution order: an explicit `--max-parallel 7`
+        # outranks `concurrency.max_workers` and dispatches against 7 even
+        # on a 2-worker fleet. Pacing scales that answer; it is not a
+        # second place `concurrency.max_workers` gets to overrule it, so a
+        # cap BELOW the resolved ceiling leaves the ceiling alone (the
+        # raise is simply refused) rather than cutting it to the cap.
+        limits = PlanLimits(status="ok", session_pct=10.0, week_pct=5.0)
+        behind = evaluate_pace(limits, _SATURDAY_RESET, now=TestEvaluatePace.NOW)
+        assert behind.concurrency_multiplier == 1.5
+        assert pace_adjusted_max_parallel(7, behind, max_workers_cap=2) == 7
+
+        # Same for the multiplier-of-1.0 no-op: a fleet that never opted
+        # into `pacing:` must see its resolved ceiling untouched, which is
+        # only true if the cap cannot lower it.
+        inert = evaluate_pace(PlanLimits(status="unknown"), PacingConfig())
+        assert pace_adjusted_max_parallel(7, inert, max_workers_cap=2) == 7
+
+        # An AHEAD reading still lowers it — pacing's own scaling is not
+        # what the base floor protects against.
+        ahead_limits = PlanLimits(status="ok", session_pct=10.0, week_pct=90.0)
+        ahead = evaluate_pace(ahead_limits, _SATURDAY_RESET, now=TestEvaluatePace.NOW)
+        assert pace_adjusted_max_parallel(4, ahead, max_workers_cap=2) == 2  # 4 * 0.5
 
 
 # ── coord drive-queue status wiring ─────────────────────────────────────────
@@ -487,26 +529,15 @@ class TestDriveQueueTickScalesConcurrency:
         # 4 * 1.5 (behind_concurrency_multiplier) == 6.
         assert "capacity: 0/6 occupied, 6 free" in result.output
 
-    def test_behind_pace_scaling_is_reclamped_to_max_workers(
+    def test_behind_pace_raise_is_bounded_by_max_workers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # An explicit `--max-parallel` is not itself clamped to
-        # `concurrency.max_workers` upstream, so without the pace scaler's
-        # own re-clamp this would dispatch against 6, not the fleet's
-        # declared real worker capacity.
+        # `concurrency.max_workers` upstream, so without the pace scaler
+        # bounding its own raise this would dispatch against 6, past the
+        # fleet's declared real worker capacity.
         config_path = tmp_path / "coordinator.yml"
-        config_path.write_text(
-            BASE
-            + """\
-pacing:
-  enabled: true
-  reset_weekday: saturday
-  reset_time: "09:00"
-  tz: UTC
-concurrency:
-  max_workers: 3
-"""
-        )
+        config_path.write_text(_enabled_pacing_with_max_workers(5))
         monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
         monkeypatch.setattr(
             "coord.usage_limits.get_plan_limits",
@@ -520,8 +551,31 @@ concurrency:
             ],
         )
         assert result.exit_code == 0, result.output
-        # 4 * 1.5 == 6, re-clamped down to concurrency.max_workers (3).
-        assert "capacity: 0/3 occupied, 3 free" in result.output
+        # 4 * 1.5 == 6, bounded by concurrency.max_workers (5).
+        assert "capacity: 0/5 occupied, 5 free" in result.output
+
+    def test_max_workers_below_the_explicit_ceiling_does_not_lower_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #3388's resolution order survives pacing: `--max-parallel 4`
+        # outranks `concurrency.max_workers: 2`, and a `behind` reading
+        # may only refuse to raise it — never cut it to the cap.
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(_enabled_pacing_with_max_workers(2))
+        monkeypatch.setattr("coord.usage_limits.time.time", lambda: _JUST_BEFORE_RESET)
+        monkeypatch.setattr(
+            "coord.usage_limits.get_plan_limits",
+            lambda *a, **k: PlanLimits(status="ok", week_pct=5.0, session_pct=10.0),
+        )
+        result = CliRunner().invoke(
+            main,
+            [
+                "drive-queue", "tick", "--dry-run", "--max-parallel", "4",
+                "--config", str(config_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "capacity: 0/4 occupied, 4 free" in result.output
 
     def test_ahead_pace_scales_down_but_never_to_reconcile_only(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
