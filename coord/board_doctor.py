@@ -7718,7 +7718,7 @@ def run_test_failure_edge_sweep(
 
     *keys* is the whole scope of this call. A drive-queue tick passes the
     rows it ITSELF just blocked on the #2972 fix-round ceiling
-    (:func:`coord.drive_queue.test_failure_edge_candidates`), so a row's
+    (:func:`coord.drive_queue.ceiling_block_failure_edges`), so a row's
     branch-specific Test failure reaches the investigate tier minutes after
     the block instead of up to an hour later. An empty *keys* returns an
     empty report without reading the board at all, so a tick that blocked

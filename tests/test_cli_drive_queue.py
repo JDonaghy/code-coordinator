@@ -4069,6 +4069,61 @@ def test_a_reconcile_only_tick_never_runs_the_test_failure_edge_pass(
     assert "test-failure edge" not in result.output
 
 
+def test_a_thin_client_tick_declines_the_test_failure_edge_pass_out_loud(
+    cli, seed, launches, monkeypatch,
+):
+    """A tick is safe to run from any machine that can reach the board
+    daemon, but the failure-edge pass reads the daemon host's queues and
+    board directly (same constraint `drive-queue sweep` states). On a thin
+    client it must decline and SAY SO, not sweep an empty queue and not go
+    silent — the daemon host's own tick still covers the row.
+    """
+    from coord import board_doctor, board_doctor_policy
+    from coord.audit import record_audit
+    from coord.drive_queue import entry_key
+
+    key = entry_key(REPO, 1650)
+
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--machine", "dellserver",
+               "--max-fix-rounds", "2").exit_code == 0
+    assert cli("tick").exit_code == 0
+    seed(assignments=[
+        {"issue_number": 1650, "type": "work", "status": "done"}
+        for _ in range(3)
+    ])
+    launched_at = queued(1650)["launched_at"]
+    _backdate(1650, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=(
+            f"drive exited for {key} (exit_code=1): test still failing after "
+            "2 fix round(s) — stopping."
+        ),
+        repo=REPO, issue=1650, ts=launched_at + 5,
+    )
+
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: True)
+
+    def _must_not_run(**_):
+        raise AssertionError("a thin client must not run the edge sweep")
+
+    monkeypatch.setattr(board_doctor, "run_test_failure_edge_sweep", _must_not_run)
+    investigated: list[str] = []
+    monkeypatch.setitem(
+        board_doctor_policy.AUTO_DISPATCHERS,
+        board_doctor.CAUSE_TEST_FAILED_AT_CEILING,
+        lambda row: investigated.append(row.key) or True,
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "(#2972)" in queued(1650)["last_reason"]
+    assert investigated == []
+    assert "not running the same-tick Test-failure-edge pass" in result.output
+    assert f"{REPO}#1650" in result.output
+
+
 def test_a_premise_refusal_park_escalates_exactly_once(
     cli, seed, launches, coord_db, monkeypatch,
 ):

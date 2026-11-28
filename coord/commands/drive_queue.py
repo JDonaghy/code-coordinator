@@ -9305,7 +9305,7 @@ def _run_test_failure_edge_sweep(plan, config) -> list[str]:
     tier minutes after the block rather than on the next hourly timer.
 
     Nothing here invents policy. Which rows are candidates is
-    :func:`coord.drive_queue.test_failure_edge_candidates`' pure read of
+    :func:`coord.drive_queue.ceiling_block_failure_edges`' pure read of
     ``plan.blocked``; whether any of them earns a leg is the doctor's own
     tier/convergence/capacity work; the per-repo ``repos[].board_doctor.
     investigate`` opt-in and the fleet-wide kill switch still gate the
@@ -9330,9 +9330,9 @@ def _run_test_failure_edge_sweep(plan, config) -> list[str]:
     AFTER the tick's writes are already applied, so an advisory pass
     failing must never turn an already-successful tick into a CLI failure.
     """
-    from coord.drive_queue import test_failure_edge_candidates  # noqa: PLC0415
+    from coord.drive_queue import ceiling_block_failure_edges  # noqa: PLC0415
 
-    keys = test_failure_edge_candidates(plan)
+    keys = ceiling_block_failure_edges(plan)
     if not keys:
         return []
 
@@ -9534,6 +9534,19 @@ def drive_queue_tick(
     `RollPending`'s own docstring for why that clear belongs solely to the
     spawned `coord-release-window.service`, once it has actually confirmed
     the roll.
+
+    A tick that blocks a row on the #2972 fix-round ceiling also runs the
+    board doctor's failure-edge pass for that row before it finishes
+    (`coord.board_doctor.run_test_failure_edge_sweep`): the row is
+    classified from its failing Test leg's own evidence and, when the
+    failure is genuinely this branch's own, handed to the investigate tier
+    straight away — minutes, not the up-to-an-hour wait for the scheduled
+    `drive-queue sweep`. Narrow by construction: only the rows THIS tick
+    blocked, only the causes a failing Test leg's evidence mints, the
+    per-repo `repos[].board_doctor.investigate` opt-in still required, and
+    nothing at all for a tick that blocked no such row. Skipped under
+    `--reconcile-only`/`--max-parallel 0` (a fix-it leg is new work) and
+    on a thin client, which cannot read the daemon host's queues.
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
