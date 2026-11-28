@@ -67,7 +67,6 @@ from coord.drive_queue import (
     STATE_BLOCKED,
     STATE_DONE,
     STATE_FAILED,
-    STATE_MERGED_PARTIAL,
     STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
@@ -7398,24 +7397,12 @@ def _fetch_live_prereq_terminal(
         if board.facts(e.key).landed:
             continue
         targets.add(e.key)
-    # #4218: a `merged-partial` entry's OWN key gets the same live
-    # re-check, same reasoning as the `parked`/`blocked`/`failed` case just
-    # above — but bounded on `facts.closed`, not `facts.landed`: a
-    # `merged-partial` row is `facts.landed` ALREADY (its own PR merged —
-    # that is how it reached this state), so gating on `landed` here would
-    # never add it as a target at all. The live call this produces
-    # (`work_is_terminal(..., branch="")`, below) can only ever confirm a
-    # CLOSE anyway — never a merge — which is exactly the question this
-    # state still has open: has board-doctor follow-through (or an
-    # operator by hand) closed the issue yet.
-    for e in entries:
-        if e.state != STATE_MERGED_PARTIAL:
-            continue
-        if e.key in targets:
-            continue
-        if board.facts(e.key).closed:
-            continue
-        targets.add(e.key)
+    # `STATE_MERGED_PARTIAL` deliberately gets NO entry here (#4218): its
+    # own self-heal in `coord.drive_queue` rests on `facts.closed` alone,
+    # never a live probe — see that sweep's comment for why a live
+    # confirmation landing ahead of the cache would put it at odds with
+    # the `#3863` done-row correction pass, which only ever reads the
+    # cache.
     if not targets:
         return {}
 

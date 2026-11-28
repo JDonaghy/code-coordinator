@@ -9943,48 +9943,37 @@ def plan_tick(
     # that is NOT actually settling to `done` would be exactly the stale,
     # misleading line this issue exists to stop showing. The question this
     # branch asks is narrower and different: not "has it landed" (already
-    # true) but "has its issue since CLOSED" — so it checks `facts.closed`/
-    # a live-confirmed close directly, and only ever writes when that is
-    # true. A `merged-partial` row whose issue is still open (an operator
-    # declined the follow-through plan, or it simply has not run yet) is
-    # left untouched here, same as every other branch below leaves a
+    # true) but "has its issue since CLOSED" — so it checks `facts.closed`
+    # directly, and only ever writes when that is true. Deliberately NOT
+    # widened with a `live_prereq_terminal` fast path the way the
+    # `parked`/`blocked`/`failed` sweep below is: a live confirmation can
+    # land ahead of the cache that the `#3863` pass right below reads from,
+    # which would write this row `done` on one tick and have `#3863` read
+    # the still-stale cache back to `merged-partial` on the very next one —
+    # two passes answering the same "done or merged-partial?" question
+    # from two different readings of the facts. Resting on `facts.closed`
+    # alone means both passes always agree, at the cost of settling on the
+    # board's own refresh cadence rather than this exact tick — still
+    # within the one-tick bar once the board itself shows the close. A
+    # `merged-partial` row whose issue is still open (an operator declined
+    # the follow-through plan, or it simply has not run yet) is left
+    # untouched here, same as every other branch below leaves a
     # not-yet-resolved row alone — whatever reason is already on it (the
     # decline, or the original merge note) keeps showing instead of being
     # overwritten.
     for entry in ordered:
         if entry.state == STATE_MERGED_PARTIAL:
             facts = board.facts(entry.key)
-            live_closed = (live_prereq_terminal or {}).get(entry.key, False)
-            if facts.closed:
-                # `_merge_landed_state` already encodes "closed wins
-                # outright, regardless of `merge_resolution`"
-                # (`IssueFacts.merged_partial`'s own docstring) — the
-                # cached board itself shows this, so asking it is both
-                # correct and the one answer every other call site shares.
-                state, _witness = _merge_landed_state(facts)
-                reason = (
-                    f"done — issue closed while {entry.state} (#4218), "
-                    "settling the remainder as landed"
-                )
-            elif live_closed:
-                # The cached `facts.closed` has not caught up yet, so
-                # `_merge_landed_state(facts)` would still read `facts.
-                # merge_resolution`'s stale "partial" and answer
-                # `STATE_MERGED_PARTIAL` — wrong, the same gap
-                # `_merge_landed_state`'s own docstring already documents
-                # for its `confirmed_merged` caller: a close is `landed`'s
-                # "closed wins outright" case regardless of any stale
-                # resolution marker, so this resolves straight to
-                # `STATE_DONE` without consulting a cache this live
-                # evidence has already outrun.
-                state = STATE_DONE
-                reason = (
-                    "done — a live re-check this tick confirms the issue "
-                    f"is now closed while {entry.state} (#4218), "
-                    "independent of the cached board"
-                )
-            else:
+            if not facts.closed:
                 continue
+            # `_merge_landed_state` already encodes "closed wins outright,
+            # regardless of `merge_resolution`" (`IssueFacts.merged_partial`'s
+            # own docstring) — the cached board itself shows this, so asking
+            # it is both correct and the one answer every other call site
+            # shares, and the same reading the `#3863` pass below re-derives
+            # on every later tick, so the two can never disagree.
+            state, _witness = _merge_landed_state(facts)
+            reason = f"done — issue closed while {entry.state} (#4218)"
             reconciles.append(
                 Reconcile(
                     entry.key,
