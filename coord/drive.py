@@ -4345,7 +4345,16 @@ def _decide_test(
                     counters.fix_rounds -= 1
                     counters.empty_fix_retried_sha = current_sha
 
-        if counters.fix_rounds >= opts.max_fix_rounds:
+        # #4212: the fix-round ceiling is checked AFTER the mechanical route
+        # below gets its chance, never before — a `mechanical` verdict
+        # dispatches a mechanic leg (#4094) on ITS OWN budget (one per SHA,
+        # never `fix_rounds`), so it must still fire even once the ordinary
+        # fix-round ceiling is reached. Every OTHER route (infra/human/
+        # substantive/no-verdict) is unchanged: it still dies here exactly
+        # like before #4212, just evaluated a few lines later.
+        ceiling_reached = counters.fix_rounds >= opts.max_fix_rounds
+
+        def _ceiling_die() -> Action:
             return _die(
                 f"test still failing after {counters.fix_rounds} fix round(s) — "
                 "stopping.\n"
@@ -4368,12 +4377,13 @@ def _decide_test(
         #                 outcome than the pre-#4093 unconditional retry).
         #   mechanical  — `coord mechanic-dispatch` (#4094), a bounded
         #                 pre-review fixer; a confirmed dispatch spends
-        #                 NEITHER the retry latch nor a fix round. A
-        #                 decline (tier off, no capable machine, budget
-        #                 already spent at this SHA, ...) falls through to
-        #                 an ordinary fix round next poll, exactly like
-        #                 `substantive` — never a worse outcome than
-        #                 today's.
+        #                 NEITHER the retry latch nor a fix round, and
+        #                 dispatches even past the fix-round ceiling
+        #                 (#4212). A decline (tier off, no capable machine,
+        #                 budget already spent at this SHA, ...) falls
+        #                 through to an ordinary fix round next poll,
+        #                 exactly like `substantive` — never a worse outcome
+        #                 than today's.
         #   substantive — `coord fix`, as always.
         #   human       — stop the row with the diagnosis as the reason and
         #                 alert once (`coord escalate record`), the same
@@ -4393,6 +4403,72 @@ def _decide_test(
                 verifier.triage_test_failure(state) if verifier is not None else None
             )
             bucket = verdict.bucket if verdict is not None else None
+
+            # #4212: `mechanical` bypasses the ceiling entirely — checked
+            # BEFORE `ceiling_reached` is consulted, since this is the one
+            # route that must still fire once the ordinary fix-round budget
+            # is exhausted. Moved ahead of the INFRA/HUMAN/skip-retry
+            # elif-chain below (rather than staying inline in it) so this
+            # never implicitly depends on evaluation order within that
+            # chain.
+            if bucket == BUCKET_MECHANICAL:
+                counters.test_retry_sha = branch_sha
+                mech_command: list[str] = [
+                    "mechanic-dispatch", state.repo, str(state.issue), branch_sha,
+                    "--diagnosis", verdict.diagnosis if verdict is not None else "",
+                    "--confidence", f"{verdict.confidence if verdict is not None else 0.0}",
+                    "--via", verdict.via if verdict is not None else "",
+                ]
+                if verdict is not None and verdict.repro_capability:
+                    mech_command += ["--repro-capability", verdict.repro_capability]
+                if verdict is not None:
+                    for proposed_file in verdict.proposed_scope.files:
+                        mech_command += ["--proposed-file", proposed_file]
+                    if verdict.proposed_scope.estimated_line_delta:
+                        mech_command += [
+                            "--proposed-line-delta",
+                            str(verdict.proposed_scope.estimated_line_delta),
+                        ]
+                # Carry the SAME failure text the triage call above already
+                # classified, and this repo's own configured test command —
+                # both already in hand here (`work_test_reason` is
+                # guaranteed non-empty by the #2596 guard above;
+                # `repo_test_command` is a populated `IssueState` field) —
+                # so the dispatched leg's briefing can tell it to reproduce
+                # via ONLY that command rather than the full suite, instead
+                # of getting zero failure output.
+                reason_text = (state.work_test_reason or "").strip()
+                if reason_text:
+                    mech_command += ["--evidence", reason_text[:4000]]
+                test_command = (state.repo_test_command or "").strip()
+                if test_command:
+                    mech_command += ["--failed-stage-command", test_command]
+                return Action(
+                    kind=RUN,
+                    label=_triage_route_label(
+                        verdict, "dispatching a mechanic leg (#4094)",
+                    ),
+                    command=tuple(mech_command),
+                    # #4095: a decline (tier off, no capable machine, budget
+                    # already spent at this SHA, ...) is an ordinary,
+                    # expected outcome — NOT a reason to kill the run. The
+                    # next poll re-enters this branch with `test_retry_sha`
+                    # already latched (set above), so it falls straight
+                    # through to the ordinary fix round below (or, if the
+                    # ceiling was already reached, dies there instead —
+                    # #4212) — never a worse outcome than today's.
+                    on_error="warn",
+                    error_message=(
+                        f"coord mechanic-dispatch {state.repo} {state.issue} "
+                        "declined or failed to dispatch — falling back to an "
+                        "ordinary fix round next poll"
+                    ),
+                    sleep_after=10.0,
+                )
+
+            if ceiling_reached:
+                return _ceiling_die()
+
             # Skip-the-retry buckets fall through to this: True once the
             # verdict (or the `infra` lane's own exhausted budget) says the
             # fix round is the only thing left worth dispatching.
@@ -4467,59 +4543,6 @@ def _decide_test(
                         "--command ...)"
                     ),
                 )
-            elif bucket == BUCKET_MECHANICAL:
-                counters.test_retry_sha = branch_sha
-                mech_command: list[str] = [
-                    "mechanic-dispatch", state.repo, str(state.issue), branch_sha,
-                    "--diagnosis", verdict.diagnosis if verdict is not None else "",
-                    "--confidence", f"{verdict.confidence if verdict is not None else 0.0}",
-                    "--via", verdict.via if verdict is not None else "",
-                ]
-                if verdict is not None and verdict.repro_capability:
-                    mech_command += ["--repro-capability", verdict.repro_capability]
-                if verdict is not None:
-                    for proposed_file in verdict.proposed_scope.files:
-                        mech_command += ["--proposed-file", proposed_file]
-                    if verdict.proposed_scope.estimated_line_delta:
-                        mech_command += [
-                            "--proposed-line-delta",
-                            str(verdict.proposed_scope.estimated_line_delta),
-                        ]
-                # Carry the SAME failure text the triage call above already
-                # classified, and this repo's own configured test command —
-                # both already in hand here (`work_test_reason` is
-                # guaranteed non-empty by the #2596 guard above;
-                # `repo_test_command` is a populated `IssueState` field) —
-                # so the dispatched leg's briefing can tell it to reproduce
-                # via ONLY that command rather than the full suite, instead
-                # of getting zero failure output.
-                reason_text = (state.work_test_reason or "").strip()
-                if reason_text:
-                    mech_command += ["--evidence", reason_text[:4000]]
-                test_command = (state.repo_test_command or "").strip()
-                if test_command:
-                    mech_command += ["--failed-stage-command", test_command]
-                return Action(
-                    kind=RUN,
-                    label=_triage_route_label(
-                        verdict, "dispatching a mechanic leg (#4094)",
-                    ),
-                    command=tuple(mech_command),
-                    # #4095: a decline (tier off, no capable machine, budget
-                    # already spent at this SHA, ...) is an ordinary,
-                    # expected outcome — NOT a reason to kill the run. The
-                    # next poll re-enters this branch with `test_retry_sha`
-                    # already latched (set above), so it falls straight
-                    # through to the ordinary fix round below — never a
-                    # worse outcome than today's.
-                    on_error="warn",
-                    error_message=(
-                        f"coord mechanic-dispatch {state.repo} {state.issue} "
-                        "declined or failed to dispatch — falling back to an "
-                        "ordinary fix round next poll"
-                    ),
-                    sleep_after=10.0,
-                )
             elif bucket in _TEST_SKIP_RETRY_BUCKETS:
                 # substantive: the quadraui#2992 shape, where retrying
                 # cannot change the outcome.
@@ -4545,6 +4568,14 @@ def _decide_test(
             # dispatch below actually executes doesn't re-run the
             # classifier, then fall straight through to the fix round.
             counters.test_retry_sha = branch_sha
+        elif ceiling_reached:
+            # #4212: no fresh triage classification to run at this SHA (no
+            # `branch_sha`, or this SHA was already routed — including a
+            # SECOND Test failure at the SAME sha right after a mechanical
+            # dispatch/decline above, which must NOT dispatch a second
+            # mechanic leg) — die exactly like the pre-#4212 unconditional
+            # ceiling check did.
+            return _ceiling_die()
 
         counters.fix_rounds += 1
         # Record the branch SHA so #3713 can detect an empty fix round.
