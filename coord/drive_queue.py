@@ -2828,6 +2828,7 @@ def _after_satisfied(
     entry: QueueEntry,
     all_entries: Sequence[QueueEntry],
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+    tranche_members: Mapping[str, str] | None = None,
 ) -> bool:
     """Is *entry*'s `after=` list satisfied by the queue it sits in?
 
@@ -2856,8 +2857,20 @@ def _after_satisfied(
     what a live truth says about it — `mark_done` on a `done` row whose
     gate has since fired is a real, later fact a `reconcile_entry` call
     taken before the gate fired cannot see, so the gate always wins.
+
+    *tranche_members* (#4227) maps a pre-req key to the master key of the
+    in-flight tranche row that will close it (:func:`tranche_prereq_
+    members`). It is the one exception to the "absent from *all_entries*
+    means satisfied" rule above, and it has to be: a pre-req a tranche
+    row has claimed is absent from the queue BECAUSE it is mid-flight, so
+    the "it may have landed long ago" reading is exactly inverted for it.
+    Checked first, before the gate and live-truth readings, since neither
+    has a row to read for a key with no `QueueEntry` at all. A key absent
+    here (or the mapping being ``None``) is the pre-#4227 behaviour.
     """
     for key in entry.after:
+        if (tranche_members or {}).get(key) is not None:
+            return False
         if any(other.key == key and _entry_is_holding(other) for other in all_entries):
             return False
         truth = (prereq_truth or {}).get(key)
@@ -2912,16 +2925,30 @@ class DriveQueueSummary:
 def summarize_drive_queue(
     entries: Sequence[QueueEntry],
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+    tranche_members: Mapping[str, str] | None = None,
 ) -> DriveQueueSummary:
     """Summarise *entries* — pure, no clock, no DB. See :class:`DriveQueueSummary`.
 
     *prereq_truth* (#3934) is passed straight through to :func:`_after_satisfied`
     — see its own docstring.
+
+    *tranche_members* (#4227) is passed straight through to
+    :func:`_after_satisfied` too — a `waiting` row whose pre-req is riding
+    an in-flight tranche is NOT `eligible`, since a tick would refuse to
+    launch it (:func:`_resolve_prereqs`' matching check). Such a row does
+    NOT make the queue read `"stalled"` either: see `tranche_deferred`
+    below for why a tranche in flight is work moving, not a stall.
     """
     pending = sum(1 for e in entries if _entry_is_pending(e))
     held = sum(1 for e in entries if _entry_is_holding(e))
     fleet_held = sum(1 for e in entries if _entry_stops_fleet(e))
     running = waiting = blocked = eligible = 0
+    # #4227: `waiting` rows held back ONLY because a pre-req is riding an
+    # in-flight tranche. Not `eligible` (a tick would refuse to launch
+    # them), but not a stall either — the tranche row IS the work they are
+    # waiting on, and it is moving, it just isn't a `QueueEntry` this
+    # summary can count under `running`.
+    tranche_deferred = 0
     for e in entries:
         if not _entry_is_pending(e):
             continue
@@ -2931,8 +2958,10 @@ def summarize_drive_queue(
             blocked += 1
         elif e.state == STATE_WAITING:
             waiting += 1
-            if _after_satisfied(e, entries, prereq_truth):
+            if _after_satisfied(e, entries, prereq_truth, tranche_members):
                 eligible += 1
+            elif any((tranche_members or {}).get(dep) for dep in e.after):
+                tranche_deferred += 1
         # An unrecognised state from a newer daemon: counted in `pending`
         # above (it is not `done`) but never as waiting/eligible/running/
         # blocked, so it can neither trigger nor mask a stall.
@@ -2946,8 +2975,10 @@ def summarize_drive_queue(
         # real one — "3 waiting, none eligible" is a symptom here, and "you
         # have a deploy to do" is the cause.
         level = "held"
-    elif waiting > 0 and eligible == 0 and running == 0:
-        # Nothing running AND nothing that could start.
+    elif waiting > 0 and eligible == 0 and running == 0 and tranche_deferred == 0:
+        # Nothing running AND nothing that could start. #4227: a row
+        # deferred behind an in-flight tranche counts as something moving
+        # — see `tranche_deferred` above.
         level = "stalled"
     elif running > 0 or waiting > 0:
         level = "normal"
@@ -4572,6 +4603,7 @@ def _resolve_prereqs(
     dep_reasons: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
     dep_interventions: Mapping[str, Mapping[str, Any]] | None = None,
+    tranche_members: Mapping[str, str] | None = None,
 ) -> _Verdict:
     """Decide whether *entry* may launch now.
 
@@ -4669,6 +4701,27 @@ def _resolve_prereqs(
     *dep_reasons* #3368 case. A key ABSENT here (no active record, or one
     that was never recorded) keeps the pre-#4216 "it will never satisfy"
     verdict unchanged.
+
+    *tranche_members* (#4227) maps a dep key to the master key of the
+    in-flight tranche row whose single closing PR will close it — exactly
+    :func:`tranche_prereq_members`, built by the shell from this tick's
+    `tranche_rows`. A dep in that mapping is neither queued nor landed: it
+    is riding a tranche (or is the tranche's own master issue), so every
+    reading below would get it wrong — "open, not queued" at best, and
+    "it will never satisfy"/"not queued, not merged and not open" for a
+    dep with a stale `blocked`/`failed` row or one the `issues` cache has
+    not synced. That is why this is checked BEFORE all of them, and
+    returns an ordinary deferral naming the tranche instead.
+
+    It is checked AFTER every positive, confirmed-landed signal above
+    (*held_gates*, `facts.landed`/`already_done`, `dep_state in
+    STATE_DONE_LIKE`) and is itself overridden by *live_prereq_terminal*,
+    for one reason: the closing PR merging is precisely what those signals
+    report, and a row still listing the dep is the staler witness of the
+    two. So this holds a dependent for exactly as long as the tranche has
+    a closing PR outstanding, and not one tick longer. A key ABSENT here
+    (or the mapping being ``None`` — the shape every caller that has no
+    tranche rows to read passes) is the pre-#4227 behaviour exactly.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -4767,6 +4820,14 @@ def _resolve_prereqs(
             # a `STATE_MERGED_PARTIAL` dep that reaches here is one whose
             # issue is already closed.)
             continue
+        tranche_master = (tranche_members or {}).get(dep)
+        if tranche_master is not None and not (live_prereq_terminal or {}).get(dep):
+            # #4227: *dep* is riding an in-flight tranche row (or is one's
+            # own master issue), so it has no queue row and no landed fact
+            # of its own yet — see this function's docstring for why this
+            # outranks every remaining reading below, and why a live
+            # terminal re-check still wins over it.
+            return _Verdict(False, False, tranche_prereq_reason(dep, tranche_master))
         dep_truth = (prereq_truth or {}).get(dep)
         if dep_truth is not None:
             truth_verdict = _prereq_truth_verdict(dep, dep_truth)
@@ -4891,6 +4952,7 @@ def diagnose_blocked_after(
     dep_reasons: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
     dep_interventions: Mapping[str, Mapping[str, Any]] | None = None,
+    tranche_members: Mapping[str, str] | None = None,
 ) -> BlockedAfterDiagnosis:
     """Re-check a `blocked`/`failed` row's `after=` graph against the CURRENT
     board, fresh on every render (#2183).
@@ -4961,6 +5023,15 @@ def diagnose_blocked_after(
     "waiting on ... (held by ...)" instead of "it will never satisfy" the
     moment an operator/agent records a rescue against the named pre-req,
     without waiting on a real tick to re-derive the same verdict.
+
+    *tranche_members* (#4227) is passed straight through to
+    :func:`_resolve_prereqs` — see its own docstring. Threading it through
+    here is what lets :func:`_reconcile_blocked_after` resume a dependent
+    that was blocked "not queued, not merged and not open" because its
+    named pre-req had just been claimed by a tranche row: that verdict
+    becomes an ordinary tranche deferral, which is not unsatisfiable, so
+    the row returns to `waiting` instead of needing an operator
+    remove+add.
     """
     live_terminal = live_prereq_terminal or {}
     truth_map = prereq_truth or {}
@@ -4981,6 +5052,7 @@ def diagnose_blocked_after(
         dep_reasons=dep_reasons,
         prereq_truth=prereq_truth,
         dep_interventions=dep_interventions,
+        tranche_members=tranche_members,
     )
     return BlockedAfterDiagnosis(
         unsatisfied,
@@ -5712,6 +5784,7 @@ def _reconcile_blocked_after(
     dep_reasons: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
     dep_interventions: Mapping[str, Mapping[str, Any]] | None = None,
+    tranche_members: Mapping[str, str] | None = None,
 ) -> Reconcile | None:
     """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
     `after=` pre-req, once every named pre-req has since landed. #2756:
@@ -5782,6 +5855,14 @@ def _reconcile_blocked_after(
     *live_prereq_terminal* already does, without waiting on the dep's own
     queue row to repaint itself.
 
+    *tranche_members* (#4227) is threaded through the same way, and
+    resumes this row for a different reason: a dep a tranche row has
+    claimed is still in flight, so an "it will never satisfy"/"not queued,
+    not merged and not open" block naming it was never true. The resume
+    lands the row back in `waiting` with #2756's live reason — the tranche
+    deferral itself — rather than leaving it terminal behind a tranche
+    that is going to close that dep.
+
     On resume: `state` flips to `waiting`, `attempts` resets to 0 (a fresh
     start, exactly like #2230's gate-cleared resume — nothing about being
     blocked on a now-landed pre-req should cost this entry its launch
@@ -5799,7 +5880,7 @@ def _reconcile_blocked_after(
         return None
     diagnosis = diagnose_blocked_after(
         entry, board, states, cycle_keys, live_prereq_terminal, dep_reasons,
-        prereq_truth, dep_interventions,
+        prereq_truth, dep_interventions, tranche_members,
     )
     if diagnosis.unsatisfiable:
         return None
@@ -9290,6 +9371,75 @@ def tranche_riding_members(rows: Sequence[TrancheRow]) -> dict[str, str]:
     return riding
 
 
+# ── native tranche rows: `after=` edges that name a rider (#4227) ───────────
+#
+# A tranche lands as ONE closing PR, and that PR is what closes every child
+# it claimed — so until it merges, nothing a child did exists on the base
+# branch an `after=` dependent would build on. But a riding child is not a
+# `QueueEntry` (see the presentation section's module comment), so a
+# dependent declaring `after=<child>` reaches the "pre-req absent from the
+# queue" tail of `_after_satisfied`/`_resolve_prereqs`, whose rule is that
+# an absent pre-req "may have landed long ago" — satisfied. That reads a
+# tranche's claim on a child as the child's own completion, which is the
+# opposite of true: the claim is what guarantees it has NOT landed yet.
+#
+# :func:`tranche_prereq_members` is the membership answer both checks
+# consult so such an edge defers instead, and releases on the dep's own
+# confirmed landing (`facts.landed`, a `done` queue row, or a live terminal
+# re-check) — which is exactly when the closing PR has merged.
+
+
+def tranche_prereq_members(rows: Sequence[TrancheRow]) -> dict[str, str]:
+    """Map every issue key an in-flight tranche row's closing PR will
+    close to the :func:`tranche_master_key` of the row that will close it:
+    :func:`tranche_riding_members`' children, PLUS each of those rows' own
+    master issue (the tracking issue the same PR closes alongside them).
+
+    Keyed the same `repo#N` way `QueueEntry.key`/`entry.after` already
+    are, so a caller holding an `after=` list looks a dep up directly.
+
+    A `"failed"` row contributes nothing, exactly as in
+    :func:`tranche_riding_members` — its children are heading back to the
+    ordinary queue (:func:`tranche_requeue_plan`), where they answer for
+    themselves as rows again. Neither does a row with no children: it has
+    claimed nothing, so it is not standing between a dependent and
+    anything.
+    """
+    members = tranche_riding_members(rows)
+    for row in rows:
+        if row.state == "failed" or not row.children:
+            continue
+        master_key = tranche_master_key(row)
+        members.setdefault(master_key, master_key)
+    return members
+
+
+def tranche_prereq_reason(dep: str, master_key: str) -> str:
+    """The deferral text for an `after=` edge naming *dep* while *dep* is
+    still part of the tranche whose master is *master_key* (#4227).
+
+    Two shapes, because a dependent's operator needs to know which one
+    they are reading: *dep* IS the master (its own closing PR is the one
+    outstanding), or *dep* is one of the children riding it (the thing
+    being waited on will be closed by a PR opened against a different
+    issue entirely — unguessable from the dependent's own row).
+
+    Deliberately phrased as an ordinary deferral, with none of
+    :func:`_is_unsatisfiable_prereq_reason`'s marker text: a tranche in
+    flight is the most plausibly-clearing pre-req there is, so a
+    dependent on one keeps its queue position rather than blocking.
+    """
+    if dep == master_key:
+        return (
+            f"waiting on {dep} (tranche master — its closing PR has not "
+            "merged yet)"
+        )
+    return (
+        f"waiting on {dep} (riding in tranche {master_key} — resolved when "
+        "that tranche's closing PR merges)"
+    )
+
+
 # `TrancheRow.state` (#4199) is the only field the frozen row shape carries
 # for its ENTIRE remaining tail once children are dispatched — nothing
 # here distinguishes "the Test leg is running" from "all three review legs
@@ -9506,6 +9656,7 @@ def plan_tick(
     live_credential_routing_clear: Mapping[str, bool] | None = None,
     live_credential_routing_reason: Mapping[str, str] | None = None,
     prereq_truth: Mapping[str, "EntryTruth"] | None = None,
+    tranche_members: Mapping[str, str] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -9852,6 +10003,18 @@ def plan_tick(
     own queue-row ``state``. A key ABSENT here (no caller-side wiring has
     computed a live truth for that dep this tick — true of every production
     caller today) leaves both call sites to their pre-#3934 behaviour.
+
+    *tranche_members* (#4227) maps an issue key to the master key of the
+    in-flight tranche row whose single closing PR will close it
+    (:func:`tranche_prereq_members`, built by the shell from this tick's
+    `tranche_rows`). Threaded to the same `after=` checks
+    *live_prereq_terminal* reaches — the launch walk's
+    :func:`_resolve_prereqs` calls and the `blocked`-row sweep's
+    :func:`_reconcile_blocked_after` — so an `after=` edge naming a
+    riding child defers on the tranche instead of reading as satisfied
+    (or dead) for want of a `QueueEntry` of its own. ``None``/empty is
+    the pre-#4227 behaviour, and is what a tick with no tranche rows
+    passes.
 
     *fix_round_config_default* (#2972) is ``pipeline.max_fix_rounds`` — the
     SAME value the shell also hands ``_launch_argv`` to compute the actual
@@ -10299,6 +10462,7 @@ def plan_tick(
                 effective_last_reason,
                 prereq_truth,
                 effective_interventions,
+                tranche_members,
             )
             if blocked_reconcile is None:
                 # #3695: re-check a Test-stage routing dead end (no
@@ -11012,6 +11176,7 @@ def plan_tick(
                 effective_last_reason,
                 prereq_truth,
                 effective_interventions,
+                tranche_members,
             )
             updates = _refresh_only(verdict.reason, entry.last_reason)
             if not updates:
@@ -11236,6 +11401,7 @@ def plan_tick(
                 effective_last_reason,
                 prereq_truth,
                 effective_interventions,
+                tranche_members,
             )
             if not verdict.satisfied:
                 deferrals.append(
@@ -11357,6 +11523,7 @@ def plan_tick(
             effective_last_reason,
             prereq_truth,
             effective_interventions,
+            tranche_members,
         )
         if verdict.unsatisfiable:
             blocked.append(
