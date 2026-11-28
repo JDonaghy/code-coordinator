@@ -1485,6 +1485,26 @@ def test_build_review_briefing_includes_shared_scenario_section() -> None:
     assert "request-changes" in briefing
 
 
+def test_build_review_briefing_omits_shared_scenario_section_when_not_opted_in() -> None:
+    cfg = ReviewsConfig(require_shared_scenario={})
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/vimcode/pull/42",
+        repo_github="acme/vimcode",
+        repo_name="vimcode",
+        issue_number=7,
+        issue_title="Add window split",
+        issue_body="Add a GTK window split command.",
+        branch="issue-7-split",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=cfg,
+        repo_claude_md=None,
+        diff_text=_VIMCODE_SINGLE_BACKEND_TEST_DIFF,
+    )
+    assert "require_shared_scenario" not in briefing
+
+
 # ── #4174: reuse check ───────────────────────────────────────────────────────
 
 
@@ -1580,26 +1600,6 @@ def test_format_review_header_round_trips_reuse_count() -> None:
     parsed = parse_review_header(header)
     assert parsed is not None
     assert parsed["reuse"] == 1
-
-
-def test_build_review_briefing_omits_shared_scenario_section_when_not_opted_in() -> None:
-    cfg = ReviewsConfig(require_shared_scenario={})
-    briefing = build_review_briefing(
-        pr_number=42,
-        pr_url="https://github.com/acme/vimcode/pull/42",
-        repo_github="acme/vimcode",
-        repo_name="vimcode",
-        issue_number=7,
-        issue_title="Add window split",
-        issue_body="Add a GTK window split command.",
-        branch="issue-7-split",
-        worker_machine="laptop",
-        same_as_worker=False,
-        reviews_cfg=cfg,
-        repo_claude_md=None,
-        diff_text=_VIMCODE_SINGLE_BACKEND_TEST_DIFF,
-    )
-    assert "require_shared_scenario" not in briefing
 
 
 def test_briefing_test_author_touching_only_sealed_path_no_tamper() -> None:
