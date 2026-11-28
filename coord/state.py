@@ -12096,6 +12096,13 @@ def _update_drive_queue_entry_local(
         # that wants to set `state="done"` and a fresh record in one write
         # is never silently overridden.
         fields = {**fields, "intervention_json": ""}
+    if fields.get("state") == "done":
+        # #4217: a row reaching `done` also drops its rescue watermark (see
+        # `clear_rescue_watch` below) — a future `coord drive-queue add` for
+        # the same repo#issue starts the #4217 sweep fresh rather than
+        # comparing its very first live SHA read against a watermark this
+        # row's earlier run left behind.
+        clear_rescue_watch(repo_name, issue_number)
 
     # #2846: wrapped in retry_on_locked like every other write in this
     # module (UPDATE-by-natural-key is idempotent, so extending the retry
@@ -12175,6 +12182,118 @@ def clear_drive_queue_intervention(repo_name: str, issue_number: int) -> bool:
     the wrong row.
     """
     return update_drive_queue_entry(repo_name, issue_number, intervention_json="")
+
+
+# ── #4217 out-of-band rescue watermark (board truth 2/3) ────────────────────
+#
+# A `blocked` drive-queue row carries no branch/head column of its own
+# (`coord.drive_queue.QueueEntry` is keyed on repo+issue alone) — detecting
+# "did someone push to this row's branch since the sweep last looked" needs
+# a durable watermark `coord.reconcile.reconcile_rescued_blocked_rows` can
+# compare each tick's live branch SHA against. `intervention_json` (#4216)
+# is NOT that watermark: an operator's own `--clear`, a fresh `coord
+# drive-queue note`, or the row reaching `done` can all rewrite/clear it at
+# any time, and none of those events should make an UNCHANGED branch look
+# "newly pushed" on the very next tick. This is its own `board_meta` row
+# instead — same single-JSON-blob-per-key, trimmed-from-the-front shape as
+# `_PR_MERGE_CI_RERUN_META_KEY` above — keyed by `repo#issue`, holding
+# ``{"baseline": <SHA the sweep last confirmed this row sitting on>,
+# "resumed_sha": <SHA the sweep already reset Test/Review for, or None>}``.
+_RESCUE_WATCH_META_KEY = "drive_queue_rescue_watch"
+
+#: Cap on the number of (repo, issue) watermarks tracked at once — same
+#: "never allowed to grow the `board_meta` row without bound" rationale as
+#: :data:`PR_MERGE_CI_RERUN_LIMIT`.
+RESCUE_WATCH_LIMIT = 1000
+
+
+def _rescue_watch_key(repo_name: str, issue_number: int) -> str:
+    return f"{repo_name}#{issue_number}"
+
+
+def _load_rescue_watch_raw(conn) -> dict[str, dict]:
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_RESCUE_WATCH_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_rescue_watch(repo_name: str, issue_number: int) -> dict | None:
+    """The #4217 rescue watermark for *repo_name*#*issue_number*, or
+    ``None`` when this row has never been observed by the sweep.
+
+    **Local-DB read only** — same limitation as
+    :func:`pr_merge_ci_rerun_already_attempted`: this lives in ``board_meta``
+    on the canonical board (the daemon host). The sweep that owns this
+    (:func:`coord.reconcile.reconcile_rescued_blocked_rows`) only ever runs
+    daemon-side (see that function's own docstring for why), so a
+    thin-client read is never a concern in practice.
+    """
+    data = _load_rescue_watch_raw(get_connection())
+    found = data.get(_rescue_watch_key(repo_name, issue_number))
+    return found if isinstance(found, dict) else None
+
+
+def set_rescue_watch(
+    repo_name: str, issue_number: int, *, baseline: str, resumed_sha: str | None
+) -> None:
+    """Persist *repo_name*#*issue_number*'s #4217 rescue watermark.
+
+    Local-DB write only, same scope caveat as :func:`get_rescue_watch`.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        data = _load_rescue_watch_raw(conn)
+        data[_rescue_watch_key(repo_name, issue_number)] = {
+            "baseline": baseline, "resumed_sha": resumed_sha,
+        }
+        if len(data) > RESCUE_WATCH_LIMIT:
+            data = dict(list(data.items())[-RESCUE_WATCH_LIMIT:])
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_RESCUE_WATCH_META_KEY, json.dumps(data)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
+def clear_rescue_watch(repo_name: str, issue_number: int) -> None:
+    """Drop *repo_name*#*issue_number*'s #4217 rescue watermark.
+
+    Called automatically once the row reconciles to ``done`` (see
+    ``_update_drive_queue_entry_local``'s own state="done" clear, mirroring
+    how that same write clears ``intervention_json``) so a future re-add of
+    the same repo#issue starts the sweep fresh rather than comparing its
+    first live SHA read against a watermark an earlier run of this row
+    left behind. Local-DB write only, same scope caveat as
+    :func:`get_rescue_watch`.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        data = _load_rescue_watch_raw(conn)
+        key = _rescue_watch_key(repo_name, issue_number)
+        if key not in data:
+            return
+        del data[key]
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_RESCUE_WATCH_META_KEY, json.dumps(data)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
 
 
 def move_drive_queue_entry(

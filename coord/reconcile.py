@@ -1030,6 +1030,247 @@ def reconcile_late_agent_reports(
     return corrected
 
 
+def _latest_work_completion_for_issue(
+    board: Board, repo_name: str, issue_number: int
+) -> Assignment | None:
+    """The most-recently-dispatched `WORK_LIKE_TYPES` completed assignment
+    for *repo_name*#*issue_number* that carries a branch, or ``None``.
+
+    #4217's rescue sweep needs to know WHICH branch to probe for a given
+    drive-queue row — the row itself carries no branch column at all
+    (`coord.drive_queue.QueueEntry` is keyed on repo+issue alone) — so this
+    scans the same ``board.completed`` list every other reconcile pass in
+    this module already reads, picking the newest by ``dispatched_at``
+    (falling back to ``finished_at`` for a row predating that column).
+    """
+    candidates = [
+        a
+        for a in board.completed
+        if a.repo_name == repo_name
+        and a.issue_number == issue_number
+        and a.type in WORK_LIKE_TYPES
+        and a.branch
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda a: (a.dispatched_at or 0.0, a.finished_at or 0.0),
+    )
+
+
+def _reconcile_one_rescued_row(
+    row: dict, board: Board, config: Config, *, now: float
+) -> str | None:
+    """#4217: detect/record an out-of-band push, and auto-resume a
+    rescued, CI-green row — see
+    :func:`reconcile_rescued_blocked_rows` for the full contract.
+
+    Returns the ``repo#issue`` key this row's processing changed something
+    for (a fresh intervention recorded, or Test/Review reset), or ``None``
+    when this tick had nothing new to say about it.
+    """
+    from coord import drive_queue as dq  # noqa: PLC0415
+    from coord import github_ops  # noqa: PLC0415
+    from coord import state  # noqa: PLC0415
+
+    if row.get("state") != dq.STATE_BLOCKED:
+        return None
+    repo_name = row.get("repo_name")
+    issue_number = row.get("issue_number")
+    if not repo_name or not issue_number:
+        return None
+    issue_number = int(issue_number)
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None or not repo_cfg.github:
+        return None
+
+    completed = _latest_work_completion_for_issue(board, repo_name, issue_number)
+    if completed is None or not completed.branch:
+        return None
+
+    live_sha = github_ops.get_branch_sha(repo_cfg.github, completed.branch)
+    if not live_sha:
+        return None
+
+    watch = state.get_rescue_watch(repo_name, issue_number) or {}
+    baseline = watch.get("baseline")
+    resumed_sha = watch.get("resumed_sha")
+    entry = dq.QueueEntry.from_row(row)
+    changed_key: str | None = None
+
+    if baseline is None:
+        # First tick this sweep has ever seen this row blocked — establish
+        # the watermark. Nothing to compare against yet, so this never
+        # flags a row "rescued" on the strength of its own first
+        # observation (#4217).
+        state.set_rescue_watch(
+            repo_name, issue_number, baseline=live_sha, resumed_sha=None
+        )
+        return None
+
+    if live_sha != baseline:
+        # The branch moved since the sweep last looked. By construction
+        # this sweep is the only thing that moves the watermark, so any
+        # difference here was NOT this sweep's own doing — i.e. an
+        # out-of-band push, whoever made it.
+        state.set_rescue_watch(
+            repo_name, issue_number, baseline=live_sha, resumed_sha=None
+        )
+        resumed_sha = None
+        if entry.intervention is None or entry.intervention.get("sha") != live_sha:
+            state.set_drive_queue_intervention(
+                repo_name,
+                issue_number,
+                by=dq.RESCUE_INTERVENTION_BY,
+                did=dq.describe_out_of_band_push(live_sha),
+                next_step=dq.RESCUE_INTERVENTION_NEXT,
+                sha=live_sha,
+                now=now,
+            )
+            changed_key = dq.entry_key(repo_name, issue_number)
+            fresh_row = state.get_drive_queue_entry(repo_name, issue_number)
+            if fresh_row is not None:
+                entry = dq.QueueEntry.from_row(fresh_row)
+
+    if not dq.is_rescue_resume_eligible(
+        entry.state, entry.last_reason, entry.intervention, now=now
+    ):
+        return changed_key
+    if entry.intervention is None or entry.intervention.get("sha") != live_sha:
+        # Held/ceiling-blocked, but not sitting on a head this sweep itself
+        # has confirmed rescued — nothing to auto-resume yet.
+        return changed_key
+    if resumed_sha == live_sha:
+        # Already reset Test/Review for THIS exact rescued head — never
+        # repeat it on the same SHA (that would clobber an in-flight leg's
+        # own `running` stamp, or re-fire forever after a genuine red
+        # verdict already came back; see this function's docstring).
+        return changed_key
+
+    pr = github_ops.find_pr_for_branch(repo_cfg.github, completed.branch)
+    if pr is None or not pr.get("number"):
+        return changed_key
+    try:
+        from coord.ci_github import GitHubCi  # noqa: PLC0415
+
+        checks = GitHubCi().list_checks_for_pr(repo_cfg.github, int(pr["number"]))
+    except Exception:  # noqa: BLE001 — best-effort live CI read
+        return changed_key
+    conclusions = [c.conclusion or "pending" for c in checks]
+    if dq.conflict_fix_push_ci_verdict(conclusions) != dq.CONFLICT_FIX_PUSH_CI_GREEN:
+        return changed_key
+
+    # Rescue confirmed green: reset the issue's Test/Review verdicts — the
+    # SAME primitives `coord diagnose --stage test/review --reset` already
+    # use — so the Test/Review bulk dispatchers already running every
+    # daemon tick (`coord.smoke.dispatch_pending_smoke`/`coord.review.
+    # dispatch_pending_reviews`, via `coord.notify.run_drain`) pick this row
+    # back up on their own next pass. No new Work leg, no fix-round spend,
+    # no `remove && add` — and the drive-queue row itself is left exactly
+    # `blocked`: it never needed a `work` relaunch for this, and
+    # `coord.drive_queue.plan_tick`'s own unconditional `facts.landed`
+    # re-check (#2055/#3368) is what eventually flips it to `done` once the
+    # issue actually merges.
+    state.reset_work_test_state(repo_name, issue_number)
+    state.reset_work_review_state(repo_name, issue_number)
+    state.set_rescue_watch(repo_name, issue_number, baseline=live_sha, resumed_sha=live_sha)
+    return dq.entry_key(repo_name, issue_number)
+
+
+def reconcile_rescued_blocked_rows(
+    config: Config, *, board: Board | None = None, now: float | None = None
+) -> list[str]:
+    """#4217: detect an out-of-band push to a `blocked` drive-queue row's
+    branch, record it (#4216's storage), and once a rescued row's PR checks
+    read CI-green, dispatch only the missing gates — no new Work leg, no
+    fix-round spend, no `remove && add`.
+
+    Two independent things, run together per row because both need the
+    same live branch SHA (:func:`_reconcile_one_rescued_row`):
+
+    1. **Detection**, for ANY `blocked` row: the branch's live HEAD differs
+       from the watermark this sweep last confirmed it sitting on
+       (``coord.state.get_rescue_watch``/``set_rescue_watch``) — nobody but
+       this sweep moves that watermark, so any difference is, by
+       construction, a push this sweep did not itself cause. Recorded via
+       ``coord.state.set_drive_queue_intervention`` with
+       ``coord.drive_queue.RESCUE_INTERVENTION_BY``/``describe_out_of_
+       band_push`` — the SAME storage/rendering #4216 built, just authored
+       by the sweep instead of an operator, so `coord drive-queue list`/the
+       board API/the dashboard show it identically either way. A row's
+       FIRST tick under this sweep only establishes the watermark (nothing
+       to compare against yet) — it never fires a "rescued" record for a
+       row that was never actually pushed to.
+
+    2. **Auto-resume**, for :func:`coord.drive_queue.is_rescue_resume_
+       eligible` rows only: once this sweep's OWN watermark shows the row
+       sitting on a rescued head it has not already resumed, and that
+       head's PR checks read CI-green
+       (:func:`coord.drive_queue.conflict_fix_push_ci_verdict` — the SAME
+       verdict ``requeue_after_conflict_fix`` trusts), this clears the
+       issue's Test/Review verdicts so the bulk dispatchers ALREADY running
+       every daemon tick (``coord.notify.run_drain`` → ``dispatch_pending_
+       smoke``/``dispatch_pending_reviews``) pick the row back up on their
+       own — Test before Review, via that pipeline's own existing
+       ``test_precedes_review`` gate, unchanged by this function. A red
+       verdict from that fresh Test/Review run needs no handling here
+       either: the `blocked` drive-queue row was never moved out of
+       `blocked`, and the intervention record stays in place either way —
+       "a red result after the rescue returns the row to blocked, keeping
+       the record" is simply what never changing it in the first place
+       already gives.
+
+    #1616: deliberately NOT a dispatcher itself — this only corrects a
+    stale reading (an out-of-band push nothing else observed) and clears a
+    now-stale verdict, the same "sibling pass that corrects a guess, never
+    dispatches" shape :func:`reconcile_late_agent_reports` already follows
+    for its own #2547 correction. The actual Test/Review dispatch is left
+    to ``run_drain``, which already runs immediately after this on the
+    daemon's own tick (see ``coord.serve_app``'s ``_tick_loop``) — adding a
+    second, duplicate dispatch call here would be exactly the "two
+    surfaces answering the same question" split this codebase's own review
+    bar rejects.
+
+    Best-effort throughout: any one row's live GitHub read failing, or a
+    repo/PR this sweep cannot resolve, skips that row and moves on to the
+    next rather than aborting the sweep. Returns the ``repo#issue`` keys
+    this pass changed something for, mirroring
+    :func:`reconcile_completed_assignments`'s own return shape.
+    """
+    import logging  # noqa: PLC0415
+
+    from coord import state  # noqa: PLC0415
+
+    if board is None:
+        board = state.build_board()
+    if now is None:
+        now = time.time()
+
+    changed: list[str] = []
+    try:
+        rows = state.list_drive_queue()
+    except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+        logging.warning(
+            "reconcile_rescued_blocked_rows: list_drive_queue failed", exc_info=True
+        )
+        return changed
+
+    for row in rows:
+        try:
+            key = _reconcile_one_rescued_row(row, board, config, now=now)
+        except Exception:  # noqa: BLE001 — one poisoned row must not abort the sweep
+            logging.warning(
+                "reconcile_rescued_blocked_rows: %s#%s failed",
+                row.get("repo_name"), row.get("issue_number"), exc_info=True,
+            )
+            continue
+        if key is not None:
+            changed.append(key)
+
+    return changed
+
+
 def _environmental_cause_phrase(classification: "FailureClassification") -> str:
     """A human phrase naming *classification*'s actual cause for the #3315
     park message — never the fixed "rate limit" string the message used to

@@ -11688,6 +11688,7 @@ def build_app(
             from coord.reconcile import (  # noqa: PLC0415
                 reconcile_completed_assignments,
                 reconcile_late_agent_reports,
+                reconcile_rescued_blocked_rows,
             )
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -11774,6 +11775,30 @@ def build_app(
                     _time.monotonic() - last_notify_drain >= notify_drain_interval
                 ):
                     last_notify_drain = _time.monotonic()
+                    # Step 1b-rescue: #4217 — detect/record an out-of-band
+                    # push to a `blocked` drive-queue row and, once a
+                    # rescued row's PR checks read CI-green, reset its
+                    # Test/Review verdicts. Rides the SAME clock as the
+                    # drain just below (rather than the tick loop's own
+                    # faster `interval`) because both do live per-row
+                    # GitHub reads, and runs immediately BEFORE it so a
+                    # verdict this reset clears is picked back up by
+                    # `dispatch_pending_smoke`/`dispatch_pending_reviews`
+                    # in THIS same tick rather than a whole drain cycle
+                    # later. Independent try/except, same reasoning as
+                    # every other step here.
+                    try:
+                        rescued = await run_in_threadpool(
+                            reconcile_rescued_blocked_rows, config
+                        )
+                        if rescued:
+                            log.info(
+                                "rescue-resume (#4217): %d drive-queue "
+                                "row(s) touched (%s)",
+                                len(rescued), ", ".join(rescued),
+                            )
+                    except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+                        log.warning("rescue-resume tick failed", exc_info=True)
                     try:
                         drained = await run_in_threadpool(
                             _notify_drain_tick, config
