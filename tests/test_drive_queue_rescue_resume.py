@@ -281,6 +281,82 @@ def test_ci_green_on_the_rescued_head_resumes_test_then_review(monkeypatch, rese
     assert watch["resumed_sha"] == "sha-b"
 
 
+def test_unconfirmed_reset_leaves_resumed_sha_unset_for_a_retry(monkeypatch, resets):
+    """#2096: a reported outcome must come from an observation taken AFTER
+    the write, not from `reset_work_test_state`/`reset_work_review_state`'s
+    own row-matched rowcount. Simulate a reset that reports success but
+    whose effect a fresh board read does not confirm (a replica lag, a
+    write that landed on the wrong row) — the row must stay un-resumed so a
+    later tick retries, rather than latching `resumed_sha` on a verdict that
+    never actually cleared."""
+    _seed_blocked_ceiling_row()
+    _rescue_to_sha_b(monkeypatch)
+    _stub_github(monkeypatch, sha="sha-b", pr_number=7)
+    _stub_checks(monkeypatch, ["success"])
+
+    stale_board = Board(
+        repos=[Repo(name=REPO, github=REPO_GITHUB)], machines=[],
+        completed=[
+            Assignment(
+                machine_name="precision", repo_name=REPO, issue_number=ISSUE,
+                issue_title="t", status="done", assignment_id="work-500",
+                type="work", branch=BRANCH, test_state="failed",
+            ),
+        ],
+    )
+    monkeypatch.setattr("coord.state.build_board", lambda: stale_board)
+
+    changed = reconcile_rescued_blocked_rows(_config(), board=_board())
+
+    assert changed == []
+    # The reset primitives were still called — only the CONFIRMATION failed.
+    assert resets.test_calls == [(REPO, ISSUE)]
+    assert resets.review_calls == [(REPO, ISSUE)]
+    watch = state.get_rescue_watch(REPO, ISSUE)
+    assert watch["resumed_sha"] is None  # never latched — a later tick retries
+
+
+def test_a_conflict_fix_leg_push_defers_to_the_4036_sweep(monkeypatch, resets):
+    """#2085/#4036: a ceiling-blocked row rescued by a `type="conflict-fix"`
+    leg is `coord.board_doctor.run_conflict_fix_ceiling_pending_sweep`'s own
+    row shape — it resets the SAME stage AND grants a fresh fix-round
+    budget via remove+re-add. This sweep must defer rather than resetting
+    the stage itself and racing that owner over the same event."""
+    _seed_blocked_ceiling_row()
+    work_completed = Assignment(
+        machine_name="precision", repo_name=REPO, issue_number=ISSUE,
+        issue_title="t", status="done", assignment_id="work-500",
+        type="work", branch=BRANCH,
+        dispatched_at=time.time() - 3600, finished_at=time.time() - 3500,
+    )
+    conflict_fix_leg = Assignment(
+        machine_name="precision", repo_name=REPO, issue_number=ISSUE,
+        issue_title="t", status="done", assignment_id="conflict-fix-500",
+        type="conflict-fix", branch=BRANCH,
+        dispatched_at=time.time() - 3000, finished_at=time.time() - 2900,
+    )
+    board_with_conflict_fix_leg = Board(
+        repos=[Repo(name=REPO, github=REPO_GITHUB)], machines=[],
+        completed=[work_completed, conflict_fix_leg],
+    )
+
+    _stub_github(monkeypatch, sha="sha-a")
+    reconcile_rescued_blocked_rows(_config(), board=board_with_conflict_fix_leg)
+    _stub_github(monkeypatch, sha="sha-b", pr_number=7)
+    reconcile_rescued_blocked_rows(_config(), board=board_with_conflict_fix_leg)
+
+    _stub_checks(monkeypatch, ["success"])
+    changed = reconcile_rescued_blocked_rows(
+        _config(), board=board_with_conflict_fix_leg
+    )
+
+    assert changed == []
+    assert resets.test_calls == []
+    assert resets.review_calls == []
+    watch = state.get_rescue_watch(REPO, ISSUE)
+    assert watch["resumed_sha"] is None  # left for the #4036 sweep to grant the budget
+
+
 def test_resume_never_repeats_for_the_same_rescued_sha(monkeypatch, resets):
     """A red verdict (or an in-flight leg) after the resume must not get
     clobbered by a second reset on the identical SHA."""

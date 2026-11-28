@@ -12229,13 +12229,16 @@ def get_rescue_watch(repo_name: str, issue_number: int) -> dict | None:
     """The #4217 rescue watermark for *repo_name*#*issue_number*, or
     ``None`` when this row has never been observed by the sweep.
 
-    **Local-DB read only** — same limitation as
-    :func:`pr_merge_ci_rerun_already_attempted`: this lives in ``board_meta``
-    on the canonical board (the daemon host). The sweep that owns this
-    (:func:`coord.reconcile.reconcile_rescued_blocked_rows`) only ever runs
-    daemon-side (see that function's own docstring for why), so a
-    thin-client read is never a concern in practice.
+    **Local-DB read only**, same ``_thin_client_local_board_guard`` limitation
+    as :func:`pr_merge_ci_rerun_already_attempted`: this lives in
+    ``board_meta`` on the canonical board (the daemon host). The sweep that
+    owns this (:func:`coord.reconcile.reconcile_rescued_blocked_rows`) only
+    ever runs daemon-side (see that function's own docstring for why), so a
+    thin-client call is never a concern in practice — the guard is here
+    anyway so a misuse fails loudly rather than silently reading/writing an
+    empty local copy.
     """
+    _thin_client_local_board_guard("get_rescue_watch")
     data = _load_rescue_watch_raw(get_connection())
     found = data.get(_rescue_watch_key(repo_name, issue_number))
     return found if isinstance(found, dict) else None
@@ -12248,6 +12251,7 @@ def set_rescue_watch(
 
     Local-DB write only, same scope caveat as :func:`get_rescue_watch`.
     """
+    _thin_client_local_board_guard("set_rescue_watch")
     conn = get_connection()
 
     def _write() -> None:
@@ -12278,6 +12282,7 @@ def clear_rescue_watch(repo_name: str, issue_number: int) -> None:
     left behind. Local-DB write only, same scope caveat as
     :func:`get_rescue_watch`.
     """
+    _thin_client_local_board_guard("clear_rescue_watch")
     conn = get_connection()
 
     def _write() -> None:
