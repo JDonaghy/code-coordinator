@@ -12529,12 +12529,27 @@ def open_tranche_closing_pr(
     row: "TrancheRow",
     config: "Config | None",
     *,
+    test_passed: bool,
+    review_verdict: "Mapping[str, object] | None",
     gh_ops: "GhOps | None" = None,
 ) -> dict | None:
     """Open (or find) the single PR for *row*'s integrated tree that
     closes every `"done"` child issue (#4129/#4202) — the LAST step of
-    the tranche flow, called only once the Test leg has passed and
-    `coord.review.tranche_review_verdict` reports `approved=True`.
+    the tranche flow.
+
+    *test_passed* and *review_verdict* (the dict `coord.review.
+    tranche_review_verdict` returns) are the gate this function enforces
+    itself: it raises `ValueError` unless *test_passed* is `True` AND
+    *review_verdict* reports `"approved": True`. Nothing upstream of this
+    function refuses on either condition on its own, so this is the one
+    place the whole tranche flow actually checks "has the Test leg
+    passed, and did all three bound review legs approve" before a PR can
+    close every child issue. This is deliberately a raise, not the same
+    `None` a missing-repo-config or `gh` failure below returns: those are
+    environment problems a retry might clear on its own; an unmet gate is
+    a caller bug (the caller must check readiness itself, same as
+    `integrate_tranche_row`'s own precondition raises) and must not look
+    identical to "retry me".
 
     Targets `tranche_integration_branch_name(row)` against the repo's
     `default_branch`, mirroring `coord.review._find_or_open_pr`'s
@@ -12557,6 +12572,14 @@ def open_tranche_closing_pr(
     `gh` failure to the caller, matching `_find_or_open_pr`'s own
     fail-safe contract.
     """
+    if not test_passed or not isinstance(review_verdict, Mapping) or not review_verdict.get("approved"):
+        raise ValueError(
+            "open_tranche_closing_pr: refusing — test_passed="
+            f"{test_passed!r}, review_verdict={review_verdict!r}; both the "
+            "Test leg must have passed and tranche_review_verdict must "
+            "report approved=True before the closing PR can open"
+        )
+
     if gh_ops is None:
         from coord import github_ops as gh_ops  # noqa: PLC0415
 

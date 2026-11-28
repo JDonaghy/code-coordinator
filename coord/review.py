@@ -9499,6 +9499,9 @@ def dispatch_tranche_review_legs(
     http_client: httpx.Client | None = None,
     now: float | None = None,
     prior_verdicts: "Mapping[str, str] | None" = None,
+    integrated_patch_id: str | None = None,
+    diff_fetcher=None,
+    patch_id_computer=None,
 ) -> dict:
     """Dispatch the three bound review legs for *row*'s integrated tree
     (#4129/#4202) — only ever called once `row.state == "done"`.
@@ -9519,6 +9522,18 @@ def dispatch_tranche_review_legs(
     instead of a from-scratch review. Absent entirely for a row's first
     dispatch.
 
+    *integrated_patch_id* is what makes the "bound to the integrated
+    patch-id" requirement reachable: every leg's `Assignment` gets
+    `review_head_sha=integrated_sha` and `review_patch_id=
+    integrated_patch_id` stamped on it at dispatch time, so a later
+    `tranche_review_verdict(..., integrated_patch_id=...)` call can
+    actually compare a leg's own patch-id against the row's CURRENT one.
+    When not given explicitly, this computes it itself via
+    `tranche_integrated_patch_id(row, integrated_sha, config,
+    diff_fetcher=diff_fetcher, patch_id_computer=patch_id_computer)` —
+    *diff_fetcher*/*patch_id_computer* are forwarded to that call only,
+    and ignored once *integrated_patch_id* is given directly.
+
     Never raises on a single leg's dispatch failure — each focus fails
     independently, mirroring `dispatch_tranche_row_children`'s per-child
     posture, so one agent rejecting a POST doesn't strand the other two
@@ -9538,12 +9553,18 @@ def dispatch_tranche_review_legs(
             "dispatch_tranche_review_legs: row.id is None — save the row "
             "(coord.state.save_tranche_row) before dispatching its review legs"
         )
+    if integrated_patch_id is None:
+        integrated_patch_id = tranche_integrated_patch_id(
+            row, integrated_sha, config,
+            diff_fetcher=diff_fetcher, patch_id_computer=patch_id_computer,
+        )
     repo_cfg = config.repo(row.repo_name)
     if repo_cfg is None:
         raise ValueError(
             f"dispatch_tranche_review_legs: repo {row.repo_name!r} is not configured"
         )
 
+    from coord.agent import FAILED as AGENT_ASSIGNMENT_FAILED  # noqa: PLC0415
     from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
 
     target_branch = tranche_integration_branch_name(row)
@@ -9599,7 +9620,23 @@ def dispatch_tranche_review_legs(
             }
             continue
 
-        assignment_id = agent_response.get("id") or uuid.uuid4().hex[:12]
+        if not isinstance(agent_response, dict) or not agent_response.get("id"):
+            legs[focus] = {
+                "ok": False,
+                "error": f"dispatch response carried no assignment id: {agent_response!r}",
+            }
+            continue
+        if agent_response.get("status") == AGENT_ASSIGNMENT_FAILED:
+            legs[focus] = {
+                "ok": False,
+                "error": (
+                    "agent reported dispatch failure: "
+                    f"{agent_response.get('error') or 'unknown error'}"
+                ),
+            }
+            continue
+
+        assignment_id = agent_response["id"]
         assignment = Assignment(
             machine_name=machine_name,
             repo_name=row.repo_name,
@@ -9615,6 +9652,8 @@ def dispatch_tranche_review_legs(
             type="review",
             review_target=review_target,
             model=config.models.default,
+            review_head_sha=integrated_sha,
+            review_patch_id=integrated_patch_id,
         )
         board.active.append(assignment)
 
@@ -9641,7 +9680,7 @@ def tranche_review_leg_assignments(
     sentinel, so the newest one is always the authoritative leg. `None`
     for a focus never dispatched.
     """
-    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    pool = list(board.completed) + list(board.active)
     result: dict[str, Assignment | None] = {}
     for focus in TRANCHE_REVIEW_FOCUSES:
         target = tranche_review_target_for(row.id, focus) if row.id is not None else None
@@ -9673,13 +9712,19 @@ def tranche_review_verdict(
 
     *integrated_patch_id*, when given, enforces the "bound to the
     integrated patch-id" requirement directly: a leg whose own
-    `review_patch_id` does not match it is treated as `pending` —
-    needing a fresh (or scoped) dispatch — REGARDLESS of what verdict it
-    already carries. This is what makes a scoped re-review of a fix delta
-    mandatory rather than advisory: an `"approve"` against a patch-id the
-    row has since moved past simply does not count. `None` (the default)
-    skips this check entirely — the caller's own job when it has no
-    reliable integrated-sha diff to fingerprint yet.
+    `review_patch_id` does not match it — INCLUDING a leg whose
+    `review_patch_id` is `None` (a leg dispatched before a caller started
+    stamping it, or one whose own patch-id computation failed) — is
+    treated as `pending`, needing a fresh (or scoped) dispatch,
+    REGARDLESS of what verdict it already carries. A missing
+    `review_patch_id` is never read as "binding satisfied" — that would
+    make this check unreachable for every leg a real dispatch failed to
+    stamp. This is what makes a scoped re-review of a fix delta mandatory
+    rather than advisory: an `"approve"` against a patch-id the row has
+    since moved past, or against no recorded patch-id at all, simply does
+    not count. `None` (the default) skips this check entirely — the
+    caller's own job when it has no reliable integrated-sha diff to
+    fingerprint yet.
 
     Returns `{"approved": bool, "pending": (...), "blocking": (...)}` —
     `pending` names focuses with no (current) verdict yet; `blocking`
@@ -9693,11 +9738,7 @@ def tranche_review_verdict(
         if leg is None or leg.review_verdict is None:
             pending.append(focus)
             continue
-        if (
-            integrated_patch_id is not None
-            and leg.review_patch_id is not None
-            and leg.review_patch_id != integrated_patch_id
-        ):
+        if integrated_patch_id is not None and leg.review_patch_id != integrated_patch_id:
             pending.append(focus)
             continue
         if leg.review_verdict != "approve":

@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
@@ -19,6 +18,7 @@ if TYPE_CHECKING:
     from coord.merge_queue import TrancheMergeResult
     from coord.milestone_dispatch import OracleReadiness
     from coord.models import Board, TrancheChild, TrancheRow
+    from coord.smoke import SmokeCommand
 
 from coord import github_ops
 from coord.comments import (
@@ -4202,13 +4202,15 @@ def dispatch_tranche_integrator(
 # integrated tree (`row.state == "done"` — see `coord.drive.
 # integrate_tranche_row`'s own docstring: "Nothing more to do; the Test/
 # review/PR slice (#4202) picks up from here"), #4129 names ONE Test leg
-# against that tree — never one per child. Routed exactly like a
-# `type="work"` diff would be (`route_work_by_capability`, reusing the
+# against that tree — never one per child. Capability matching reuses the
 # SAME `coord.smoke.required_capabilities` the Test stage's own routing
-# uses — #2096, one question one answer), from the union of every done
+# uses — #2096, one question one answer — from the union of every done
 # child's own self-reported touched files (`TrancheChild.result["files"]`,
 # #4200's contract) rather than a fresh diff this module would otherwise
-# have to compute a second way.
+# have to compute a second way. Unlike `route_work_by_capability` (a
+# `type="work"` primitive that always returns a best-covering machine),
+# this NEVER relaxes: no capable machine in the given pool means refusal,
+# mirroring `coord.smoke`'s own Test-stage posture.
 #
 # Dispatched as a standalone `type="smoke"` leg via a raw `/assign` POST,
 # mirroring `coord.gate_b.dispatch_gate_b_review`'s posture for the same
@@ -4238,6 +4240,8 @@ def tranche_test_files_likely(row: "TrancheRow") -> list[str]:
     files: list[str] = []
     seen: set[str] = set()
     for child in row.children:
+        if child.state != "done":
+            continue
         for f in (child.result or {}).get("files") or []:
             if f not in seen:
                 seen.add(f)
@@ -4249,45 +4253,78 @@ def tranche_test_machine_name(
     row: "TrancheRow",
     config: Config,
     machine_names: Sequence[str],
-    *,
-    now: "datetime | None" = None,
-) -> str:
+) -> str | None:
     """Pick the machine for the tranche's ONE capability-routed Test leg
     (#4129/#4202).
 
-    Reuses `route_work_by_capability` — the SAME capability-matching
-    primitive a `type="work"` dispatch reroutes through — rather than a
-    second copy of "what capability does this diff need" (#2096). The
-    proposed machine is `machine_names[0]`; `route_work_by_capability`
-    returns `None` (meaning "nothing required, leave it alone") whenever
-    neither the repo's unconditional `requires` nor
-    `tranche_test_files_likely(row)` needs anything, so this falls back to
-    `machine_names[0]` in that case too — the same "no capability needed,
-    no reroute" posture that function's own callers already apply.
+    Capability matching here is never relaxed — the Test stage's own
+    posture (`coord.smoke.rank_smoke_machines`'s docstring: "a fallback
+    that dispatched to a machine lacking the capability would produce a
+    green verdict from a machine that cannot run the suite, which is worse
+    than refusing"), not `route_work_by_capability`'s `type="work"`
+    posture of always returning a best-covering machine. Computes the same
+    `coord.smoke.required_capabilities(repo_requires,
+    tranche_test_files_likely(row), capability_rules)` union
+    `route_work_by_capability` itself calls, plus any
+    `backend_capability_from_title` tag (#2096, one question one answer),
+    then walks *machine_names* IN ORDER — respecting the caller's own
+    pool/exclusions rather than falling through to `config.machines` at
+    large — for the first machine that declares every required
+    capability.
+
+    Returns `None` when nothing in *machine_names* does; the caller must
+    refuse the dispatch rather than land the Test leg on a machine that
+    cannot verify it. Returns `machine_names[0]` unconditionally when no
+    capability is required at all.
 
     Raises ValueError if *machine_names* is empty.
     """
     if not machine_names:
         raise ValueError("tranche_test_machine_name: machine_names is empty")
+    from coord.smoke import required_capabilities  # noqa: PLC0415
+
     repo_cfg = config.repo(row.repo_name)
-    routing = route_work_by_capability(
-        proposed_machine_name=machine_names[0],
-        repo_name=row.repo_name,
-        files_likely=tranche_test_files_likely(row),
-        machines=config.machines,
-        capability_rules=config.smoke_tests.capability_rules,
-        repo_requires=repo_cfg.requires if repo_cfg is not None else (),
-        issue_title=row.issue_title,
-        now=now,
+    required = list(
+        required_capabilities(
+            repo_cfg.requires if repo_cfg is not None else (),
+            tranche_test_files_likely(row),
+            config.smoke_tests.capability_rules,
+        )
     )
-    return routing.machine_name if routing is not None else machine_names[0]
+    backend_capability = backend_capability_from_title(row.issue_title)
+    if backend_capability and backend_capability not in required:
+        required.append(backend_capability)
+    if not required:
+        return machine_names[0]
+
+    by_name = {m.name: m for m in config.machines}
+    for name in machine_names:
+        machine = by_name.get(name)
+        if (
+            machine is not None
+            and machine.can_work_on(row.repo_name)
+            and all(cap in machine.capabilities for cap in required)
+        ):
+            return name
+    return None
 
 
-def build_tranche_test_briefing(row: "TrancheRow", integrated_sha: str) -> str:
+def build_tranche_test_briefing(
+    row: "TrancheRow", integrated_sha: str, smoke_command: "SmokeCommand | None" = None,
+) -> str:
     """Briefing text for the tranche's ONE Test leg (#4129/#4202) — tells
     the worker exactly what tree it's testing and why there's no PR to
     check out from, mirroring `build_tranche_integrator_briefing`'s own
     "start with the same information the coordinator had" posture.
+
+    *smoke_command* (`coord.smoke.resolve_smoke_command`'s result, the
+    SAME resolution every other Test-stage leg's briefing embeds) names
+    the actual command to run; `None` (no command configured for this
+    repo at all) tells the worker to fall back to the repo's own suite.
+    The verdict instructions name the real marker `coord.notify` parses
+    for a `type="smoke"` row (`SMOKE: pass`/`SMOKE: fail <reason>`,
+    `coord.smoke`'s own contract) rather than a `coord report-result`
+    flag that does not exist for this leg type.
     """
     done_children = sorted(
         (c for c in row.children if c.state == "done"), key=lambda c: c.issue_number,
@@ -4295,6 +4332,18 @@ def build_tranche_test_briefing(row: "TrancheRow", integrated_sha: str) -> str:
     children_lines = "\n".join(
         f"- #{c.issue_number} ({c.title or 'untitled'})" for c in done_children
     ) or "(none)"
+    if smoke_command is not None and smoke_command.command:
+        command_block = (
+            f"{smoke_command.briefing_note()}\n\n"
+            f"```bash\n{smoke_command.command}\n```\n"
+        )
+    else:
+        command_block = (
+            "No Test-stage command is configured for this repo "
+            "(`repos[].ci_command` / `smoke_tests.default_command` / "
+            "`repos[].test_command`) — run whatever this repo's own test "
+            "suite is.\n"
+        )
     return (
         f"Run this repo's Test-stage suite against the INTEGRATED tree for "
         f"tranche row {row.id}, {row.repo_name}#{row.issue_number} "
@@ -4304,9 +4353,15 @@ def build_tranche_test_briefing(row: "TrancheRow", integrated_sha: str) -> str:
         f"(no PR exists for this branch yet — the coordinator merged these "
         f"itself):\n{children_lines}\n\n"
         f"Current tree sha: `{integrated_sha}`.\n\n"
-        f"Report your result through the normal Test-stage verdict "
-        f"contract (`coord report-result --verdict pass|fail`, or the "
-        f"printed fallback marker) exactly as any other Test leg would."
+        f"{command_block}\n"
+        f"Report your result with exactly one final line, at the start of "
+        f"the line — this is the SAME marker contract any other Test leg "
+        f"uses, and the only thing `coord.notify` parses for a "
+        f'`type="smoke"` row:\n\n'
+        f"- `SMOKE: pass` — the command above exited 0\n"
+        f"- `SMOKE: fail <one-line reason>` — it failed\n\n"
+        f"A run that ends with no such line records NO verdict (never a "
+        f"pass) and this Test leg is simply re-dispatched."
     )
 
 
@@ -4335,12 +4390,26 @@ def dispatch_tranche_test(
     the agent itself rejecting/being unreachable for the POST).
 
     Raises ValueError if *machine_names* is empty — there is nowhere to
-    route the single Test leg to.
+    route the single Test leg to. Returns ``{"ok": False, "error": ...}``
+    (never raises) when *machine_names* contains no machine that declares
+    every capability `tranche_test_files_likely(row)` needs — capability
+    matching for this leg is never relaxed, mirroring `coord.smoke`'s own
+    Test-stage posture rather than silently landing on an incapable
+    machine.
     """
     if not machine_names:
         raise ValueError("dispatch_tranche_test: machine_names is empty")
 
     machine_name = tranche_test_machine_name(row, config, machine_names)
+    if machine_name is None:
+        return {
+            "ok": False,
+            "error": (
+                f"no machine in {list(machine_names)!r} declares every "
+                "capability this tranche's Test leg needs — refusing "
+                "rather than running an unverified suite"
+            ),
+        }
     machine = next((m for m in config.machines if m.name == machine_name), None)
     if machine is None:
         return {"ok": False, "error": f"unknown machine {machine_name!r}"}
@@ -4352,9 +4421,15 @@ def dispatch_tranche_test(
         }
 
     from coord.merge_queue import tranche_integration_branch_name  # noqa: PLC0415
+    from coord.smoke import resolve_smoke_command  # noqa: PLC0415
 
     target_branch = tranche_integration_branch_name(row)
-    briefing = build_tranche_test_briefing(row, integrated_sha)
+    repo_cfg = config.repo(row.repo_name)
+    smoke_command = (
+        resolve_smoke_command(repo_cfg, config.smoke_tests, tranche_test_files_likely(row))
+        if repo_cfg is not None else None
+    )
+    briefing = build_tranche_test_briefing(row, integrated_sha, smoke_command)
     payload = {
         "repo_name": row.repo_name,
         "repo_path": repo_path,
@@ -4379,7 +4454,23 @@ def dispatch_tranche_test(
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
         return {"ok": False, "error": f"agent {machine_name!r} rejected dispatch: {exc}"}
 
-    assignment_id = agent_response.get("id") or uuid.uuid4().hex[:12]
+    from coord.agent import FAILED as AGENT_ASSIGNMENT_FAILED  # noqa: PLC0415
+
+    if not isinstance(agent_response, dict) or not agent_response.get("id"):
+        return {
+            "ok": False,
+            "error": f"dispatch response carried no assignment id: {agent_response!r}",
+        }
+    if agent_response.get("status") == AGENT_ASSIGNMENT_FAILED:
+        return {
+            "ok": False,
+            "error": (
+                "agent reported dispatch failure: "
+                f"{agent_response.get('error') or 'unknown error'}"
+            ),
+        }
+
+    assignment_id = agent_response["id"]
     assignment = Assignment(
         machine_name=machine_name,
         repo_name=row.repo_name,
@@ -4399,7 +4490,6 @@ def dispatch_tranche_test(
 
     from coord.state import record_dispatched_assignment  # noqa: PLC0415
 
-    repo_cfg = config.repo(row.repo_name)
     record_dispatched_assignment(
         assignment=assignment, repo_github=repo_cfg.github if repo_cfg else "",
     )

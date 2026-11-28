@@ -151,6 +151,34 @@ class TestTrancheTestMachineName:
         with pytest.raises(ValueError, match="machine_names is empty"):
             tranche_test_machine_name(row, config, [])
 
+    def test_never_relaxes_when_no_pool_machine_is_capable(self) -> None:
+        # A required capability no machine in the CALLER'S pool declares
+        # must refuse (`None`), never silently fall back to machine_names[0]
+        # the way `route_work_by_capability` does for an ordinary
+        # `type="work"` dispatch.
+        row = _row(children=[
+            TrancheChild(
+                issue_number=101, repo_name="api", state="done",
+                result={"outcome": "done", "summary": "", "files": ["src/gtk/widget.c"]},
+            ),
+        ])
+        config = _config(
+            machines=[
+                Machine(name="m1", host="m1.tail", repos=["api"], repo_paths={"api": "/r"}),
+                Machine(
+                    name="gtk-box", host="gtk.tail", repos=["api"],
+                    repo_paths={"api": "/r"}, capabilities=["gtk"],
+                ),
+            ],
+            smoke_tests=SmokeTestsConfig(
+                capability_rules=[SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+            ),
+        )
+        # `gtk-box` IS capable, but it is excluded from the caller's pool —
+        # must refuse, never silently pick "m1" (which cannot run gtk) nor
+        # reach outside the given pool to find "gtk-box" on its own.
+        assert tranche_test_machine_name(row, config, ["m1"]) is None
+
 
 class TestDispatchTrancheTest:
     def test_happy_path_posts_smoke_type_assignment(self) -> None:
@@ -174,6 +202,8 @@ class TestDispatchTrancheTest:
         assert payload["type"] == "smoke"
         assert payload["branch"] == "tranche-7-integrated"
         assert "cafef00d" in payload["briefing"]
+        assert "SMOKE: pass" in payload["briefing"]
+        assert "SMOKE: fail" in payload["briefing"]
 
     def test_unreachable_agent_fails_closed_without_phantom_assignment(self) -> None:
         row = _row()
@@ -204,6 +234,62 @@ class TestDispatchTrancheTest:
         board = Board()
         with pytest.raises(ValueError, match="machine_names is empty"):
             dispatch_tranche_test(row, "cafef00d", config, [], board)
+
+    def test_no_capable_machine_in_pool_fails_closed(self) -> None:
+        # Capability matching for the Test leg is never relaxed — a pool
+        # with no capable machine must refuse rather than land the leg on
+        # one that cannot verify it.
+        row = _row(children=[
+            TrancheChild(
+                issue_number=101, repo_name="api", state="done",
+                result={"outcome": "done", "summary": "", "files": ["src/gtk/widget.c"]},
+            ),
+        ])
+        config = _config(
+            machines=[Machine(name="m1", host="m1.tail", repos=["api"], repo_paths={"api": "/r"})],
+            smoke_tests=SmokeTestsConfig(
+                capability_rules=[SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+            ),
+        )
+        board = Board()
+
+        result = dispatch_tranche_test(row, "cafef00d", config, ["m1"], board)
+
+        assert result["ok"] is False
+        assert board.active == []
+
+    def test_agent_reported_failure_is_not_a_phantom_success(self) -> None:
+        # A 202 whose body reports the agent's own worktree-setup failure
+        # must not read as `ok=True` with a fabricated assignment id —
+        # mirrors the sibling child/integrator dispatchers' fail-closed
+        # read of exactly this shape.
+        row = _row()
+        config = _config()
+        board = Board()
+        client = _FakeHTTPClient({
+            "id": "test-1", "status": "failed", "error": "worktree not writable",
+        })
+
+        result = dispatch_tranche_test(
+            row, "cafef00d", config, ["m1"], board, http_client=client,
+        )
+
+        assert result["ok"] is False
+        assert "worktree not writable" in result["error"]
+        assert board.active == []
+
+    def test_agent_response_with_no_id_is_not_a_phantom_success(self) -> None:
+        row = _row()
+        config = _config()
+        board = Board()
+        client = _FakeHTTPClient({})
+
+        result = dispatch_tranche_test(
+            row, "cafef00d", config, ["m1"], board, http_client=client,
+        )
+
+        assert result["ok"] is False
+        assert board.active == []
 
 
 # ── Three-way bound review ──────────────────────────────────────────────────
@@ -256,6 +342,7 @@ class TestDispatchTrancheReviewLegs:
 
         result = dispatch_tranche_review_legs(
             row, "cafef00d", config, ["m1", "m2"], board, http_client=client, now=1000.0,
+            integrated_patch_id="patch-xyz",
         )
 
         assert result["ok"] is True
@@ -268,10 +355,30 @@ class TestDispatchTrancheReviewLegs:
         assert machines_used == ["m1", "m2", "m1"]  # round-robin over 2 machines, 3 legs
         for a in board.active:
             assert a.type == "review"
+            # Every leg is bound to the integrated patch-id at dispatch
+            # time, so `tranche_review_verdict`'s staleness check has
+            # something real to compare against.
+            assert a.review_head_sha == "cafef00d"
+            assert a.review_patch_id == "patch-xyz"
         _url, payload = client.calls[0]
         from coord.review import REVIEWER_SYSTEM_PROMPT
 
         assert payload["system_prompt"] == REVIEWER_SYSTEM_PROMPT
+
+    def test_computes_patch_id_itself_when_not_given(self) -> None:
+        row = _row()
+        config = _config()
+        board = Board()
+        client = _FakeHTTPClient({"id": "rev-1"})
+        diff_fetcher = MagicMock(return_value="diff --git a/x b/x\n")
+        patch_id_computer = MagicMock(return_value="computed-patch")
+
+        dispatch_tranche_review_legs(
+            row, "cafef00d", config, ["m1"], board, http_client=client,
+            diff_fetcher=diff_fetcher, patch_id_computer=patch_id_computer,
+        )
+
+        assert all(a.review_patch_id == "computed-patch" for a in board.active)
 
     def test_one_leg_failing_does_not_block_the_other_two(self) -> None:
         row = _row()
@@ -284,6 +391,7 @@ class TestDispatchTrancheReviewLegs:
 
         result = dispatch_tranche_review_legs(
             row, "cafef00d", config, ["m1", "bare"], board, http_client=client,
+            diff_fetcher=MagicMock(return_value=None),
         )
 
         assert result["ok"] is False
@@ -291,6 +399,42 @@ class TestDispatchTrancheReviewLegs:
         assert oks.count(True) == 2
         assert oks.count(False) == 1
         assert len(board.active) == 2
+
+    def test_agent_reported_failure_is_not_a_phantom_success(self) -> None:
+        # Mirrors the sibling child/integrator dispatchers' fail-closed
+        # read of a `status: "failed"` 202 body — no fabricated assignment
+        # id, no phantom board row.
+        row = _row()
+        config = _config()
+        board = Board()
+        client = _FakeHTTPClient({
+            "id": "rev-1", "status": "failed", "error": "worktree not writable",
+        })
+
+        result = dispatch_tranche_review_legs(
+            row, "cafef00d", config, ["m1"], board, http_client=client,
+            diff_fetcher=MagicMock(return_value=None),
+        )
+
+        assert result["ok"] is False
+        for leg in result["legs"].values():
+            assert leg["ok"] is False
+            assert "worktree not writable" in leg["error"]
+        assert board.active == []
+
+    def test_agent_response_with_no_id_is_not_a_phantom_success(self) -> None:
+        row = _row()
+        config = _config()
+        board = Board()
+        client = _FakeHTTPClient({})
+
+        result = dispatch_tranche_review_legs(
+            row, "cafef00d", config, ["m1"], board, http_client=client,
+            diff_fetcher=MagicMock(return_value=None),
+        )
+
+        assert result["ok"] is False
+        assert board.active == []
 
     def test_raises_on_empty_machine_names(self) -> None:
         row = _row()
@@ -315,6 +459,7 @@ class TestDispatchTrancheReviewLegs:
         dispatch_tranche_review_legs(
             row, "cafef00d", config, ["m1", "m2"], board, http_client=client,
             prior_verdicts={"gates": "request-changes"},
+            diff_fetcher=MagicMock(return_value=None),
         )
 
         gates_calls = [
@@ -405,6 +550,19 @@ class TestTrancheReviewVerdict:
         verdict = tranche_review_verdict(legs)
         assert verdict["approved"] is True
 
+    def test_missing_patch_id_on_a_leg_is_pending_not_vacuously_bound(self) -> None:
+        # A leg with no `review_patch_id` at all (the production shape
+        # before dispatch stamped one) must read as `pending`, not fall
+        # into the permissive "binding satisfied" branch just because
+        # it's `None`.
+        legs = {
+            f: _review_leg(f, verdict="approve", patch_id=None)
+            for f in TRANCHE_REVIEW_FOCUSES
+        }
+        verdict = tranche_review_verdict(legs, integrated_patch_id="new-patch")
+        assert verdict["approved"] is False
+        assert set(verdict["pending"]) == set(TRANCHE_REVIEW_FOCUSES)
+
 
 class TestTrancheIntegratedPatchId:
     def test_computes_from_fetched_diff(self) -> None:
@@ -482,13 +640,18 @@ class _FakeGhOps:
         return self._response
 
 
+_APPROVED_VERDICT = {"approved": True, "pending": (), "blocking": ()}
+
+
 class TestOpenTrancheClosingPr:
     def test_opens_against_default_branch_with_closing_body(self) -> None:
         row = _row()
         config = _config()
         gh_ops = _FakeGhOps()
 
-        result = open_tranche_closing_pr(row, config, gh_ops=gh_ops)
+        result = open_tranche_closing_pr(
+            row, config, test_passed=True, review_verdict=_APPROVED_VERDICT, gh_ops=gh_ops,
+        )
 
         assert result == {"number": 55, "url": "https://x/55", "existed": False}
         assert len(gh_ops.calls) == 1
@@ -504,7 +667,9 @@ class TestOpenTrancheClosingPr:
         config = _config()
         gh_ops = _FakeGhOps()
 
-        result = open_tranche_closing_pr(row, config, gh_ops=gh_ops)
+        result = open_tranche_closing_pr(
+            row, config, test_passed=True, review_verdict=_APPROVED_VERDICT, gh_ops=gh_ops,
+        )
 
         assert result is None
         assert gh_ops.calls == []
@@ -514,6 +679,45 @@ class TestOpenTrancheClosingPr:
         config = _config()
         gh_ops = _FakeGhOps(raises=True)
 
-        result = open_tranche_closing_pr(row, config, gh_ops=gh_ops)
+        result = open_tranche_closing_pr(
+            row, config, test_passed=True, review_verdict=_APPROVED_VERDICT, gh_ops=gh_ops,
+        )
 
         assert result is None
+
+    def test_refuses_when_test_has_not_passed(self) -> None:
+        # The ordering "Test leg passed AND tranche_review_verdict
+        # reports approved=True" is a gate this function enforces itself,
+        # not prose a caller might skip.
+        row = _row()
+        config = _config()
+        gh_ops = _FakeGhOps()
+
+        with pytest.raises(ValueError, match="test_passed"):
+            open_tranche_closing_pr(
+                row, config, test_passed=False, review_verdict=_APPROVED_VERDICT, gh_ops=gh_ops,
+            )
+        assert gh_ops.calls == []
+
+    def test_refuses_when_review_verdict_is_not_approved(self) -> None:
+        row = _row()
+        config = _config()
+        gh_ops = _FakeGhOps()
+        unapproved = {"approved": False, "pending": (), "blocking": ("gates",)}
+
+        with pytest.raises(ValueError):
+            open_tranche_closing_pr(
+                row, config, test_passed=True, review_verdict=unapproved, gh_ops=gh_ops,
+            )
+        assert gh_ops.calls == []
+
+    def test_refuses_when_review_verdict_is_none(self) -> None:
+        row = _row()
+        config = _config()
+        gh_ops = _FakeGhOps()
+
+        with pytest.raises(ValueError):
+            open_tranche_closing_pr(
+                row, config, test_passed=True, review_verdict=None, gh_ops=gh_ops,
+            )
+        assert gh_ops.calls == []
