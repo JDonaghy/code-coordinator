@@ -9400,12 +9400,27 @@ def tranche_rows_ready_to_requeue(rows: Sequence[TrancheRow]) -> list[TrancheRow
     ordinary queue now (#4227) — the "it didn't make it" sibling of
     :func:`tranche_rows_ready_to_dispatch`/:func:`tranche_rows_ready_to_advance`.
 
-    Ready means `state == "failed"` AND at least one child — a row that
-    failed with no children ever assigned has nothing to hand back,
-    mirroring the "nothing to act on" screen both sibling filters already
-    apply.
+    Ready means `state == "failed"` AND at least one child AND the row has
+    an id — a row that failed with no children ever assigned has nothing
+    to hand back (mirroring the "nothing to act on" screen both sibling
+    filters already apply), and an unsaved row has nothing for
+    :func:`coord.state.delete_tranche_row` to delete once its children are
+    handed back, the same "no id, no action" screen
+    :func:`tranche_rows_ready_to_advance` already applies.
+
+    `"failed"` never clears on its own — nothing transitions a row out of
+    it — so the bound that keeps this from re-selecting the SAME row every
+    tick forever is not in this predicate at all: it is the shell's job
+    (mirroring `tranche_rows_ready_to_dispatch`/`tranche_rows_ready_to_advance`,
+    whose own bound is the state write their shells make after acting) to
+    delete the row via `coord.state.delete_tranche_row` once it has handed
+    the children back, so the row itself stops existing rather than
+    lingering in `"failed"` for this filter to pick up a second time.
     """
-    return [row for row in rows if row.state == "failed" and row.children]
+    return [
+        row for row in rows
+        if row.id is not None and row.state == "failed" and row.children
+    ]
 
 
 def tranche_requeue_plan(row: TrancheRow) -> TrancheRequeuePlan:
@@ -9417,24 +9432,31 @@ def tranche_requeue_plan(row: TrancheRow) -> TrancheRequeuePlan:
     back: which children, off which failed tranche row, naming the master
     key the operator would otherwise have to cross-reference by hand.
 
-    Raises `ValueError` if `row.state != "failed"` — the caller's job is
-    to select only ready rows first (:func:`tranche_rows_ready_to_requeue`),
+    Raises `ValueError` if `row.state != "failed"` or `row.children` is
+    empty — the caller's job is to select only ready rows first
+    (:func:`tranche_rows_ready_to_requeue`, which already screens both),
     the same precondition-on-the-caller contract `coord.drive.
     integrate_tranche_row`/`advance_tranche_row` already use for their own
-    state checks.
+    state checks. A childless row has nothing to hand back, so there is no
+    note worth writing about it either — refusing it here keeps
+    `remainder_note` from ever reading as a note about nothing.
     """
     if row.state != "failed":
         raise ValueError(
             f"tranche_requeue_plan: row {row.id} is {row.state!r}, not "
             "'failed' — nothing to hand back to the ordinary queue"
         )
+    if not row.children:
+        raise ValueError(
+            f"tranche_requeue_plan: row {row.id} has no children — "
+            "nothing to hand back to the ordinary queue"
+        )
     master_key = tranche_master_key(row)
     requeue = tuple(sorted(row.children, key=lambda c: c.issue_number))
     names = ", ".join(f"#{c.issue_number}" for c in requeue)
     remainder_note = (
         f"tranche row {row.id} ({master_key}) failed before its closing "
-        f"PR — {names or '(no children)'} dropped back to the queue as "
-        "ordinary row(s)"
+        f"PR — {names} dropped back to the queue as ordinary row(s)"
     )
     return TrancheRequeuePlan(
         row_id=row.id,
