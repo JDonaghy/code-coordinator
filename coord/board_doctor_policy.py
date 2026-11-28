@@ -226,6 +226,7 @@ from coord.board_doctor import (
     CAUSE_NEXT_ACTION_UNPERFORMED,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
+    CAUSE_TEST_FAILED,
     CAUSE_TEST_FAILED_AT_CEILING,
     TIER_ALERT,
     TIER_AUTO,
@@ -3839,14 +3840,19 @@ for _investigate_cause in (
     queue_diagnose.CAUSE_GATE_BLOCKED,
     queue_diagnose.CAUSE_AGENT_UNREACHABLE,
     queue_diagnose.CAUSE_UNKNOWN,
-    # #4210: a row whose failing Test leg's own evidence names a real,
-    # branch-specific failure AND whose drive-queue row has already
-    # exhausted the #2972 fix-round ceiling (`coord.board_doctor.
-    # _reclassify_test_failed`, the only minter of this cause). Reaches
+    # A row whose failing Test leg's own evidence names a real,
+    # branch-specific failure, with fix-round budget still remaining
+    # (`coord.board_doctor._reclassify_test_failed`, the only minter of
+    # this cause). Routed through the ordinary investigate dispatch like
+    # every other investigate-eligible cause — no ceiling bypass needed,
+    # since the drive loop itself still has rework budget left for it.
+    CAUSE_TEST_FAILED,
+    # The same evidence, but this row's drive-queue entry has ALSO
+    # already exhausted the #2972 fix-round ceiling. Reaches
     # `_investigate`'s ordinary ceiling check like every other
     # investigate-eligible cause; `_fixit_rebudget_environmental`'s own
-    # #4210 branch is what lets a BUCKET_MECHANICAL verdict bypass it —
-    # a BUCKET_SUBSTANTIVE (or unclassified) verdict still escalates once
+    # branch is what lets a BUCKET_MECHANICAL verdict bypass it — a
+    # BUCKET_SUBSTANTIVE (or unclassified) verdict still escalates once
     # to the alert tier instead, same as any other ceiling-blocked cause.
     CAUSE_TEST_FAILED_AT_CEILING,
 ):

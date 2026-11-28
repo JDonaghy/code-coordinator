@@ -233,9 +233,11 @@ class TestPolicyTierOf:
             queue_diagnose.CAUSE_GATE_BLOCKED,
             queue_diagnose.CAUSE_AGENT_UNREACHABLE,
             queue_diagnose.CAUSE_UNKNOWN,
-            # #4210: a row whose failing Test leg's own evidence names a
-            # real, branch-specific failure at the #2972 fix-round
-            # ceiling — see `coord.board_doctor._reclassify_test_failed`.
+            # A row whose failing Test leg's own evidence names a real,
+            # branch-specific failure — see
+            # `coord.board_doctor._reclassify_test_failed`.
+            CAUSE_TEST_FAILED,
+            # The same evidence, but also at the #2972 fix-round ceiling.
             CAUSE_TEST_FAILED_AT_CEILING,
         }
         for cause in INVESTIGATE_CAUSES:
