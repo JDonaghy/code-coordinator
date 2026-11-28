@@ -295,6 +295,18 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # save_board — each handler's own write goes through the routed
         # board-mutation helpers it already uses.
         ("drive_queue_doctor_act", "build_board"),
+        # #4202-guarded: `_advance_tranche_rows` is the queue tick's step for
+        # native tranche rows, and carries the `_fetch_live_*` family's guard
+        # in the same place — the
+        # `if resolve_board_service() is not None: return []` early return
+        # sits ABOVE the `from coord.state import load_board` import, so a
+        # thin client returns before the local read is even imported; only
+        # the daemon host, where `coord drive-queue tick` runs (#1870),
+        # reaches it. Read-only with respect to the board: load_board only, no
+        # save_board — its writes go to the separate tranche-row table via
+        # `save_tranche_row`, and every leg it dispatches goes through
+        # `advance_tranche_row`'s own routed helpers.
+        ("_advance_tranche_rows", "load_board"),
     },
     # #4095-guarded: `mechanic_dispatch` is `coord drive`'s one call site for
     # the #4094 mechanic leg, and carries the same guard in the same place as

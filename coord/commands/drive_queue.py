@@ -7403,7 +7403,16 @@ def _advance_tranche_rows(config_path: Path) -> list[str]:
     Best-effort throughout, like every other live re-read this tick runs:
     an unreadable config/board, or one row raising, costs that row this
     tick only and never the queue walk.
+
+    Runs only on the daemon host: a thin client returns before the local
+    board read is imported, because the tranche rows, the board and the
+    legs it dispatches all live on the daemon host.
     """
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return []
+
     try:
         from coord.commands._common import _load_config  # noqa: PLC0415
         from coord.drive import advance_tranche_row  # noqa: PLC0415
