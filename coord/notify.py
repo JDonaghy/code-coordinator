@@ -4458,9 +4458,15 @@ def _attach_review_header(
     for what the gate decided, disagree with the gate itself. The header
     always carries the verdict; counts/identity fields are omitted when
     unavailable.
+
+    `reuse` (#4174) comes from `count_reuse_findings` instead, not from
+    `authoritative_review_counts` — it is an independent prose scan for
+    "duplicates X at file:line" findings, not part of the blocking/
+    nonblocking/nits attestation that function's "one question, one
+    answer" contract covers, so adding it here does not touch that read.
     """
     from coord.review import (  # noqa: PLC0415 — local import keeps import graph clean
-        authoritative_review_counts, format_review_header,
+        authoritative_review_counts, count_reuse_findings, format_review_header,
     )
     blocking, nonblocking, nits = authoritative_review_counts(
         body, assignment_id=assignment_id,
@@ -4472,6 +4478,7 @@ def _attach_review_header(
         blocking=blocking,
         nonblocking=nonblocking,
         nits=nits,
+        reuse=count_reuse_findings(body),
     )
     return f"{header}\n\n{body}"
 
