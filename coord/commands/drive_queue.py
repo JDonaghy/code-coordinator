@@ -1845,6 +1845,42 @@ def _board_for_list_diagnosis() -> BoardView | None:
         return None
 
 
+def _fetch_tranche_prereq_members() -> dict[str, str]:
+    """Every issue key an in-flight tranche row's closing PR will close,
+    mapped to that row's master key (#4227) — `coord.drive_queue.
+    tranche_prereq_members` over this tick's `tranche_rows`.
+
+    This is the `after=` half of the tranche's presentation: a riding
+    child has no `QueueEntry` of its own, so without this mapping an
+    ordinary row declaring `after=<child>` reads that child as having
+    landed long ago (`_after_satisfied`) or as unknown to the board
+    (`_resolve_prereqs`) — see `tranche_prereq_members`' own module
+    comment. Threaded into `plan_tick` and into `list`/`status`'s
+    `diagnose_blocked_after` renders, so an operator's view and a live
+    tick's verdict are derived from the same membership.
+
+    `{}` on a thin client and `{}` on any read failure, the same
+    best-effort posture `_advance_tranche_rows`/`_tranche_status_lines`
+    take: the local `tranche_rows` table a thin client would read is not
+    the daemon's, and an empty mapping is exactly the pre-tranche
+    behaviour rather than a wrong one.
+    """
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}
+    try:
+        from coord.drive_queue import tranche_prereq_members  # noqa: PLC0415
+        from coord.models import TRANCHE_ROW_STATES  # noqa: PLC0415
+        from coord.state import load_tranche_rows_in_states  # noqa: PLC0415
+
+        return tranche_prereq_members(
+            load_tranche_rows_in_states(TRANCHE_ROW_STATES)
+        )
+    except Exception:  # noqa: BLE001 — advisory read; never break list/tick
+        return {}
+
+
 def _drive_queue_list_read(
     repo: str | None,
 ) -> tuple[list[dict], DriveQueueRead | None, str | None]:
@@ -1981,6 +2017,14 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     dep_interventions = fresh_interventions(
         {e.key: e.intervention for e in all_entries if e.intervention}, now,
     )
+    # #4227: same "thread it through so a render never disagrees with a live
+    # tick" rule again, for a dep that is riding an in-flight tranche row
+    # instead of holding a queue row of its own — see
+    # `_fetch_tranche_prereq_members`. Read only when a diagnosis is
+    # actually going to run, matching `board` above.
+    tranche_members = (
+        _fetch_tranche_prereq_members() if board is not None else {}
+    )
     cycle_keys: dict[str, str] = {}
     cycle = find_cycle({e.key: list(e.after) for e in all_entries})
     if cycle is not None:
@@ -2019,6 +2063,7 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             pre_diag = diagnose_blocked_after(
                 candidate, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons,
                 dep_interventions=dep_interventions,
+                tranche_members=tranche_members,
             )
             if not pre_diag.unsatisfiable:
                 cascaded_states[candidate.key] = STATE_WAITING
@@ -2033,6 +2078,7 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             diagnosis = diagnose_blocked_after(
                 entry, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons,
                 dep_interventions=dep_interventions,
+                tranche_members=tranche_members,
             )
             unsatisfied = diagnosis.unsatisfied
             dependency_reason = diagnosis.dependency_reason
@@ -9685,6 +9731,12 @@ def drive_queue_tick(
         # chained `--after` it, recoverable only by a manual remove+add).
         live_prereq_terminal = _fetch_live_prereq_terminal(entries, board, config_path)
 
+        # #4227: which issues an in-flight tranche row's single closing PR
+        # is going to close — the children riding it have no queue row of
+        # their own, so an `after=` edge naming one has nothing to read
+        # without this. See `_fetch_tranche_prereq_members`.
+        tranche_members = _fetch_tranche_prereq_members()
+
         # #2101: release cordons. THIS is the hole the issue names — the
         # queue's launcher had zero pause awareness (`coord/drive.py` checks
         # pause only when routing a *worker*), so a cordoned host kept getting
@@ -9756,6 +9808,7 @@ def drive_queue_tick(
             live_test_routing_reason=live_test_routing_reason,
             live_credential_routing_clear=live_credential_routing_clear,
             live_credential_routing_reason=live_credential_routing_reason,
+            tranche_members=tranche_members,
         )
 
         if roll_pending is not None:

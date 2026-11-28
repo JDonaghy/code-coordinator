@@ -2762,6 +2762,39 @@ def build_app(
             return _fixture.drive_queue()
         return list_drive_queue()
 
+    def _read_tranche_members() -> dict[str, str]:
+        """Which issues an in-flight tranche row's single closing PR will
+        close, mapped to that row's master key (#4227) — the mapping
+        ``summarize_drive_queue``'s ``eligible`` count needs so a `waiting`
+        row whose pre-req is riding a tranche is not counted as something
+        a tick could launch (:func:`coord.drive_queue.tranche_prereq_members`).
+
+        ``{}`` under a fixture (seeded boards carry no tranche rows),
+        ``{}`` on a thin client (the daemon exposes no tranche-row route,
+        so the only readable table is this host's own, which is not the
+        daemon's) and ``{}`` on any read failure — an empty mapping is the
+        pre-tranche reading, never a wrong one, same best-effort posture
+        ``coord.commands.drive_queue._fetch_tranche_prereq_members`` takes
+        for the CLI.
+        """
+        if _fixture is not None:
+            return {}
+        try:
+            from coord.board_service import resolve as resolve_board_service
+            from coord.drive_queue import tranche_prereq_members
+            from coord.models import TRANCHE_ROW_STATES
+            from coord.state import load_tranche_rows_in_states
+
+            if resolve_board_service() is not None:
+                return {}
+
+            return tranche_prereq_members(
+                load_tranche_rows_in_states(TRANCHE_ROW_STATES)
+            )
+        except Exception:  # noqa: BLE001 — advisory; never fail the endpoint
+            logger.debug("tranche prereq members unavailable", exc_info=True)
+            return {}
+
     def _read_leg_counts() -> dict[str, dict[str, int]]:
         """All-time per-issue assignment leg counts by type (#3060).
 
@@ -3524,7 +3557,11 @@ def build_app(
         ``GET /api/drive-queue?repo=web`` report ``level: "normal"`` while a
         DIFFERENT repo's entry actually holds the whole fleet queue, and could
         count a cross-repo ``after=`` dependency as eligible when the real
-        prerequisite is still pending, just filtered out of view. So the
+        prerequisite is still pending, just filtered out of view. The one
+        pre-req shape that is NOT read as satisfied while absent from
+        ``entries`` is one riding an in-flight tranche row — see
+        ``_read_tranche_members``, whose mapping is passed to the summary
+        for exactly that reason. So the
         Queue panel sidebar's pending/running/waiting/eligible/blocked/held
         counts are always fleet-wide, exactly like the TUI's; only the visible
         row list narrows with ``?repo=``.
@@ -3562,7 +3599,9 @@ def build_app(
 
         repo = request.query_params.get("repo") or None
         rows = _read_drive_queue()
-        summary = summarize_drive_queue(entries_from_rows(rows))
+        summary = summarize_drive_queue(
+            entries_from_rows(rows), tranche_members=_read_tranche_members()
+        )
         entries = [r for r in rows if r.get("repo_name") == repo] if repo else rows
         return JSONResponse({
             "entries": entries,
