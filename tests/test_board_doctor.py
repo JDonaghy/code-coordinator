@@ -34,6 +34,7 @@ from coord.board_doctor import (
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
     CAUSE_STRANDED_PREREQ_BLOCKED,
+    CAUSE_TEST_FAILED,
     IDLE_FLEET_ROOT_QUEUE,
     MECHANICAL_MERGE_PENDING_STALE_AFTER_SECONDS,
     MECHANICAL_SWEEP_COUNTER_NAMESPACE,
@@ -52,6 +53,7 @@ from coord.board_doctor import (
     _reclassify_checks_stale_race,
     _reclassify_merge_never_attempted,
     _refresh_ceiling_blocked_settled_rows,
+    _resolve_test_failure_evidence,
     baseline_red_rows,
     branch_merged_guard_rows,
     build_refile_candidate,
@@ -6035,6 +6037,223 @@ class TestCollectRowsOnlySweepsLiveQueueRows:
         rows = self._collect(monkeypatch, live_entry=live_entry)
 
         assert rows == []
+
+
+class TestResolveTestFailureEvidence:
+    """#4210's own resolver — the real, board-aware source
+    `_collect_rows_with_board` reads instead of the three mappings staying
+    permanently ``None`` in production."""
+
+    def _assignment(self, issue: int, reason: str, **kw) -> Assignment:
+        base = dict(
+            machine_name="m1", repo_name="acme/widgets", issue_number=issue,
+            issue_title="t", type="work", test_state="failed", test_reason=reason,
+        )
+        base.update(kw)
+        return Assignment(**base)
+
+    def test_extracts_own_and_base_failing_tests_by_repo(self) -> None:
+        board = Board(
+            active=[],
+            completed=[
+                self._assignment(
+                    40, "FAILED tests/test_thin_client_board_audit.py::test_x - boom",
+                ),
+                self._assignment(
+                    99,
+                    "baseline-red (#2170), also fails on main:\n"
+                    "FAILED tests/test_populated_home.py::test_y - boom",
+                    test_state="skipped", test_confirmation="baseline_red",
+                ),
+            ],
+        )
+
+        own, base, bucket = _resolve_test_failure_evidence(board, config=None)
+
+        assert own == {
+            "acme/widgets#40": ("tests/test_thin_client_board_audit.py::test_x",),
+        }
+        assert base == {"acme/widgets": ("tests/test_populated_home.py::test_y",)}
+        assert bucket == {}
+
+    def test_ignores_assignments_with_no_parseable_failure(self) -> None:
+        board = Board(
+            active=[],
+            completed=[self._assignment(40, "the build timed out, no test names here")],
+        )
+
+        own, base, bucket = _resolve_test_failure_evidence(board, config=None)
+
+        assert own == {}
+        assert base == {}
+        assert bucket == {}
+
+    def test_resolves_a_triage_bucket_only_for_a_branch_specific_ceiling_row(
+        self, monkeypatch,
+    ) -> None:
+        calls: list[str] = []
+
+        def _fake_triage_tier_enabled(repo_name, config):
+            return True
+
+        def _fake_triage_failure(*, evidence, failure_reason):
+            calls.append(failure_reason)
+            from coord.failure_triage import BUCKET_MECHANICAL, ProposedScope, TriageVerdict
+
+            return TriageVerdict(
+                bucket=BUCKET_MECHANICAL, diagnosis="d", repro_capability=None,
+                proposed_scope=ProposedScope(), confidence=0.9, via="deterministic:mechanical:test",
+            )
+
+        monkeypatch.setattr(
+            "coord.board_doctor_policy._triage_tier_enabled", _fake_triage_tier_enabled,
+        )
+        monkeypatch.setattr(
+            "coord.failure_triage.triage_failure", _fake_triage_failure,
+        )
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: issue_number == 40,
+        )
+
+        board = Board(
+            active=[],
+            completed=[
+                # At the ceiling — eligible for triage.
+                self._assignment(
+                    40, "FAILED tests/test_thin_client_board_audit.py::test_x - boom",
+                ),
+                # NOT at the ceiling — must never pay for triage.
+                self._assignment(
+                    41, "FAILED tests/test_other.py::test_z - boom",
+                ),
+            ],
+        )
+
+        own, base, bucket = _resolve_test_failure_evidence(board, config=None)
+
+        assert bucket == {"acme/widgets#40": "mechanical"}
+        assert calls == ["FAILED tests/test_thin_client_board_audit.py::test_x - boom"]
+
+
+class TestCollectRowsResolvesTestFailureEvidenceForRealCaller:
+    """#4210: `coord.board_doctor.run_sweep` is the one production caller
+    that passes ``resolve_test_failure_evidence=True`` — this drives the
+    ACTUAL "subtract, not mask" fold end to end, through `collect_rows`
+    against a real :class:`Board`, rather than hand-building a
+    :class:`StuckRow` and calling `_reclassify_test_failed` directly (that
+    coverage already lives in ``tests/test_board_doctor_policy.py``). A
+    red base poisons both issues' episodes identically; only the one whose
+    OWN failing test is NOT also on the base survives un-suppressed.
+    """
+
+    def _episode(self, key: str) -> dict:
+        return {
+            "key": key,
+            "state": STATE_BLOCKED,
+            "diagnosed_cause": queue_diagnose.CAUSE_CI_PENDING,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+            "diagnosis_evidence": ("last_reason: ci pending",),
+            "resolved": False,
+            "diagnoses": 1,
+        }
+
+    def _collect(self, monkeypatch, *, board: Board) -> list[StuckRow]:
+        import coord.board_doctor as board_doctor_mod
+
+        entries = [
+            QueueEntry(repo="acme/widgets", issue=40, state=STATE_BLOCKED),
+            QueueEntry(repo="acme/widgets", issue=41, state=STATE_BLOCKED),
+        ]
+        episodes = [self._episode("acme/widgets#40"), self._episode("acme/widgets#41")]
+
+        monkeypatch.setattr(board_doctor_mod, "merge_queue_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "merged_partial_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "no_progress_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "smoke_no_verdict_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "stranded_prereq_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "branch_merged_guard_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod, "config_drift_rows", lambda *a, **k: [])
+        monkeypatch.setattr(board_doctor_mod.queue_diagnose, "run_pass", lambda *a, **k: [])
+        monkeypatch.setattr("coord.block_log.episodes", lambda *a, **k: episodes)
+        monkeypatch.setattr("coord.block_log.read_events", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "coord.commands.drive_queue._fetch_board_view_with_retry",
+            lambda: (_ for _ in ()).throw(RuntimeError("no board view in this test")),
+        )
+        monkeypatch.setattr("coord.commands.drive_queue._local_host_id", lambda: "host")
+        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda: [])
+        monkeypatch.setattr(
+            "coord.health.aggregate.local_fleet_health_block", lambda *a, **k: {},
+        )
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: [])
+        # The repo's base IS red right now (the #4202 shape: main also
+        # failing on an unrelated test) — every row for this repo would be
+        # folded into the collapsed baseline-red alert were it not for the
+        # per-row subtraction this test exists to prove.
+        monkeypatch.setattr("coord.state.baseline_red_merge_blocked", lambda *a, **k: True)
+        monkeypatch.setattr(
+            "coord.state.baseline_red_streaks", lambda: {"acme/widgets": 5},
+        )
+        monkeypatch.setattr("coord.state.build_board", lambda: board)
+        monkeypatch.setattr(
+            "coord.state.list_drive_queue", lambda: [e.__dict__ for e in entries],
+        )
+        monkeypatch.setattr("coord.drive_queue.entries_from_rows", lambda rows: entries)
+        monkeypatch.setattr("coord.drive_queue.read_systemd_max_parallel_flags", lambda: {})
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: False,
+        )
+
+        config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+        return board_doctor_mod.collect_rows(
+            config=config, resolve_test_failure_evidence=True,
+        )
+
+    def test_branch_specific_failure_survives_a_red_base_unsuppressed(
+        self, monkeypatch,
+    ) -> None:
+        board = Board(
+            active=[],
+            completed=[
+                # #40's own Test leg: fails on a test that is NOT also
+                # failing on the base.
+                Assignment(
+                    machine_name="m1", repo_name="acme/widgets", issue_number=40,
+                    issue_title="t", type="work", test_state="failed",
+                    test_reason="FAILED tests/test_thin_client_board_audit.py::test_x - boom",
+                ),
+                # The base's own currently-red test, self-reported
+                # baseline-red on a DIFFERENT issue's leg — real,
+                # board-recorded evidence for `baseline_red_failing_tests`.
+                Assignment(
+                    machine_name="m1", repo_name="acme/widgets", issue_number=99,
+                    issue_title="t", type="work", test_state="skipped",
+                    test_reason=(
+                        "baseline-red (#2170), also fails on main:\n"
+                        "FAILED tests/test_populated_home.py::test_y - boom"
+                    ),
+                    test_confirmation="baseline_red",
+                ),
+                # #41's own Test leg: fails on the SAME test as the base —
+                # fully explained, the acceptance case 2 shape.
+                Assignment(
+                    machine_name="m1", repo_name="acme/widgets", issue_number=41,
+                    issue_title="t", type="work", test_state="failed",
+                    test_reason="FAILED tests/test_populated_home.py::test_y - boom",
+                ),
+            ],
+        )
+
+        rows = self._collect(monkeypatch, board=board)
+
+        branch_specific = next(r for r in rows if r.key == "acme/widgets#40")
+        assert branch_specific.cause == CAUSE_TEST_FAILED
+        assert branch_specific.suppressed is False
+
+        base_explained = next(r for r in rows if r.key == "acme/widgets#41")
+        assert base_explained.suppressed is True
 
 
 class TestIdleFleetRootRows:
