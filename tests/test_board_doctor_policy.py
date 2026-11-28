@@ -25,15 +25,19 @@ from coord.board_doctor import (
     CAUSE_MERGE_PENDING_STUCK,
     CAUSE_SMOKE_NO_VERDICT,
     CAUSE_STRANDED_PREREQ,
+    CAUSE_TEST_FAILED,
+    CAUSE_TEST_FAILED_AT_CEILING,
     CONVERGENCE_LIMIT,
     MERGE_PENDING_STALE_AFTER_SECONDS,
     TIER_ALERT,
     TIER_AUTO,
+    TRIAGE_BUCKET_EVIDENCE_PREFIX,
     StuckRow,
     _confirm_merge_pending_stuck,
     _reclassify_after_prereqs_landed,
     _reclassify_blocked_on_prereq,
     _reclassify_stale_latch,
+    _reclassify_test_failed,
     after_prereqs_landed_for_entry,
     blocked_on_prereq_dep_for_entry,
     merge_queue_rows,
@@ -56,6 +60,7 @@ from coord.board_doctor_policy import (
     _requeue_after_prereqs_landed,
     _requeue_ceiling_blocked_mergeable,
     _requeue_never_dispatched,
+    _row_triage_bucket,
     dismiss_resolved_escalation,
     escalation_alert_dispatcher,
     make_investigate_capacity_check,
@@ -63,7 +68,7 @@ from coord.board_doctor_policy import (
     write_drive_escalation,
 )
 from coord.config import Config
-from coord.drive_queue import parse_key
+from coord.drive_queue import branch_specific_test_failures, parse_key
 from coord.models import Assignment, Board, Machine, Repo
 
 _IN_FLIGHT_DETAIL = (
@@ -228,6 +233,10 @@ class TestPolicyTierOf:
             queue_diagnose.CAUSE_GATE_BLOCKED,
             queue_diagnose.CAUSE_AGENT_UNREACHABLE,
             queue_diagnose.CAUSE_UNKNOWN,
+            # #4210: a row whose failing Test leg's own evidence names a
+            # real, branch-specific failure at the #2972 fix-round
+            # ceiling — see `coord.board_doctor._reclassify_test_failed`.
+            CAUSE_TEST_FAILED_AT_CEILING,
         }
         for cause in INVESTIGATE_CAUSES:
             assert policy_tier_of(cause) == TIER_AUTO
@@ -4767,3 +4776,263 @@ class TestSweepMarkDoneThenTickWritesMergedPartial:
 
         reconcile = next(r for r in plan.reconciles if r.key == "acme/widgets#81")
         assert reconcile.updates["state"] == STATE_MERGED_PARTIAL
+
+
+class TestBranchSpecificTestFailures:
+    """#4210's pure subtraction primitive — the "subtract, not mask" half
+    of the baseline-red fix, shared by `coord.board_doctor.
+    _reclassify_test_failed` and any future caller (#2096).
+    """
+
+    def test_subtracts_the_shared_failure(self) -> None:
+        assert branch_specific_test_failures(
+            ("tests/test_a.py::test_x", "tests/test_b.py::test_y"),
+            ("tests/test_a.py::test_x",),
+        ) == ("tests/test_b.py::test_y",)
+
+    def test_empty_when_every_own_failure_is_also_on_the_base(self) -> None:
+        assert branch_specific_test_failures(
+            ("tests/test_a.py::test_x",), ("tests/test_a.py::test_x",),
+        ) == ()
+
+    def test_empty_for_no_own_failures(self) -> None:
+        assert branch_specific_test_failures((), ("tests/test_a.py::test_x",)) == ()
+
+    def test_everything_kept_when_base_has_no_failures(self) -> None:
+        assert branch_specific_test_failures(
+            ("tests/test_a.py::test_x",), (),
+        ) == ("tests/test_a.py::test_x",)
+
+    def test_order_preserving_and_deduplicated(self) -> None:
+        assert branch_specific_test_failures(
+            ("t2", "t1", "t2", "t3"), ("t3",),
+        ) == ("t2", "t1")
+
+
+class TestReclassifyTestFailed:
+    """#4210: classify a row from its failing Test leg's own evidence,
+    never the generic live-check/next-action wording — the #4202
+    incident's own shape.
+    """
+
+    def _row(self, **kw) -> StuckRow:
+        base = dict(
+            queue="drive-queue", key="acme/widgets#40", state="blocked",
+            cause=queue_diagnose.CAUSE_CI_PENDING, confidence=queue_diagnose.CONFIDENCE_MEDIUM,
+            evidence=(), fresh=True, suppressed=False,
+        )
+        base.update(kw)
+        return StuckRow(**base)
+
+    def test_leaves_a_row_with_no_evidence_entirely_unchanged(self) -> None:
+        row = self._row()
+        reclassified = _reclassify_test_failed([row], failing_tests_by_key={})
+        assert reclassified[0] == row
+
+    def test_leaves_a_row_fully_explained_by_the_base_unchanged(self) -> None:
+        # Acceptance case 2: the same failing test also fails on the base
+        # — nothing here is the branch's own doing, so the existing
+        # baseline-red fold must still be free to suppress it.
+        row = self._row()
+        reclassified = _reclassify_test_failed(
+            [row],
+            failing_tests_by_key={"acme/widgets#40": ("tests/test_a.py::test_thin_client",)},
+            base_failing_tests_by_repo={
+                "acme/widgets": ("tests/test_a.py::test_thin_client",),
+            },
+        )
+        assert reclassified[0].cause == queue_diagnose.CAUSE_CI_PENDING
+        assert reclassified[0].suppressed is False
+
+    def test_classifies_test_failed_at_ceiling_when_branch_specific_and_at_ceiling(
+        self, monkeypatch,
+    ) -> None:
+        # Acceptance case 1 (the #4202 replay): one failing test is NOT
+        # also failing on the base, and the row's own drive-queue entry
+        # has already exhausted the #2972 ceiling.
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+        row = self._row(suppressed=True)
+
+        reclassified = _reclassify_test_failed(
+            [row],
+            failing_tests_by_key={
+                "acme/widgets#40": ("tests/test_thin_client_board_audit",),
+            },
+            base_failing_tests_by_repo={"acme/widgets": ("tests/test_populated_home",)},
+            triage_bucket_by_key={"acme/widgets#40": "mechanical"},
+        )
+
+        result = reclassified[0]
+        assert result.cause == CAUSE_TEST_FAILED_AT_CEILING
+        # #4210: "subtract, not mask" — a genuinely branch-specific
+        # failure is never withdrawn, even if it arrived already
+        # suppressed from an earlier pass.
+        assert result.suppressed is False
+        assert result.fresh is True
+        assert "failing_test=tests/test_thin_client_board_audit" in result.evidence
+        assert f"{TRIAGE_BUCKET_EVIDENCE_PREFIX}mechanical" in result.evidence
+
+    def test_classifies_plain_test_failed_when_not_at_the_ceiling(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: False,
+        )
+        row = self._row()
+
+        reclassified = _reclassify_test_failed(
+            [row],
+            failing_tests_by_key={"acme/widgets#40": ("tests/test_x.py::test_y",)},
+        )
+
+        assert reclassified[0].cause == CAUSE_TEST_FAILED
+
+    def test_never_overwrites_a_row_with_no_parseable_key(self, monkeypatch) -> None:
+        row = self._row(key="not-a-valid-key")
+
+        reclassified = _reclassify_test_failed(
+            [row], failing_tests_by_key={"not-a-valid-key": ("tests/test_x.py::test_y",)},
+        )
+
+        assert reclassified[0].cause == queue_diagnose.CAUSE_CI_PENDING
+
+
+class TestFixitRebudgetEnvironmentalTestFailedAtCeiling:
+    """#4210: the triage-bucket-keyed admission path, independent of
+    :data:`_FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES`/``confidence``.
+    """
+
+    def _row(self, bucket: str | None, **kw) -> StuckRow:
+        evidence = ("failing_test=tests/test_x.py::test_y",)
+        if bucket is not None:
+            evidence = (*evidence, f"{TRIAGE_BUCKET_EVIDENCE_PREFIX}{bucket}")
+        base = dict(
+            queue="drive-queue", key="acme/widgets#40", state="blocked",
+            cause=CAUSE_TEST_FAILED_AT_CEILING, confidence=queue_diagnose.CONFIDENCE_NONE,
+            evidence=evidence, fresh=True,
+        )
+        base.update(kw)
+        return StuckRow(**base)
+
+    def test_mechanical_bucket_is_environmental(self) -> None:
+        assert _fixit_rebudget_environmental(self._row("mechanical")) is True
+
+    def test_substantive_bucket_is_flailing(self) -> None:
+        assert _fixit_rebudget_environmental(self._row("substantive")) is False
+
+    def test_no_bucket_at_all_is_flailing(self) -> None:
+        assert _fixit_rebudget_environmental(self._row(None)) is False
+
+    def test_a_stale_row_never_reads_as_environmental_even_mechanical(self) -> None:
+        assert _fixit_rebudget_environmental(self._row("mechanical", fresh=False)) is False
+
+    def test_row_triage_bucket_reads_the_marker_back(self) -> None:
+        row = self._row("mechanical")
+        assert _row_triage_bucket(row) == "mechanical"
+
+    def test_row_triage_bucket_is_none_when_absent(self) -> None:
+        row = self._row(None)
+        assert _row_triage_bucket(row) is None
+
+
+class TestInvestigateTestFailedAtCeiling:
+    """#4210 end-to-end (within `_investigate`'s own existing wiring): a
+    row this sweep reclassified to `CAUSE_TEST_FAILED_AT_CEILING` reaches
+    exactly the SAME ceiling-bypass/alert-fallback branches every other
+    investigate-eligible cause does — one more confirmation that
+    `_reclassify_test_failed` producing the right cause is sufficient; no
+    bespoke dispatch path was added for it (#2096).
+    """
+
+    def _mechanical_row(self) -> StuckRow:
+        reclassified = _reclassify_test_failed(
+            [
+                StuckRow(
+                    queue="drive-queue", key="acme/widgets#40", state="blocked",
+                    cause=queue_diagnose.CAUSE_CI_PENDING,
+                    confidence=queue_diagnose.CONFIDENCE_MEDIUM,
+                    evidence=(), fresh=True, suppressed=True,
+                )
+            ],
+            failing_tests_by_key={
+                "acme/widgets#40": ("tests/test_thin_client_board_audit",),
+            },
+            base_failing_tests_by_repo={"acme/widgets": ("tests/test_populated_home",)},
+            triage_bucket_by_key={"acme/widgets#40": "mechanical"},
+        )
+        return reclassified[0]
+
+    def test_replay_of_4202_dispatches_one_investigate_leg_at_the_ceiling(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
+        monkeypatch.setattr(state, "build_board", lambda: object())
+        dispatched: list[str] = []
+
+        def fake_dispatch(*a, **k):
+            dispatched.append("leg")
+            return {
+                "dispatched": True, "assignment_id": "asn-1", "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        row = self._mechanical_row()
+        assert row.cause == CAUSE_TEST_FAILED_AT_CEILING
+        assert row.suppressed is False
+
+        assert _investigate(row) is True
+        assert dispatched == ["leg"]
+        assert state.list_drive_escalations() == []
+
+    def test_substantive_verdict_escalates_once_with_no_leg(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+        monkeypatch.setattr(
+            common, "resolve_and_load_config", lambda *a, **k: Config(repos=[], machines=[]),
+        )
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "dispatch_sweep_action must not run for a substantive "
+                "test-failed-at-ceiling row"
+            )
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+
+        reclassified = _reclassify_test_failed(
+            [
+                StuckRow(
+                    queue="drive-queue", key="acme/widgets#40", state="blocked",
+                    cause=queue_diagnose.CAUSE_CI_PENDING,
+                    confidence=queue_diagnose.CONFIDENCE_MEDIUM,
+                    evidence=(), fresh=True, suppressed=True,
+                )
+            ],
+            failing_tests_by_key={
+                "acme/widgets#40": ("tests/test_thin_client_board_audit",),
+            },
+            base_failing_tests_by_repo={"acme/widgets": ("tests/test_populated_home",)},
+            triage_bucket_by_key={"acme/widgets#40": "substantive"},
+        )
+        row = reclassified[0]
+        assert row.cause == CAUSE_TEST_FAILED_AT_CEILING
+
+        assert _investigate(row) is False
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"

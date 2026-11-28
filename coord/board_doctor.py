@@ -546,6 +546,26 @@ def stranded_prereq_rows(entries: Sequence[Any], *, config: Any) -> list[StuckRo
 #: #4045: the one cause :func:`next_action_unperformed_rows` ever mints.
 CAUSE_NEXT_ACTION_UNPERFORMED = "next-action-unperformed"
 
+#: #4210: a row whose failing Test leg's OWN evidence — not the generic
+#: live-check/next-action wording every earlier pass in
+#: :func:`_collect_rows_with_board` reads instead — names at least one
+#: test failure genuinely this branch's own (`coord.drive_queue.
+#: branch_specific_test_failures` already subtracted whatever also fails
+#: on the base). Minted only by :func:`_reclassify_test_failed`, never by
+#: `queue_diagnose` itself, the same "narrow cause minted by a
+#: reclassifier" shape :data:`CAUSE_CEILING_BLOCKED_MERGEABLE` documents.
+CAUSE_TEST_FAILED = "test-failed"
+
+#: The same evidence, on a row whose drive-queue entry has ALSO already
+#: given up on the #2972 fix-round ceiling (`coord.drive_queue.
+#: fix_round_ceiling_blocked_for_issue`) — distinguished from
+#: :data:`CAUSE_TEST_FAILED` because only this cause ever reaches
+#: `coord.board_doctor_policy._investigate`'s ceiling-bypass branch
+#: (`_fixit_rebudget_eligible`); a plain :data:`CAUSE_TEST_FAILED` row
+#: still has fix-round budget left, so the ordinary investigate dispatch
+#: needs no bypass at all.
+CAUSE_TEST_FAILED_AT_CEILING = "test-failed-at-ceiling"
+
 #: How long a row may sit with a live, dispatchable `next_action` and no leg
 #: in flight before this sweep acts on it (#4045) — a much tighter floor
 #: than :attr:`coord.config.BoardDoctorConfig.no_progress_minutes`'s
@@ -3745,6 +3765,114 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     return reclassified
 
 
+#: #4210: the evidence-marker prefix used to carry a `coord.failure_triage.
+#: TriageVerdict.bucket` through a plain :class:`StuckRow` to
+#: `coord.board_doctor_policy._fixit_rebudget_environmental`, the one
+#: reader of it — a `StuckRow` has no dedicated field for it, and adding
+#: one would mean every OTHER builder in this module has to populate it
+#: too, for a value only this one cause ever carries.
+TRIAGE_BUCKET_EVIDENCE_PREFIX = "triage_bucket="
+
+
+def _reclassify_test_failed(
+    rows: list[StuckRow],
+    *,
+    failing_tests_by_key: Mapping[str, tuple[str, ...]] | None = None,
+    base_failing_tests_by_repo: Mapping[str, tuple[str, ...]] | None = None,
+    triage_bucket_by_key: Mapping[str, str] | None = None,
+) -> list[StuckRow]:
+    """Classify a row from its failing Test LEG's own evidence (#4210),
+    never the generic live-check/next-action wording every earlier pass in
+    :func:`_collect_rows_with_board` reads instead — the #4202 incident's
+    whole shape: a row whose latest Test verdict is a real, branch-specific
+    failure got classified ``next-action-unperformed`` by one sweep and
+    ``queue_diagnose.CAUSE_CI_PENDING`` by the next, neither of which is
+    what actually happened.
+
+    *failing_tests_by_key* (row key -> the failing leg's own extracted
+    failing-test identifiers, e.g. `coord.failure_evidence`'s #4092
+    extractor run over that leg's stored log) names every row this
+    function may touch; a row absent from it is returned completely
+    unchanged — "no Test-failure evidence available for this row" must
+    never invent a cause from nothing, the same posture every other
+    reclassifier in this module takes toward its own missing evidence.
+
+    For an included row, `coord.drive_queue.branch_specific_test_failures`
+    subtracts *base_failing_tests_by_repo* (keyed by repo name — the SAME
+    baseline-red env-probe output `coord.board_doctor_policy.
+    _baseline_red_env_and_lost_work_options` already derives) from the
+    row's own failing set:
+
+    * Nothing left — every one of the row's own failures is ALSO failing
+      on the base right now. The row is returned unchanged: #3761's
+      baseline-red fold is right to withdraw it, since none of this is
+      the branch's own doing (acceptance case 2).
+    * Something left — the row has a failure genuinely its own. Its cause
+      becomes :data:`CAUSE_TEST_FAILED_AT_CEILING` when `coord.
+      drive_queue.fix_round_ceiling_blocked_for_issue` says this row's
+      issue already exhausted the #2972 ceiling, or :data:`CAUSE_TEST_FAILED`
+      otherwise; ``suppressed`` is force-cleared — a genuinely
+      branch-specific failure must never be withdrawn by a LATER
+      baseline-red fold in :func:`_collect_rows_with_board` (#4210:
+      "subtract, not mask"); ``evidence`` becomes the branch-specific
+      failing-test names, so a human or a dispatched leg reads the real
+      list, not the base's inflated one; ``fresh`` is set ``True`` — the
+      caller only ever supplies *failing_tests_by_key* from evidence read
+      THIS sweep, the same #3777 contract every other fresh-setting
+      builder in this module upholds.
+
+    *triage_bucket_by_key*, when given, stashes the caller's own #4093
+    triage-verdict bucket (``"mechanical"``/``"substantive"``/...) onto
+    the reclassified row's evidence as a :data:`TRIAGE_BUCKET_EVIDENCE_
+    PREFIX`-prefixed marker — the only channel `coord.board_doctor_policy.
+    _fixit_rebudget_environmental` has to read it back from a plain
+    :class:`StuckRow`.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        branch_specific_test_failures,
+        fix_round_ceiling_blocked_for_issue,
+        parse_key as _parse_row_key,
+    )
+
+    failing_by_key = failing_tests_by_key or {}
+    base_by_repo = base_failing_tests_by_repo or {}
+    bucket_by_key = triage_bucket_by_key or {}
+
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        own_failing = failing_by_key.get(row.key)
+        if not own_failing:
+            reclassified.append(row)
+            continue
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            reclassified.append(row)
+            continue
+        repo_name, issue_number = parsed
+        branch_specific = branch_specific_test_failures(
+            own_failing, base_by_repo.get(repo_name, ()),
+        )
+        if not branch_specific:
+            reclassified.append(row)
+            continue
+        at_ceiling = fix_round_ceiling_blocked_for_issue(repo_name, issue_number)
+        cause = CAUSE_TEST_FAILED_AT_CEILING if at_ceiling else CAUSE_TEST_FAILED
+        evidence = tuple(f"failing_test={t}" for t in branch_specific)
+        bucket = bucket_by_key.get(row.key)
+        if bucket:
+            evidence = (*evidence, f"{TRIAGE_BUCKET_EVIDENCE_PREFIX}{bucket}")
+        reclassified.append(
+            replace(
+                row,
+                cause=cause,
+                evidence=evidence,
+                suppressed=False,
+                fresh=True,
+            )
+        )
+    return reclassified
+
+
 def _reclassify_checks_stale_race(rows: list[StuckRow], *, config) -> list[StuckRow]:
     """Relabel checks-stale-race-but-live-clear rows (#3859).
 
@@ -5223,16 +5351,29 @@ def collect_rows(
     config,
     trigger: str = "board-doctor-sweep",
     merge_pending_stale_after_seconds: float | None = None,
+    test_failure_evidence: Mapping[str, tuple[str, ...]] | None = None,
+    baseline_red_failing_tests: Mapping[str, tuple[str, ...]] | None = None,
+    test_failure_triage_bucket: Mapping[str, str] | None = None,
 ) -> list[StuckRow]:
     """The impure production walk over both queues (#3758). Thin wrapper
     over :func:`_collect_rows_with_board` for every caller that only wants
     the rows — :func:`run_sweep` wants the :class:`Board` this walk
     already built too, so it unpacks both instead of paying for a second
-    :func:`coord.state.build_board` read of its own."""
+    :func:`coord.state.build_board` read of its own.
+
+    *test_failure_evidence*/*baseline_red_failing_tests*/
+    *test_failure_triage_bucket* (#4210) forward, unchanged, to
+    :func:`_reclassify_test_failed` — see its own docstring. Every caller
+    that does not pass them (every caller today) gets exactly the
+    pre-#4210 classification, since each defaults to ``None``.
+    """
     rows, _board = _collect_rows_with_board(
         config=config,
         trigger=trigger,
         merge_pending_stale_after_seconds=merge_pending_stale_after_seconds,
+        test_failure_evidence=test_failure_evidence,
+        baseline_red_failing_tests=baseline_red_failing_tests,
+        test_failure_triage_bucket=test_failure_triage_bucket,
     )
     return rows
 
@@ -5242,6 +5383,9 @@ def _collect_rows_with_board(
     config,
     trigger: str = "board-doctor-sweep",
     merge_pending_stale_after_seconds: float | None = None,
+    test_failure_evidence: Mapping[str, tuple[str, ...]] | None = None,
+    baseline_red_failing_tests: Mapping[str, tuple[str, ...]] | None = None,
+    test_failure_triage_bucket: Mapping[str, str] | None = None,
 ) -> tuple[list[StuckRow], Board]:
     """The impure production walk over both queues (#3758).
 
@@ -5510,6 +5654,24 @@ def _collect_rows_with_board(
         if row.key not in covered_keys
     )
 
+    # #4210: re-derive cause from the failing Test leg's OWN evidence —
+    # run LAST among the reclassifiers (every row this walk could possibly
+    # have already produced, by any pass, including `next_action_
+    # unperformed_rows`'s generic next-action reading just above, is
+    # candidate for this override) and strictly BEFORE the blocked-streaks
+    # suppression block below, so a row this call reclassifies to
+    # `CAUSE_TEST_FAILED`/`CAUSE_TEST_FAILED_AT_CEILING` is already wearing
+    # its real cause by the time that block decides whether to withdraw
+    # it. *test_failure_evidence* is ``None`` for every caller that does
+    # not resolve it (today, every caller) — see `_reclassify_test_failed`'s
+    # own docstring for why that is a strict no-op, not a partial one.
+    rows = _reclassify_test_failed(
+        rows,
+        failing_tests_by_key=test_failure_evidence,
+        base_failing_tests_by_repo=baseline_red_failing_tests,
+        triage_bucket_by_key=test_failure_triage_bucket,
+    )
+
     blocked_streaks = {
         repo_name: streak
         for repo_name, streak in baseline_red_streaks().items()
@@ -5539,6 +5701,15 @@ def _collect_rows_with_board(
         from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
 
         def _suppress_if_blocked(row: StuckRow) -> StuckRow:
+            # #4210: "subtract, not mask" — a row `_reclassify_test_failed`
+            # already confirmed has a failure genuinely its own (NOT
+            # explained by the base) must not be withdrawn here just
+            # because its repo also happens to be on a baseline-red
+            # streak right now. Only a row this walk has NOT already
+            # proven branch-specific may still be folded into the
+            # repo-wide baseline-red row below.
+            if row.cause in (CAUSE_TEST_FAILED, CAUSE_TEST_FAILED_AT_CEILING):
+                return row
             parsed = _parse_row_key(row.key)
             if parsed is not None and parsed[0] in blocked_streaks:
                 return replace(row, suppressed=True)
